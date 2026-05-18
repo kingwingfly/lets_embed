@@ -8,6 +8,13 @@ wget -O models/cn_clip_vision.onnx https://huggingface.co/felixdu/chinese-clip-v
 wget -O models/tokenizer.json https://huggingface.co/Xenova/chinese-clip-vit-base-patch16/resolve/main/tokenizer.json?download=true
 ```
 
+Try infer
+```sh
+# set `ORT_CUDA_VERSION` you cuda version
+ORT_CUDA_VERSION=13 cargo run --example infer_text
+ORT_CUDA_VERSION=13 cargo run --example infer_text
+```
+
 # Dev
 
 ```bash
