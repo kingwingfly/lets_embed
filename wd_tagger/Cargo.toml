@@ -1,0 +1,10 @@
+[package]
+name = "wd_tagger"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[dependencies]

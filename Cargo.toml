@@ -1,0 +1,41 @@
+[workspace]
+members = ["db",
+    "wd_tagger"
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+authors = ["Louis <836250617@qq.com>"]
+license = "MIT"
+repository = "https://github.com/kingwingfly/lets_embed"
+documentation = "https://github.com/kingwingfly/lets_embed"
+
+[workspace.dependencies]
+# runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+tokio-util = "0.7"
+tokio-stream = { version = "0.1", features = ["io-util"] }
+tokio-retry = "0.3"
+ort = { version = "2.0.0-rc.12", features = ["tracing"] }
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# error
+anyhow = "1.0"
+# serde
+struson = { version = "0.7", features = ["simple-api"] }
+# data structure
+dashmap = "6.1"
+bytes = "1.11"
+# storage layer
+opendal = { version = "0.56", features = [] }
+# http
+axum = "0.8"
+url = "2.5"
+# db
+sqlx = { version = "0.8", features = [ "runtime-tokio", "postgres", "macros", "derive", "migrate", "json"] }
+pgvector = { version = "0.4", features = ["sqlx"] }
+# util
+tokenizers = "0.23.1"
