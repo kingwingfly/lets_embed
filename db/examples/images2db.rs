@@ -98,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 titles AS (
                     SELECT * FROM ins_titles
-                    UNION
+                    UNION ALL
                     SELECT id, title
                     FROM input i
                     JOIN titles USING (title)
@@ -115,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 images AS (
                     SELECT * FROM ins_images
-                    UNION
+                    UNION ALL
                     SELECT id, name
                     FROM input i
                     CROSS JOIN LATERAL UNNEST(i.images::VARCHAR[]) as _(name)
@@ -143,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 authors AS (
                     SELECT * FROM ins_authors
-                    UNION
+                    UNION ALL
                     SELECT id, name
                     FROM input i
                     CROSS JOIN LATERAL UNNEST(i.authors::VARCHAR[]) as _(name)
@@ -171,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 tags AS (
                     SELECT * FROM ins_tags
-                    UNION
+                    UNION ALL
                     SELECT id, name
                     FROM input i
                     CROSS JOIN LATERAL UNNEST(i.tags::VARCHAR[]) as _(name)
@@ -187,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
                     ON CONFLICT DO NOTHING
                     RETURNING tag_id, title_id
                 )
-                SELECT * FROM titles
+                SELECT 1 AS ok
                 "#,
                 &metas as _
             )
