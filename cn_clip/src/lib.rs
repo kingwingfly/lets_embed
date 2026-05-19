@@ -8,7 +8,6 @@ use fast_image_resize::{
     FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
     images::{CroppedImageMut, Image},
 };
-#[cfg(target_os = "macos")]
 use ort::ep;
 use ort::{inputs, session::Session, value::Tensor};
 use tokenizers::{EncodeInput, Tokenizer};
