@@ -96,7 +96,7 @@ where
     }
 
     let output = session.run(inputs![
-        "pixel_values" => Tensor::from_array(([batch_size, 3, 224, 224], pixel_values))?,
+        "pixel_values" => Tensor::from_array(([batch_size, IMAGE_INPUT_DIM, IMAGE_SIZE, IMAGE_SIZE], pixel_values))?,
     ])?;
 
     let (shape, predictions) = output["image_features"].try_extract_tensor::<f32>()?;
@@ -110,6 +110,9 @@ where
         .collect())
 }
 
+/// width, height: target size
+///
+/// Returns normalized CHW (black padded if ratio not match).
 pub fn load_image<R: Read + Seek>(r: R, width: u32, height: u32) -> anyhow::Result<Vec<f32>> {
     let src_image = image::ImageReader::new(BufReader::new(r))
         .with_guessed_format()?
@@ -129,17 +132,19 @@ pub fn load_image<R: Read + Seek>(r: R, width: u32, height: u32) -> anyhow::Resu
     let mut resizer = Resizer::new();
     resizer.resize(&src_image, &mut view, None)?;
 
-    let mut buf = dst_image
-        .buffer()
-        .iter()
-        .map(|i| *i as f32)
-        .collect::<Vec<_>>();
+    let hwc = dst_image.buffer();
 
-    for pix in buf.chunks_mut(3) {
-        pix[0] = ((pix[0] as f64 - MEAN[0]) / STD[0]) as f32;
-        pix[1] = ((pix[1] as f64 - MEAN[1]) / STD[1]) as f32;
-        pix[2] = ((pix[2] as f64 - MEAN[2]) / STD[2]) as f32;
+    let mut chw = vec![0.0f32; hwc.len()];
+    let hw = (height * width) as usize;
+    for h in 0..height as usize {
+        for w in 0..width as usize {
+            let src = (h * width as usize + w) * 3;
+            for c in 0..3usize {
+                chw[c * hw + h * width as usize + w] =
+                    ((hwc[src + c] as f64 / 255.0 - MEAN[c]) / STD[c]) as f32;
+            }
+        }
     }
 
-    Ok(buf)
+    Ok(chw)
 }
