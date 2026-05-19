@@ -18,9 +18,6 @@ pub const IMAGE_WIDTH: usize = 448;
 pub const IMAGE_HEIGHT: usize = 448;
 pub const IMAGE_CHANNEL: usize = 3;
 
-pub const MEAN: [f64; 3] = [0.5; 3];
-pub const STD: [f64; 3] = [0.5; 3];
-
 pub fn model(model_path: impl AsRef<Path>) -> anyhow::Result<Session> {
     #[cfg(target_os = "macos")]
     let session = Session::builder()?
@@ -56,6 +53,7 @@ pub fn infer_tag<'a>(
     batch_input: Vec<Vec<f32>>,
     tags: &'a [impl AsRef<str>],
     top_k: usize,
+    threshold: f32,
 ) -> anyhow::Result<Vec<Vec<(&'a str, f32)>>>
 where
 {
@@ -81,7 +79,7 @@ where
     let tags = predictions
         .chunks(OUT_DIM)
         .map(|prediction| {
-            top_k_heap(prediction, top_k)
+            top_k_heap(prediction, top_k, threshold)
                 .into_iter()
                 .map(|(i, p)| (tags[i].as_ref(), p))
                 .collect()
@@ -93,7 +91,9 @@ where
 
 /// width, height: target size
 ///
-/// Returns normalized HWC (black padded if ratio not match).
+/// Returns HWC BGR (black padded if ratio not match).
+///
+/// Normalization is not needed in preprocess of wd-tagger.
 pub fn load_image<R: Read + Seek>(r: R, width: u32, height: u32) -> anyhow::Result<Vec<f32>> {
     let src_image = image::ImageReader::new(BufReader::new(r))
         .with_guessed_format()?
@@ -120,9 +120,7 @@ pub fn load_image<R: Read + Seek>(r: R, width: u32, height: u32) -> anyhow::Resu
         .collect::<Vec<_>>();
 
     for pix in hwc.chunks_mut(3) {
-        pix[0] = ((pix[0] as f64 / 255.0 - MEAN[0]) / STD[0]) as f32;
-        pix[1] = ((pix[1] as f64 / 255.0 - MEAN[1]) / STD[1]) as f32;
-        pix[2] = ((pix[2] as f64 / 255.0 - MEAN[2]) / STD[2]) as f32;
+        pix.reverse(); // rgb -> bgr
     }
 
     Ok(hwc)
@@ -145,10 +143,10 @@ impl Ord for FloatOrd {
     }
 }
 
-fn top_k_heap(vec: &[f32], k: usize) -> Vec<(usize, f32)> {
+fn top_k_heap(vec: &[f32], k: usize, threshold: f32) -> Vec<(usize, f32)> {
     let mut heap: BinaryHeap<Reverse<(FloatOrd, usize)>> = BinaryHeap::with_capacity(k + 1);
 
-    for (i, &val) in vec.iter().enumerate() {
+    for (i, &val) in vec.iter().enumerate().filter(|(_, p)| **p >= threshold) {
         if heap.len() < k {
             heap.push(Reverse((FloatOrd(val), i)));
         } else if let Some(&Reverse((FloatOrd(min_val), _))) = heap.peek()
@@ -163,6 +161,6 @@ fn top_k_heap(vec: &[f32], k: usize) -> Vec<(usize, f32)> {
         .into_iter()
         .map(|Reverse((FloatOrd(val), idx))| (idx, val))
         .collect();
-    result.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    result.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
     result
 }

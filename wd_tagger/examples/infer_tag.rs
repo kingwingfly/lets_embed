@@ -10,7 +10,7 @@ fn main() -> anyhow::Result<()> {
         IMAGE_WIDTH as u32,
         IMAGE_HEIGHT as u32,
     )?;
-    let res = infer_tag(&mut session, vec![pika], &tags, 10)?;
+    let res = infer_tag(&mut session, vec![pika], &tags, 10, 0.8)?;
     dbg!(res);
     Ok(())
 }

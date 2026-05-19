@@ -7,7 +7,7 @@ wget -O models/cn_clip_text.onnx https://huggingface.co/felixdu/chinese-clip-vit
 wget -O models/cn_clip_vision.onnx https://huggingface.co/felixdu/chinese-clip-vit-base-patch16-onnx/resolve/main/cn_clip_vision.onnx
 wget -O models/tokenizer.json https://huggingface.co/Xenova/chinese-clip-vit-base-patch16/resolve/main/tokenizer.json?download=true
 
-wget -O models/models/wd-eva02-large-tagger-v3.onnx https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/model.onnx
+wget -O models/wd-eva02-large-tagger-v3.onnx https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/model.onnx
 wget -O models/selected_tags.csv https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/selected_tags.csv?download=true
 ```
 
