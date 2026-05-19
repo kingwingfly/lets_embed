@@ -10,7 +10,7 @@ use fast_image_resize::{
     FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
     images::{CroppedImageMut, Image},
 };
-use ort::{inputs, session::Session, value::Tensor};
+use ort::{ep, inputs, session::Session, value::Tensor};
 
 pub const OUT_DIM: usize = 10861;
 
@@ -19,14 +19,14 @@ pub const IMAGE_HEIGHT: usize = 448;
 pub const IMAGE_CHANNEL: usize = 3;
 
 pub fn model(model_path: impl AsRef<Path>) -> anyhow::Result<Session> {
-    #[cfg(target_os = "macos")]
     let session = Session::builder()?
-        .with_execution_providers([ort::ep::WebGPU::default().build().error_on_failure()])
-        .unwrap()
-        .commit_from_file(model_path)?;
-    #[cfg(not(target_os = "macos"))]
-    let session = Session::builder()?
-        .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
+        .with_execution_providers([
+            ep::TensorRT::default().build(),
+            ep::CUDA::default().build(),
+            ep::DirectML::default().build(),
+            ep::WebGPU::default().build(),
+            ep::CoreML::default().build().error_on_failure(),
+        ])
         .unwrap()
         .commit_from_file(model_path)?;
 

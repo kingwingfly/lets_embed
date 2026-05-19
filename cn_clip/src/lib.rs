@@ -8,6 +8,8 @@ use fast_image_resize::{
     FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
     images::{CroppedImageMut, Image},
 };
+#[cfg(target_os = "macos")]
+use ort::ep;
 use ort::{inputs, session::Session, value::Tensor};
 use tokenizers::{EncodeInput, Tokenizer};
 
@@ -28,14 +30,14 @@ pub fn tokenizer(config: impl AsRef<Path>) -> anyhow::Result<Tokenizer> {
 }
 
 pub fn model(model_path: impl AsRef<Path>) -> anyhow::Result<Session> {
-    #[cfg(target_os = "macos")]
     let session = Session::builder()?
-        .with_execution_providers([ort::ep::WebGPU::default().build().error_on_failure()])
-        .unwrap()
-        .commit_from_file(model_path)?;
-    #[cfg(not(target_os = "macos"))]
-    let session = Session::builder()?
-        .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
+        .with_execution_providers([
+            ep::TensorRT::default().build(),
+            ep::CUDA::default().build(),
+            ep::DirectML::default().build(),
+            ep::WebGPU::default().build(),
+            ep::CoreML::default().build().error_on_failure(),
+        ])
         .unwrap()
         .commit_from_file(model_path)?;
 
