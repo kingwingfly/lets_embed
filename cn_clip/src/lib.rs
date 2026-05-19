@@ -3,7 +3,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use fast_image_resize::{
     PixelType, Resizer,
     images::{CroppedImageMut, Image},
@@ -11,30 +11,33 @@ use fast_image_resize::{
 use ort::{inputs, session::Session, value::Tensor};
 use tokenizers::{EncodeInput, Tokenizer};
 
-pub const TOKEN_DIM: usize = 52;
 pub const EMBED_DIM: usize = 512;
-pub const IMAGE_INPUT_DIM: usize = 3;
-pub const IMAGE_SIZE: usize = 224;
-pub const PAD_ID: i64 = 0;
+
+pub const TOKEN_DIM: usize = 52;
+pub const TOKEN_PAD_ID: i64 = 0;
+
+pub const IMAGE_CHANNEL: usize = 3;
+pub const IMAGE_WIDTH: usize = 224;
+pub const IMAGE_HEIGHT: usize = 224;
 
 pub const MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 pub const STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 
 pub fn tokenizer(config: impl AsRef<Path>) -> anyhow::Result<Tokenizer> {
-    Ok(Tokenizer::from_file(config).unwrap())
+    Tokenizer::from_file(config).map_err(|e| anyhow!("{e}"))
 }
 
-pub fn model(text_model_path: impl AsRef<Path>) -> anyhow::Result<Session> {
+pub fn model(model_path: impl AsRef<Path>) -> anyhow::Result<Session> {
     #[cfg(target_os = "macos")]
     let session = Session::builder()?
         .with_execution_providers([ort::ep::WebGPU::default().build().error_on_failure()])
         .unwrap()
-        .commit_from_file(text_model_path)?;
+        .commit_from_file(model_path)?;
     #[cfg(not(target_os = "macos"))]
     let session = Session::builder()?
         .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
         .unwrap()
-        .commit_from_file(text_model_path)?;
+        .commit_from_file(model_path)?;
 
     Ok(session)
 }
@@ -47,14 +50,16 @@ pub fn infer_text<'s, E>(
 where
     E: Into<EncodeInput<'s>> + Send + 's,
 {
-    let tokens = tokenizer.encode_batch(batch_input, true).unwrap();
+    let tokens = tokenizer
+        .encode_batch(batch_input, true)
+        .map_err(|e| anyhow!("{e}"))?;
     let batch_size = tokens.len();
 
     let input_ids: Vec<i64> = tokens
         .iter()
         .flat_map(|enc| {
             let ids = enc.get_ids();
-            (0..TOKEN_DIM).map(|i| ids.get(i).map(|&x| x as i64).unwrap_or(PAD_ID))
+            (0..TOKEN_DIM).map(|i| ids.get(i).map(|&x| x as i64).unwrap_or(TOKEN_PAD_ID))
         })
         .collect();
 
@@ -91,12 +96,12 @@ where
     let batch_size = batch_input.len();
     let pixel_values = batch_input.into_iter().flatten().collect::<Vec<_>>();
 
-    if pixel_values.len() != batch_size * IMAGE_INPUT_DIM * IMAGE_SIZE * IMAGE_SIZE {
+    if pixel_values.len() != batch_size * IMAGE_CHANNEL * IMAGE_HEIGHT * IMAGE_WIDTH {
         bail!("invalid input image size")
     }
 
     let output = session.run(inputs![
-        "pixel_values" => Tensor::from_array(([batch_size, IMAGE_INPUT_DIM, IMAGE_SIZE, IMAGE_SIZE], pixel_values))?,
+        "pixel_values" => Tensor::from_array(([batch_size, IMAGE_CHANNEL, IMAGE_HEIGHT, IMAGE_WIDTH], pixel_values))?,
     ])?;
 
     let (shape, predictions) = output["image_features"].try_extract_tensor::<f32>()?;
