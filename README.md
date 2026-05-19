@@ -18,6 +18,32 @@ ORT_CUDA_VERSION=13 cargo run --example infer_text
 ORT_CUDA_VERSION=13 cargo run --example infer_text
 ```
 
+# Distribute infer
+
+## Control node
+
+```bash
+# set up pgdb
+mkdir pgdata
+podman run -d --name pgvector -p 5432:5432 -v ./pgdata:/var/lib/postgresql -e POSTGRES_PASSWORD=postgres docker.io/pgvector/pgvector:pg18-trixie
+# - migrate
+cargo run --release --example refresh
+# - import image records
+cargo run --release --example images2db
+# set up greptime db for telemetry
+mkdir gtdata
+podman run -d --name greptime -p 4000:4000 -v ./gtdata:/greptimedb_data docker.io/greptime/greptimedb:v1.0.2 standalone start --http-addr=0.0.0.0:4000
+# (option) set up grafana, or you can use `127.0.0.1:4000/dashboard` directly
+podman run -d --name grafana -p 3000:3000 docker.io/greptime/grafana-greptimedb:11.2.5-greptime-v2.1.7
+```
+
+## Worker node
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317 cargo run --release -p embed
+# or `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4000/v1/otlp` if telemetry to greptime db directly
+```
+
 # Dev
 
 ```bash

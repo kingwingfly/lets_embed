@@ -8,3 +8,23 @@ repository.workspace = true
 documentation.workspace = true
 
 [dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.32"
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
+opentelemetry-appender-tracing = "0.31"
+clap = { version = "4.6.1", features = ["derive"] }
+
+opendal = { version = "0.56", features = ["services-fs", "services-http"] }
+sqlx.workspace = true
+
+url.workspace = true
+sanitize-filename = "0.6.0"
+sysinfo = "0.39"
+nvml-wrapper = "0.12"
+parking_lot = "0.12.5"

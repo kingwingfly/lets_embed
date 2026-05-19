@@ -31,10 +31,7 @@ struson = { version = "0.7", features = ["simple-api"] }
 # data structure
 dashmap = "6.1"
 bytes = "1.11"
-# storage layer
-opendal = { version = "0.56", features = [] }
 # http
-axum = "0.8"
 url = "2.5"
 # db
 sqlx = { version = "0.8", features = [ "runtime-tokio", "postgres", "macros", "derive", "migrate", "json"] }
