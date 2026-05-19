@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{anyhow, bail};
 use fast_image_resize::{
-    PixelType, Resizer,
+    FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
     images::{CroppedImageMut, Image},
 };
 use ort::{inputs, session::Session, value::Tensor};
@@ -135,7 +135,11 @@ pub fn load_image<R: Read + Seek>(r: R, width: u32, height: u32) -> anyhow::Resu
     let mut view = CroppedImageMut::new(&mut dst_image, dx, dy, nw, nh)?;
 
     let mut resizer = Resizer::new();
-    resizer.resize(&src_image, &mut view, None)?;
+    resizer.resize(
+        &src_image,
+        &mut view,
+        &ResizeOptions::new().resize_alg(ResizeAlg::Interpolation(FilterType::CatmullRom)),
+    )?;
 
     let hwc = dst_image.buffer();
 
