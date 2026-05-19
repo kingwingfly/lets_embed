@@ -36,7 +36,7 @@ pub fn model(model_path: impl AsRef<Path>) -> anyhow::Result<Session> {
             ep::CUDA::default().build(),
             ep::DirectML::default().build(),
             ep::WebGPU::default().build(),
-            ep::CoreML::default().build().error_on_failure(),
+            ep::CoreML::default().build(),
         ])
         .unwrap()
         .commit_from_file(model_path)?;

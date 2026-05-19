@@ -1,6 +1,6 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 
-CREATE TYPE process_status AS ENUM ('Pending', 'Complete');
+CREATE TYPE process_status AS ENUM ('Pending', 'Processing', 'Complete');
 
 CREATE TYPE meta AS (
     title TEXT,
@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS titles (
 CREATE TABLE IF NOT EXISTS images (
     id BIGSERIAL PRIMARY KEY,
     name VARCHAR(255) UNIQUE NOT NULL CHECK (trim(name) != ''),
-    status process_status,
+    status process_status NOT NULL DEFAULT 'Pending'::process_status,
     dinov3_embedding vector(384),
     clip_embedding vector(512),
     created_at TIMESTAMPTZ DEFAULT NOW()
