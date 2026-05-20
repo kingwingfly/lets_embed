@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
                 let mut meta = Meta::default();
                 reader.read_object_borrowed_names(|mut reader| {
                     match reader.read_name()? {
-                        "title" => meta.title = reader.read_string()?,
+                        "post" => meta.post = reader.read_string()?,
                         "cosplayers" => {
                             let mut items = vec![];
                             reader.read_array_items(|reader| {
@@ -80,20 +80,20 @@ async fn main() -> anyhow::Result<()> {
                     SELECT * FROM UNNEST($1::meta[])
                     AS _(title, authors, tags, images)
                 ),
-                ins_titles AS (
-                    INSERT INTO titles (title)
+                ins_posts AS (
+                    INSERT INTO posts (title)
                     SELECT DISTINCT title FROM input
                     WHERE trim(title) != ''
                     ORDER BY title
                     ON CONFLICT DO NOTHING
                     RETURNING id, title
                 ),
-                titles AS (
-                    SELECT * FROM ins_titles
+                posts AS (
+                    SELECT * FROM ins_posts
                     UNION ALL
                     SELECT DISTINCT ON (id) id, title
                     FROM input i
-                    JOIN titles USING (title)
+                    JOIN posts p USING (title)
                 ),
                 ins_images AS (
                     INSERT INTO images (name)
@@ -113,15 +113,15 @@ async fn main() -> anyhow::Result<()> {
                     CROSS JOIN LATERAL UNNEST(i.images::VARCHAR[]) as _(name)
                     JOIN images USING (name)
                 ),
-                title_images AS (
-                    INSERT INTO title_images (title_id, image_id)
-                    SELECT t.id, images.id
-                    FROM input i JOIN titles t USING (title)
+                post_images AS (
+                    INSERT INTO post_images (post_id, image_id)
+                    SELECT p.id, images.id
+                    FROM input i JOIN posts p USING (title)
                     CROSS JOIN LATERAL UNNEST(i.images::VARCHAR[]) AS _(name)
                     JOIN images USING (name)
-                    ORDER BY t.id, images.id
+                    ORDER BY p.id, images.id
                     ON CONFLICT DO NOTHING
-                    RETURNING title_id, image_id
+                    RETURNING post_id, image_id
                 ),
                 ins_authors AS (
                     INSERT INTO authors (name)
@@ -141,15 +141,15 @@ async fn main() -> anyhow::Result<()> {
                     CROSS JOIN LATERAL UNNEST(i.authors::VARCHAR[]) as _(name)
                     JOIN authors USING (name)
                 ),
-                author_titles AS (
-                    INSERT INTO author_titles (author_id, title_id)
-                    SELECT authors.id, t.id
-                    FROM input i JOIN titles t USING (title)
+                author_posts AS (
+                    INSERT INTO author_posts (author_id, post_id)
+                    SELECT authors.id, p.id
+                    FROM input i JOIN posts p USING (title)
                     CROSS JOIN LATERAL UNNEST(i.authors::VARCHAR[]) AS _(name)
                     JOIN authors USING (name)
-                    ORDER BY authors.id, t.id
+                    ORDER BY authors.id, p.id
                     ON CONFLICT DO NOTHING
-                    RETURNING author_id, title_id
+                    RETURNING author_id, post_id
                 ),
                 ins_tags AS (
                     INSERT INTO tags (name)
@@ -169,15 +169,15 @@ async fn main() -> anyhow::Result<()> {
                     CROSS JOIN LATERAL UNNEST(i.tags::VARCHAR[]) as _(name)
                     JOIN tags USING (name)
                 ),
-                tag_titles AS (
-                    INSERT INTO tag_titles (tag_id, title_id)
-                    SELECT tags.id, t.id
-                    FROM input i JOIN titles t USING (title)
+                tag_posts AS (
+                    INSERT INTO tag_posts (tag_id, post_id)
+                    SELECT tags.id, p.id
+                    FROM input i JOIN posts p USING (title)
                     CROSS JOIN LATERAL UNNEST(i.tags::VARCHAR[]) AS _(name)
                     JOIN tags USING (name)
-                    ORDER BY tags.id, t.id
+                    ORDER BY tags.id, p.id
                     ON CONFLICT DO NOTHING
-                    RETURNING tag_id, title_id
+                    RETURNING tag_id, post_id
                 )
                 SELECT 1 AS ok
                 "#,
@@ -206,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
 #[derive(Debug, Default, sqlx::Type)]
 #[sqlx(type_name = "meta")]
 struct Meta {
-    title: String,
+    post: String,
     authors: Vec<String>,
     tags: Vec<String>,
     images: Vec<String>,

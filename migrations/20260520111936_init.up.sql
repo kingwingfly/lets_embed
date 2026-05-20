@@ -9,12 +9,14 @@ CREATE TYPE meta AS (
     images TEXT[]
 );
 
--- titles
-CREATE TABLE IF NOT EXISTS titles (
+-- posts
+CREATE TABLE IF NOT EXISTS posts (
     id BIGSERIAL PRIMARY KEY,
     title VARCHAR(255) UNIQUE NOT NULL CHECK (trim(title) != ''),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_posts_title ON posts(title);
 
 -- images
 CREATE TABLE IF NOT EXISTS images (
@@ -30,13 +32,13 @@ CREATE INDEX IF NOT EXISTS idx_images_status ON images (status) WHERE status = '
 CREATE INDEX IF NOT EXISTS idx_images_dinov3 ON images USING hnsw (dinov3_embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS idx_images_clip ON images USING hnsw (clip_embedding vector_cosine_ops);
 
-CREATE TABLE IF NOT EXISTS title_images (
-    title_id BIGINT NOT NULL REFERENCES titles(id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS post_images (
+    post_id BIGINT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
     image_id BIGINT NOT NULL REFERENCES images(id) ON DELETE CASCADE,
-    PRIMARY KEY (title_id, image_id)
+    PRIMARY KEY (post_id, image_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_title_images_image_id ON title_images(image_id);
+CREATE INDEX IF NOT EXISTS idx_post_images_image_id ON post_images(image_id);
 
 -- authors
 CREATE TABLE IF NOT EXISTS authors (
@@ -45,13 +47,13 @@ CREATE TABLE IF NOT EXISTS authors (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS author_titles (
+CREATE TABLE IF NOT EXISTS author_posts (
     author_id BIGINT NOT NULL REFERENCES authors(id) ON DELETE CASCADE,
-    title_id BIGINT NOT NULL REFERENCES titles(id) ON DELETE CASCADE,
-    PRIMARY KEY (author_id, title_id)
+    post_id BIGINT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    PRIMARY KEY (author_id, post_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_author_titles_title_id ON author_titles(title_id);
+CREATE INDEX IF NOT EXISTS idx_author_posts_post_id ON author_posts(post_id);
 
 -- tags
 CREATE TABLE IF NOT EXISTS tags (
@@ -60,13 +62,13 @@ CREATE TABLE IF NOT EXISTS tags (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS tag_titles (
+CREATE TABLE IF NOT EXISTS tag_posts (
     tag_id BIGINT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-    title_id BIGINT NOT NULL REFERENCES titles(id) ON DELETE CASCADE,
-    PRIMARY KEY (tag_id, title_id)
+    post_id BIGINT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    PRIMARY KEY (tag_id, post_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_tag_titles_title_id ON tag_titles(title_id);
+CREATE INDEX IF NOT EXISTS idx_tag_posts_post_id ON tag_posts(post_id);
 
 -- wd_tags
 CREATE TABLE IF NOT EXISTS wd_tags (

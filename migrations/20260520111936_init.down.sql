@@ -5,25 +5,26 @@ DROP TABLE wd_tag_images;
 DROP TABLE wd_tags;
 
 -- tags
-DROP INDEX idx_tag_titles_title_id;
-DROP TABLE tag_titles;
+DROP INDEX idx_tag_posts_post_id;
+DROP TABLE tag_posts;
 DROP TABLE tags;
 
 -- authors
-DROP INDEX idx_author_titles_title_id;
-DROP TABLE author_titles;
+DROP INDEX idx_author_posts_post_id;
+DROP TABLE author_posts;
 DROP TABLE authors;
 
 -- images
-DROP INDEX idx_title_images_image_id;
-DROP TABLE title_images;
+DROP INDEX idx_post_images_image_id;
+DROP TABLE post_images;
 DROP INDEX idx_images_clip;
 DROP INDEX idx_images_dinov3;
 DROP INDEX idx_images_status;
 DROP TABLE images;
 
--- titles
-DROP TABLE titles;
+-- posts
+DROP TABLE posts;
+DROP INDEX idx_posts_title;
 
 DROP TYPE meta;
 DROP TYPE process_status;
