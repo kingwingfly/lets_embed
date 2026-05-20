@@ -39,15 +39,7 @@ async fn main() -> anyhow::Result<()> {
                             })?;
                             meta.authors = items;
                         }
-                        "characters" => {
-                            let mut items = vec![];
-                            reader.read_array_items(|reader| {
-                                items.push(reader.read_string()?);
-                                Ok(())
-                            })?;
-                            meta.tags.extend(items);
-                        }
-                        "tags" => {
+                        "characters" | "tags" => {
                             let mut items = vec![];
                             reader.read_array_items(|reader| {
                                 items.push(reader.read_string()?);
