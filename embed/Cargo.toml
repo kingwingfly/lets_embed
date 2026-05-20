@@ -8,7 +8,11 @@ repository.workspace = true
 documentation.workspace = true
 
 [dependencies]
+wd_tagger = { path = "../wd_tagger" }
+cn_clip = { path = "../cn_clip" }
+
 tokio.workspace = true
+futures.workspace = true
 anyhow.workspace = true
 
 tracing = "0.1"
@@ -22,9 +26,12 @@ clap = { version = "4.6.1", features = ["derive"] }
 
 opendal = { version = "0.56", features = ["services-fs", "services-http"] }
 sqlx.workspace = true
+pgvector.workspace = true
 
+ort.workspace = true
 url.workspace = true
-sanitize-filename = "0.6.0"
+sanitize-filename = "0.6"
 sysinfo = "0.39"
 nvml-wrapper = "0.12"
-parking_lot = "0.12.5"
+parking_lot = "0.12"
+rayon.workspace = true

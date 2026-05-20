@@ -89,25 +89,23 @@ where
     Ok(tags)
 }
 
-/// width, height: target size
-///
 /// Returns HWC BGR (black padded if ratio not match).
 ///
 /// Normalization is not needed in preprocess of wd-tagger.
-pub fn load_image<R: Read + Seek>(r: R, width: u32, height: u32) -> anyhow::Result<Vec<f32>> {
+pub fn convert_image<R: Read + Seek>(r: R) -> anyhow::Result<Vec<f32>> {
     let src_image = image::ImageReader::new(BufReader::new(r))
         .with_guessed_format()?
         .decode()?
         .to_rgb8();
 
     let (w, h) = src_image.dimensions();
-    let r = (width as f32 / w as f32).min(height as f32 / h as f32);
+    let r = (IMAGE_WIDTH as f32 / w as f32).min(IMAGE_HEIGHT as f32 / h as f32);
     let nw = ((w as f32 * r).round() as u32).max(1);
     let nh = ((h as f32 * r).round() as u32).max(1);
-    let dx = (width as i32 - nw as i32).unsigned_abs() / 2;
-    let dy = (height as i32 - nh as i32).unsigned_abs() / 2;
+    let dx = (IMAGE_WIDTH as i32 - nw as i32).unsigned_abs() / 2;
+    let dy = (IMAGE_HEIGHT as i32 - nh as i32).unsigned_abs() / 2;
 
-    let mut dst_image = Image::new(width, height, PixelType::U8x3);
+    let mut dst_image = Image::new(IMAGE_WIDTH as u32, IMAGE_HEIGHT as u32, PixelType::U8x3);
     let mut view = CroppedImageMut::new(&mut dst_image, dx, dy, nw, nh)?;
 
     let mut resizer = Resizer::new();

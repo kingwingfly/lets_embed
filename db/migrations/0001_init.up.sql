@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS images (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE INDEX IF NOT EXISTS idx_images_status ON images (status) WHERE status = 'Pending'::process_status;
 CREATE INDEX IF NOT EXISTS idx_images_dinov3 ON images USING hnsw (dinov3_embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS idx_images_clip ON images USING hnsw (clip_embedding vector_cosine_ops);
 

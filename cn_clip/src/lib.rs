@@ -116,23 +116,21 @@ where
         .collect())
 }
 
-/// width, height: target size
-///
 /// Returns normalized CHW (black padded if ratio not match).
-pub fn load_image<R: Read + Seek>(r: R, width: u32, height: u32) -> anyhow::Result<Vec<f32>> {
+pub fn convert_image<R: Read + Seek>(r: R) -> anyhow::Result<Vec<f32>> {
     let src_image = image::ImageReader::new(BufReader::new(r))
         .with_guessed_format()?
         .decode()?
         .to_rgb8();
 
     let (w, h) = src_image.dimensions();
-    let r = (width as f32 / w as f32).min(height as f32 / h as f32);
+    let r = (IMAGE_WIDTH as f32 / w as f32).min(IMAGE_HEIGHT as f32 / h as f32);
     let nw = ((w as f32 * r).round() as u32).max(1);
     let nh = ((h as f32 * r).round() as u32).max(1);
-    let dx = (width as i32 - nw as i32).unsigned_abs() / 2;
-    let dy = (height as i32 - nh as i32).unsigned_abs() / 2;
+    let dx = (IMAGE_WIDTH as i32 - nw as i32).unsigned_abs() / 2;
+    let dy = (IMAGE_HEIGHT as i32 - nh as i32).unsigned_abs() / 2;
 
-    let mut dst_image = Image::new(width, height, PixelType::U8x3);
+    let mut dst_image = Image::new(IMAGE_WIDTH as u32, IMAGE_HEIGHT as u32, PixelType::U8x3);
     let mut view = CroppedImageMut::new(&mut dst_image, dx, dy, nw, nh)?;
 
     let mut resizer = Resizer::new();
@@ -145,12 +143,12 @@ pub fn load_image<R: Read + Seek>(r: R, width: u32, height: u32) -> anyhow::Resu
     let hwc = dst_image.buffer();
 
     let mut chw = vec![0.0f32; hwc.len()];
-    let hw = (height * width) as usize;
-    for h in 0..height as usize {
-        for w in 0..width as usize {
-            let src = (h * width as usize + w) * 3;
+    const HW: usize = IMAGE_HEIGHT * IMAGE_WIDTH;
+    for h in 0..IMAGE_HEIGHT {
+        for w in 0..IMAGE_WIDTH {
+            let src = (h * IMAGE_WIDTH + w) * 3;
             for c in 0..3usize {
-                chw[c * hw + h * width as usize + w] =
+                chw[c * HW + h * IMAGE_WIDTH + w] =
                     ((hwc[src + c] as f64 / 255.0 - MEAN[c]) / STD[c]) as f32;
             }
         }

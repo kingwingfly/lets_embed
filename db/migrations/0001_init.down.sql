@@ -14,14 +14,15 @@ DROP INDEX idx_author_titles_title_id;
 DROP TABLE author_titles;
 DROP TABLE authors;
 
--- titles
+-- images
 DROP INDEX idx_title_images_image_id;
 DROP TABLE title_images;
 DROP INDEX idx_images_clip;
 DROP INDEX idx_images_dinov3;
+DROP INDEX idx_images_status;
 DROP TABLE images;
 
--- images
+-- titles
 DROP TABLE titles;
 
 DROP TYPE meta;
