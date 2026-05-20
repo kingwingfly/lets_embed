@@ -1,9 +1,11 @@
-use std::{sync::LazyLock, time::Duration};
+use std::{collections::HashMap, sync::LazyLock, time::Duration};
 
 use nvml_wrapper::Nvml;
 use opentelemetry::{KeyValue, global, trace::TracerProvider as _};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp::{ExporterBuildError, LogExporter, MetricExporter, SpanExporter};
+use opentelemetry_otlp::{
+    ExporterBuildError, LogExporter, MetricExporter, SpanExporter, WithHttpConfig,
+};
 use opentelemetry_sdk::{
     Resource,
     error::OTelSdkError,
@@ -36,7 +38,13 @@ impl Telemetry {
             .with_detectors(&[Box::new(CpuDetector), Box::new(GpuDetector)])
             .build();
 
-        let trace_exporter = SpanExporter::builder().with_http().build()?;
+        let trace_exporter = SpanExporter::builder()
+            .with_http()
+            .with_headers(HashMap::from([(
+                "x-greptime-pipeline-name".to_string(),
+                "greptime_trace_v1".to_string(),
+            )]))
+            .build()?;
         let tracer_provider = SdkTracerProvider::builder()
             .with_batch_exporter(trace_exporter)
             .with_resource(resource.clone())
