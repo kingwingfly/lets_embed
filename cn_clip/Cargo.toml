@@ -14,7 +14,7 @@ image.workspace = true
 fast_image_resize.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-ort = { workspace = true, features = ["webgpu", "coreml"] }
+ort = { workspace = true, features = ["webgpu"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-ort = { workspace = true, features = ["cuda", "tensorrt"] }
+ort = { workspace = true, features = ["cuda"] }

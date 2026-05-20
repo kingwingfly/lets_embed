@@ -43,6 +43,7 @@ podman run -d --name grafana -p 3000:3000 docker.io/greptime/grafana-greptimedb:
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4000/v1/otlp \
 ORT_CUDA_VERSION=13 \
+ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so \
 cargo run --release -p embed -- -s fs:path/to/images
 # or `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4000/v1/otlp` if telemetry to greptime db directly
 ```

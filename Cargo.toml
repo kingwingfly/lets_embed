@@ -20,7 +20,7 @@ futures = "0.3"
 tokio-util = "0.7"
 tokio-stream = { version = "0.1", features = ["io-util"] }
 tokio-retry = "0.3"
-ort = { version = "2.0.0-rc.12", features = ["tracing"] }
+ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
 # observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
