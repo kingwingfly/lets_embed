@@ -1,5 +1,6 @@
 use std::{
-    iter::repeat, path::PathBuf, sync::LazyLock, thread::available_parallelism, time::Duration,
+    io::Cursor, iter::repeat, path::PathBuf, sync::LazyLock, thread::available_parallelism,
+    time::Duration,
 };
 
 use anyhow::bail;
@@ -15,6 +16,7 @@ use pgvector::Vector;
 use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
 use sanitize_filename::sanitize;
 use sqlx::postgres::PgPool;
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span};
 
 use crate::telemetry::HOSTNAME;
@@ -67,7 +69,7 @@ pub struct EmbedCli {
 }
 
 impl EmbedCli {
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub async fn run(self, cancel: CancellationToken) -> anyhow::Result<()> {
         let op = match self.storage.scheme() {
             "fs" | "file" => {
                 let root = self.storage.path();
@@ -91,6 +93,9 @@ impl EmbedCli {
         let mut clip_vision_session = cn_clip::model(self.clip_vision_model)?;
 
         loop {
+            if cancel.is_cancelled() {
+                break;
+            }
             let records = sqlx::query!(
                 r#"
                 WITH next_jobs AS (
@@ -170,7 +175,7 @@ impl EmbedCli {
                     wd_tags AS (
                         SELECT * FROM ins_wd_tags
                         UNION ALL
-                        SELECT wt.id, name
+                        SELECT DISTINCT ON (wt.id) wt.id, name
                         FROM input i
                         JOIN wd_tags wt USING (name)
                     )
@@ -178,6 +183,8 @@ impl EmbedCli {
                     SELECT wt.id, i.id, i.score
                     FROM input i
                     JOIN wd_tags wt USING (name)
+                    ON CONFLICT (wd_tag_id, image_id) DO UPDATE
+                    SET score = EXCLUDED.score
                 "#,
                     &wd_ids,
                     &tag_names as _,
@@ -265,6 +272,7 @@ async fn handle_batch<'a>(
                     op.read(filename.as_str())
                         .await
                         .inspect_err(|e| tracing::warn!(id, err = %e, "read image"))
+                        .map(|buf| buf.to_bytes())
                         .ok(),
                 )
             }
@@ -282,12 +290,12 @@ async fn handle_batch<'a>(
                         id,
                         opt_buf.and_then(|buf| {
                             Some((
-                                wd_tagger::convert_image(buf.clone())
+                                wd_tagger::convert_image(Cursor::new(buf.clone()))
                                     .inspect_err(
                                         |e| tracing::warn!(id, err = %e, "wd_tagger convert image"),
                                     )
                                     .ok()?,
-                                cn_clip::convert_image(buf)
+                                cn_clip::convert_image(Cursor::new(buf))
                                     .inspect_err(
                                         |e| tracing::warn!(id, err = %e, "clip convert image"),
                                     )

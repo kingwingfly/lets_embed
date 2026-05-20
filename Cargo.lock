@@ -856,6 +856,7 @@ dependencies = [
  "sqlx",
  "sysinfo",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

@@ -99,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
                 titles AS (
                     SELECT * FROM ins_titles
                     UNION ALL
-                    SELECT id, title
+                    SELECT DISTINCT ON (id) id, title
                     FROM input i
                     JOIN titles USING (title)
                 ),
@@ -116,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
                 images AS (
                     SELECT * FROM ins_images
                     UNION ALL
-                    SELECT id, name
+                    SELECT DISTINCT ON (id) id, name
                     FROM input i
                     CROSS JOIN LATERAL UNNEST(i.images::VARCHAR[]) as _(name)
                     JOIN images USING (name)
@@ -144,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
                 authors AS (
                     SELECT * FROM ins_authors
                     UNION ALL
-                    SELECT id, name
+                    SELECT DISTINCT ON (id) id, name
                     FROM input i
                     CROSS JOIN LATERAL UNNEST(i.authors::VARCHAR[]) as _(name)
                     JOIN authors USING (name)
@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
                 tags AS (
                     SELECT * FROM ins_tags
                     UNION ALL
-                    SELECT id, name
+                    SELECT DISTINCT ON (id) id, name
                     FROM input i
                     CROSS JOIN LATERAL UNNEST(i.tags::VARCHAR[]) as _(name)
                     JOIN tags USING (name)

@@ -190,12 +190,11 @@ pub fn register_system_meters() {
     if let Some(nvml) = &*NVML
         && let Ok(count) = nvml.device_count()
     {
-        for i in 0..count {
-            let Ok(device) = nvml.device_by_index(i) else {
+        for idx in 0..count {
+            let Ok(device) = nvml.device_by_index(idx) else {
                 continue;
             };
-            let name = format!("device-{i}");
-            gpu.u64_observable_gauge(format!("gpu.{name}.memory"))
+            gpu.u64_observable_gauge("gpu.memory")
                 .with_unit("MiB")
                 .with_callback(move |i| {
                     let Ok(mem_info) = device.memory_info() else {
@@ -208,15 +207,15 @@ pub fn register_system_meters() {
                             KeyValue::new("service.name", "embed"),
                             KeyValue::new("job", "embed"),
                             KeyValue::new("hostname", (*HOSTNAME).as_str()),
+                            KeyValue::new("device_index", idx.to_string()),
                         ],
                     );
                 })
                 .build();
-            let Ok(device) = nvml.device_by_index(i) else {
+            let Ok(device) = nvml.device_by_index(idx) else {
                 continue;
             };
-            let name = format!("device-{i}");
-            gpu.u64_observable_gauge(format!("gpu.{name}.memory.utilization"))
+            gpu.u64_observable_gauge("gpu.memory.utilization")
                 .with_unit("100")
                 .with_callback(move |i| {
                     let Ok(utilization) = device.utilization_rates() else {
@@ -229,15 +228,15 @@ pub fn register_system_meters() {
                             KeyValue::new("service.name", "embed"),
                             KeyValue::new("job", "embed"),
                             KeyValue::new("hostname", (*HOSTNAME).as_str()),
+                            KeyValue::new("device_index", idx.to_string()),
                         ],
                     );
                 })
                 .build();
-            let Ok(device) = nvml.device_by_index(i) else {
+            let Ok(device) = nvml.device_by_index(idx) else {
                 continue;
             };
-            let name = format!("device-{i}");
-            gpu.u64_observable_gauge(format!("gpu.{name}.utilization"))
+            gpu.u64_observable_gauge("gpu.utilization")
                 .with_unit("100")
                 .with_callback(move |i| {
                     let Ok(utilization) = device.utilization_rates() else {
@@ -250,6 +249,7 @@ pub fn register_system_meters() {
                             KeyValue::new("service.name", "embed"),
                             KeyValue::new("job", "embed"),
                             KeyValue::new("hostname", (*HOSTNAME).as_str()),
+                            KeyValue::new("device_index", idx.to_string()),
                         ],
                     );
                 })
