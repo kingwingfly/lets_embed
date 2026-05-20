@@ -324,14 +324,22 @@ async fn handle_batch<'a>(
         },
     );
 
-    let wd_res = wd_tagger::infer_tag(wd_tagger_session, wd_images, tags, top_k, threshold)?;
-    let clip_res = cn_clip::infer_vision(clip_vision_session, clip_images)?;
-
-    Ok(some_ids.into_iter().chain(none_ids).zip(
-        wd_res
-            .into_iter()
-            .zip(clip_res)
-            .map(Some)
-            .chain(repeat(None)),
-    ))
+    Ok(
+        match (
+            wd_tagger::infer_tag(wd_tagger_session, wd_images, tags, top_k, threshold),
+            cn_clip::infer_vision(clip_vision_session, clip_images),
+        ) {
+            (Ok(wd_res), Ok(clip_res)) => some_ids.into_iter().chain(none_ids).zip(
+                wd_res
+                    .into_iter()
+                    .zip(clip_res)
+                    .map(Some)
+                    .chain(repeat(None)),
+            ),
+            _ => some_ids
+                .into_iter()
+                .chain(none_ids)
+                .zip(vec![].into_iter().zip(vec![]).map(Some).chain(repeat(None))),
+        },
+    )
 }
