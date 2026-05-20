@@ -1,0 +1,27 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE images SET clip_embedding = embeddings.embedding\n                    FROM UNNEST($1::BIGINT[], $2::vector[]) AS embeddings (id, embedding)\n                    WHERE embeddings.id = images.id\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8Array",
+        {
+          "Custom": {
+            "name": "vector[]",
+            "kind": {
+              "Array": {
+                "Custom": {
+                  "name": "vector",
+                  "kind": "Simple"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2bcaf36f0d51ba0962a5e76f529b9e16ab9a67fff34a4670718ed8cc0e597f7d"
+}
