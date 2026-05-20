@@ -15,7 +15,7 @@ Try infer
 ```sh
 # set `ORT_CUDA_VERSION` you cuda version
 ORT_CUDA_VERSION=13 cargo run --example infer_text
-ORT_CUDA_VERSION=13 cargo run --example infer_text
+ORT_CUDA_VERSION=13 cargo run --example infer_vision
 ```
 
 # Distribute infer
@@ -40,7 +40,7 @@ podman run -d --name grafana -p 3000:3000 docker.io/greptime/grafana-greptimedb:
 ## Worker node
 
 ```bash
-OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317 \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4000/v1/otlp \
 ORT_CUDA_VERSION=13 \
 cargo run --release -p embed -- -s fs:path/to/images
 # or `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4000/v1/otlp` if telemetry to greptime db directly
@@ -51,4 +51,5 @@ cargo run --release -p embed -- -s fs:path/to/images
 ```bash
 mkdir pg_data
 podman run -d --name pgvector -p 5432:5432 -v ./pgdata:/var/lib/postgresql -e POSTGRES_PASSWORD=postgres docker.io/pgvector/pgvector:pg18-trixie
+# so that sqlx can compile
 ```
