@@ -42,15 +42,13 @@ pub fn tags(csv_path: impl AsRef<Path>) -> anyhow::Result<Vec<String>> {
 /// tags should be [`OUT_DIM`] long.
 ///
 /// Returns top_k `(tag: &str, p: f32)`s
-pub fn infer_tag<'a>(
+pub fn infer_tag<T: Clone>(
     session: &mut Session,
     batch_input: Vec<Vec<f32>>,
-    tags: &'a [impl AsRef<str>],
+    tags: &[T],
     top_k: usize,
     threshold: f32,
-) -> anyhow::Result<Vec<Vec<(&'a str, f32)>>>
-where
-{
+) -> anyhow::Result<Vec<Vec<(T, f32)>>> {
     if tags.len() != OUT_DIM {
         bail!("invalid tags number")
     }
@@ -75,7 +73,7 @@ where
         .map(|prediction| {
             top_k_heap(prediction, top_k, threshold)
                 .into_iter()
-                .map(|(i, p)| (tags[i].as_ref(), p))
+                .map(|(i, p)| (tags[i].clone(), p))
                 .collect()
         })
         .collect();
