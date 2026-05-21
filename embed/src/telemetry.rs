@@ -177,11 +177,11 @@ pub fn register_system_meters() {
     memory
         .u64_observable_gauge("memory")
         .with_description("memory usage")
-        .with_unit("MiB")
+        .with_unit("B")
         .with_callback(|i| {
             let mut sys = (*SYS).lock();
             sys.refresh_memory();
-            let measurement = sys.used_memory() / 1024u64.pow(2);
+            let measurement = sys.used_memory();
             drop(sys);
             i.observe(measurement, &[]);
         })
@@ -195,12 +195,12 @@ pub fn register_system_meters() {
                 continue;
             };
             gpu.u64_observable_gauge("gpu.memory")
-                .with_unit("MiB")
+                .with_unit("B")
                 .with_callback(move |i| {
                     let Ok(mem_info) = device.memory_info() else {
                         return;
                     };
-                    let measurement = mem_info.used / 1024u64.pow(2);
+                    let measurement = mem_info.used;
                     i.observe(
                         measurement,
                         &[KeyValue::new("device_index", idx.to_string())],
@@ -211,7 +211,7 @@ pub fn register_system_meters() {
                 continue;
             };
             gpu.u64_observable_gauge("gpu.memory.utilization")
-                .with_unit("100")
+                .with_unit("%")
                 .with_callback(move |i| {
                     let Ok(utilization) = device.utilization_rates() else {
                         return;
@@ -227,7 +227,7 @@ pub fn register_system_meters() {
                 continue;
             };
             gpu.u64_observable_gauge("gpu.utilization")
-                .with_unit("100")
+                .with_unit("%")
                 .with_callback(move |i| {
                     let Ok(utilization) = device.utilization_rates() else {
                         return;

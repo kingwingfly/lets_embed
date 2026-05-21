@@ -62,8 +62,8 @@ pub struct EmbedCli {
     batch_size: i64,
 
     /// whether to quit if `SELECT ... FOR UPDATE SKIP LOCKED` got no record
-    #[arg(long, default_value_t = true)]
-    quit_while_empty: bool,
+    #[arg(long, alias = "nq")]
+    no_quit_while_empty: bool,
 }
 
 impl EmbedCli {
@@ -102,7 +102,7 @@ impl EmbedCli {
             pool.clone(),
             self.batch_size,
             tx,
-            self.quit_while_empty,
+            self.no_quit_while_empty,
             cancel,
         ));
         let (tx, rx_) = mpsc::channel(4);
@@ -132,7 +132,7 @@ async fn fetch_batch(
     pool: PgPool,
     batch_size: i64,
     tx: mpsc::Sender<Vec<(i64, String)>>,
-    quit_while_empty: bool,
+    no_quit_while_empty: bool,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     loop {
@@ -161,12 +161,12 @@ async fn fetch_batch(
         .collect::<Vec<_>>();
 
         if records.is_empty() {
-            match quit_while_empty {
-                true => break,
-                false => {
+            match no_quit_while_empty {
+                true => {
                     tokio::time::sleep(Duration::from_secs(3)).await;
                     continue;
                 }
+                false => break,
             }
         }
         tx.send(records).await?;
