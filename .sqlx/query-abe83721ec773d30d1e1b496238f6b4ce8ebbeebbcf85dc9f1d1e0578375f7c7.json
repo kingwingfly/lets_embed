@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH next_jobs AS (\n                SELECT id, name FROM images\n                WHERE status = 'pending'::process_status AND attempt <= 5\n                LIMIT $1\n                FOR UPDATE SKIP LOCKED\n            )\n            UPDATE images SET\n            status = 'processing'::process_status, attempt = attempt + 1\n            FROM next_jobs WHERE images.id = next_jobs.id\n            RETURNING images.id, images.name\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "abe83721ec773d30d1e1b496238f6b4ce8ebbeebbcf85dc9f1d1e0578375f7c7"
+}

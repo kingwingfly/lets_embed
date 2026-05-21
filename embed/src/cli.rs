@@ -10,7 +10,7 @@ use opendal::{
     Operator,
     services::{Fs, Http},
 };
-use opentelemetry::{KeyValue, global, metrics::Counter};
+use opentelemetry::{global, metrics::Counter};
 use ort::session::Session;
 use pgvector::Vector;
 use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
@@ -18,9 +18,6 @@ use sanitize_filename::sanitize;
 use sqlx::postgres::PgPool;
 use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, info_span};
-
-use crate::telemetry::HOSTNAME;
 
 #[derive(Debug, Parser)]
 #[clap(version)]
@@ -146,11 +143,12 @@ async fn fetch_batch(
             r#"
             WITH next_jobs AS (
                 SELECT id, name FROM images
-                WHERE status = 'Pending'::process_status
+                WHERE status = 'pending'::process_status AND attempt <= 5
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
             )
-            UPDATE images SET status = 'Processing'::process_status
+            UPDATE images SET
+            status = 'processing'::process_status, attempt = attempt + 1
             FROM next_jobs WHERE images.id = next_jobs.id
             RETURNING images.id, images.name
         "#,
@@ -198,7 +196,6 @@ async fn convert_image(
                             .ok(),
                     )
                 }
-                .instrument(info_span!("read_image"))
             })
             .buffer_unordered(available_parallelism().map(|num| num.get()).unwrap_or(1))
             .collect::<Vec<_>>()
@@ -261,27 +258,34 @@ fn infer(
                 (sids, wd_images, clip_images, nids)
             },
         );
-        let res = match (
-            wd_tagger::infer_tag(&mut wd_tagger_session, wd_images, tags, top_k, threshold),
-            cn_clip::infer_vision(&mut clip_vision_session, clip_images),
-        ) {
-            (Ok(wd_res), Ok(clip_res)) => some_ids
-                .into_iter()
-                .chain(none_ids)
-                .zip(
-                    wd_res
+        let res =
+            match wd_tagger::infer_tag(&mut wd_tagger_session, wd_images, tags, top_k, threshold)
+                .and_then(|tags| {
+                    Ok((
+                        tags,
+                        cn_clip::infer_vision(&mut clip_vision_session, clip_images)?,
+                    ))
+                }) {
+                Ok((wd_res, clip_res)) => some_ids
+                    .into_iter()
+                    .chain(none_ids)
+                    .zip(
+                        wd_res
+                            .into_iter()
+                            .zip(clip_res)
+                            .map(Some)
+                            .chain(repeat(None)),
+                    )
+                    .collect::<Vec<_>>(),
+                Err(e) => {
+                    tracing::error!("{e}");
+                    some_ids
                         .into_iter()
-                        .zip(clip_res)
-                        .map(Some)
-                        .chain(repeat(None)),
-                )
-                .collect::<Vec<_>>(),
-            _ => some_ids
-                .into_iter()
-                .chain(none_ids)
-                .zip(repeat(None))
-                .collect::<Vec<_>>(),
-        };
+                        .chain(none_ids)
+                        .zip(repeat(None))
+                        .collect::<Vec<_>>()
+                }
+            };
         tx.blocking_send(res)?;
     }
     Ok(())
@@ -365,7 +369,7 @@ async fn record(
 
         sqlx::query!(
             r#"
-            UPDATE images SET status = 'Complete'::process_status
+            UPDATE images SET status = 'completed'::process_status
             FROM UNNEST($1::BIGINT[]) AS ids (id)
             WHERE ids.id = images.id
         "#,
@@ -376,7 +380,7 @@ async fn record(
 
         sqlx::query!(
             r#"
-            UPDATE images SET status = 'Pending'::process_status
+            UPDATE images SET status = 'pending'::process_status
             FROM UNNEST($1::BIGINT[]) AS ids (id)
             WHERE ids.id = images.id
         "#,
@@ -393,14 +397,7 @@ async fn record(
                 .with_unit("1")
                 .build()
         });
-        (*COMPLETE_COUNTER).add(
-            completed_ids.len() as u64,
-            &[
-                KeyValue::new("service.name", "embed"),
-                KeyValue::new("job", "embed"),
-                KeyValue::new("hostname", (*HOSTNAME).as_str()),
-            ],
-        );
+        (*COMPLETE_COUNTER).add(completed_ids.len() as u64, &[]);
     }
     Ok(())
 }

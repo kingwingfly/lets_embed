@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE images SET status = 'pending'::process_status\n            FROM UNNEST($1::BIGINT[]) AS ids (id)\n            WHERE ids.id = images.id\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "707fd31213e1826c1c701dbdb4d79060a417e54face34901bb0000eb98884f78"
+}

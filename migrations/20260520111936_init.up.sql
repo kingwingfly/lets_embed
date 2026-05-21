@@ -1,6 +1,6 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 
-CREATE TYPE process_status AS ENUM ('Pending', 'Processing', 'Complete');
+CREATE TYPE process_status AS ENUM ('pending', 'processing', 'completed');
 
 CREATE TYPE meta AS (
     title TEXT,
@@ -22,13 +22,14 @@ CREATE INDEX IF NOT EXISTS idx_posts_title ON posts(title);
 CREATE TABLE IF NOT EXISTS images (
     id BIGSERIAL PRIMARY KEY,
     name VARCHAR(255) UNIQUE NOT NULL CHECK (trim(name) != ''),
-    status process_status NOT NULL DEFAULT 'Pending'::process_status,
+    status process_status NOT NULL DEFAULT 'pending'::process_status,
+    attempt INT NOT NULL DEFAULT 0,
     dinov3_embedding vector(384),
     clip_embedding vector(512),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_images_status ON images (status) WHERE status = 'Pending'::process_status;
+CREATE INDEX IF NOT EXISTS idx_images_status ON images (status) WHERE status = 'pending'::process_status;
 CREATE INDEX IF NOT EXISTS idx_images_dinov3 ON images USING hnsw (dinov3_embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS idx_images_clip ON images USING hnsw (clip_embedding vector_cosine_ops);
 
