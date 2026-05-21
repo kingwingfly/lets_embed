@@ -1,0 +1,366 @@
+{
+    "kind": "Dashboard",
+    "metadata": {
+        "name": "embed",
+        "project": "default",
+        "version": 0
+    },
+    "spec": {
+        "display": {
+            "name": "embed"
+        },
+        "panels": {
+            "1779381413666z4808r55ypp": {
+                "kind": "Panel",
+                "spec": {
+                    "display": {
+                        "name": "gpu-memory"
+                    },
+                    "plugin": {
+                        "kind": "TimeSeriesChart",
+                        "spec": {
+                            "legend": {
+                                "position": "bottom"
+                            },
+                            "visual": {
+                                "display": "line",
+                                "lineWidth": 1.25,
+                                "lineStyle": "solid",
+                                "areaOpacity": 0,
+                                "pointRadius": 2.75,
+                                "connectNulls": false
+                            },
+                            "thresholds": {},
+                            "yAxis": {
+                                "show": true,
+                                "label": "",
+                                "format": {
+                                    "unit": "bytes"
+                                }
+                            }
+                        }
+                    },
+                    "queries": [
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "gpu_memory_B",
+                                        "seriesNameFormat": "{{ hostname }}-{{ device_index }}"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "1779385246189tj8u5awawm8": {
+                "kind": "Panel",
+                "spec": {
+                    "display": {
+                        "name": "gpu-memory-utilization"
+                    },
+                    "plugin": {
+                        "kind": "TimeSeriesChart",
+                        "spec": {
+                            "legend": {
+                                "position": "bottom"
+                            },
+                            "yAxis": {
+                                "show": true,
+                                "label": "",
+                                "format": {
+                                    "unit": "percent"
+                                }
+                            }
+                        }
+                    },
+                    "queries": [
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "gpu_memory_utilization_percent",
+                                        "seriesNameFormat": "{{ hostname }}-{{ device_index }}"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "1779385337295f02nv9bc5ig": {
+                "kind": "Panel",
+                "spec": {
+                    "display": {
+                        "name": "gpu-utilization"
+                    },
+                    "plugin": {
+                        "kind": "TimeSeriesChart",
+                        "spec": {
+                            "legend": {
+                                "position": "bottom"
+                            },
+                            "yAxis": {
+                                "show": true,
+                                "label": "",
+                                "format": {
+                                    "unit": "percent"
+                                }
+                            }
+                        }
+                    },
+                    "queries": [
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "gpu_utilization_percent",
+                                        "seriesNameFormat": "{{ hostname }}-{{ device_index }}"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "1779385442272yj5qgnrsq4a": {
+                "kind": "Panel",
+                "spec": {
+                    "display": {
+                        "name": "memory"
+                    },
+                    "plugin": {
+                        "kind": "TimeSeriesChart",
+                        "spec": {
+                            "legend": {
+                                "position": "bottom"
+                            },
+                            "yAxis": {
+                                "show": true,
+                                "label": "",
+                                "format": {
+                                    "unit": "bytes"
+                                }
+                            }
+                        }
+                    },
+                    "queries": [
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "memory_B"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "1779385649392by4b1o9x10s": {
+                "kind": "Panel",
+                "spec": {
+                    "display": {
+                        "name": "cpu-utilization"
+                    },
+                    "plugin": {
+                        "kind": "TimeSeriesChart",
+                        "spec": {
+                            "yAxis": {
+                                "show": true,
+                                "label": "",
+                                "format": {
+                                    "unit": "percent"
+                                }
+                            },
+                            "legend": {
+                                "position": "bottom"
+                            }
+                        }
+                    },
+                    "queries": [
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "cpu_usage_ratio",
+                                        "seriesNameFormat": "{{ hostname }}"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "1779385863205iwspcy0twmk": {
+                "kind": "Panel",
+                "spec": {
+                    "display": {
+                        "name": "completed"
+                    },
+                    "plugin": {
+                        "kind": "TimeSeriesChart",
+                        "spec": {}
+                    },
+                    "queries": [
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "infer_complete_total",
+                                        "seriesNameFormat": "{{ hostname }}"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "sum(infer_complete_total)",
+                                        "seriesNameFormat": "sum"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "1779385948613ozsupataxw": {
+                "kind": "Panel",
+                "spec": {
+                    "display": {
+                        "name": "complete_rate"
+                    },
+                    "plugin": {
+                        "kind": "TimeSeriesChart",
+                        "spec": {}
+                    },
+                    "queries": [
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "rate(infer_complete_total[1m]) * 60",
+                                        "seriesNameFormat": "{{ hostname }}"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "sum(rate(infer_complete_total[1m])) * 60",
+                                        "seriesNameFormat": "sum"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        },
+        "layouts": [
+            {
+                "kind": "Grid",
+                "spec": {
+                    "display": {
+                        "title": "Panel Group",
+                        "collapse": {
+                            "open": true
+                        }
+                    },
+                    "items": [
+                        {
+                            "x": 0,
+                            "y": 0,
+                            "width": 12,
+                            "height": 6,
+                            "content": {
+                                "$ref": "#/spec/panels/1779381413666z4808r55ypp"
+                            }
+                        },
+                        {
+                            "x": 12,
+                            "y": 0,
+                            "width": 12,
+                            "height": 6,
+                            "content": {
+                                "$ref": "#/spec/panels/1779385246189tj8u5awawm8"
+                            }
+                        },
+                        {
+                            "x": 0,
+                            "y": 6,
+                            "width": 12,
+                            "height": 6,
+                            "content": {
+                                "$ref": "#/spec/panels/1779385337295f02nv9bc5ig"
+                            }
+                        },
+                        {
+                            "x": 0,
+                            "y": 12,
+                            "width": 12,
+                            "height": 7,
+                            "content": {
+                                "$ref": "#/spec/panels/1779385442272yj5qgnrsq4a"
+                            }
+                        },
+                        {
+                            "x": 0,
+                            "y": 19,
+                            "width": 12,
+                            "height": 6,
+                            "content": {
+                                "$ref": "#/spec/panels/1779385649392by4b1o9x10s"
+                            }
+                        },
+                        {
+                            "x": 12,
+                            "y": 6,
+                            "width": 12,
+                            "height": 6,
+                            "content": {
+                                "$ref": "#/spec/panels/1779385863205iwspcy0twmk"
+                            }
+                        },
+                        {
+                            "x": 12,
+                            "y": 12,
+                            "width": 12,
+                            "height": 6,
+                            "content": {
+                                "$ref": "#/spec/panels/1779385948613ozsupataxw"
+                            }
+                        }
+                    ]
+                }
+            }
+        ],
+        "variables": [],
+        "duration": "15m",
+        "refreshInterval": "10s",
+        "datasources": {}
+    }
+}
