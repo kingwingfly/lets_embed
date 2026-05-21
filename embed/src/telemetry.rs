@@ -33,8 +33,8 @@ pub struct Telemetry {
 impl Telemetry {
     pub fn init(service_name: impl AsRef<str>) -> Result<Self, ExporterBuildError> {
         let resource = Resource::builder()
-            .with_service_name(service_name.as_ref().to_string())
-            .with_attribute(KeyValue::new("hostname", HOSTNAME.as_str()))
+            .with_service_name(service_name.as_ref().to_owned())
+            .with_attributes([KeyValue::new("hostname", HOSTNAME.as_str())])
             .with_detectors(&[Box::new(CpuDetector), Box::new(GpuDetector)])
             .build();
 
@@ -57,7 +57,13 @@ impl Telemetry {
             .with_resource(resource.clone())
             .build();
 
-        let metric_exporter = MetricExporter::builder().with_http().build()?;
+        let metric_exporter = MetricExporter::builder()
+            .with_http()
+            .with_headers(HashMap::from([(
+                "x-greptime-otlp-metric-promote-resource-attrs".to_string(),
+                "service.name;hostname;".to_string(),
+            )]))
+            .build()?;
         let metric_reader = PeriodicReader::builder(metric_exporter)
             .with_interval(Duration::from_secs(10))
             .build();
@@ -164,10 +170,7 @@ pub fn register_system_meters() {
             sys.refresh_cpu_usage();
             let measurement = sys.global_cpu_usage() as f64;
             drop(sys);
-            i.observe(
-                measurement,
-                &[KeyValue::new("hostname", (*HOSTNAME).as_str())],
-            );
+            i.observe(measurement, &[]);
         })
         .build();
     let memory = global::meter("memory");
@@ -180,10 +183,7 @@ pub fn register_system_meters() {
             sys.refresh_memory();
             let measurement = sys.used_memory() / 1024u64.pow(2);
             drop(sys);
-            i.observe(
-                measurement,
-                &[KeyValue::new("hostname", (*HOSTNAME).as_str())],
-            );
+            i.observe(measurement, &[]);
         })
         .build();
     let gpu = global::meter("gpu");
@@ -203,10 +203,7 @@ pub fn register_system_meters() {
                     let measurement = mem_info.used / 1024u64.pow(2);
                     i.observe(
                         measurement,
-                        &[
-                            KeyValue::new("hostname", (*HOSTNAME).as_str()),
-                            KeyValue::new("device_index", idx.to_string()),
-                        ],
+                        &[KeyValue::new("device_index", idx.to_string())],
                     );
                 })
                 .build();
@@ -222,10 +219,7 @@ pub fn register_system_meters() {
                     let measurement = utilization.memory as u64;
                     i.observe(
                         measurement,
-                        &[
-                            KeyValue::new("hostname", (*HOSTNAME).as_str()),
-                            KeyValue::new("device_index", idx.to_string()),
-                        ],
+                        &[KeyValue::new("device_index", idx.to_string())],
                     );
                 })
                 .build();
@@ -241,10 +235,7 @@ pub fn register_system_meters() {
                     let measurement = utilization.gpu as u64;
                     i.observe(
                         measurement,
-                        &[
-                            KeyValue::new("hostname", (*HOSTNAME).as_str()),
-                            KeyValue::new("device_index", idx.to_string()),
-                        ],
+                        &[KeyValue::new("device_index", idx.to_string())],
                     );
                 })
                 .build();

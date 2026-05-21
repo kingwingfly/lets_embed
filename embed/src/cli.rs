@@ -10,7 +10,7 @@ use opendal::{
     Operator,
     services::{Fs, Http},
 };
-use opentelemetry::{KeyValue, global, metrics::Counter};
+use opentelemetry::{global, metrics::Counter};
 use ort::session::Session;
 use pgvector::Vector;
 use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
@@ -18,8 +18,6 @@ use sanitize_filename::sanitize;
 use sqlx::postgres::PgPool;
 use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
-
-use crate::telemetry::HOSTNAME;
 
 #[derive(Debug, Parser)]
 #[clap(version)]
@@ -399,10 +397,7 @@ async fn record(
                 .with_unit("1")
                 .build()
         });
-        (*COMPLETE_COUNTER).add(
-            completed_ids.len() as u64,
-            &[KeyValue::new("hostname", HOSTNAME.as_str())],
-        );
+        (*COMPLETE_COUNTER).add(completed_ids.len() as u64, &[]);
     }
     Ok(())
 }
