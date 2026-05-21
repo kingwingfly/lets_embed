@@ -10,7 +10,7 @@ use opendal::{
     Operator,
     services::{Fs, Http},
 };
-use opentelemetry::{global, metrics::Counter};
+use opentelemetry::{KeyValue, global, metrics::Counter};
 use ort::session::Session;
 use pgvector::Vector;
 use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
@@ -18,6 +18,8 @@ use sanitize_filename::sanitize;
 use sqlx::postgres::PgPool;
 use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+
+use crate::telemetry::HOSTNAME;
 
 #[derive(Debug, Parser)]
 #[clap(version)]
@@ -97,7 +99,7 @@ impl EmbedCli {
 
         let mut jhs = JoinSet::new();
 
-        let (tx, rx) = mpsc::channel(8);
+        let (tx, rx) = mpsc::channel(2);
         jhs.spawn(fetch_batch(
             pool.clone(),
             self.batch_size,
@@ -105,9 +107,9 @@ impl EmbedCli {
             self.quit_while_empty,
             cancel,
         ));
-        let (tx, rx_) = mpsc::channel(8);
+        let (tx, rx_) = mpsc::channel(4);
         jhs.spawn(convert_image(op, rx, tx));
-        let (tx, rx__) = mpsc::channel(8);
+        let (tx, rx__) = mpsc::channel(4);
         jhs.spawn_blocking(move || {
             infer(
                 wd_tagger_session,
@@ -397,7 +399,10 @@ async fn record(
                 .with_unit("1")
                 .build()
         });
-        (*COMPLETE_COUNTER).add(completed_ids.len() as u64, &[]);
+        (*COMPLETE_COUNTER).add(
+            completed_ids.len() as u64,
+            &[KeyValue::new("hostname", HOSTNAME.as_str())],
+        );
     }
     Ok(())
 }

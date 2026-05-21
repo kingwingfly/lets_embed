@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
         },
         _ = tokio::signal::ctrl_c() => {
             cancel.cancel();
-            println!("Ctrl-C received: waiting last batch to finish...");
+            println!("Ctrl-C received: waiting the last queued batch to finish...");
             if let Err(e) = task.await {
                 tracing::error!(err = %e, "Cancelled");
             }

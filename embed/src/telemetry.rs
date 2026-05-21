@@ -34,7 +34,7 @@ impl Telemetry {
     pub fn init(service_name: impl AsRef<str>) -> Result<Self, ExporterBuildError> {
         let resource = Resource::builder()
             .with_service_name(service_name.as_ref().to_string())
-            .with_attribute(KeyValue::new("hostname", (*HOSTNAME).as_str()))
+            .with_attribute(KeyValue::new("hostname", HOSTNAME.as_str()))
             .with_detectors(&[Box::new(CpuDetector), Box::new(GpuDetector)])
             .build();
 
@@ -59,7 +59,7 @@ impl Telemetry {
 
         let metric_exporter = MetricExporter::builder().with_http().build()?;
         let metric_reader = PeriodicReader::builder(metric_exporter)
-            .with_interval(Duration::from_secs(3))
+            .with_interval(Duration::from_secs(10))
             .build();
         let meter_provider = SdkMeterProvider::builder()
             .with_reader(metric_reader)
@@ -166,11 +166,7 @@ pub fn register_system_meters() {
             drop(sys);
             i.observe(
                 measurement,
-                &[
-                    KeyValue::new("service.name", "embed"),
-                    KeyValue::new("job", "embed"),
-                    KeyValue::new("hostname", (*HOSTNAME).as_str()),
-                ],
+                &[KeyValue::new("hostname", (*HOSTNAME).as_str())],
             );
         })
         .build();
@@ -186,11 +182,7 @@ pub fn register_system_meters() {
             drop(sys);
             i.observe(
                 measurement,
-                &[
-                    KeyValue::new("service.name", "embed"),
-                    KeyValue::new("job", "embed"),
-                    KeyValue::new("hostname", (*HOSTNAME).as_str()),
-                ],
+                &[KeyValue::new("hostname", (*HOSTNAME).as_str())],
             );
         })
         .build();
@@ -212,8 +204,6 @@ pub fn register_system_meters() {
                     i.observe(
                         measurement,
                         &[
-                            KeyValue::new("service.name", "embed"),
-                            KeyValue::new("job", "embed"),
                             KeyValue::new("hostname", (*HOSTNAME).as_str()),
                             KeyValue::new("device_index", idx.to_string()),
                         ],
@@ -233,8 +223,6 @@ pub fn register_system_meters() {
                     i.observe(
                         measurement,
                         &[
-                            KeyValue::new("service.name", "embed"),
-                            KeyValue::new("job", "embed"),
                             KeyValue::new("hostname", (*HOSTNAME).as_str()),
                             KeyValue::new("device_index", idx.to_string()),
                         ],
@@ -254,8 +242,6 @@ pub fn register_system_meters() {
                     i.observe(
                         measurement,
                         &[
-                            KeyValue::new("service.name", "embed"),
-                            KeyValue::new("job", "embed"),
                             KeyValue::new("hostname", (*HOSTNAME).as_str()),
                             KeyValue::new("device_index", idx.to_string()),
                         ],
