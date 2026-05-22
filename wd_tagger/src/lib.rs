@@ -20,7 +20,12 @@ pub const IMAGE_CHANNEL: usize = 3;
 
 pub fn model(model_path: impl AsRef<Path>) -> anyhow::Result<Session> {
     let session = Session::builder()?
-        .with_execution_providers([ep::CUDA::default().build()])
+        .with_execution_providers([
+            #[cfg(not(target_os = "macos"))]
+            ep::CUDA::default().build(),
+            #[cfg(target_os = "macos")]
+            ep::WebGPU::default().build(),
+        ])
         .unwrap()
         .commit_from_file(model_path)?;
 

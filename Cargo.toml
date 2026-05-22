@@ -3,7 +3,7 @@ members = [
     "db",
     "cn_clip",
     "wd_tagger"
-, "embed"]
+, "embed", "search"]
 resolver = "3"
 
 [workspace.package]

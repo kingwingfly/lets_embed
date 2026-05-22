@@ -30,23 +30,27 @@ pub fn tokenizer(config: impl AsRef<Path>) -> anyhow::Result<Tokenizer> {
 
 pub fn model(model_path: impl AsRef<Path>) -> anyhow::Result<Session> {
     let session = Session::builder()?
-        .with_execution_providers([ep::CUDA::default().build()])
+        .with_execution_providers([
+            #[cfg(not(target_os = "macos"))]
+            ep::CUDA::default().build(),
+            #[cfg(target_os = "macos")]
+            ep::WebGPU::default().build(),
+        ])
         .unwrap()
         .commit_from_file(model_path)?;
 
     Ok(session)
 }
 
-pub fn infer_text<'s, E>(
+pub fn infer_text<'s>(
     tokenizer: &Tokenizer,
     session: &mut Session,
-    batch_input: Vec<E>,
+    batch_input: impl IntoIterator<Item = impl Into<EncodeInput<'s>> + Send + 's>,
 ) -> anyhow::Result<Vec<Vec<f32>>>
 where
-    E: Into<EncodeInput<'s>> + Send + 's,
 {
     let tokens = tokenizer
-        .encode_batch(batch_input, true)
+        .encode_batch(batch_input.into_iter().collect(), true)
         .map_err(|e| anyhow!("{e}"))?;
     let batch_size = tokens.len();
 

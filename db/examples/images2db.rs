@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
                 let mut meta = Meta::default();
                 reader.read_object_borrowed_names(|mut reader| {
                     match reader.read_name()? {
-                        "post" => meta.post = reader.read_string()?,
+                        "title" => meta.title = reader.read_string()?,
                         "cosplayers" => {
                             let mut items = vec![];
                             reader.read_array_items(|reader| {
@@ -206,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
 #[derive(Debug, Default, sqlx::Type)]
 #[sqlx(type_name = "meta")]
 struct Meta {
-    post: String,
+    title: String,
     authors: Vec<String>,
     tags: Vec<String>,
     images: Vec<String>,
