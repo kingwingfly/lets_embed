@@ -17,5 +17,7 @@ tokenizers.workspace = true
 
 cn_clip = { path = "../cn_clip" }
 
+parking_lot.workspace = true
+
 [dev-dependencies]
 tokio.workspace = true

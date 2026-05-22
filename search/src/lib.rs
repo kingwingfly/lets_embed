@@ -1,13 +1,16 @@
-use std::{env, path::Path};
+use std::{env, path::Path, sync::Arc};
 
+use anyhow::bail;
 use ort::session::Session;
+use parking_lot::Mutex;
+use pgvector::Vector;
 use sqlx::{PgPool, Postgres};
 use tokenizers::{EncodeInput, Tokenizer};
 
 #[derive(Debug)]
 pub struct Engine {
     pool: PgPool,
-    clip_text_session: Session,
+    clip_text_session: Arc<Mutex<Session>>,
     tokeniser: Tokenizer,
 }
 
@@ -26,7 +29,7 @@ impl Engine {
         let tokeniser = cn_clip::tokenizer(tokenizer_config_path)?;
         Ok(Self {
             pool,
-            clip_text_session,
+            clip_text_session: Arc::new(Mutex::new(clip_text_session)),
             tokeniser,
         })
     }
@@ -35,16 +38,14 @@ impl Engine {
         &self,
         tags: impl IntoIterator<Item = T>,
         not_tags: impl IntoIterator<Item = T>,
-    ) -> anyhow::Result<(
-        impl IntoIterator<Item = Post>,
-        impl IntoIterator<Item = Image>,
-    )>
+    ) -> anyhow::Result<(Vec<Post>, Vec<Image>)>
     where
         for<'a> &'a [T]: sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres>,
     {
         let tags = tags.into_iter().collect::<Vec<_>>();
         let not_tags = not_tags.into_iter().collect::<Vec<_>>();
-        let posts = sqlx::query!(
+        let posts = sqlx::query_as!(
+            Post,
             r#"
             SELECT DISTINCT p.id, p.title
                 FROM posts p
@@ -71,13 +72,10 @@ impl Engine {
             not_tags.as_slice() as _,
         )
         .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|r| Post {
-            id: r.id,
-            title: r.title,
-        });
-        let images = sqlx::query!(
+        .await?;
+
+        let images = sqlx::query_as!(
+            Image,
             r#"
             SELECT DISTINCT i.id, i.name
                 FROM images i
@@ -94,23 +92,60 @@ impl Engine {
             not_tags.as_slice() as _,
         )
         .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|r| Image {
-            id: r.id,
-            name: r.name,
-        });
+        .await?;
+
         Ok((posts, images))
     }
 
     pub async fn search_clip<'s>(
-        &mut self,
+        &self,
         describes: impl IntoIterator<Item = impl Into<EncodeInput<'s>> + Send + 's>,
-        _limit: usize,
-    ) -> anyhow::Result<Vec<Image>> {
-        let _text_embeddings =
-            cn_clip::infer_text(&self.tokeniser, &mut self.clip_text_session, describes)?;
-        todo!()
+        limit: i64,
+    ) -> anyhow::Result<Vec<Vec<Image>>> {
+        if limit < 0 {
+            bail!("limit should >= 0");
+        }
+
+        let text_embeddings = cn_clip::infer_text(
+            &self.tokeniser,
+            &mut self.clip_text_session.lock(),
+            describes,
+        )?
+        .into_iter()
+        .map(Into::into)
+        .collect::<Vec<Vector>>();
+
+        let mut res: Vec<Vec<Image>> = Vec::with_capacity(text_embeddings.len());
+        sqlx::query!(
+            r#"
+            SELECT
+                q.ord AS "ord!",
+                i.id,
+                i.name
+            FROM UNNEST($1::vector[]) WITH ORDINALITY AS q(vec, ord)
+            CROSS JOIN LATERAL (
+                SELECT id, name, clip_embedding <=> q.vec AS dist
+                FROM images
+                ORDER BY dist
+                LIMIT $2
+            ) AS i
+            ORDER BY q.ord, i.dist;
+            "#,
+            &text_embeddings as _,
+            limit
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .for_each(|r| match res.get_mut((r.ord - 1) as usize) {
+            Some(images) => images.push(Image {
+                id: r.id,
+                name: r.name,
+            }),
+            None => res.push(Vec::with_capacity(limit as usize)),
+        });
+
+        Ok(res)
     }
 }
 

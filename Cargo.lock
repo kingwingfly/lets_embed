@@ -3358,6 +3358,7 @@ dependencies = [
  "anyhow",
  "cn_clip",
  "ort",
+ "parking_lot",
  "pgvector",
  "sqlx",
  "tokenizers",

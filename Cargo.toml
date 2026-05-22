@@ -41,3 +41,4 @@ tokenizers = "0.23"
 image = "0.25"
 fast_image_resize = { version = "6.0", features = ["image"] }
 rayon = "1.12"
+parking_lot = "0.12"
