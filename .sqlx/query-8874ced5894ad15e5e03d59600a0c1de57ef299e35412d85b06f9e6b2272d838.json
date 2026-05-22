@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT p.id, p.title\n                FROM posts p\n                WHERE (\n                    EXISTS (\n                        SELECT 1\n                        FROM tag_posts tp\n                        JOIN tags t ON t.id = tp.tag_id\n                        WHERE tp.post_id = p.id\n                          AND t.name ~* ANY($1::TEXT[])\n                          AND NOT (t.name ~* ANY($2::TEXT[]))\n                    )\n                    OR EXISTS (\n                        SELECT 1\n                        FROM author_posts ap\n                        JOIN authors a ON a.id = ap.author_id\n                        WHERE ap.post_id = p.id\n                          AND a.name ~* ANY($1::TEXT[])\n                          AND NOT a.name ~* ANY($2::TEXT[])\n                    )\n                )\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "title",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "8874ced5894ad15e5e03d59600a0c1de57ef299e35412d85b06f9e6b2272d838"
+}
