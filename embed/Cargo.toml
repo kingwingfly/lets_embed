@@ -16,14 +16,14 @@ tokio-util.workspace = true
 futures.workspace = true
 anyhow.workspace = true
 
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 tracing-opentelemetry = "0.33"
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.32", features = [] }
 opentelemetry-appender-tracing = "0.32"
-clap = { version = "4.6", features = ["derive"] }
+clap.workspace = true
 
 opendal = { version = "0.56", features = ["services-fs", "services-http"] }
 sqlx.workspace = true
@@ -31,7 +31,7 @@ pgvector.workspace = true
 
 ort.workspace = true
 url.workspace = true
-sanitize-filename = "0.6"
+sanitize-filename.workspace = true
 sysinfo = "0.39"
 nvml-wrapper = "0.12"
 parking_lot.workspace = true

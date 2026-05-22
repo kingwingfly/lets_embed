@@ -1,0 +1,28 @@
+[package]
+name = "search_engine"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+sqlx.workspace = true
+pgvector.workspace = true
+
+ort.workspace = true
+tokenizers.workspace = true
+
+cn_clip = { path = "../cn_clip" }
+
+parking_lot.workspace = true
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
+
+[features]
+default = []
+serde = ['dep:serde']

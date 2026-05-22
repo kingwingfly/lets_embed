@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ssearch</title>
+<link rel="stylesheet" href="/dist/style.css">
+</head>
+<body>
+<header>
+  <h1>ssearch</h1>
+  <form id="search-form" autocomplete="off">
+    <div class="row">
+      <select id="mode" title="search mode">
+        <option value="tag">Tag</option>
+        <option value="clip">CLIP</option>
+      </select>
+      <input id="query" placeholder="genshin impact, 1girl  /  长满青苔的小路, 樱花" autofocus>
+      <input id="exclude" placeholder="exclude (tag mode)">
+      <input id="limit" type="number" value="20" min="1" title="page size">
+      <button type="submit">Search</button>
+    </div>
+    <small>用英文逗号分隔多个 tag / CLIP query。CLIP 多 query 结果会合并去重。</small>
+  </form>
+</header>
+
+<main>
+  <section id="posts-section" hidden>
+    <h2>Posts</h2>
+    <div id="posts"></div>
+  </section>
+  <section id="images-section" hidden>
+    <h2>Images</h2>
+    <div id="images" class="grid"></div>
+  </section>
+  <div id="sentinel"></div>
+  <div id="status"></div>å
+</main>
+
+<script src="/dist/app.js"></script>
+</body>
+</html>

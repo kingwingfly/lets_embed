@@ -22,7 +22,7 @@ ORT_CUDA_VERSION=13 cargo run --example infer_vision
 
 ## Control node
 
-```bash
+```sh
 # set up pgdb
 mkdir pgdata
 podman run -d --name pgvector -p 5432:5432 -v ./pgdata:/var/lib/postgresql -e POSTGRES_PASSWORD=postgres docker.io/pgvector/pgvector:pg18-trixie
@@ -40,7 +40,7 @@ podman run -d --name grafana -p 3000:3000 docker.io/greptime/grafana-greptimedb:
 
 ## Worker node
 
-```bash
+```sh
 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4000/v1/otlp \
 ORT_CUDA_VERSION=13 \
 ORT_DYLIB_PATH=/path/to/libonnxruntime.so \
@@ -61,6 +61,19 @@ After infer/embed, you can do search on the data:
 ORT_CUDA_VERSION=13 \
 ORT_DYLIB_PATH=/path/to/libonnxruntime.so \
 cargo run --example search
+```
+
+# Search
+
+```sh
+cargo run -p search -- serve --prefix /data/to/images
+
+# broswer http://127.0.0.1:3000
+
+# search by tag
+cargo run -p search -- tag --include "genshin impact" --limit 20
+# search by clip
+cargo run -p search --example client -- clip --query "长满青苔的小路" --query "樱花飞舞" --limit 10
 ```
 
 # Dev

@@ -38,10 +38,15 @@ impl Engine {
         &self,
         tags: impl IntoIterator<Item = T>,
         not_tags: impl IntoIterator<Item = T>,
+        limit: i64,
+        offset: i64,
     ) -> anyhow::Result<(Vec<Post>, Vec<Image>)>
     where
         for<'a> &'a [T]: sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres>,
     {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
         let tags = tags.into_iter().collect::<Vec<_>>();
         let not_tags = not_tags.into_iter().collect::<Vec<_>>();
         let posts = sqlx::query_as!(
@@ -67,9 +72,12 @@ impl Engine {
                           AND NOT a.name ~* ANY($2::TEXT[])
                     )
                 )
+                LIMIT $3 OFFSET $4
             "#,
             tags.as_slice() as _,
             not_tags.as_slice() as _,
+            limit,
+            offset
         )
         .fetch_all(&self.pool)
         .await?;
@@ -101,10 +109,14 @@ impl Engine {
         &self,
         describes: impl IntoIterator<Item = impl Into<EncodeInput<'s>> + Send + 's>,
         limit: i64,
+        offset: i64,
     ) -> anyhow::Result<Vec<Vec<Image>>> {
-        if limit < 0 {
-            bail!("limit should >= 0");
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
         }
+        // if limit > 1000 || offser > 1000 {
+        //     bail!("both limit and offset should <= 1000 due to HNSW limitation")
+        // }
 
         let text_embeddings = cn_clip::infer_text(
             &self.tokeniser,
@@ -116,6 +128,26 @@ impl Engine {
         .collect::<Vec<Vector>>();
 
         let mut res: Vec<Vec<Image>> = Vec::with_capacity(text_embeddings.len());
+
+        let mut xact = self.pool.begin().await?;
+
+        sqlx::query(
+            format!(
+                "SET LOCAL hnsw.ef_search = {}",
+                (limit * 4).clamp(100, 1000)
+            )
+            .as_str(),
+        )
+        .execute(&mut *xact)
+        .await?;
+
+        sqlx::query!("SET LOCAL hnsw.iterative_scan = strict_order")
+            .execute(&mut *xact)
+            .await?;
+        sqlx::query!("SET LOCAL hnsw.max_scan_tuples = 20000")
+            .execute(&mut *xact)
+            .await?;
+
         sqlx::query!(
             r#"
             SELECT
@@ -127,35 +159,60 @@ impl Engine {
                 SELECT id, name, clip_embedding <=> q.vec AS dist
                 FROM images
                 ORDER BY dist
-                LIMIT $2
+                LIMIT $2 OFFSET $3
             ) AS i
             ORDER BY q.ord, i.dist;
             "#,
             &text_embeddings as _,
-            limit
+            limit,
+            offset
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *xact)
         .await?
         .into_iter()
-        .for_each(|r| match res.get_mut((r.ord - 1) as usize) {
-            Some(images) => images.push(Image {
+        .for_each(|r| {
+            let idx = (r.ord - 1) as usize;
+            if res.len() <= idx {
+                res.resize_with(idx + 1, || Vec::with_capacity(limit as usize));
+            }
+            res[idx].push(Image {
                 id: r.id,
                 name: r.name,
-            }),
-            None => res.push(Vec::with_capacity(limit as usize)),
+            });
         });
 
+        xact.commit().await?;
+
         Ok(res)
+    }
+
+    pub async fn list(&self, post_id: i64) -> anyhow::Result<Vec<Image>> {
+        sqlx::query_as!(
+            Image,
+            r#"
+            SELECT id, name
+            FROM images i
+            JOIN post_images pi
+            ON i.id = pi.image_id
+            WHERE pi.post_id = $1
+            "#,
+            post_id
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Image {
     pub id: i64,
     pub name: String,
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Post {
     pub id: i64,
     pub title: String,

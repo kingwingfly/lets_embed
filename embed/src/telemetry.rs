@@ -83,7 +83,7 @@ impl Telemetry {
             .with(trace_layer)
             .with(log_layer)
             .with(tracing_subscriber::fmt::layer())
-            .with(EnvFilter::from_default_env().add_directive("embed=info".parse().unwrap()))
+            .with(EnvFilter::try_from_default_env().unwrap_or("embed=info".into()))
             .init();
 
         Ok(Self {

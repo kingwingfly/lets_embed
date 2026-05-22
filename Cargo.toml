@@ -2,8 +2,11 @@
 members = [
     "db",
     "cn_clip",
-    "wd_tagger"
-, "embed", "search"]
+    "wd_tagger",
+    "embed",
+    "search",
+    "search_engine"
+]
 resolver = "3"
 
 [workspace.package]
@@ -42,3 +45,6 @@ image = "0.25"
 fast_image_resize = { version = "6.0", features = ["image"] }
 rayon = "1.12"
 parking_lot = "0.12"
+clap = { version = "4.6", features = ["derive"] }
+sanitize-filename = "0.6"
+serde = { version = "1", features = ["derive"] }
