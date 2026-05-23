@@ -1,0 +1,17 @@
+[package]
+name = "frontend"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+leptos = { version = "0.8", features = ["nightly", "hydrate"] }
+console_error_panic_hook = { version = "0.1" }
+wasm-bindgen = { version = "0.2" }
+app = { path = "../app", features = ["hydrate"] }

@@ -5,8 +5,9 @@ members = [
     "wd_tagger",
     "embed",
     "search_engine",
-    "search_backend",
-    "search_frontend",
+    "search/app",
+    "search/frontend",
+    "search/server",
 ]
 resolver = "3"
 
@@ -60,10 +61,10 @@ panic = "abort"
 [[workspace.metadata.leptos]]
 name = "search"
 
-tailwind-input-file = "search_frontend/style/tailwind.css"
+tailwind-input-file = "search/style/tailwind.css"
 
-bin-package = "search_backend"
-lib-package = "search_frontend"
+bin-package = "server"
+lib-package = "frontend"
 bin-features = []
-lib-features = ["hydrate"]
+lib-features = []
 lib-profile-release = "wasm-release"

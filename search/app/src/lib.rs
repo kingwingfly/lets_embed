@@ -28,10 +28,8 @@ pub fn App() -> impl IntoView {
     provide_meta_context();
 
     view! {
-        <Stylesheet id="leptos" href="/pkg/search.css"/>
-
-        <Title text="Welcome to Leptos"/>
-
+        <Title formatter=|text| format!("{text} - Let's Embed")/>
+        <Stylesheet href="/pkg/search.css"/>
         <Router>
             <main>
                 <Routes fallback=|| "Page not found.".into_view()>

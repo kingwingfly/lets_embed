@@ -1,5 +1,5 @@
 [package]
-name = "search_backend"
+name = "server"
 version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
@@ -9,9 +9,11 @@ documentation.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-axum = { version = "0.8" }
 futures.workspace = true
-leptos = { version = "0.8", features = ["nightly", "ssr"] }
+tokio.workspace = true
+
+axum = { version = "0.8" }
 leptos_axum = { version = "0.8" }
-tokio = { workspace = true }
-search_frontend = { path = "../search_frontend", features = ["ssr"] }
+
+leptos = { version = "0.8", features = ["nightly", "ssr"] }
+app = { path = "../app", features = ["ssr"] }

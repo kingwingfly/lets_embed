@@ -1,8 +1,8 @@
- use axum::Router;
- use leptos::logging::log;
- use leptos::prelude::*;
- use leptos_axum::{LeptosRoutes, generate_route_list};
- use search_frontend::app::*;
+use app::*;
+use axum::Router;
+use leptos::logging::log;
+use leptos::prelude::*;
+use leptos_axum::{LeptosRoutes, generate_route_list};
 
 #[tokio::main]
 async fn main() {

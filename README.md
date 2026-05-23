@@ -66,14 +66,11 @@ cargo run --example search
 # Search
 
 ```sh
-cargo run -p search -- serve --prefix /data/to/images
+cargo binstall --locked cargo-leptos
+
+cargo leptos serve
 
 # broswer http://127.0.0.1:3000
-
-# search by tag
-cargo run -p search -- tag --include "genshin impact" --limit 20
-# search by clip
-cargo run -p search --example client -- clip --query "长满青苔的小路" --query "樱花飞舞" --limit 10
 ```
 
 # Dev
