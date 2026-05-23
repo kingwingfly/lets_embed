@@ -1,0 +1,23 @@
+[package]
+name = "search_frontend"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+leptos = { version = "0.8", features = ["nightly"] }
+leptos_meta = { version = "0.8", features = [] }
+leptos_router = { version = "0.8", features = ["nightly"] }
+console_error_panic_hook = { version = "0.1" }
+wasm-bindgen = { version = "0.2" }
+
+[features]
+default = []
+hydrate = ["leptos/hydrate"]
+ssr = ["leptos/ssr", "leptos_meta/ssr", "leptos_router/ssr"]

@@ -5,7 +5,8 @@ members = [
     "wd_tagger",
     "embed",
     "search_engine",
-    "search_server"
+    "search_backend",
+    "search_frontend",
 ]
 resolver = "3"
 
@@ -48,3 +49,21 @@ parking_lot = "0.12"
 clap = { version = "4.6", features = ["derive"] }
 sanitize-filename = "0.6"
 serde = { version = "1", features = ["derive"] }
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[[workspace.metadata.leptos]]
+name = "search"
+
+tailwind-input-file = "search_frontend/style/tailwind.css"
+
+bin-package = "search_backend"
+lib-package = "search_frontend"
+bin-features = []
+lib-features = ["hydrate"]
+lib-profile-release = "wasm-release"

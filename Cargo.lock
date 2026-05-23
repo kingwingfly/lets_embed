@@ -4204,6 +4204,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "search_backend"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures",
+ "leptos",
+ "leptos_axum",
+ "search_frontend",
+ "tokio",
+]
+
+[[package]]
 name = "search_engine"
 version = "0.1.0"
 dependencies = [
@@ -4219,18 +4232,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "search_server"
+name = "search_frontend"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "axum",
  "console_error_panic_hook",
- "futures",
  "leptos",
- "leptos_axum",
  "leptos_meta",
  "leptos_router",
- "tokio",
  "wasm-bindgen",
 ]
 
