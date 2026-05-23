@@ -1,0 +1,48 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                q.ord AS \"ord!\",\n                i.id,\n                i.name\n            FROM UNNEST($1::vector[]) WITH ORDINALITY AS q(vec, ord)\n            CROSS JOIN LATERAL (\n                SELECT id, name, clip_embedding <=> q.vec AS dist\n                FROM images\n                ORDER BY dist\n                LIMIT $2 OFFSET $3\n            ) AS i\n            ORDER BY q.ord, i.dist;\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ord!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "vector[]",
+            "kind": {
+              "Array": {
+                "Custom": {
+                  "name": "vector",
+                  "kind": "Simple"
+                }
+              }
+            }
+          }
+        },
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      false,
+      false
+    ]
+  },
+  "hash": "5b9af1f22a0824e29268b7bc9043657ace5d5c7e3fd87a414011b905afbb96f6"
+}

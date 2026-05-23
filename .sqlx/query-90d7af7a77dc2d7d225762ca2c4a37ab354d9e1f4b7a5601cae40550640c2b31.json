@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SET LOCAL hnsw.max_scan_tuples = 20000",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "90d7af7a77dc2d7d225762ca2c4a37ab354d9e1f4b7a5601cae40550640c2b31"
+}

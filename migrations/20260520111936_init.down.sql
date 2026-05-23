@@ -29,7 +29,6 @@ DROP TABLE images;
 -- posts
 DROP INDEX idx_posts_title;
 DROP TABLE posts;
-DROP INDEX idx_posts_title;
 
 DROP TYPE meta;
 DROP TYPE process_status;
