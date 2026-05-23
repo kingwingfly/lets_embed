@@ -11,7 +11,7 @@ documentation.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-leptos = { version = "0.8", features = ["nightly", "hydrate"] }
+leptos = { version = "0.8", features = ["nightly", "hydrate", "islands"] }
 console_error_panic_hook = { version = "0.1" }
 wasm-bindgen = { version = "0.2" }
 app = { path = "../app", features = ["hydrate"] }

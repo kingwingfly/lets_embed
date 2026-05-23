@@ -131,6 +131,7 @@ dependencies = [
  "leptos-use",
  "leptos_meta",
  "leptos_router",
+ "serde",
 ]
 
 [[package]]

@@ -12,6 +12,7 @@ leptos = { version = "0.8", features = ["nightly"] }
 leptos_meta = { version = "0.8", features = [] }
 leptos_router = { version = "0.8", features = ["nightly"] }
 leptos-use = { version = "0.18", default-features = false, features = [] }
+serde.workspace = true
 
 [features]
 default = []
