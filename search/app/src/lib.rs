@@ -44,15 +44,7 @@ pub fn App() -> impl IntoView {
 #[component]
 fn HomePage() -> impl IntoView {
     view! {
-        <div class="flex flex-col md:flex-row w-full items-center justify-items-center gap-2 py-2">
-            <div class="text-white text-4xl font-bold text-center w-full md:w-1/3 max-w-64 shrink-0">
-                "Let's Embed"
-            </div>
-            <div class="w-full">
-                <SearchBar />
-            </div>
-        </div>
-        <hr class="w-full h-1 bg-gray-200 border-0" />
+        <SearchBar />
     }
 }
 
@@ -60,18 +52,24 @@ fn HomePage() -> impl IntoView {
 fn SearchBar() -> impl IntoView {
     let action = ServerAction::<Search>::new();
     view! {
-        <ActionForm action attr:class="flex w-full items-center gap-4 px-4">
-            <input
-                class="w-full bg-gray-200 rounded-lg py-2 px-4"
-                name="query"
-                placeholder="Type something here."
-            />
-            <button
-                class="w-fit bg-gray-500 text-white rounded-lg py-2 px-2 hover:bg-gray-400"
-            >
-                "Search"
-            </button>
-        </ActionForm>
+        <div class="flex flex-col md:flex-row w-full items-center justify-items-center gap-2 py-2">
+            <div class="text-white text-4xl font-bold text-center w-full md:w-1/3 max-w-64 shrink-0">
+                "Let's Embed"
+            </div>
+            <ActionForm action attr:class="flex w-full items-center gap-4 px-4">
+                <input
+                    class="w-full bg-gray-200 rounded-lg py-2 px-4"
+                    name="query"
+                    placeholder="Type something here."
+                />
+                <button
+                    class="w-fit bg-gray-500 text-white rounded-lg py-2 px-2 hover:bg-gray-400"
+                >
+                    "Search"
+                </button>
+            </ActionForm>
+        </div>
+        <hr class="w-full h-1 bg-gray-200 border-0" />
     }
 }
 
