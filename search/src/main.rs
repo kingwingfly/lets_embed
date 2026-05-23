@@ -1,4 +1,3 @@
-mod error;
 mod handlers;
 mod payload;
 mod server;

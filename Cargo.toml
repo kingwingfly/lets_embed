@@ -37,7 +37,7 @@ bytes = "1.11"
 # http
 url = "2.5"
 # db
-sqlx = { version = "0.8", features = [ "runtime-tokio", "postgres", "macros", "derive", "migrate"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "derive", "migrate"] }
 pgvector = { version = "0.4", features = ["sqlx"] }
 # util
 tokenizers = "0.23"
