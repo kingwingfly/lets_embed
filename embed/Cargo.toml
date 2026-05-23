@@ -11,7 +11,7 @@ documentation.workspace = true
 wd_tagger = { path = "../wd_tagger" }
 cn_clip = { path = "../cn_clip" }
 
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 tokio-util.workspace = true
 futures.workspace = true
 anyhow.workspace = true
