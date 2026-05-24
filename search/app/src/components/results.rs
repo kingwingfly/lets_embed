@@ -71,7 +71,35 @@ pub fn Results() -> impl IntoView {
 
     let render_item = move |(_, it): (usize, Item)| -> AnyView {
         match it {
-            Item::Post(p) => render_post_card(p, lightbox).into_any(),
+            Item::Post(p) => {
+                let cover = p.images.first().cloned();
+                let count = p.images.len();
+                let p_for_click = p.clone();
+                view! {
+                    <div class="mb-2 break-inside-avoid">
+                        <div
+                            class="relative cursor-pointer group rounded overflow-hidden bg-gray-900"
+                            on:click=move |_| lightbox.set(Some(p_for_click.clone()))
+                        >
+                            {cover.map(|c| view! {
+                                <img
+                                    loading="lazy"
+                                    decoding="async"
+                                    class="w-full h-auto block group-hover:opacity-90"
+                                    src=format!("/images/{}.jpeg", encode(&c.name))
+                                />
+                            })}
+                            <div class="absolute top-1 right-1 bg-black/70 text-white text-xs px-2 py-0.5 rounded">
+                                {count}" imgs"
+                            </div>
+                            <div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent text-white text-xs p-1 truncate">
+                                {p.title.clone()}
+                            </div>
+                        </div>
+                    </div>
+                }
+                .into_any()
+            }
             Item::Image(im) => {
                 let url = format!("/images/{}.jpeg", encode(&im.name));
                 let url_for_click = url.clone();
@@ -167,35 +195,6 @@ pub fn Results() -> impl IntoView {
             {end_view}
             {lightbox_view}
             {viewer_view}
-        </div>
-    }
-}
-
-fn render_post_card(p: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl IntoView {
-    let cover = p.images.first().cloned();
-    let count = p.images.len();
-    let p_for_click = p.clone();
-    view! {
-        <div class="mb-2 break-inside-avoid">
-            <div
-                class="relative cursor-pointer group rounded overflow-hidden bg-gray-900"
-                on:click=move |_| lightbox.set(Some(p_for_click.clone()))
-            >
-                {cover.map(|c| view! {
-                    <img
-                        loading="lazy"
-                        decoding="async"
-                        class="w-full h-auto block group-hover:opacity-90"
-                        src=format!("/images/{}.jpeg", encode(&c.name))
-                    />
-                })}
-                <div class="absolute top-1 right-1 bg-black/70 text-white text-xs px-2 py-0.5 rounded">
-                    {count}" imgs"
-                </div>
-                <div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent text-white text-xs p-1 truncate">
-                    {p.title.clone()}
-                </div>
-            </div>
         </div>
     }
 }
