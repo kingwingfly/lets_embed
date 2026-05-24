@@ -3,7 +3,7 @@ use std::{env, path::Path, sync::Arc};
 use anyhow::bail;
 use ort::session::Session;
 use parking_lot::Mutex;
-use pgvector::Vector;
+use pgvector::HalfVector;
 use sqlx::{PgPool, Postgres};
 use tokenizers::{EncodeInput, Tokenizer};
 
@@ -85,7 +85,7 @@ impl Engine {
         let images = sqlx::query_as!(
             Image,
             r#"
-            SELECT DISTINCT i.id, i.name
+            SELECT DISTINCT i.id, i.name, i.width, i.height
                 FROM images i
                 WHERE EXISTS (
                     SELECT 1
@@ -121,8 +121,8 @@ impl Engine {
             describes,
         )?
         .into_iter()
-        .map(Into::into)
-        .collect::<Vec<Vector>>();
+        .map(|embedding| HalfVector::from_f32_slice(&embedding))
+        .collect::<Vec<_>>();
 
         let mut res: Vec<Vec<Image>> = Vec::with_capacity(text_embeddings.len());
 
@@ -150,10 +150,12 @@ impl Engine {
             SELECT
                 q.ord AS "ord!",
                 i.id,
-                i.name
-            FROM UNNEST($1::vector[]) WITH ORDINALITY AS q(vec, ord)
+                i.name,
+                i.width,
+                i.height
+            FROM UNNEST($1::halfvec[]) WITH ORDINALITY AS q(vec, ord)
             CROSS JOIN LATERAL (
-                SELECT id, name, clip_embedding <=> q.vec AS dist
+                SELECT id, name, width, height, clip_embedding <=> q.vec AS dist
                 FROM images
                 ORDER BY dist
                 LIMIT $2 OFFSET $3
@@ -175,6 +177,8 @@ impl Engine {
             res[idx].push(Image {
                 id: r.id,
                 name: r.name,
+                width: r.width,
+                height: r.height,
             });
         });
 
@@ -187,7 +191,7 @@ impl Engine {
         sqlx::query_as!(
             Image,
             r#"
-            SELECT id, name
+            SELECT id, name, width, height
             FROM images i
             JOIN post_images pi
             ON i.id = pi.image_id
@@ -206,6 +210,8 @@ impl Engine {
 pub struct Image {
     pub id: i64,
     pub name: String,
+    pub width: i32,
+    pub height: i32,
 }
 
 #[derive(Debug)]

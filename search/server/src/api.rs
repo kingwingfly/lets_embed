@@ -60,7 +60,12 @@ pub async fn search_sse(
                                         id: post.id,
                                         title: sanitize(post.title),
                                         images: imgs.into_iter()
-                                            .map(|i| ImageItem { id: i.id, name: sanitize(i.name) })
+                                            .map(|i| ImageItem {
+                                                id: i.id,
+                                                name: sanitize(i.name),
+                                                width: i.width as u32,
+                                                height: i.height as u32,
+                                            })
                                             .collect(),
                                     };
                                     yield Ok(Event::default()
@@ -76,7 +81,12 @@ pub async fn search_sse(
                         }
 
                         for img in images {
-                            let item = ImageItem { id: img.id, name: sanitize(img.name) };
+                            let item = ImageItem {
+                                id: img.id,
+                                name: sanitize(img.name),
+                                width: img.width as u32,
+                                height: img.height as u32,
+                            };
                             yield Ok(Event::default()
                                 .event("image")
                                 .json_data(item)
@@ -100,7 +110,12 @@ pub async fn search_sse(
                         let images = results.pop().unwrap_or_default();
                         let count = images.len();
                         for img in images {
-                            let item = ImageItem { id: img.id, name: sanitize(img.name) };
+                            let item = ImageItem {
+                                id: img.id,
+                                name: sanitize(img.name),
+                                width: img.width as u32,
+                                height: img.height as u32,
+                            };
                             yield Ok(Event::default()
                                 .event("image")
                                 .json_data(item)

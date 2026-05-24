@@ -26,6 +26,8 @@ impl Mode {
 pub struct ImageItem {
     pub id: i64,
     pub name: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,7 +47,7 @@ pub struct ErrorEvent {
     pub message: String,
 }
 
-/// 解析 `foo bar -baz` 形式
+/// parse `foo bar -baz` query
 pub fn parse_tag_query(q: &str) -> (Vec<String>, Vec<String>) {
     let mut tags = Vec::new();
     let mut not_tags = Vec::new();
