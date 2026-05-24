@@ -86,7 +86,7 @@ pub fn Results() -> impl IntoView {
                                     loading="lazy"
                                     decoding="async"
                                     class="w-full h-auto block group-hover:opacity-90"
-                                    src=format!("/images/{}.jpeg", encode(&c.name))
+                                    src=format!("/images/{}.webp", encode(&c.name))
                                 />
                             })}
                             <div class="absolute top-1 right-1 bg-black/70 text-white text-xs px-2 py-0.5 rounded">
@@ -101,7 +101,7 @@ pub fn Results() -> impl IntoView {
                 .into_any()
             }
             Item::Image(im) => {
-                let url = format!("/images/{}.jpeg", encode(&im.name));
+                let url = format!("/images/{}.webp", encode(&im.name));
                 let url_for_click = url.clone();
                 view! {
                     <div class="mb-2 break-inside-avoid">

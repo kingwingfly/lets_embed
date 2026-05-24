@@ -63,7 +63,7 @@ pub fn Lightbox(
             imgs.iter()
                 .take(v)
                 .map(|im| {
-                    let url = format!("/images/{}.jpeg", encode(&im.name));
+                    let url = format!("/images/{}.webp", encode(&im.name));
                     let url_for_click = url.clone();
                     view! {
                         <div class="relative aspect-square overflow-hidden rounded bg-gray-800">

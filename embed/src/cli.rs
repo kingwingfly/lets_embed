@@ -186,7 +186,7 @@ async fn convert_image(
             .map(|(id, name)| {
                 let op = op.clone();
                 async move {
-                    let filename = format!("{}.jpeg", sanitize(name));
+                    let filename = format!("{}.webp", sanitize(name));
                     (
                         id,
                         op.read(filename.as_str())
