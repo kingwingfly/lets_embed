@@ -100,7 +100,7 @@ pub async fn search_sse(
                         let images = results.pop().unwrap_or_default();
                         let count = images.len();
                         for img in images {
-                            let item = ImageItem { id: img.id, name: img.name };
+                            let item = ImageItem { id: img.id, name: sanitize(img.name) };
                             yield Ok(Event::default()
                                 .event("image")
                                 .json_data(item)

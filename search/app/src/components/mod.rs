@@ -1,3 +1,4 @@
+mod lightbox;
 mod results;
 mod search_bar;
 

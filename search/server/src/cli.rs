@@ -16,7 +16,5 @@ pub struct Cli {
     #[arg(long, default_value = "models/tokenizer.json")]
     pub tokenizer: PathBuf,
 
-    /// 图片根目录
-    #[arg(long, default_value = "images")]
     pub prefix: PathBuf,
 }

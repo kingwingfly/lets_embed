@@ -1,6 +1,10 @@
-use crate::types::{ImageItem, Mode, PostItem};
+use crate::{
+    components::lightbox::Lightbox,
+    types::{ImageItem, Mode, PostItem},
+};
 use leptos::prelude::*;
 use leptos_router::hooks::use_query_map;
+use urlencoding::encode;
 
 #[cfg(target_arch = "wasm32")]
 use crate::types::{DoneEvent, ErrorEvent};
@@ -14,11 +18,10 @@ enum Item {
     Image(ImageItem),
 }
 
-#[island]
+#[component]
 pub fn Results() -> impl IntoView {
     let qmap = use_query_map();
 
-    // 响应式参数：mode / q / limit
     let params = Memo::new(move |_| {
         qmap.with(|m| {
             (
@@ -38,14 +41,13 @@ pub fn Results() -> impl IntoView {
     let loading = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let lightbox: RwSignal<Option<PostItem>> = RwSignal::new(None);
+    let viewer: RwSignal<Option<String>> = RwSignal::new(None);
 
-    // 通过 StoredValue 在 wasm 端持有当前 EventSource 与闭包，避免泄漏
     #[cfg(target_arch = "wasm32")]
     let active: StoredValue<Option<ActiveSse>, LocalStorage> = StoredValue::new_local(None);
 
-    // 触发加载：参数变化 → 重置；offset 变化 → 拉新一页
     Effect::new(move |_| {
-        let _ = params.get(); // 订阅
+        let _ = params.get();
         items.set(Vec::new());
         offset.set(0);
         has_more.set(true);
@@ -54,7 +56,6 @@ pub fn Results() -> impl IntoView {
         load_page(0, params, items, offset, has_more, loading, error, active);
     });
 
-    // 无限滚动哨兵
     let sentinel = NodeRef::<leptos::html::Div>::new();
 
     #[cfg(target_arch = "wasm32")]
@@ -68,19 +69,25 @@ pub fn Results() -> impl IntoView {
         }
     });
 
-    // 先把 children 渲染逻辑提出来
     let render_item = move |(_, it): (usize, Item)| -> AnyView {
         match it {
             Item::Post(p) => render_post_card(p, lightbox).into_any(),
-            Item::Image(im) => view! {
-                <img
-                    loading="lazy"
-                    decoding="async"
-                    class="w-full h-auto rounded bg-gray-900"
-                    src=format!("/images/{}.jpeg", im.name)
-                />
+            Item::Image(im) => {
+                let url = format!("/images/{}.jpeg", encode(&im.name));
+                let url_for_click = url.clone();
+                view! {
+                    <div class="mb-2 break-inside-avoid">
+                        <img
+                            loading="lazy"
+                            decoding="async"
+                            class="w-full h-auto block rounded bg-gray-900 cursor-zoom-in"
+                            src=url
+                            on:click=move |_| viewer.set(Some(url_for_click.clone()))
+                        />
+                    </div>
+                }
+                .into_any()
             }
-            .into_any(),
         }
     };
 
@@ -111,7 +118,32 @@ pub fn Results() -> impl IntoView {
         })
     };
 
-    let lightbox_view = move || lightbox.get().map(|p| render_lightbox(p, lightbox));
+    let lightbox_view = move || {
+        lightbox.get().map(|p| {
+            view! {
+                <Lightbox post=p lightbox=lightbox viewer=viewer />
+            }
+        })
+    };
+
+    let viewer_view = move || {
+        viewer.get().map(|url| view! {
+            <div
+                class="fixed inset-0 bg-black/95 z-[60] flex items-center justify-center cursor-zoom-out p-2"
+                on:click=move |ev| { ev.stop_propagation(); viewer.set(None); }
+            >
+                <img
+                    src=url
+                    class="max-w-full max-h-full object-contain select-none"
+                    on:click=move |_| viewer.set(None)
+                />
+                <button
+                    class="absolute top-2 right-2 text-white bg-black/60 hover:bg-black/80 rounded-full w-10 h-10 text-2xl"
+                    on:click=move |_| viewer.set(None)
+                >"×"</button>
+            </div>
+        })
+    };
 
     let items_iter = move || items.get().into_iter().enumerate().collect::<Vec<_>>();
 
@@ -119,7 +151,7 @@ pub fn Results() -> impl IntoView {
         <div class="px-2 pb-8">
             {error_view}
 
-            <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2 pt-2">
+            <div class="columns-2 sm:columns-3 md:columns-4 lg:columns-6 gap-2 px-2 pt-2">
                 <For
                     each=items_iter
                     key=|(i, it)| match it {
@@ -135,6 +167,7 @@ pub fn Results() -> impl IntoView {
             {loading_view}
             {end_view}
             {lightbox_view}
+            {viewer_view}
         </div>
     }
 }
@@ -144,39 +177,25 @@ fn render_post_card(p: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl I
     let count = p.images.len();
     let p_for_click = p.clone();
     view! {
-        <div class="relative cursor-pointer group"
-             on:click=move |_| lightbox.set(Some(p_for_click.clone()))>
-            {cover.map(|c| view!{
-                <img loading="lazy" decoding="async"
-                    class="w-full h-auto rounded bg-gray-900 group-hover:opacity-90"
-                    src=format!("/images/{}.jpeg", c.name) />
-            })}
-            <div class="absolute top-1 right-1 bg-black/70 text-white text-xs px-2 py-0.5 rounded">
-                {count}" imgs"
-            </div>
-            <div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent text-white text-xs p-1 truncate rounded-b">
-                {p.title.clone()}
-            </div>
-        </div>
-    }
-}
-
-fn render_lightbox(p: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl IntoView {
-    let close = move |_| lightbox.set(None);
-    view! {
-        <div class="fixed inset-0 bg-black/95 z-50 overflow-y-auto" on:click=close>
-            <div class="sticky top-0 flex items-center justify-between px-4 py-2 bg-black/80 text-white">
-                <div class="font-semibold truncate">{p.title.clone()}</div>
-                <button class="px-3 py-1 hover:bg-gray-700 rounded"
-                        on:click=close>"Close"</button>
-            </div>
-            <div class="flex flex-col items-center gap-2 p-2"
-                 on:click=move |ev| ev.stop_propagation()>
-                { p.images.into_iter().map(|im| view!{
-                    <img loading="lazy" decoding="async"
-                        class="max-w-full h-auto"
-                        src=format!("/images/{}.jpeg", im.name) />
-                }).collect::<Vec<_>>() }
+        <div class="mb-2 break-inside-avoid">
+            <div
+                class="relative cursor-pointer group rounded overflow-hidden bg-gray-900"
+                on:click=move |_| lightbox.set(Some(p_for_click.clone()))
+            >
+                {cover.map(|c| view! {
+                    <img
+                        loading="lazy"
+                        decoding="async"
+                        class="w-full h-auto block group-hover:opacity-90"
+                        src=format!("/images/{}.jpeg", encode(&c.name))
+                    />
+                })}
+                <div class="absolute top-1 right-1 bg-black/70 text-white text-xs px-2 py-0.5 rounded">
+                    {count}" imgs"
+                </div>
+                <div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent text-white text-xs p-1 truncate">
+                    {p.title.clone()}
+                </div>
             </div>
         </div>
     }
