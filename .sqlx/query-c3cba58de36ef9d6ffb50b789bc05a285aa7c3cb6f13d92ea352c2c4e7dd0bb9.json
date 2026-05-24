@@ -1,0 +1,60 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                q.ord AS \"ord!\",\n                i.id,\n                i.name,\n                i.width,\n                i.height\n            FROM UNNEST($1::halfvec[]) WITH ORDINALITY AS q(vec, ord)\n            CROSS JOIN LATERAL (\n                SELECT id, name, width, height, clip_embedding <=> q.vec AS dist\n                FROM images\n                ORDER BY dist\n                LIMIT $2 OFFSET $3\n            ) AS i\n            ORDER BY q.ord, i.dist;\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ord!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "width",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "height",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "halfvec[]",
+            "kind": {
+              "Array": {
+                "Custom": {
+                  "name": "halfvec",
+                  "kind": "Simple"
+                }
+              }
+            }
+          }
+        },
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c3cba58de36ef9d6ffb50b789bc05a285aa7c3cb6f13d92ea352c2c4e7dd0bb9"
+}
