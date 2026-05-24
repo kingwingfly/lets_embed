@@ -12,8 +12,19 @@ anyhow.workspace = true
 futures.workspace = true
 tokio.workspace = true
 
-axum = { version = "0.8" }
+search_engine = { path = "../../search_engine" }
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+axum = { version = "0.8", features = ["macros"] }
 leptos_axum = { version = "0.8" }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+async-stream = "0.3"
 
 leptos = { version = "0.8", features = ["nightly", "ssr"] }
 app = { path = "../app", features = ["ssr"] }
+
+clap.workspace = true
+serde.workspace = true
+sanitize-filename.workspace = true
