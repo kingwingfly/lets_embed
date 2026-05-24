@@ -10,10 +10,13 @@ pub struct Cli {
     #[arg(long, default_value_t = 3000)]
     pub port: u16,
 
-    #[arg(long, default_value = "models/cn_clip_text.onnx")]
-    pub clip_model: PathBuf,
+    #[arg(
+        long,
+        default_value = "models/jina-clip-v2/onnx/jina-clip-v2-text.onnx"
+    )]
+    pub clip_text_model: PathBuf,
 
-    #[arg(long, default_value = "models/tokenizer.json")]
+    #[arg(long, default_value = "models/jina-clip-v2/tokenizer.json")]
     pub tokenizer: PathBuf,
 
     pub prefix: PathBuf,

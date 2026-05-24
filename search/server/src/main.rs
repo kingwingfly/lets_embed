@@ -22,7 +22,8 @@ async fn main() -> anyhow::Result<()> {
     leptos_options.site_addr = format!("{}:{}", args.host, args.port).parse()?;
 
     // 初始化 engine
-    let engine = Arc::new(search_engine::Engine::new(&args.clip_model, &args.tokenizer).await?);
+    let engine =
+        Arc::new(search_engine::Engine::new(&args.clip_text_model, &args.tokenizer).await?);
 
     let app_state = state::AppState {
         leptos_options: leptos_options.clone(),
