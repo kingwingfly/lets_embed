@@ -14,6 +14,8 @@ use tokenizers::{EncodeInput, Tokenizer};
 
 pub const EMBED_DIM: usize = 1024;
 
+pub const MAX_TOEKN_DIM: usize = 77;
+
 pub const IMAGE_CHANNEL: usize = 3;
 pub const IMAGE_WIDTH: usize = 512;
 pub const IMAGE_HEIGHT: usize = 512;
@@ -46,27 +48,33 @@ pub fn infer_text<'s>(
 ) -> anyhow::Result<Vec<Vec<f32>>>
 where
 {
-    let tokens = tokenizer
+    let encodings = tokenizer
         .encode_batch(batch_input.into_iter().collect(), true)
         .map_err(|e| anyhow!("{e}"))?;
 
-    let batch_size = tokens.len();
+    let batch_size = encodings.len();
     if batch_size == 0 {
         bail!("empty batch")
     }
-    let token_dim = tokens.iter().map(|enc| enc.get_ids().len()).max().unwrap();
+    let token_dim = encodings
+        .iter()
+        .map(|enc| enc.get_ids().len())
+        .max()
+        .unwrap();
     if token_dim == 0 {
         bail!("empty input")
     }
+    if token_dim > MAX_TOEKN_DIM {
+        bail!("token dim too long (should <= {MAX_TOEKN_DIM})")
+    }
 
     let token_pad_id = tokenizer.token_to_id("<pad>").unwrap_or(1) as i64;
-    let input_ids: Vec<i64> = tokens
-        .iter()
-        .flat_map(|enc| {
-            let ids = enc.get_ids();
-            (0..token_dim).map(|i| ids.get(i).map(|&x| x as i64).unwrap_or(token_pad_id))
-        })
-        .collect();
+    let mut input_ids = vec![token_pad_id; batch_size * token_dim];
+    for (i, enc) in encodings.iter().enumerate() {
+        for (j, &id) in enc.get_ids().iter().enumerate() {
+            input_ids[i * token_dim + j] = id as i64;
+        }
+    }
 
     let output = session.run(inputs![
         "input_ids" => Tensor::from_array(([batch_size, token_dim], input_ids))?,
