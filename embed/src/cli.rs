@@ -35,19 +35,27 @@ pub struct EmbedCli {
     storage: url::Url,
 
     /// CLIP vision onnx model path
-    #[arg(long, alias = "cv", default_value = "models/cn_clip_vision.onnx")]
+    #[arg(
+        long,
+        alias = "cv",
+        default_value = "models/jina-clip-v2/onnx/jina-clip-v2-vision.onnx"
+    )]
     clip_vision_model: PathBuf,
 
     /// wd-tagger onnx model path
     #[arg(
         long,
         alias = "wd",
-        default_value = "models/wd-eva02-large-tagger-v3.onnx"
+        default_value = "models/wd-eva02-large-tagger-v3/wd-eva02-large-tagger-v3.onnx"
     )]
     wd_tagger_model: PathBuf,
 
     /// wd-tagger selected tags csv
-    #[arg(long, alias = "tags", default_value = "models/selected_tags.csv")]
+    #[arg(
+        long,
+        alias = "tags",
+        default_value = "models/wd-eva02-large-tagger-v3/selected_tags.csv"
+    )]
     selected_tags: PathBuf,
 
     /// wd-tagger top_k
@@ -93,7 +101,7 @@ impl EmbedCli {
             .collect::<Vec<_>>();
 
         let wd_tagger_session = wd_tagger::model(self.wd_tagger_model)?;
-        let clip_vision_session = cn_clip::model(self.clip_vision_model)?;
+        let clip_vision_session = jina_clip::model(self.clip_vision_model)?;
 
         let mut jhs = JoinSet::new();
 
@@ -214,7 +222,7 @@ async fn convert_image(
                                             |e| tracing::warn!(id, err = %e, "wd_tagger convert image"),
                                         )
                                         .ok()?,
-                                    cn_clip::convert_image(Cursor::new(buf))
+                                    jina_clip::convert_image(Cursor::new(buf))
                                         .inspect_err(
                                             |e| tracing::warn!(id, err = %e, "clip convert image"),
                                         )
@@ -263,7 +271,7 @@ fn infer(
                 .and_then(|tags| {
                     Ok((
                         tags,
-                        cn_clip::infer_vision(&mut clip_vision_session, clip_images)?,
+                        jina_clip::infer_vision(&mut clip_vision_session, clip_images)?,
                     ))
                 }) {
                 Ok((wd_res, clip_res)) => some_ids

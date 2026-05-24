@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS images (
     status process_status NOT NULL DEFAULT 'pending'::process_status,
     attempt INT NOT NULL DEFAULT 0,
     dinov3_embedding vector(384),
-    clip_embedding vector(512),
+    clip_embedding vector(1024),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 

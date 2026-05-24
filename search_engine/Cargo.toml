@@ -15,7 +15,7 @@ pgvector.workspace = true
 ort.workspace = true
 tokenizers.workspace = true
 
-cn_clip = { path = "../cn_clip" }
+jina_clip = { path = "../jina_clip" }
 
 parking_lot.workspace = true
 serde = { workspace = true, optional = true }

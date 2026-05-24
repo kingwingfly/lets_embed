@@ -9,7 +9,7 @@ documentation.workspace = true
 
 [dependencies]
 wd_tagger = { path = "../wd_tagger" }
-cn_clip = { path = "../cn_clip" }
+jina_clip = { path = "../jina_clip" }
 
 tokio = { workspace = true, features = ["signal"] }
 tokio-util.workspace = true

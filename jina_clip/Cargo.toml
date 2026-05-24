@@ -1,5 +1,5 @@
 [package]
-name = "cn_clip"
+name = "jina_clip"
 version = "0.1.0"
 edition.workspace = true
 authors.workspace = true

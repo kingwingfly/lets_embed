@@ -25,8 +25,8 @@ impl Engine {
                 .as_str(),
         )
         .await?;
-        let clip_text_session = cn_clip::model(clip_text_model_path)?;
-        let tokeniser = cn_clip::tokenizer(tokenizer_config_path)?;
+        let clip_text_session = jina_clip::model(clip_text_model_path)?;
+        let tokeniser = jina_clip::tokenizer(tokenizer_config_path)?;
         Ok(Self {
             pool,
             clip_text_session: Arc::new(Mutex::new(clip_text_session)),
@@ -114,11 +114,8 @@ impl Engine {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
         }
-        // if limit > 1000 || offser > 1000 {
-        //     bail!("both limit and offset should <= 1000 due to HNSW limitation")
-        // }
 
-        let text_embeddings = cn_clip::infer_text(
+        let text_embeddings = jina_clip::infer_text(
             &self.tokeniser,
             &mut self.clip_text_session.lock(),
             describes,

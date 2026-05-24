@@ -12,14 +12,11 @@ use ort::ep;
 use ort::{inputs, session::Session, value::Tensor};
 use tokenizers::{EncodeInput, Tokenizer};
 
-pub const EMBED_DIM: usize = 512;
-
-pub const TOKEN_DIM: usize = 52;
-pub const TOKEN_PAD_ID: i64 = 0;
+pub const EMBED_DIM: usize = 1024;
 
 pub const IMAGE_CHANNEL: usize = 3;
-pub const IMAGE_WIDTH: usize = 224;
-pub const IMAGE_HEIGHT: usize = 224;
+pub const IMAGE_WIDTH: usize = 512;
+pub const IMAGE_HEIGHT: usize = 512;
 
 pub const MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 pub const STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
@@ -52,30 +49,30 @@ where
     let tokens = tokenizer
         .encode_batch(batch_input.into_iter().collect(), true)
         .map_err(|e| anyhow!("{e}"))?;
-    let batch_size = tokens.len();
 
+    let batch_size = tokens.len();
+    if batch_size == 0 {
+        bail!("empty batch")
+    }
+    let token_dim = tokens.iter().map(|enc| enc.get_ids().len()).max().unwrap();
+    if token_dim == 0 {
+        bail!("empty input")
+    }
+
+    let token_pad_id = tokenizer.token_to_id("<pad>").unwrap_or(1) as i64;
     let input_ids: Vec<i64> = tokens
         .iter()
         .flat_map(|enc| {
             let ids = enc.get_ids();
-            (0..TOKEN_DIM).map(|i| ids.get(i).map(|&x| x as i64).unwrap_or(TOKEN_PAD_ID))
-        })
-        .collect();
-
-    let attention_mask: Vec<i64> = tokens
-        .iter()
-        .flat_map(|enc| {
-            let mask = enc.get_attention_mask();
-            (0..TOKEN_DIM).map(|i| mask.get(i).map(|&x| x as i64).unwrap_or(0))
+            (0..token_dim).map(|i| ids.get(i).map(|&x| x as i64).unwrap_or(token_pad_id))
         })
         .collect();
 
     let output = session.run(inputs![
-        "input_ids" => Tensor::from_array(([batch_size, 52], input_ids))?,
-        "attention_mask" => Tensor::from_array(([batch_size, 52], attention_mask))?
+        "input_ids" => Tensor::from_array(([batch_size, token_dim], input_ids))?,
     ])?;
 
-    let (shape, predictions) = output["text_features"].try_extract_tensor::<f32>()?;
+    let (shape, predictions) = output["l2norm_text_embeddings"].try_extract_tensor::<f32>()?;
 
     debug_assert_eq!(shape[0], batch_size as i64);
     debug_assert_eq!(shape[1], EMBED_DIM as i64);
@@ -92,18 +89,21 @@ pub fn infer_vision(
 ) -> anyhow::Result<Vec<Vec<f32>>>
 where
 {
-    let batch_size = batch_input.len();
-    let pixel_values = batch_input.into_iter().flatten().collect::<Vec<_>>();
-
-    if pixel_values.len() != batch_size * IMAGE_CHANNEL * IMAGE_HEIGHT * IMAGE_WIDTH {
+    if batch_input
+        .iter()
+        .any(|i| i.len() != IMAGE_CHANNEL * IMAGE_HEIGHT * IMAGE_WIDTH)
+    {
         bail!("invalid input image size")
     }
+
+    let batch_size = batch_input.len();
+    let pixel_values = batch_input.into_iter().flatten().collect::<Vec<_>>();
 
     let output = session.run(inputs![
         "pixel_values" => Tensor::from_array(([batch_size, IMAGE_CHANNEL, IMAGE_HEIGHT, IMAGE_WIDTH], pixel_values))?,
     ])?;
 
-    let (shape, predictions) = output["image_features"].try_extract_tensor::<f32>()?;
+    let (shape, predictions) = output["l2norm_image_embeddings"].try_extract_tensor::<f32>()?;
 
     debug_assert_eq!(shape[0], batch_size as i64);
     debug_assert_eq!(shape[1], EMBED_DIM as i64);

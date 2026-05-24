@@ -2,20 +2,24 @@
 
 Model download
 ```sh
-mkdir models
-wget -O models/cn_clip_text.onnx https://huggingface.co/felixdu/chinese-clip-vit-base-patch16-onnx/resolve/main/cn_clip_text.onnx
-wget -O models/cn_clip_vision.onnx https://huggingface.co/felixdu/chinese-clip-vit-base-patch16-onnx/resolve/main/cn_clip_vision.onnx
-wget -O models/tokenizer.json https://huggingface.co/Xenova/chinese-clip-vit-base-patch16/resolve/main/tokenizer.json?download=true
+mkdir -p models/jina-clip-v2/onnx
+# download Jina CLIP v2
+wget -O models/jina-clip-v2/onnx/model.onnx https://huggingface.co/jinaai/jina-clip-v2/resolve/main/onnx/model.onnx?download=true
+wget -O models/jina-clip-v2/onnx/model.onnx_data https://huggingface.co/jinaai/jina-clip-v2/resolve/main/onnx/model.onnx_data?download=true
+wget -O models/jina-clip-v2/tokenizer.json https://huggingface.co/jinaai/jina-clip-v2/resolve/main/tokenizer.json?download=true
+# split it into text/vision
+uv run split_clip_model/main.py
 
-wget -O models/wd-eva02-large-tagger-v3.onnx https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/model.onnx
+# download wd-tagger
+wget -O models/wd-eva02-large-tagger-v3.onnx https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/model.onnx?download=true
 wget -O models/selected_tags.csv https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/selected_tags.csv?download=true
 ```
 
 Try infer
 ```sh
 # set `ORT_CUDA_VERSION` you cuda version
-ORT_CUDA_VERSION=13 cargo run --example infer_text
-ORT_CUDA_VERSION=13 cargo run --example infer_vision
+ORT_CUDA_VERSION=13 ORT_DYLIB_PATH=/path/to/libonnxruntime.so cargo run --example infer_text
+ORT_CUDA_VERSION=13 ORT_DYLIB_PATH=/path/to/libonnxruntime.so cargo run --example infer_vision
 ```
 
 # Distribute infer
@@ -45,7 +49,6 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4000/v1/otlp \
 ORT_CUDA_VERSION=13 \
 ORT_DYLIB_PATH=/path/to/libonnxruntime.so \
 cargo run --release -p embed -- -s fs:path/to/images
-# or `OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4000/v1/otlp` if telemetry to greptime db directly
 ```
 
 ## Telemetry
@@ -58,16 +61,10 @@ Moreover, `greptime db` [dashboard config file](assets/dashboard.json) is provid
 
 After infer/embed, you can do search on the data:
 ```sh
-ORT_CUDA_VERSION=13 \
-ORT_DYLIB_PATH=/path/to/libonnxruntime.so \
-cargo run --example search
-```
-
-# Search
-
-```sh
 cargo binstall --locked cargo-leptos
 
+ORT_CUDA_VERSION=13 \
+ORT_DYLIB_PATH=/path/to/libonnxruntime.so \
 cargo leptos serve
 
 # broswer http://127.0.0.1:3000
