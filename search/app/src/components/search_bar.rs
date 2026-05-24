@@ -26,9 +26,9 @@ pub fn SearchBar() -> impl IntoView {
         ev.prevent_default();
         let url = format!(
             "/?mode={}&q={}&limit={}",
-            mode.get().as_str(),
-            urlencoding::encode(&q_input.get()),
-            limit.get().max(1),
+            mode.read().as_str(),
+            urlencoding::encode(q_input.read().as_str()),
+            limit.read().max(1),
         );
         nav(&url, NavigateOptions::default());
     };

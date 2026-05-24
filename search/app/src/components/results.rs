@@ -91,7 +91,6 @@ pub fn Results() -> impl IntoView {
         }
     };
 
-    // 各种条件片段也单独绑定
     let error_view = move || {
         error.get().map(|e| {
             view! {
@@ -209,7 +208,6 @@ use wasm_bindgen::{JsCast, prelude::Closure};
 #[cfg(target_arch = "wasm32")]
 struct ActiveSse {
     es: web_sys::EventSource,
-    // 保留闭包所有权，避免提前 drop
     _closures: Vec<Closure<dyn FnMut(web_sys::MessageEvent)>>,
 }
 
@@ -236,7 +234,6 @@ fn load_page(
         return;
     }
 
-    // 关闭旧连接
     active.update_value(|v| *v = None);
 
     let url = format!(
@@ -293,7 +290,6 @@ fn load_page(
             .unwrap_or(DoneEvent { has_more: false });
         has_more.set(d.has_more);
         loading.set(false);
-        // 关闭连接（drop ActiveSse 时 close）
         active.set_value(None);
     }) as Box<dyn FnMut(_)>);
     es.add_event_listener_with_callback("done", cb.as_ref().unchecked_ref())
@@ -317,13 +313,10 @@ fn load_page(
         .ok();
     closures.push(cb);
 
-    // 同时监听原生 onerror（连接级）
     let onerror = Closure::wrap(Box::new(move |_ev: web_sys::Event| {
-        // 连接级错误：可能是网络问题；不一定致命，但停止加载
         loading.set(false);
     }) as Box<dyn FnMut(_)>);
     es.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-    // onerror 与上面四个不同签名，单独 leak（数量有限：每次搜索一次）
     onerror.forget();
 
     let new_sse = ActiveSse {

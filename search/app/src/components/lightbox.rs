@@ -2,7 +2,7 @@ use crate::types::PostItem;
 use leptos::prelude::*;
 use urlencoding::encode;
 
-const PAGE: usize = 30; // 每次追加多少张
+const PAGE: usize = 20;
 
 #[component]
 pub fn Lightbox(
@@ -11,7 +11,6 @@ pub fn Lightbox(
     viewer: RwSignal<Option<String>>,
 ) -> impl IntoView {
     let total = post.images.len();
-    // 一次性持有所有 metadata（来自 SSE post event），但渲染分批
     let images = StoredValue::new(post.images.clone());
     let title = post.title.clone();
 
@@ -58,7 +57,7 @@ pub fn Lightbox(
         }
     });
 
-    let render_thumbs = move || {
+    let render_items = move || {
         let v = visible.get();
         images.with_value(|imgs| {
             imgs.iter()
@@ -87,7 +86,6 @@ pub fn Lightbox(
             class="fixed inset-0 bg-black/95 z-50 overflow-y-auto"
             on:click=close
         >
-            // 顶栏
             <div class="sticky top-0 z-10 flex items-center justify-between px-4 py-2 bg-black/80 text-white">
                 <div class="font-semibold truncate">{title}</div>
                 <div class="flex items-center gap-4">
@@ -101,18 +99,15 @@ pub fn Lightbox(
                 </div>
             </div>
 
-            // 网格（阻断点击关闭）
             <div
                 class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2 p-2"
                 on:click=move |ev| ev.stop_propagation()
             >
-                {render_thumbs}
+                {render_items}
             </div>
 
-            // 哨兵
             <div node_ref=sentinel class="h-12 w-full"></div>
 
-            // 全部展示完时给个提示
             {move || (visible.get() >= total).then(|| view! {
                 <div class="text-gray-500 text-center pb-6">"-- End --"</div>
             })}
