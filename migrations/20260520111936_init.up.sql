@@ -24,8 +24,8 @@ CREATE TABLE IF NOT EXISTS images (
     name VARCHAR(255) UNIQUE NOT NULL CHECK (trim(name) != ''),
     status process_status NOT NULL DEFAULT 'pending'::process_status,
     attempt INT NOT NULL DEFAULT 0,
-    dinov3_embedding vector(384),
-    clip_embedding vector(1024),
+    dinov3_embedding halfvec(384),
+    clip_embedding halfvec(1024),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -37,8 +37,8 @@ CREATE TABLE IF NOT EXISTS post_images (
 
 CREATE INDEX IF NOT EXISTS idx_images_name ON images(name);
 CREATE INDEX IF NOT EXISTS idx_images_status ON images (status) WHERE status = 'pending'::process_status;
-CREATE INDEX IF NOT EXISTS idx_images_dinov3 ON images USING hnsw (dinov3_embedding vector_cosine_ops);
-CREATE INDEX IF NOT EXISTS idx_images_clip ON images USING hnsw (clip_embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_images_dinov3 ON images USING hnsw (dinov3_embedding halfvec_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_images_clip ON images USING hnsw (clip_embedding halfvec_cosine_ops);
 CREATE INDEX IF NOT EXISTS idx_post_images_image_id ON post_images(image_id);
 
 -- authors

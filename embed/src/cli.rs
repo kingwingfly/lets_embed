@@ -12,7 +12,7 @@ use opendal::{
 };
 use opentelemetry::{global, metrics::Counter};
 use ort::session::Session;
-use pgvector::Vector;
+use pgvector::HalfVector;
 use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
 use sanitize_filename::sanitize;
 use sqlx::postgres::PgPool;
@@ -322,7 +322,7 @@ async fn record(
                         scores.push(score);
                     }
                     clip_ids.push(id);
-                    embeddings.push(Vector::from(embedding));
+                    embeddings.push(HalfVector::from_f32_slice(&embedding));
                     completed_ids.push(id);
                 }
                 None => failed_ids.push(id),
@@ -366,7 +366,7 @@ async fn record(
         sqlx::query!(
             r#"
             UPDATE images SET clip_embedding = embeddings.embedding
-            FROM UNNEST($1::BIGINT[], $2::vector[]) AS embeddings (id, embedding)
+            FROM UNNEST($1::BIGINT[], $2::halfvec[]) AS embeddings (id, embedding)
             WHERE embeddings.id = images.id
         "#,
             &clip_ids,
