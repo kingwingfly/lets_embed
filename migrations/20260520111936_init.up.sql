@@ -2,11 +2,17 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TYPE process_status AS ENUM ('pending', 'processing', 'completed');
 
+CREATE TYPE image AS (
+    name TEXT,
+    width INT,
+    height INT
+);
+
 CREATE TYPE meta AS (
     title TEXT,
     authors TEXT[],
     tags TEXT[],
-    images TEXT[]
+    images image[]
 );
 
 -- posts
@@ -22,6 +28,8 @@ CREATE INDEX IF NOT EXISTS idx_posts_title ON posts(title);
 CREATE TABLE IF NOT EXISTS images (
     id BIGSERIAL PRIMARY KEY,
     name VARCHAR(255) UNIQUE NOT NULL CHECK (trim(name) != ''),
+    width INT NOT NULL CHECK (width > 0),
+    height INT NOT NULL CHECK (height > 0),
     status process_status NOT NULL DEFAULT 'pending'::process_status,
     attempt INT NOT NULL DEFAULT 0,
     dinov3_embedding halfvec(384),

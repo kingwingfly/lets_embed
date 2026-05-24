@@ -50,7 +50,17 @@ async fn main() -> anyhow::Result<()> {
                         "images" => {
                             let mut items = vec![];
                             reader.read_array_items(|reader| {
-                                items.push(reader.read_string()?);
+                                let mut image = Image::default();
+                                reader.read_object_borrowed_names(|mut reader| {
+                                    match reader.read_name()? {
+                                        "name" => image.name = reader.read_string()?,
+                                        "width" => image.width = reader.read_number()??,
+                                        "height" => image.height = reader.read_number()??,
+                                        _ => {}
+                                    }
+                                    Ok(())
+                                })?;
+                                items.push(image);
                                 Ok(())
                             })?;
                             meta.images = items;
@@ -96,10 +106,10 @@ async fn main() -> anyhow::Result<()> {
                     JOIN posts p USING (title)
                 ),
                 ins_images AS (
-                    INSERT INTO images (name)
-                    SELECT DISTINCT name
+                    INSERT INTO images (name, width, height)
+                    SELECT DISTINCT ON (name) name, width, height
                     FROM input i
-                    CROSS JOIN LATERAL UNNEST(i.images::VARCHAR[]) as _(name)
+                    CROSS JOIN LATERAL UNNEST(i.images::image[]) as _(name, width, height)
                     WHERE trim(name) != ''
                     ORDER BY name
                     ON CONFLICT DO NOTHING
@@ -110,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
                     UNION ALL
                     SELECT DISTINCT ON (id) id, name
                     FROM input i
-                    CROSS JOIN LATERAL UNNEST(i.images::VARCHAR[]) as _(name)
+                    CROSS JOIN LATERAL UNNEST(i.images::image[]) as _(name, width, height)
                     JOIN images USING (name)
                 ),
                 post_images AS (
@@ -204,10 +214,18 @@ async fn main() -> anyhow::Result<()> {
 }
 
 #[derive(Debug, Default, sqlx::Type)]
+#[sqlx(type_name = "image")]
+struct Image {
+    name: String,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Debug, Default, sqlx::Type)]
 #[sqlx(type_name = "meta")]
 struct Meta {
     title: String,
     authors: Vec<String>,
     tags: Vec<String>,
-    images: Vec<String>,
+    images: Vec<Image>,
 }
