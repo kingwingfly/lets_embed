@@ -1,16 +1,31 @@
+use std::iter::repeat_with;
+
 use crate::{
     components::lightbox::Lightbox,
     types::{DoneEvent, ErrorEvent, ImageItem, Mode, PostItem},
 };
 use leptos::prelude::*;
 use leptos_router::hooks::use_query_map;
+use leptos_use::{
+    UseWindowSizeReturn, signal_debounced, use_intersection_observer, use_window_size,
+};
 use urlencoding::encode;
 use wasm_bindgen::{JsCast, prelude::Closure};
 
-#[derive(Clone)]
+const COLUMN_WIDTH: u32 = 360;
+const COLUMN_PAD: u32 = 2;
+
+#[derive(Debug, Clone)]
 enum Item {
     Post(PostItem),
     Image(ImageItem),
+}
+
+#[derive(Debug, Clone)]
+struct Column {
+    items: Vec<Item>,
+    width: u32,
+    height: u32,
 }
 
 #[component]
@@ -30,7 +45,51 @@ pub fn Results() -> impl IntoView {
         })
     });
 
-    let items: RwSignal<Vec<Item>> = RwSignal::new(Vec::new());
+    let UseWindowSizeReturn { width, .. } = use_window_size();
+    let width: Signal<f64> = signal_debounced(width, 1000.0);
+    let columns = Memo::new(move |columns: Option<&Vec<RwSignal<Column>>>| {
+        let mut new = repeat_with(|| Column {
+            items: vec![],
+            width: COLUMN_WIDTH,
+            height: 0,
+        })
+        .take((width() / COLUMN_WIDTH as f64).round() as usize)
+        .collect::<Vec<_>>();
+        if let Some(old) = columns {
+            let old = old.iter().map(|c| c.get()).collect::<Vec<_>>();
+            let max_row = old.iter().map(|c| c.items.len()).max().unwrap_or_default();
+            for item in
+                (0..max_row).flat_map(|row| old.iter().filter_map(move |c| c.items.get(row)))
+            {
+                match item {
+                    Item::Post(p) => {
+                        let Some(cover) = p.images.first() else {
+                            continue;
+                        };
+                        let Some(column) = new.iter_mut().min_by_key(|c| c.height) else {
+                            continue;
+                        };
+                        let height = ((cover.height as f64 / cover.width as f64)
+                            * column.width as f64)
+                            .round() as u32;
+                        column.height += height + COLUMN_PAD;
+                        column.items.push(Item::Post(p.clone()));
+                    }
+                    Item::Image(im) => {
+                        let Some(column) = new.iter_mut().min_by_key(|c| c.height) else {
+                            continue;
+                        };
+                        let height = ((im.height as f64 / im.width as f64) * column.width as f64)
+                            .round() as u32;
+                        column.height += height + COLUMN_PAD;
+                        column.items.push(Item::Image(im.clone()));
+                    }
+                }
+            }
+        }
+        new.into_iter().map(|c| RwSignal::new(c)).collect()
+    });
+
     let offset = RwSignal::new(0i64);
     let has_more = RwSignal::new(true);
     let loading = RwSignal::new(false);
@@ -42,23 +101,25 @@ pub fn Results() -> impl IntoView {
 
     Effect::new(move |_| {
         let _ = params.get();
-        items.set(Vec::new());
+        for column in columns.get_untracked() {
+            column.update(|c| c.items = vec![]);
+        }
         offset.set(0);
         has_more.set(true);
         error.set(None);
-        load_page(0, params, items, has_more, loading, error, active);
+        load_page(0, params, columns, has_more, loading, error, active);
     });
 
     let sentinel = NodeRef::<leptos::html::Div>::new();
 
-    leptos_use::use_intersection_observer([sentinel], move |entries, _| {
+    use_intersection_observer([sentinel], move |entries, _| {
         if !entries[0].is_intersecting() || loading.get_untracked() || !has_more.get_untracked() {
             return;
         }
         let (_, _, limit) = params.get_untracked();
         let next = offset.get_untracked() + limit;
         offset.set(next);
-        load_page(next, params, items, has_more, loading, error, active);
+        load_page(next, params, columns, has_more, loading, error, active);
     });
 
     let render_item = move |(_, it): (usize, Item)| -> AnyView {
@@ -111,6 +172,29 @@ pub fn Results() -> impl IntoView {
         }
     };
 
+    let render_column = move |(_, column): (usize, RwSignal<Column>)| {
+        let item_iter = move || {
+            column
+                .get()
+                .items
+                .into_iter()
+                .enumerate()
+                .collect::<Vec<_>>()
+        };
+        view! {
+            <div class="columns-1 gap-2 px-2 pt-2">
+                <For
+                    each=item_iter
+                    key=|(i, it)| match it {
+                        Item::Post(p) => format!("p_{}_{}", i, p.id),
+                        Item::Image(im) => format!("i_{}_{}", i, im.id),
+                    }
+                    children=render_item
+                />
+            </div>
+        }
+    };
+
     let error_view = move || {
         error.get().map(|e| {
             view! {
@@ -130,7 +214,10 @@ pub fn Results() -> impl IntoView {
     };
 
     let end_view = move || {
-        (!loading.get() && !has_more.get() && !items.get().is_empty()).then(|| {
+        (!loading.get()
+            && !has_more.get()
+            && !columns.read().iter().all(|c| c.read().items.is_empty()))
+        .then(|| {
             view! {
                 <div class="text-gray-500 p-4 text-center">"-- End --"</div>
             }
@@ -164,20 +251,16 @@ pub fn Results() -> impl IntoView {
         })
     };
 
-    let items_iter = move || items.get().into_iter().enumerate().collect::<Vec<_>>();
+    let column_iter = move || columns.get().into_iter().enumerate().collect::<Vec<_>>();
 
     view! {
         <div class="px-2 pb-8">
             {error_view}
-
-            <div class="columns-2 sm:columns-3 md:columns-4 lg:columns-6 gap-2 px-2 pt-2">
+            <div class="flex px-2">
                 <For
-                    each=items_iter
-                    key=|(i, it)| match it {
-                        Item::Post(p) => format!("p_{}_{}", i, p.id),
-                        Item::Image(im) => format!("i_{}_{}", i, im.id),
-                    }
-                    children=render_item
+                    each=column_iter
+                    key=|(i, _)| *i
+                    children=render_column
                 />
             </div>
 
@@ -193,9 +276,11 @@ pub fn Results() -> impl IntoView {
 
 // ===================== wasm-only =====================
 
+#[derive(Debug)]
 struct ActiveSse {
     es: web_sys::EventSource,
     _closures: Vec<Closure<dyn FnMut(web_sys::MessageEvent)>>,
+    _err_closure: Closure<dyn FnMut(web_sys::Event)>,
 }
 
 impl Drop for ActiveSse {
@@ -208,7 +293,7 @@ impl Drop for ActiveSse {
 fn load_page(
     offset_val: i64,
     params: Memo<(Mode, String, i64)>,
-    items: RwSignal<Vec<Item>>,
+    columns: Memo<Vec<RwSignal<Column>>>,
     has_more: RwSignal<bool>,
     loading: RwSignal<bool>,
     error: RwSignal<Option<String>>,
@@ -224,7 +309,7 @@ fn load_page(
     let url = format!(
         "/api/search?mode={}&q={}&limit={}&offset={}",
         mode.as_str(),
-        urlencoding::encode(&q),
+        encode(&q),
         limit,
         offset_val,
     );
@@ -247,7 +332,19 @@ fn load_page(
         if let Some(s) = ev.data().as_string()
             && let Ok(p) = serde_json::from_str::<PostItem>(&s)
         {
-            items.update(|v| v.push(Item::Post(p)));
+            let Some(cover) = p.images.first() else {
+                return;
+            };
+            let columns = columns.read_untracked();
+            let Some(column) = columns.iter().min_by_key(|c| c.read_untracked().height) else {
+                return;
+            };
+            let height = ((cover.height as f64 / cover.width as f64) * column.read().width as f64)
+                .round() as u32;
+            column.update(|c| {
+                c.height += height + COLUMN_PAD;
+                c.items.push(Item::Post(p));
+            });
         }
     }) as Box<dyn FnMut(_)>);
     es.add_event_listener_with_callback("post", cb.as_ref().unchecked_ref())
@@ -259,7 +356,16 @@ fn load_page(
         if let Some(s) = ev.data().as_string()
             && let Ok(im) = serde_json::from_str::<ImageItem>(&s)
         {
-            items.update(|v| v.push(Item::Image(im)));
+            let columns = columns.read_untracked();
+            let Some(column) = columns.iter().min_by_key(|c| c.read().height) else {
+                return;
+            };
+            let height =
+                ((im.height as f64 / im.width as f64) * column.read().width as f64).round() as u32;
+            column.update(|c| {
+                c.height += height + COLUMN_PAD;
+                c.items.push(Item::Image(im));
+            });
         }
     }) as Box<dyn FnMut(_)>);
     es.add_event_listener_with_callback("image", cb.as_ref().unchecked_ref())
@@ -302,11 +408,11 @@ fn load_page(
         loading.set(false);
     }) as Box<dyn FnMut(_)>);
     es.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-    onerror.forget();
 
     let new_sse = ActiveSse {
         es,
         _closures: closures,
+        _err_closure: onerror,
     };
     active.update_value(|v| *v = Some(new_sse));
 }

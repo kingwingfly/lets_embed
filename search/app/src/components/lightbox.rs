@@ -1,5 +1,6 @@
 use crate::types::PostItem;
 use leptos::prelude::*;
+use leptos_use::use_intersection_observer;
 use urlencoding::encode;
 
 const PAGE: usize = 20;
@@ -17,7 +18,7 @@ pub fn Lightbox(
     let visible = RwSignal::new(PAGE.min(total));
     let sentinel = NodeRef::<leptos::html::Div>::new();
 
-    leptos_use::use_intersection_observer([sentinel], move |entries, _| {
+    use_intersection_observer([sentinel], move |entries, _| {
         if !entries[0].is_intersecting() {
             return;
         }
