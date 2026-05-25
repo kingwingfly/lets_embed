@@ -48,7 +48,7 @@ pub fn Results() -> impl IntoView {
     let UseWindowSizeReturn { width, .. } = use_window_size();
     let width: Signal<f64> = signal_debounced(width, 1000.0);
 
-    let columns: RwSignal<Vec<RwSignal<Column>>> = RwSignal::new(vec![]);
+    let columns: RwSignal<Vec<Column>> = RwSignal::new(vec![]);
 
     Effect::new(move || {
         let width = width();
@@ -62,15 +62,10 @@ pub fn Results() -> impl IntoView {
         .take(column_count)
         .collect::<Vec<_>>();
         let old = columns.get_untracked();
-        let max_row = old
-            .iter()
-            .map(|c| c.read_untracked().items.len())
-            .max()
-            .unwrap_or_default();
-        for item in (0..max_row).flat_map(|row| {
-            old.iter()
-                .filter_map(move |c| c.read_untracked().items.get(row).cloned())
-        }) {
+        let max_row = old.iter().map(|c| c.items.len()).max().unwrap_or_default();
+        for item in
+            (0..max_row).flat_map(|row| old.iter().filter_map(move |c| c.items.get(row).cloned()))
+        {
             match item {
                 Item::Post(p) => {
                     let Some(cover) = p.images.first() else {
@@ -95,7 +90,7 @@ pub fn Results() -> impl IntoView {
                 }
             }
         }
-        columns.set(new.into_iter().map(RwSignal::new).collect());
+        columns.set(new);
     });
 
     let offset = RwSignal::new(0i64);
@@ -111,10 +106,8 @@ pub fn Results() -> impl IntoView {
         let _ = params.get();
         columns.update(|cs| {
             cs.iter_mut().for_each(|c| {
-                c.update(|c| {
-                    c.items.clear();
-                    c.height = 0;
-                })
+                c.items.clear();
+                c.height = 0;
             })
         });
         offset.set(0);
@@ -203,14 +196,12 @@ pub fn Results() -> impl IntoView {
     };
 
     let end_view = move || {
-        (!loading.get()
-            && !has_more.get()
-            && !columns.read().iter().all(|c| c.read().items.is_empty()))
-        .then(|| {
-            view! {
-                <div class="text-gray-500 p-4 text-center">"-- End --"</div>
-            }
-        })
+        (!loading.get() && !has_more.get() && !columns.read().iter().all(|c| c.items.is_empty()))
+            .then(|| {
+                view! {
+                    <div class="text-gray-500 p-4 text-center">"-- End --"</div>
+                }
+            })
     };
 
     let lightbox_view = move || {
@@ -247,11 +238,16 @@ pub fn Results() -> impl IntoView {
                 <For
                     each=move || columns.get().into_iter().enumerate()
                     key=|(i, _)| *i
-                    let((_, column))
+                    let((i, _))
                 >
                     <div class="columns-1 gap-2">
                         <For
-                            each=move || column.get().items.into_iter().enumerate()
+                            each=move || {
+                                columns
+                                    .with(|cs| cs.get(i).map(|c| c.items.clone()).unwrap_or_default())
+                                    .into_iter()
+                                    .enumerate()
+                            }
                             key=|(i, it)| match it {
                                 Item::Post(p) => format!("p_{}_{}", i, p.id),
                                 Item::Image(im) => format!("i_{}_{}", i, im.id),
@@ -293,7 +289,7 @@ impl Drop for ActiveSse {
 fn load_page(
     offset_val: i64,
     params: Memo<(Mode, String, i64)>,
-    columns: RwSignal<Vec<RwSignal<Column>>>,
+    columns: RwSignal<Vec<Column>>,
     has_more: RwSignal<bool>,
     loading: RwSignal<bool>,
     error: RwSignal<Option<String>>,
@@ -336,17 +332,13 @@ fn load_page(
                 let Some(cover) = p.images.first() else {
                     return;
                 };
-                let Some(column) = columns.iter_mut().min_by_key(|c| c.read_untracked().height)
-                else {
+                let Some(column) = columns.iter_mut().min_by_key(|c| c.height) else {
                     return;
                 };
-                let height = ((cover.height as f64 / cover.width as f64)
-                    * column.read_untracked().width as f64)
+                let height = ((cover.height as f64 / cover.width as f64) * column.width as f64)
                     .round() as u32;
-                column.update(|column| {
-                    column.height += height + COLUMN_PAD;
-                    column.items.push(Item::Post(p));
-                });
+                column.height += height + COLUMN_PAD;
+                column.items.push(Item::Post(p));
             });
         }
     }) as Box<dyn FnMut(_)>);
@@ -360,17 +352,13 @@ fn load_page(
             && let Ok(im) = serde_json::from_str::<ImageItem>(&s)
         {
             columns.update(|columns| {
-                let Some(column) = columns.iter_mut().min_by_key(|c| c.read_untracked().height)
-                else {
+                let Some(column) = columns.iter_mut().min_by_key(|c| c.height) else {
                     return;
                 };
-                let height = ((im.height as f64 / im.width as f64)
-                    * column.read_untracked().width as f64)
-                    .round() as u32;
-                column.update(|column| {
-                    column.height += height + COLUMN_PAD;
-                    column.items.push(Item::Image(im));
-                });
+                let height =
+                    ((im.height as f64 / im.width as f64) * column.width as f64).round() as u32;
+                column.height += height + COLUMN_PAD;
+                column.items.push(Item::Image(im));
             });
         }
     }) as Box<dyn FnMut(_)>);
