@@ -46,7 +46,7 @@ pub fn Results() -> impl IntoView {
         offset.set(0);
         has_more.set(true);
         error.set(None);
-        load_page(0, params, items, offset, has_more, loading, error, active);
+        load_page(0, params, items, has_more, loading, error, active);
     });
 
     let sentinel = NodeRef::<leptos::html::Div>::new();
@@ -58,9 +58,7 @@ pub fn Results() -> impl IntoView {
         let (_, _, limit) = params.get_untracked();
         let next = offset.get_untracked() + limit;
         offset.set(next);
-        load_page(
-            next, params, items, offset, has_more, loading, error, active,
-        );
+        load_page(next, params, items, has_more, loading, error, active);
     });
 
     let render_item = move |(_, it): (usize, Item)| -> AnyView {
@@ -211,7 +209,6 @@ fn load_page(
     offset_val: i64,
     params: Memo<(Mode, String, i64)>,
     items: RwSignal<Vec<Item>>,
-    offset: RwSignal<i64>,
     has_more: RwSignal<bool>,
     loading: RwSignal<bool>,
     error: RwSignal<Option<String>>,
@@ -312,5 +309,4 @@ fn load_page(
         _closures: closures,
     };
     active.update_value(|v| *v = Some(new_sse));
-    let _ = offset; // suppress unused
 }
