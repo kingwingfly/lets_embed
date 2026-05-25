@@ -22,6 +22,7 @@ pub fn Lightbox(
     #[cfg(target_arch = "wasm32")]
     Effect::new(move |_| {
         use wasm_bindgen::{JsCast, closure::Closure};
+
         let Some(el) = sentinel.get() else { return };
         let el: web_sys::Element = el.unchecked_into();
 

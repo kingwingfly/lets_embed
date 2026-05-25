@@ -60,12 +60,43 @@ pub fn Results() -> impl IntoView {
 
     #[cfg(target_arch = "wasm32")]
     Effect::new(move |_| {
-        use wasm_bindgen::JsCast;
-        if let Some(el) = sentinel.get() {
-            let element: web_sys::Element = el.unchecked_into();
-            setup_observer(
-                element, params, items, offset, has_more, loading, error, active,
-            );
+        use wasm_bindgen::{JsCast, closure::Closure};
+
+        let Some(el) = sentinel.get() else { return };
+        let el: web_sys::Element = el.unchecked_into();
+
+        let element: web_sys::Element = el.unchecked_into();
+        let cb = Closure::wrap(Box::new(
+            move |entries: js_sys::Array, _obs: web_sys::IntersectionObserver| {
+                let mut intersect = false;
+                for i in 0..entries.length() {
+                    if let Ok(entry) = entries
+                        .get(i)
+                        .dyn_into::<web_sys::IntersectionObserverEntry>()
+                    {
+                        if entry.is_intersecting() {
+                            intersect = true;
+                            break;
+                        }
+                    }
+                }
+                if !intersect || loading.get_untracked() || !has_more.get_untracked() {
+                    return;
+                }
+                let (_, _, limit) = params.get_untracked();
+                let next = offset.get_untracked() + limit;
+                offset.set(next);
+                load_page(
+                    next, params, items, offset, has_more, loading, error, active,
+                );
+            },
+        )
+            as Box<dyn FnMut(js_sys::Array, web_sys::IntersectionObserver)>);
+
+        if let Ok(obs) = web_sys::IntersectionObserver::new(cb.as_ref().unchecked_ref()) {
+            obs.observe(&el);
+            cb.forget();
+            std::mem::forget(obs);
         }
     });
 
@@ -324,51 +355,4 @@ fn load_page(
     };
     active.update_value(|v| *v = Some(new_sse));
     let _ = offset; // suppress unused
-}
-
-#[cfg(target_arch = "wasm32")]
-fn setup_observer(
-    el: web_sys::Element,
-    params: Memo<(Mode, String, i64)>,
-    items: RwSignal<Vec<Item>>,
-    offset: RwSignal<i64>,
-    has_more: RwSignal<bool>,
-    loading: RwSignal<bool>,
-    error: RwSignal<Option<String>>,
-    active: StoredValue<Option<ActiveSse>, LocalStorage>,
-) {
-    use wasm_bindgen::JsCast;
-
-    let cb = Closure::wrap(Box::new(
-        move |entries: js_sys::Array, _obs: web_sys::IntersectionObserver| {
-            let mut intersect = false;
-            for i in 0..entries.length() {
-                if let Ok(entry) = entries
-                    .get(i)
-                    .dyn_into::<web_sys::IntersectionObserverEntry>()
-                {
-                    if entry.is_intersecting() {
-                        intersect = true;
-                        break;
-                    }
-                }
-            }
-            if !intersect || loading.get_untracked() || !has_more.get_untracked() {
-                return;
-            }
-            let (_, _, limit) = params.get_untracked();
-            let next = offset.get_untracked() + limit;
-            offset.set(next);
-            load_page(
-                next, params, items, offset, has_more, loading, error, active,
-            );
-        },
-    )
-        as Box<dyn FnMut(js_sys::Array, web_sys::IntersectionObserver)>);
-
-    if let Ok(obs) = web_sys::IntersectionObserver::new(cb.as_ref().unchecked_ref()) {
-        obs.observe(&el);
-        cb.forget();
-        std::mem::forget(obs);
-    }
 }
