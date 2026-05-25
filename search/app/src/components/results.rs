@@ -1,17 +1,12 @@
 use crate::{
     components::lightbox::Lightbox,
-    types::{ImageItem, Mode, PostItem},
+    types::{DoneEvent, ErrorEvent, ImageItem, Mode, PostItem},
 };
 use leptos::prelude::*;
 use leptos_router::hooks::use_query_map;
 use urlencoding::encode;
+use wasm_bindgen::{JsCast, prelude::Closure};
 
-#[cfg(target_arch = "wasm32")]
-use crate::types::{DoneEvent, ErrorEvent};
-#[cfg(target_arch = "wasm32")]
-use leptos::prelude::LocalStorage;
-
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone)]
 enum Item {
     Post(PostItem),
@@ -43,7 +38,6 @@ pub fn Results() -> impl IntoView {
     let lightbox: RwSignal<Option<PostItem>> = RwSignal::new(None);
     let viewer: RwSignal<Option<String>> = RwSignal::new(None);
 
-    #[cfg(target_arch = "wasm32")]
     let active: StoredValue<Option<ActiveSse>, LocalStorage> = StoredValue::new_local(None);
 
     Effect::new(move |_| {
@@ -52,52 +46,21 @@ pub fn Results() -> impl IntoView {
         offset.set(0);
         has_more.set(true);
         error.set(None);
-        #[cfg(target_arch = "wasm32")]
         load_page(0, params, items, offset, has_more, loading, error, active);
     });
 
     let sentinel = NodeRef::<leptos::html::Div>::new();
 
-    #[cfg(target_arch = "wasm32")]
-    Effect::new(move |_| {
-        use wasm_bindgen::{JsCast, closure::Closure};
-
-        let Some(el) = sentinel.get() else { return };
-        let el: web_sys::Element = el.unchecked_into();
-
-        let element: web_sys::Element = el.unchecked_into();
-        let cb = Closure::wrap(Box::new(
-            move |entries: js_sys::Array, _obs: web_sys::IntersectionObserver| {
-                let mut intersect = false;
-                for i in 0..entries.length() {
-                    if let Ok(entry) = entries
-                        .get(i)
-                        .dyn_into::<web_sys::IntersectionObserverEntry>()
-                    {
-                        if entry.is_intersecting() {
-                            intersect = true;
-                            break;
-                        }
-                    }
-                }
-                if !intersect || loading.get_untracked() || !has_more.get_untracked() {
-                    return;
-                }
-                let (_, _, limit) = params.get_untracked();
-                let next = offset.get_untracked() + limit;
-                offset.set(next);
-                load_page(
-                    next, params, items, offset, has_more, loading, error, active,
-                );
-            },
-        )
-            as Box<dyn FnMut(js_sys::Array, web_sys::IntersectionObserver)>);
-
-        if let Ok(obs) = web_sys::IntersectionObserver::new(cb.as_ref().unchecked_ref()) {
-            obs.observe(&el);
-            cb.forget();
-            std::mem::forget(obs);
+    leptos_use::use_intersection_observer([sentinel], move |entries, _| {
+        if !entries[0].is_intersecting() || loading.get_untracked() || !has_more.get_untracked() {
+            return;
         }
+        let (_, _, limit) = params.get_untracked();
+        let next = offset.get_untracked() + limit;
+        offset.set(next);
+        load_page(
+            next, params, items, offset, has_more, loading, error, active,
+        );
     });
 
     let render_item = move |(_, it): (usize, Item)| -> AnyView {
@@ -232,23 +195,18 @@ pub fn Results() -> impl IntoView {
 
 // ===================== wasm-only =====================
 
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::{JsCast, prelude::Closure};
-
-#[cfg(target_arch = "wasm32")]
 struct ActiveSse {
     es: web_sys::EventSource,
     _closures: Vec<Closure<dyn FnMut(web_sys::MessageEvent)>>,
 }
 
-#[cfg(target_arch = "wasm32")]
 impl Drop for ActiveSse {
     fn drop(&mut self) {
         self.es.close();
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[allow(clippy::too_many_arguments)]
 fn load_page(
     offset_val: i64,
     params: Memo<(Mode, String, i64)>,
@@ -289,10 +247,10 @@ fn load_page(
 
     // post
     let cb = Closure::wrap(Box::new(move |ev: web_sys::MessageEvent| {
-        if let Some(s) = ev.data().as_string() {
-            if let Ok(p) = serde_json::from_str::<PostItem>(&s) {
-                items.update(|v| v.push(Item::Post(p)));
-            }
+        if let Some(s) = ev.data().as_string()
+            && let Ok(p) = serde_json::from_str::<PostItem>(&s)
+        {
+            items.update(|v| v.push(Item::Post(p)));
         }
     }) as Box<dyn FnMut(_)>);
     es.add_event_listener_with_callback("post", cb.as_ref().unchecked_ref())
@@ -301,10 +259,10 @@ fn load_page(
 
     // image
     let cb = Closure::wrap(Box::new(move |ev: web_sys::MessageEvent| {
-        if let Some(s) = ev.data().as_string() {
-            if let Ok(im) = serde_json::from_str::<ImageItem>(&s) {
-                items.update(|v| v.push(Item::Image(im)));
-            }
+        if let Some(s) = ev.data().as_string()
+            && let Ok(im) = serde_json::from_str::<ImageItem>(&s)
+        {
+            items.update(|v| v.push(Item::Image(im)));
         }
     }) as Box<dyn FnMut(_)>);
     es.add_event_listener_with_callback("image", cb.as_ref().unchecked_ref())

@@ -17,44 +17,13 @@ pub fn Lightbox(
     let visible = RwSignal::new(PAGE.min(total));
     let sentinel = NodeRef::<leptos::html::Div>::new();
 
-    let close = move |_| lightbox.set(None);
-
-    #[cfg(target_arch = "wasm32")]
-    Effect::new(move |_| {
-        use wasm_bindgen::{JsCast, closure::Closure};
-
-        let Some(el) = sentinel.get() else { return };
-        let el: web_sys::Element = el.unchecked_into();
-
-        let cb = Closure::wrap(Box::new(
-            move |entries: js_sys::Array, _: web_sys::IntersectionObserver| {
-                let mut hit = false;
-                for i in 0..entries.length() {
-                    if let Ok(e) = entries
-                        .get(i)
-                        .dyn_into::<web_sys::IntersectionObserverEntry>()
-                    {
-                        if e.is_intersecting() {
-                            hit = true;
-                            break;
-                        }
-                    }
-                }
-                if !hit {
-                    return;
-                }
-                let cur = visible.get_untracked();
-                if cur < total {
-                    visible.set((cur + PAGE).min(total));
-                }
-            },
-        )
-            as Box<dyn FnMut(js_sys::Array, web_sys::IntersectionObserver)>);
-
-        if let Ok(obs) = web_sys::IntersectionObserver::new(cb.as_ref().unchecked_ref()) {
-            obs.observe(&el);
-            cb.forget();
-            std::mem::forget(obs);
+    leptos_use::use_intersection_observer([sentinel], move |entries, _| {
+        if !entries[0].is_intersecting() {
+            return;
+        }
+        let cur = visible.get_untracked();
+        if cur < total {
+            visible.set((cur + PAGE).min(total));
         }
     });
 
@@ -81,6 +50,8 @@ pub fn Lightbox(
                 .collect::<Vec<_>>()
         })
     };
+
+    let close = move |_| lightbox.set(None);
 
     view! {
         <div
