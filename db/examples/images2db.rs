@@ -127,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
                     INSERT INTO post_images (post_id, image_id)
                     SELECT p.id, images.id
                     FROM input i JOIN posts p USING (title)
-                    CROSS JOIN LATERAL UNNEST(i.images::VARCHAR[]) AS _(name)
+                    CROSS JOIN LATERAL UNNEST(i.images::image[]) AS _(name, width, height)
                     JOIN images USING (name)
                     ORDER BY p.id, images.id
                     ON CONFLICT DO NOTHING

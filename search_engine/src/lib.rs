@@ -95,9 +95,12 @@ impl Engine {
                         AND wt.name ~* ANY($1::TEXT[])
                         AND NOT wt.name ~* ANY($2::TEXT[])
                 )
+            LIMIT $3 OFFSET $4
             "#,
             tags.as_slice() as _,
             not_tags.as_slice() as _,
+            limit,
+            offset
         )
         .fetch_all(&self.pool)
         .await?;

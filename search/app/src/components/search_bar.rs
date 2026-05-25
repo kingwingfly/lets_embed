@@ -57,7 +57,7 @@ pub fn SearchBar() -> impl IntoView {
                             on:click=move |_| mode.set(Mode::Tag)>"Tag"</button>
                         <button type="button"
                             class=move || tab_cls(Mode::Clip)
-                            on:click=move |_| mode.set(Mode::Clip)>"Clip"</button>
+                            on:click=move |_| mode.set(Mode::Clip)>"CLIP"</button>
                     </div>
                     <input
                         class="w-full bg-gray-200 rounded-lg py-2 px-4 outline-none"
