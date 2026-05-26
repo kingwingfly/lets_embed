@@ -60,6 +60,7 @@ panic = "abort"
 
 [[workspace.metadata.leptos]]
 name = "search"
+site_addr = "0.0.0.0:3000"
 
 tailwind-input-file = "search/style/tailwind.css"
 
