@@ -18,6 +18,7 @@ use sanitize_filename::sanitize;
 use sqlx::postgres::PgPool;
 use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+use wd_tagger::Tag;
 
 #[derive(Debug, Parser)]
 #[clap(version)]
@@ -59,14 +60,18 @@ pub struct EmbedCli {
     selected_tags: PathBuf,
 
     /// wd-tagger top_k
-    #[arg(long, alias = "tk", default_value_t = 16)]
+    #[arg(long, alias = "tk", default_value_t = 36)]
     top_k: usize,
 
     /// wd-tagger threshold
-    #[arg(long, alias = "th", default_value_t = 0.75)]
-    threshold: f32,
+    #[arg(long, alias = "gth", default_value_t = 0.3)]
+    general_threshold: f32,
 
-    #[arg(long, alias = "bs", default_value_t = 8)]
+    /// wd-tagger threshold
+    #[arg(long, alias = "cth", default_value_t = 0.75)]
+    character_threshold: f32,
+
+    #[arg(long, alias = "bs", default_value_t = 4)]
     batch_size: i64,
 
     /// whether to quit if `SELECT ... FOR UPDATE SKIP LOCKED` got no record
@@ -95,10 +100,7 @@ impl EmbedCli {
         let pool = PgPool::connect(&self.database_url).await?;
 
         let tags = wd_tagger::tags(self.selected_tags)?;
-        let tags = tags
-            .into_iter()
-            .map(|t| &*t.leak::<'static>())
-            .collect::<Vec<_>>();
+        let tags = tags.leak::<'static>();
 
         let wd_tagger_session = wd_tagger::model(self.wd_tagger_model)?;
         let clip_vision_session = siglip2::model(self.clip_vision_model)?;
@@ -119,9 +121,10 @@ impl EmbedCli {
         jhs.spawn_blocking(move || {
             infer(
                 wd_tagger_session,
-                &tags,
+                tags,
                 self.top_k,
-                self.threshold,
+                self.general_threshold,
+                self.character_threshold,
                 clip_vision_session,
                 rx_,
                 tx,
@@ -241,15 +244,16 @@ async fn convert_image(
 }
 
 #[tracing::instrument(skip_all, err)]
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn infer(
     mut wd_tagger_session: Session,
-    tags: &[&'static str],
+    tags: &'static [Tag],
     top_k: usize,
-    threshold: f32,
+    general_threshold: f32,
+    character_threshold: f32,
     mut clip_vision_session: Session,
     mut rx: mpsc::Receiver<Vec<(i64, Option<(Vec<f32>, Vec<f32>)>)>>,
-    tx: mpsc::Sender<Vec<(i64, Option<(Vec<(&'static str, f32)>, Vec<f32>)>)>>,
+    tx: mpsc::Sender<Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>)>)>>,
 ) -> anyhow::Result<()> {
     while let Some(images) = rx.blocking_recv() {
         let (some_ids, wd_images, clip_images, none_ids) = images.into_iter().fold(
@@ -266,34 +270,40 @@ fn infer(
                 (sids, wd_images, clip_images, nids)
             },
         );
-        let res =
-            match wd_tagger::infer_tag(&mut wd_tagger_session, wd_images, tags, top_k, threshold)
-                .and_then(|tags| {
-                    Ok((
-                        tags,
-                        siglip2::infer_vision(&mut clip_vision_session, clip_images)?,
-                    ))
-                }) {
-                Ok((wd_res, clip_res)) => some_ids
+        let res = match wd_tagger::infer_tag(
+            &mut wd_tagger_session,
+            wd_images,
+            tags,
+            top_k,
+            general_threshold,
+            character_threshold,
+        )
+        .and_then(|tags| {
+            Ok((
+                tags,
+                siglip2::infer_vision(&mut clip_vision_session, clip_images)?,
+            ))
+        }) {
+            Ok((wd_res, clip_res)) => some_ids
+                .into_iter()
+                .chain(none_ids)
+                .zip(
+                    wd_res
+                        .into_iter()
+                        .zip(clip_res)
+                        .map(Some)
+                        .chain(repeat(None)),
+                )
+                .collect::<Vec<_>>(),
+            Err(e) => {
+                tracing::error!("{e}");
+                some_ids
                     .into_iter()
                     .chain(none_ids)
-                    .zip(
-                        wd_res
-                            .into_iter()
-                            .zip(clip_res)
-                            .map(Some)
-                            .chain(repeat(None)),
-                    )
-                    .collect::<Vec<_>>(),
-                Err(e) => {
-                    tracing::error!("{e}");
-                    some_ids
-                        .into_iter()
-                        .chain(none_ids)
-                        .zip(repeat(None))
-                        .collect::<Vec<_>>()
-                }
-            };
+                    .zip(repeat(None))
+                    .collect::<Vec<_>>()
+            }
+        };
         tx.blocking_send(res)?;
     }
     Ok(())
@@ -303,7 +313,7 @@ fn infer(
 #[allow(clippy::type_complexity)]
 async fn record(
     pool: PgPool,
-    mut rx: mpsc::Receiver<Vec<(i64, Option<(Vec<(&'static str, f32)>, Vec<f32>)>)>>,
+    mut rx: mpsc::Receiver<Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>)>)>>,
 ) -> anyhow::Result<()> {
     while let Some(res) = rx.recv().await {
         let mut wd_ids = vec![];
@@ -316,9 +326,9 @@ async fn record(
         for (id, opt_out) in res {
             match opt_out {
                 Some((tags, embedding)) => {
-                    for (name, score) in tags {
+                    for (tag, score) in tags {
                         wd_ids.push(id);
-                        tag_names.push(name);
+                        tag_names.push(tag.name.as_str());
                         scores.push(score);
                     }
                     clip_ids.push(id);

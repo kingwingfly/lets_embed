@@ -32,14 +32,38 @@ pub fn model(model_path: impl AsRef<Path>) -> anyhow::Result<Session> {
     Ok(session)
 }
 
-pub fn tags(csv_path: impl AsRef<Path>) -> anyhow::Result<Vec<String>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TagType {
+    General,
+    Character,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Tag {
+    pub r#type: TagType,
+    pub name: String,
+}
+
+pub fn tags(csv_path: impl AsRef<Path>) -> anyhow::Result<Vec<Tag>> {
     let mut reader = csv::Reader::from_path(csv_path)?;
 
-    let mut tags = vec!["".to_string(); OUT_DIM];
-    for (i, r) in reader.records().enumerate() {
+    let mut tags = Vec::with_capacity(OUT_DIM);
+    for r in reader.records() {
         let r = r?;
-        tags[i] = r.get(1).unwrap_or_default().to_string();
+        tags.push(Tag {
+            r#type: match r.get(2) {
+                Some("4") => TagType::Character,
+                _ => TagType::General,
+            },
+            name: r.get(1).unwrap_or_default().to_string(),
+        });
     }
+
+    assert_eq!(
+        OUT_DIM,
+        tags.len(),
+        "there should be as many tags as wd-tagger OUT_DIM"
+    );
 
     Ok(tags)
 }
@@ -47,13 +71,14 @@ pub fn tags(csv_path: impl AsRef<Path>) -> anyhow::Result<Vec<String>> {
 /// tags should be [`OUT_DIM`] long.
 ///
 /// Returns top_k `(tag: &str, p: f32)`s
-pub fn infer_tag<T: Clone>(
+pub fn infer_tag<'a>(
     session: &mut Session,
     batch_input: Vec<Vec<f32>>,
-    tags: &[T],
+    tags: &'a [Tag],
     top_k: usize,
-    threshold: f32,
-) -> anyhow::Result<Vec<Vec<(T, f32)>>> {
+    general_threshold: f32,
+    character_threshold: f32,
+) -> anyhow::Result<Vec<Vec<(&'a Tag, f32)>>> {
     if tags.len() != OUT_DIM {
         bail!("invalid tags number")
     }
@@ -76,10 +101,13 @@ pub fn infer_tag<T: Clone>(
     let tags = predictions
         .chunks(OUT_DIM)
         .map(|prediction| {
-            top_k_heap(prediction, top_k, threshold)
-                .into_iter()
-                .map(|(i, p)| (tags[i].clone(), p))
-                .collect()
+            top_k_heap(
+                prediction,
+                top_k,
+                general_threshold,
+                character_threshold,
+                tags,
+            )
         })
         .collect();
 
@@ -142,10 +170,23 @@ impl Ord for FloatOrd {
     }
 }
 
-fn top_k_heap(vec: &[f32], k: usize, threshold: f32) -> Vec<(usize, f32)> {
+fn top_k_heap<'a>(
+    vec: &[f32],
+    k: usize,
+    general_threshold: f32,
+    character_threshold: f32,
+    tags: &'a [Tag],
+) -> Vec<(&'a Tag, f32)> {
+    debug_assert_eq!(vec.len(), tags.len());
+
     let mut heap: BinaryHeap<Reverse<(FloatOrd, usize)>> = BinaryHeap::with_capacity(k + 1);
 
-    for (i, &val) in vec.iter().enumerate().filter(|(_, p)| **p >= threshold) {
+    for (i, (&val, _)) in vec.iter().zip(tags).enumerate().filter(|(_, (p, t))| {
+        **p >= match t.r#type {
+            TagType::General => general_threshold,
+            TagType::Character => character_threshold,
+        }
+    }) {
         if heap.len() < k {
             heap.push(Reverse((FloatOrd(val), i)));
         } else if let Some(&Reverse((FloatOrd(min_val), _))) = heap.peek()
@@ -156,9 +197,9 @@ fn top_k_heap(vec: &[f32], k: usize, threshold: f32) -> Vec<(usize, f32)> {
         }
     }
 
-    let mut result: Vec<(usize, f32)> = heap
+    let mut result: Vec<(&Tag, f32)> = heap
         .into_iter()
-        .map(|Reverse((FloatOrd(val), idx))| (idx, val))
+        .map(|Reverse((FloatOrd(val), idx))| (&tags[idx], val))
         .collect();
     result.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
     result
