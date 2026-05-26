@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE images\n            SET dinov3_embedding = embeddings.dinov3_embedding,\n                clip_embedding = embeddings.clip_embedding\n            FROM unnest($1::BIGINT[], $2::halfvec[], $3::halfvec[])\n                AS embeddings(id, dinov3_embedding, clip_embedding)\n            WHERE embeddings.id = images.id\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8Array",
+        {
+          "Custom": {
+            "name": "halfvec[]",
+            "kind": {
+              "Array": {
+                "Custom": {
+                  "name": "halfvec",
+                  "kind": "Simple"
+                }
+              }
+            }
+          }
+        },
+        {
+          "Custom": {
+            "name": "halfvec[]",
+            "kind": {
+              "Array": {
+                "Custom": {
+                  "name": "halfvec",
+                  "kind": "Simple"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "933e5675143448d9f49847a3866a21aab4d9b16b7beb3cae7a09564af2365a06"
+}

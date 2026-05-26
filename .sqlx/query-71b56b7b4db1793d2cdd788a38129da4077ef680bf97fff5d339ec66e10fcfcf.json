@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT i.id, i.name, i.width, i.height\n                FROM images i\n                JOIN (\n                    SELECT wti.image_id, MAX(wti.score) AS max_score\n                    FROM wd_tag_images wti\n                    JOIN wd_tags wt ON wt.id = wti.wd_tag_id\n                    WHERE (\n                        wt.name ~* ANY($1::TEXT[])\n                        OR EXISTS (\n                            SELECT 1\n                            FROM unnest(wt.translations) AS tr\n                            WHERE tr ~* ANY($1::TEXT[])\n                        )\n                    )\n                    AND NOT (\n                        wt.name ~* ANY($2::TEXT[])\n                        OR EXISTS (\n                            SELECT 1\n                            FROM unnest(wt.translations) AS tr\n                            WHERE tr ~* ANY($2::TEXT[])\n                        )\n                    )\n                    GROUP BY wti.image_id\n                ) sub ON sub.image_id = i.id\n            ORDER BY sub.max_score DESC\n            LIMIT $3 OFFSET $4\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "width",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "height",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "71b56b7b4db1793d2cdd788a38129da4077ef680bf97fff5d339ec66e10fcfcf"
+}
