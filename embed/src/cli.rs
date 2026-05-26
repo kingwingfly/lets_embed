@@ -30,7 +30,7 @@ pub struct EmbedCli {
     )]
     database_url: String,
 
-    /// storage url of image data directory: e.g. `fs:./`, `http://127.0.0.1:3000/path/to/image`
+    /// storage url of image data directory: e.g. `fs:./images`, `http://127.0.0.1:3000/path/to/images`
     #[arg(short, long)]
     storage: url::Url,
 
