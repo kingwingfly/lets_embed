@@ -166,7 +166,7 @@ pub fn Results() -> impl IntoView {
                         <img
                             loading="lazy"
                             decoding="async"
-                            class="w-full h-auto block rounded bg-gray-900 cursor-zoom-in"
+                            class="w-full h-auto block bg-gray-900 cursor-zoom-in"
                             src=url
                             on:click=move |_| viewer.set(Some(url_for_click.clone()))
                         />
@@ -234,13 +234,13 @@ pub fn Results() -> impl IntoView {
     view! {
         <div class="px-2 pb-8">
             {error_view}
-            <div class="flex px-2">
+            <div class="flex">
                 <For
                     each=move || columns.get().into_iter().enumerate()
                     key=|(i, _)| *i
                     let((i, _))
                 >
-                    <div class="columns-1 gap-2">
+                    <div class="flex-1 columns-1 gap-2">
                         <For
                             each=move || {
                                 columns
