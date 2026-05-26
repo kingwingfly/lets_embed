@@ -45,15 +45,15 @@ async fn main() -> anyhow::Result<()> {
 
 #[derive(Debug, Deserialize)]
 struct Class {
-    name: Option<String>,
+    _name: Option<String>,
     #[serde(default)]
     groups: Vec<Group>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Group {
-    name: Option<String>,
-    r#type: Option<String>,
+    _name: Option<String>,
+    _type: Option<String>,
     #[serde(default)]
     tags: HashMap<String, String>,
 }

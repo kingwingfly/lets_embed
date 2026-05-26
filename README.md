@@ -41,7 +41,7 @@ cargo run --release --example images2db
 # set up greptime db for telemetry
 mkdir gtdata
 podman run -d --name greptime -p 4000:4000 -v ./gtdata:/greptimedb_data docker.io/greptime/greptimedb:v1.0.2 standalone start --http-addr=0.0.0.0:4000
-# (option) set up grafana, or you can use `127.0.0.1:4000/dashboard` directly
+# (option) set up grafana, or you can use greptimedb's `127.0.0.1:4000/dashboard` directly
 podman run -d --name grafana -p 3000:3000 docker.io/greptime/grafana-greptimedb:11.2.5-greptime-v2.1.7
 ```
 
@@ -60,18 +60,18 @@ Visit `127.0.0.1:4000/dashboard` to see the training process.
 
 Moreover, `greptime db` [dashboard config file](assets/dashboard.json) is provided.
 
-# Wd-tags Translation (zh_CN)
+# Wd-tags Translation (zh_CN for example)
 
 Add zh_CN translations to wd_tags.
 
 ```sh
 # download dictionary
 wget models/wd-eva02-large-tagger-v3/zh_CN.yaml https://raw.githubusercontent.com/Physton/sd-webui-prompt-all-in-one/refs/heads/main/group_tags/zh_CN.yaml
-# import into db
+# import translations into db
 cargo run --example wd_tags_translation2db
 ```
 
-# Search
+# Search (full-stack app based on axum/sqlx and **leptos**)
 
 After infer/embed, you can do search on the data:
 ```sh

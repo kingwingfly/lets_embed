@@ -86,15 +86,29 @@ impl Engine {
             Image,
             r#"
             SELECT i.id, i.name, i.width, i.height
-            FROM images i
-            JOIN (
-                SELECT wti.image_id, MAX(wti.score) AS max_score
-                FROM wd_tag_images wti
-                JOIN wd_tags wt ON wt.id = wti.wd_tag_id
-                WHERE wt.name ~* ANY($1::TEXT[])
-                  AND NOT wt.name ~* ANY($2::TEXT[])
-                GROUP BY wti.image_id
-            ) sub ON sub.image_id = i.id
+                FROM images i
+                JOIN (
+                    SELECT wti.image_id, MAX(wti.score) AS max_score
+                    FROM wd_tag_images wti
+                    JOIN wd_tags wt ON wt.id = wti.wd_tag_id
+                    WHERE (
+                        wt.name ~* ANY($1::TEXT[])
+                        OR EXISTS (
+                            SELECT 1
+                            FROM unnest(wt.translations) AS tr
+                            WHERE tr ~* ANY($1::TEXT[])
+                        )
+                    )
+                    AND NOT (
+                        wt.name ~* ANY($2::TEXT[])
+                        OR EXISTS (
+                            SELECT 1
+                            FROM unnest(wt.translations) AS tr
+                            WHERE tr ~* ANY($2::TEXT[])
+                        )
+                    )
+                    GROUP BY wti.image_id
+                ) sub ON sub.image_id = i.id
             ORDER BY sub.max_score DESC
             LIMIT $3 OFFSET $4
             "#,
