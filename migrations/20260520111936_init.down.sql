@@ -1,6 +1,7 @@
 -- wd_tags
 DROP INDEX idx_wd_tag_images_score;
 DROP INDEX idx_image_wd_tags_image_id;
+DROP INDEX idx_wd_tags_translations;
 DROP INDEX idx_wd_tags_name;
 DROP TABLE wd_tag_images;
 DROP TABLE wd_tags;

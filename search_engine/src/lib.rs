@@ -85,16 +85,17 @@ impl Engine {
         let images = sqlx::query_as!(
             Image,
             r#"
-            SELECT DISTINCT ON (i.id) i.id, i.name, i.width, i.height
-                FROM images i
-                WHERE EXISTS (
-                    SELECT 1
-                    FROM wd_tag_images wti
-                    JOIN wd_tags wt ON wt.id = wti.wd_tag_id
-                    WHERE wti.image_id = i.id
-                        AND wt.name ~* ANY($1::TEXT[])
-                        AND NOT wt.name ~* ANY($2::TEXT[])
-                )
+            SELECT i.id, i.name, i.width, i.height
+            FROM images i
+            JOIN (
+                SELECT wti.image_id, MAX(wti.score) AS max_score
+                FROM wd_tag_images wti
+                JOIN wd_tags wt ON wt.id = wti.wd_tag_id
+                WHERE wt.name ~* ANY($1::TEXT[])
+                  AND NOT wt.name ~* ANY($2::TEXT[])
+                GROUP BY wti.image_id
+            ) sub ON sub.image_id = i.id
+            ORDER BY sub.max_score DESC
             LIMIT $3 OFFSET $4
             "#,
             tags.as_slice() as _,
@@ -156,7 +157,7 @@ impl Engine {
                 i.name,
                 i.width,
                 i.height
-            FROM UNNEST($1::halfvec[]) WITH ORDINALITY AS q(vec, ord)
+            FROM unnest($1::halfvec[]) WITH ORDINALITY AS q(vec, ord)
             CROSS JOIN LATERAL (
                 SELECT id, name, width, height, clip_embedding <=> q.vec AS dist
                 FROM images

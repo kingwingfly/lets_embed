@@ -25,6 +25,8 @@ ORT_CUDA_VERSION=13 ORT_DYLIB_PATH=/path/to/libonnxruntime.so cargo run --exampl
 
 # Distribute infer
 
+Based on `wd-tagger` and `siglip2`, the tags and vision embeddings are stored into db.
+
 ## Control node
 
 ```sh
@@ -58,6 +60,17 @@ Visit `127.0.0.1:4000/dashboard` to see the training process.
 
 Moreover, `greptime db` [dashboard config file](assets/dashboard.json) is provided.
 
+# Wd-tags Translation (zh_CN)
+
+Add zh_CN translations to wd_tags.
+
+```sh
+# download dictionary
+wget models/wd-eva02-large-tagger-v3/zh_CN.yaml https://raw.githubusercontent.com/Physton/sd-webui-prompt-all-in-one/refs/heads/main/group_tags/zh_CN.yaml
+# import into db
+cargo run --example wd_tags_translation2db
+```
+
 # Search
 
 After infer/embed, you can do search on the data:
@@ -77,4 +90,7 @@ cargo leptos serve
 mkdir pg_data
 podman run -d --name pgvector -p 5432:5432 -v ./pgdata:/var/lib/postgresql -e POSTGRES_PASSWORD=postgres docker.io/pgvector/pgvector:pg18-trixie
 # so that sqlx can compile
+
+# to compile in CI
+cargo sqlx prepare --workspace
 ```

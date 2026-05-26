@@ -18,7 +18,7 @@ CREATE TYPE meta AS (
 -- posts
 CREATE TABLE IF NOT EXISTS posts (
     id BIGSERIAL PRIMARY KEY,
-    title VARCHAR(255) UNIQUE NOT NULL CHECK (trim(title) != ''),
+    title VARCHAR(255) UNIQUE NOT NULL CHECK (btrim(title) != ''),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -27,7 +27,7 @@ CREATE INDEX IF NOT EXISTS idx_posts_title ON posts(title);
 -- images
 CREATE TABLE IF NOT EXISTS images (
     id BIGSERIAL PRIMARY KEY,
-    name VARCHAR(255) UNIQUE NOT NULL CHECK (trim(name) != ''),
+    name VARCHAR(255) UNIQUE NOT NULL CHECK (btrim(name) != ''),
     width INT NOT NULL CHECK (width > 0),
     height INT NOT NULL CHECK (height > 0),
     status process_status NOT NULL DEFAULT 'pending'::process_status,
@@ -52,7 +52,7 @@ CREATE INDEX IF NOT EXISTS idx_post_images_image_id ON post_images(image_id);
 -- authors
 CREATE TABLE IF NOT EXISTS authors (
     id BIGSERIAL PRIMARY KEY,
-    name VARCHAR(100) UNIQUE NOT NULL CHECK (trim(name) != ''),
+    name VARCHAR(100) UNIQUE NOT NULL CHECK (btrim(name) != ''),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -68,7 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_author_posts_post_id ON author_posts(post_id);
 -- tags
 CREATE TABLE IF NOT EXISTS tags (
     id BIGSERIAL PRIMARY KEY,
-    name VARCHAR(100) UNIQUE NOT NULL CHECK (trim(name) != ''),
+    name VARCHAR(100) UNIQUE NOT NULL CHECK (btrim(name) != ''),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -84,7 +84,14 @@ CREATE INDEX IF NOT EXISTS idx_tag_posts_post_id ON tag_posts(post_id);
 -- wd_tags
 CREATE TABLE IF NOT EXISTS wd_tags (
     id BIGSERIAL PRIMARY KEY,
-    name VARCHAR(100) UNIQUE NOT NULL CHECK (trim(name) != ''),
+    name VARCHAR(100) UNIQUE NOT NULL CHECK (btrim(name) != ''),
+    translations VARCHAR(100)[] CHECK (
+            translations IS NULL
+            OR (
+                array_position(translations, NULL) IS NULL
+                AND array_position(translations, '') IS NULL
+            )
+        ),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -98,5 +105,6 @@ CREATE TABLE IF NOT EXISTS wd_tag_images (
 );
 
 CREATE INDEX IF NOT EXISTS idx_wd_tags_name ON wd_tags(name);
+CREATE INDEX IF NOT EXISTS idx_wd_tags_translations ON wd_tags USING gin (translations);
 CREATE INDEX IF NOT EXISTS idx_image_wd_tags_image_id ON wd_tag_images(image_id);
 CREATE INDEX IF NOT EXISTS idx_wd_tag_images_score ON wd_tag_images(score);

@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
             sqlx::query!(
                 r#"
                 WITH input AS (
-                    SELECT * FROM UNNEST($1::meta[])
+                    SELECT * FROM unnest($1::meta[])
                     AS _(title, authors, tags, images)
                 ),
                 ins_posts AS (
@@ -109,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
                     INSERT INTO images (name, width, height)
                     SELECT DISTINCT ON (name) name, width, height
                     FROM input i
-                    CROSS JOIN LATERAL UNNEST(i.images::image[]) as _(name, width, height)
+                    CROSS JOIN LATERAL unnest(i.images::image[]) as _(name, width, height)
                     WHERE trim(name) != ''
                     ORDER BY name
                     ON CONFLICT DO NOTHING
@@ -120,14 +120,14 @@ async fn main() -> anyhow::Result<()> {
                     UNION ALL
                     SELECT DISTINCT ON (id) id, name
                     FROM input i
-                    CROSS JOIN LATERAL UNNEST(i.images::image[]) as _(name, width, height)
+                    CROSS JOIN LATERAL unnest(i.images::image[]) as _(name, width, height)
                     JOIN images USING (name)
                 ),
                 post_images AS (
                     INSERT INTO post_images (post_id, image_id)
                     SELECT p.id, images.id
                     FROM input i JOIN posts p USING (title)
-                    CROSS JOIN LATERAL UNNEST(i.images::image[]) AS _(name, width, height)
+                    CROSS JOIN LATERAL unnest(i.images::image[]) AS _(name, width, height)
                     JOIN images USING (name)
                     ORDER BY p.id, images.id
                     ON CONFLICT DO NOTHING
@@ -137,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
                     INSERT INTO authors (name)
                     SELECT DISTINCT name
                     FROM input i
-                    CROSS JOIN LATERAL UNNEST(i.authors::VARCHAR[]) AS _(name)
+                    CROSS JOIN LATERAL unnest(i.authors::VARCHAR[]) AS _(name)
                     WHERE trim(name) != ''
                     ORDER BY name
                     ON CONFLICT DO NOTHING
@@ -148,14 +148,14 @@ async fn main() -> anyhow::Result<()> {
                     UNION ALL
                     SELECT DISTINCT ON (id) id, name
                     FROM input i
-                    CROSS JOIN LATERAL UNNEST(i.authors::VARCHAR[]) as _(name)
+                    CROSS JOIN LATERAL unnest(i.authors::VARCHAR[]) as _(name)
                     JOIN authors USING (name)
                 ),
                 author_posts AS (
                     INSERT INTO author_posts (author_id, post_id)
                     SELECT authors.id, p.id
                     FROM input i JOIN posts p USING (title)
-                    CROSS JOIN LATERAL UNNEST(i.authors::VARCHAR[]) AS _(name)
+                    CROSS JOIN LATERAL unnest(i.authors::VARCHAR[]) AS _(name)
                     JOIN authors USING (name)
                     ORDER BY authors.id, p.id
                     ON CONFLICT DO NOTHING
@@ -165,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
                     INSERT INTO tags (name)
                     SELECT name
                     FROM input i
-                    CROSS JOIN LATERAL UNNEST(i.tags::VARCHAR[]) AS _(name)
+                    CROSS JOIN LATERAL unnest(i.tags::VARCHAR[]) AS _(name)
                     WHERE trim(name) != ''
                     ORDER BY name
                     ON CONFLICT DO NOTHING
@@ -176,14 +176,14 @@ async fn main() -> anyhow::Result<()> {
                     UNION ALL
                     SELECT DISTINCT ON (id) id, name
                     FROM input i
-                    CROSS JOIN LATERAL UNNEST(i.tags::VARCHAR[]) as _(name)
+                    CROSS JOIN LATERAL unnest(i.tags::VARCHAR[]) as _(name)
                     JOIN tags USING (name)
                 ),
                 tag_posts AS (
                     INSERT INTO tag_posts (tag_id, post_id)
                     SELECT tags.id, p.id
                     FROM input i JOIN posts p USING (title)
-                    CROSS JOIN LATERAL UNNEST(i.tags::VARCHAR[]) AS _(name)
+                    CROSS JOIN LATERAL unnest(i.tags::VARCHAR[]) AS _(name)
                     JOIN tags USING (name)
                     ORDER BY tags.id, p.id
                     ON CONFLICT DO NOTHING

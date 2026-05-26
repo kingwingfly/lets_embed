@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                q.ord AS \"ord!\",\n                i.id,\n                i.name,\n                i.width,\n                i.height\n            FROM UNNEST($1::halfvec[]) WITH ORDINALITY AS q(vec, ord)\n            CROSS JOIN LATERAL (\n                SELECT id, name, width, height, clip_embedding <=> q.vec AS dist\n                FROM images\n                ORDER BY dist\n                LIMIT $2 OFFSET $3\n            ) AS i\n            ORDER BY q.ord, i.dist;\n            ",
+  "query": "\n            SELECT\n                q.ord AS \"ord!\",\n                i.id,\n                i.name,\n                i.width,\n                i.height\n            FROM unnest($1::halfvec[]) WITH ORDINALITY AS q(vec, ord)\n            CROSS JOIN LATERAL (\n                SELECT id, name, width, height, clip_embedding <=> q.vec AS dist\n                FROM images\n                ORDER BY dist\n                LIMIT $2 OFFSET $3\n            ) AS i\n            ORDER BY q.ord, i.dist;\n            ",
   "describe": {
     "columns": [
       {
@@ -56,5 +56,5 @@
       false
     ]
   },
-  "hash": "c3cba58de36ef9d6ffb50b789bc05a285aa7c3cb6f13d92ea352c2c4e7dd0bb9"
+  "hash": "214c4603b430343fdce33530384d2a20de8637f8751406c5cced236e262f3136"
 }

@@ -332,7 +332,7 @@ async fn record(
         sqlx::query!(
             r#"
             WITH input AS (
-                SELECT * FROM UNNEST($1::BIGINT[], $2::TEXT[], $3::REAL[]) AS _(id, name, score)
+                SELECT * FROM unnest($1::BIGINT[], $2::TEXT[], $3::REAL[]) AS _(id, name, score)
             ),
             ins_wd_tags AS (
                 INSERT INTO wd_tags (name)
@@ -366,7 +366,7 @@ async fn record(
         sqlx::query!(
             r#"
             UPDATE images SET clip_embedding = embeddings.embedding
-            FROM UNNEST($1::BIGINT[], $2::halfvec[]) AS embeddings (id, embedding)
+            FROM unnest($1::BIGINT[], $2::halfvec[]) AS embeddings (id, embedding)
             WHERE embeddings.id = images.id
         "#,
             &clip_ids,
@@ -378,7 +378,7 @@ async fn record(
         sqlx::query!(
             r#"
             UPDATE images SET status = 'completed'::process_status
-            FROM UNNEST($1::BIGINT[]) AS ids (id)
+            FROM unnest($1::BIGINT[]) AS ids (id)
             WHERE ids.id = images.id
         "#,
             &completed_ids
@@ -389,7 +389,7 @@ async fn record(
         sqlx::query!(
             r#"
             UPDATE images SET status = 'pending'::process_status
-            FROM UNNEST($1::BIGINT[]) AS ids (id)
+            FROM unnest($1::BIGINT[]) AS ids (id)
             WHERE ids.id = images.id
         "#,
             &failed_ids

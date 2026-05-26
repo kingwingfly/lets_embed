@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE images SET clip_embedding = embeddings.embedding\n            FROM UNNEST($1::BIGINT[], $2::halfvec[]) AS embeddings (id, embedding)\n            WHERE embeddings.id = images.id\n        ",
+  "query": "\n            UPDATE images SET clip_embedding = embeddings.embedding\n            FROM unnest($1::BIGINT[], $2::halfvec[]) AS embeddings (id, embedding)\n            WHERE embeddings.id = images.id\n        ",
   "describe": {
     "columns": [],
     "parameters": {
@@ -23,5 +23,5 @@
     },
     "nullable": []
   },
-  "hash": "302ee12f64175abff9f57588ca91351dbde5774b553fd9b7dcfcb1472174b8ab"
+  "hash": "53a8b751bce450fda22d6fa954d4ded9eba61c2534a07f73c7557862a6894754"
 }
