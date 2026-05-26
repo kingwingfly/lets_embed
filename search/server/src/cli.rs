@@ -12,11 +12,14 @@ pub struct Cli {
 
     #[arg(
         long,
-        default_value = "models/jina-clip-v2/onnx/jina-clip-v2-text.onnx"
+        default_value = "models/siglip2-so400m-patch14-384/onnx/text_model.onnx"
     )]
     pub clip_text_model: PathBuf,
 
-    #[arg(long, default_value = "models/jina-clip-v2/tokenizer.json")]
+    #[arg(
+        long,
+        default_value = "models/siglip2-so400m-patch14-384/tokenizer.json"
+    )]
     pub tokenizer: PathBuf,
 
     pub prefix: PathBuf,

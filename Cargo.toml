@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "db",
-    "jina_clip",
+    "siglip2",
     "wd_tagger",
     "embed",
     "search_engine",

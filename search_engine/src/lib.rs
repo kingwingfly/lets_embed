@@ -11,7 +11,7 @@ use tokenizers::{EncodeInput, Tokenizer};
 pub struct Engine {
     pool: PgPool,
     clip_text_session: Arc<Mutex<Session>>,
-    tokeniser: Tokenizer,
+    tokenizer: Tokenizer,
 }
 
 impl Engine {
@@ -25,12 +25,12 @@ impl Engine {
                 .as_str(),
         )
         .await?;
-        let clip_text_session = jina_clip::model(clip_text_model_path)?;
-        let tokeniser = jina_clip::tokenizer(tokenizer_config_path)?;
+        let clip_text_session = siglip2::model(clip_text_model_path)?;
+        let tokenizer = siglip2::tokenizer(tokenizer_config_path)?;
         Ok(Self {
             pool,
             clip_text_session: Arc::new(Mutex::new(clip_text_session)),
-            tokeniser,
+            tokenizer,
         })
     }
 
@@ -118,8 +118,8 @@ impl Engine {
             bail!("both limit and offset should >= 0")
         }
 
-        let text_embeddings = jina_clip::infer_text(
-            &self.tokeniser,
+        let text_embeddings = siglip2::infer_text(
+            &self.tokenizer,
             &mut self.clip_text_session.lock(),
             describes,
         )?

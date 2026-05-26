@@ -38,7 +38,7 @@ pub struct EmbedCli {
     #[arg(
         long,
         alias = "cv",
-        default_value = "models/jina-clip-v2/onnx/jina-clip-v2-vision.onnx"
+        default_value = "models/siglip2-so400m-patch14-384/onnx/vision_model.onnx"
     )]
     clip_vision_model: PathBuf,
 
@@ -101,7 +101,7 @@ impl EmbedCli {
             .collect::<Vec<_>>();
 
         let wd_tagger_session = wd_tagger::model(self.wd_tagger_model)?;
-        let clip_vision_session = jina_clip::model(self.clip_vision_model)?;
+        let clip_vision_session = siglip2::model(self.clip_vision_model)?;
 
         let mut jhs = JoinSet::new();
 
@@ -222,7 +222,7 @@ async fn convert_image(
                                             |e| tracing::warn!(id, err = %e, "wd_tagger convert image"),
                                         )
                                         .ok()?,
-                                    jina_clip::convert_image(Cursor::new(buf))
+                                    siglip2::convert_image(Cursor::new(buf))
                                         .inspect_err(
                                             |e| tracing::warn!(id, err = %e, "clip convert image"),
                                         )
@@ -271,7 +271,7 @@ fn infer(
                 .and_then(|tags| {
                     Ok((
                         tags,
-                        jina_clip::infer_vision(&mut clip_vision_session, clip_images)?,
+                        siglip2::infer_vision(&mut clip_vision_session, clip_images)?,
                     ))
                 }) {
                 Ok((wd_res, clip_res)) => some_ids

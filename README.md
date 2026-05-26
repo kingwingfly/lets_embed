@@ -2,17 +2,17 @@
 
 Model download
 ```sh
-mkdir -p models/jina-clip-v2/onnx
-# download Jina CLIP v2
-wget -O models/jina-clip-v2/onnx/model.onnx https://huggingface.co/jinaai/jina-clip-v2/resolve/main/onnx/model.onnx?download=true
-wget -O models/jina-clip-v2/onnx/model.onnx_data https://huggingface.co/jinaai/jina-clip-v2/resolve/main/onnx/model.onnx_data?download=true
-wget -O models/jina-clip-v2/tokenizer.json https://huggingface.co/jinaai/jina-clip-v2/resolve/main/tokenizer.json?download=true
-# split it into text/vision
-uv run split_clip_model/main.py
+mkdir -p models/siglip2-so400m-patch14-384/onnx
+# download google/siglip2-so400m-patch14-384 ONNX
+wget -O models/siglip2-so400m-patch14-384/onnx/text_model.onnx https://huggingface.co/onnx-community/siglip2-so400m-patch14-384-ONNX/resolve/main/onnx/text_model.onnx?download=true
+wget -O models/siglip2-so400m-patch14-384/onnx/text_model.onnx_data https://huggingface.co/onnx-community/siglip2-so400m-patch14-384-ONNX/resolve/main/onnx/text_model.onnx_data?download=true
+wget -O models/siglip2-so400m-patch14-384/tokenizer.json https://huggingface.co/onnx-community/siglip2-so400m-patch14-384-ONNX/resolve/main/tokenizer.json?download=true
+wget -O models/siglip2-so400m-patch14-384/onnx/vision_model.onnx https://huggingface.co/onnx-community/siglip2-so400m-patch14-384-ONNX/resolve/main/onnx/vision_model.onnx?download=true
 
+mkdir -p models/wd-eva02-large-tagger-v3
 # download wd-tagger
-wget -O models/wd-eva02-large-tagger-v3.onnx https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/model.onnx?download=true
-wget -O models/selected_tags.csv https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/selected_tags.csv?download=true
+wget -O models/wd-eva02-large-tagger-v3/wd-eva02-large-tagger-v3.onnx https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/model.onnx?download=true
+wget -O models/wd-eva02-large-tagger-v3/selected_tags.csv https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/selected_tags.csv?download=true
 ```
 
 Try infer
@@ -20,6 +20,7 @@ Try infer
 # set `ORT_CUDA_VERSION` you cuda version
 ORT_CUDA_VERSION=13 ORT_DYLIB_PATH=/path/to/libonnxruntime.so cargo run --example infer_text
 ORT_CUDA_VERSION=13 ORT_DYLIB_PATH=/path/to/libonnxruntime.so cargo run --example infer_vision
+ORT_CUDA_VERSION=13 ORT_DYLIB_PATH=/path/to/libonnxruntime.so cargo run --example infer_tag
 ```
 
 # Distribute infer
