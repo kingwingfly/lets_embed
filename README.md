@@ -30,7 +30,7 @@ ORT_CUDA_VERSION=13 ORT_DYLIB_PATH=/path/to/libonnxruntime.so cargo run --exampl
 
 # Distribute infer
 
-Based on `wd-tagger` and `siglip2`, the tags and vision embeddings are stored into db.
+Based on `wd-tagger`, `dinov3` and `siglip2`, the tags and vision embeddings are stored into db.
 
 ## Control node
 
@@ -70,10 +70,10 @@ Moreover, `greptime db` [dashboard config file](assets/dashboard.json) is provid
 Add zh_CN translations to wd_tags.
 
 ```sh
-# download dictionary
-wget models/wd-eva02-large-tagger-v3/zh_CN.yaml https://raw.githubusercontent.com/Physton/sd-webui-prompt-all-in-one/refs/heads/main/group_tags/zh_CN.yaml
-# import translations into db
-cargo run --example wd_tags_translation2db
+# (optional) use scraper to get translations (aliases) of wd tagger selected tags
+cargo run --example translate
+# import translations into db (use assets/translations.json)
+cargo run --example translations2db
 ```
 
 # Search (full-stack app based on axum/sqlx and **leptos**)

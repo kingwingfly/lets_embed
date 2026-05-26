@@ -31,6 +31,7 @@ DROP TABLE images;
 DROP INDEX idx_posts_title;
 DROP TABLE posts;
 
+DROP TYPE translation;
 DROP TYPE meta;
 DROP TYPE image;
 DROP TYPE process_status;

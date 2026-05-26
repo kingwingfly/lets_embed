@@ -15,6 +15,11 @@ CREATE TYPE meta AS (
     images image[]
 );
 
+CREATE TYPE translation AS (
+    name TEXT,
+    translations TEXT[]
+);
+
 -- posts
 CREATE TABLE IF NOT EXISTS posts (
     id BIGSERIAL PRIMARY KEY,

@@ -14,5 +14,5 @@ tokio-stream.workspace = true
 futures.workspace = true
 sqlx.workspace = true
 struson = { version = "0.7", features = ["simple-api"] }
-yaml_serde = "0.10"
 serde.workspace = true
+serde_json.workspace = true
