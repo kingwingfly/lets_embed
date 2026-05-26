@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT ON (i.id) i.id, i.name, i.width, i.height\n                FROM images i\n                WHERE EXISTS (\n                    SELECT 1\n                    FROM wd_tag_images wti\n                    JOIN wd_tags wt ON wt.id = wti.wd_tag_id\n                    WHERE wti.image_id = i.id\n                        AND wt.name ~* ANY($1::TEXT[])\n                        AND NOT wt.name ~* ANY($2::TEXT[])\n                )\n            LIMIT $3 OFFSET $4\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "width",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "height",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "060094147f0e38d32ad0b226b25cf0c22b97d17a2173a581122a0dd5c1944674"
+}

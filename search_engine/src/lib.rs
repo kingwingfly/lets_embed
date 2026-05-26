@@ -52,7 +52,7 @@ impl Engine {
         let posts = sqlx::query_as!(
             Post,
             r#"
-            SELECT DISTINCT p.id, p.title
+            SELECT DISTINCT ON (p.id) p.id, p.title
                 FROM posts p
                 WHERE (
                     EXISTS (
@@ -61,7 +61,7 @@ impl Engine {
                         JOIN tags t ON t.id = tp.tag_id
                         WHERE tp.post_id = p.id
                           AND t.name ~* ANY($1::TEXT[])
-                          AND NOT (t.name ~* ANY($2::TEXT[]))
+                          AND NOT t.name ~* ANY($2::TEXT[])
                     )
                     OR EXISTS (
                         SELECT 1
@@ -85,7 +85,7 @@ impl Engine {
         let images = sqlx::query_as!(
             Image,
             r#"
-            SELECT DISTINCT i.id, i.name, i.width, i.height
+            SELECT DISTINCT ON (i.id) i.id, i.name, i.width, i.height
                 FROM images i
                 WHERE EXISTS (
                     SELECT 1
