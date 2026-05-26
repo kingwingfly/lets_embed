@@ -10,6 +10,7 @@ documentation.workspace = true
 [dependencies]
 wd_tagger = { path = "../wd_tagger" }
 siglip2 = { path = "../siglip2" }
+dinov3 = { path = "../dinov3" }
 
 tokio = { workspace = true, features = ["signal"] }
 tokio-util.workspace = true

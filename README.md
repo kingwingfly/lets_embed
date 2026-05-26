@@ -2,6 +2,11 @@
 
 Model download
 ```sh
+mkdir -p models/wd-eva02-large-tagger-v3
+# download wd-tagger ONNX
+wget -O models/wd-eva02-large-tagger-v3/wd-eva02-large-tagger-v3.onnx https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/model.onnx?download=true
+wget -O models/wd-eva02-large-tagger-v3/selected_tags.csv https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/selected_tags.csv?download=true
+
 mkdir -p models/siglip2-so400m-patch14-384/onnx
 # download google/siglip2-so400m-patch14-384 ONNX
 wget -O models/siglip2-so400m-patch14-384/onnx/text_model.onnx https://huggingface.co/onnx-community/siglip2-so400m-patch14-384-ONNX/resolve/main/onnx/text_model.onnx?download=true
@@ -9,10 +14,10 @@ wget -O models/siglip2-so400m-patch14-384/onnx/text_model.onnx_data https://hugg
 wget -O models/siglip2-so400m-patch14-384/tokenizer.json https://huggingface.co/onnx-community/siglip2-so400m-patch14-384-ONNX/resolve/main/tokenizer.json?download=true
 wget -O models/siglip2-so400m-patch14-384/onnx/vision_model.onnx https://huggingface.co/onnx-community/siglip2-so400m-patch14-384-ONNX/resolve/main/onnx/vision_model.onnx?download=true
 
-mkdir -p models/wd-eva02-large-tagger-v3
-# download wd-tagger
-wget -O models/wd-eva02-large-tagger-v3/wd-eva02-large-tagger-v3.onnx https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/model.onnx?download=true
-wget -O models/wd-eva02-large-tagger-v3/selected_tags.csv https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/selected_tags.csv?download=true
+mkdir -p mkdir -p models/dinov3-vitb16-pretrain-lvd1689m/onnx
+# download facebook/dinov3-vitb16-pretrain-lvd1689m ONNX
+wget -O models/dinov3-vitb16-pretrain-lvd1689m/onnx/model.onnx https://huggingface.co/onnx-community/dinov3-vitb16-pretrain-lvd1689m-ONNX/resolve/main/onnx/model.onnx?download=true
+wget -O models/dinov3-vitb16-pretrain-lvd1689m/onnx/model.onnx_data https://huggingface.co/onnx-community/dinov3-vitb16-pretrain-lvd1689m-ONNX/resolve/main/onnx/model.onnx_data?download=true
 ```
 
 Try infer

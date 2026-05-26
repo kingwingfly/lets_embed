@@ -1055,6 +1055,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dinov3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fast_image_resize",
+ "image",
+ "ort",
+]
+
+[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1153,6 +1163,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dinov3",
  "futures",
  "nvml-wrapper",
  "opendal",

@@ -1,8 +1,9 @@
 [workspace]
 members = [
     "db",
-    "siglip2",
     "wd_tagger",
+    "siglip2",
+    "dinov3",
     "embed",
     "search_engine",
     "search/app",

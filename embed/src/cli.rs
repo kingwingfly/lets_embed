@@ -35,14 +35,6 @@ pub struct EmbedCli {
     #[arg(short, long)]
     storage: url::Url,
 
-    /// CLIP vision onnx model path
-    #[arg(
-        long,
-        alias = "cv",
-        default_value = "models/siglip2-so400m-patch14-384/onnx/vision_model.onnx"
-    )]
-    clip_vision_model: PathBuf,
-
     /// wd-tagger onnx model path
     #[arg(
         long,
@@ -70,6 +62,22 @@ pub struct EmbedCli {
     /// wd-tagger threshold
     #[arg(long, alias = "cth", default_value_t = 0.75)]
     character_threshold: f32,
+
+    /// CLIP vision onnx model path
+    #[arg(
+        long,
+        alias = "cv",
+        default_value = "models/siglip2-so400m-patch14-384/onnx/vision_model.onnx"
+    )]
+    clip_vision_model: PathBuf,
+
+    /// DINOv3 onnx model path
+    #[arg(
+        long,
+        alias = "cv",
+        default_value = "models/dinov3-vitb16-pretrain-lvd1689m/onnx/model.onnx"
+    )]
+    dinov3_model: PathBuf,
 
     #[arg(long, alias = "bs", default_value_t = 4)]
     batch_size: i64,
@@ -104,6 +112,7 @@ impl EmbedCli {
 
         let wd_tagger_session = wd_tagger::model(self.wd_tagger_model)?;
         let clip_vision_session = siglip2::model(self.clip_vision_model)?;
+        let dinov3_session = dinov3::model(self.dinov3_model)?;
 
         let mut jhs = JoinSet::new();
 
@@ -126,6 +135,7 @@ impl EmbedCli {
                 self.general_threshold,
                 self.character_threshold,
                 clip_vision_session,
+                dinov3_session,
                 rx_,
                 tx,
             )
@@ -190,7 +200,7 @@ async fn fetch_batch(
 async fn convert_image(
     op: Operator,
     mut rx: mpsc::Receiver<Vec<(i64, String)>>,
-    tx: mpsc::Sender<Vec<(i64, Option<(Vec<f32>, Vec<f32>)>)>>,
+    tx: mpsc::Sender<Vec<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>)>>,
 ) -> anyhow::Result<()> {
     while let Some(records) = rx.recv().await {
         let buffers = stream::iter(records)
@@ -225,9 +235,14 @@ async fn convert_image(
                                             |e| tracing::warn!(id, err = %e, "wd_tagger convert image"),
                                         )
                                         .ok()?,
-                                    siglip2::convert_image(Cursor::new(buf))
+                                    siglip2::convert_image(Cursor::new(buf.clone()))
                                         .inspect_err(
-                                            |e| tracing::warn!(id, err = %e, "clip convert image"),
+                                            |e| tracing::warn!(id, err = %e, "siglip2 convert image"),
+                                        )
+                                        .ok()?,
+                                    dinov3::convert_image(Cursor::new(buf))
+                                        .inspect_err(
+                                            |e| tracing::warn!(id, err = %e, "dinov3 convert image"),
                                         )
                                         .ok()?,
                                 ))
@@ -252,22 +267,24 @@ fn infer(
     general_threshold: f32,
     character_threshold: f32,
     mut clip_vision_session: Session,
-    mut rx: mpsc::Receiver<Vec<(i64, Option<(Vec<f32>, Vec<f32>)>)>>,
-    tx: mpsc::Sender<Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>)>)>>,
+    mut dinov3_session: Session,
+    mut rx: mpsc::Receiver<Vec<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>)>>,
+    tx: mpsc::Sender<Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>, Vec<f32>)>)>>,
 ) -> anyhow::Result<()> {
     while let Some(images) = rx.blocking_recv() {
-        let (some_ids, wd_images, clip_images, none_ids) = images.into_iter().fold(
-            (vec![], vec![], vec![], vec![]),
-            |(mut sids, mut wd_images, mut clip_images, mut nids), (id, opt)| {
+        let (some_ids, wd_images, clip_images, dino_images, none_ids) = images.into_iter().fold(
+            (vec![], vec![], vec![], vec![], vec![]),
+            |(mut sids, mut wd_images, mut clip_images, mut dino_images, mut nids), (id, opt)| {
                 match opt {
-                    Some((a, b)) => {
+                    Some((a, b, c)) => {
                         sids.push(id);
                         wd_images.push(a);
                         clip_images.push(b);
+                        dino_images.push(c);
                     }
                     None => nids.push(id),
                 }
-                (sids, wd_images, clip_images, nids)
+                (sids, wd_images, clip_images, dino_images, nids)
             },
         );
         let res = match wd_tagger::infer_tag(
@@ -283,14 +300,23 @@ fn infer(
                 tags,
                 siglip2::infer_vision(&mut clip_vision_session, clip_images)?,
             ))
+        })
+        .and_then(|(tags, clip_embeddings)| {
+            Ok((
+                tags,
+                clip_embeddings,
+                dinov3::infer_vision(&mut dinov3_session, dino_images)?,
+            ))
         }) {
-            Ok((wd_res, clip_res)) => some_ids
+            Ok((wd_res, clip_res, dino_res)) => some_ids
                 .into_iter()
                 .chain(none_ids)
                 .zip(
                     wd_res
                         .into_iter()
                         .zip(clip_res)
+                        .zip(dino_res)
+                        .map(|((a, b), c)| (a, b, c))
                         .map(Some)
                         .chain(repeat(None)),
                 )
@@ -313,26 +339,28 @@ fn infer(
 #[allow(clippy::type_complexity)]
 async fn record(
     pool: PgPool,
-    mut rx: mpsc::Receiver<Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>)>)>>,
+    mut rx: mpsc::Receiver<Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>, Vec<f32>)>)>>,
 ) -> anyhow::Result<()> {
     while let Some(res) = rx.recv().await {
         let mut wd_ids = vec![];
         let mut tag_names = vec![];
         let mut scores = vec![];
-        let mut clip_ids = vec![];
-        let mut embeddings = vec![];
+        let mut embed_ids = vec![];
+        let mut clip_embeddings = vec![];
+        let mut dino_embeddings = vec![];
         let mut completed_ids = vec![];
         let mut failed_ids = vec![];
         for (id, opt_out) in res {
             match opt_out {
-                Some((tags, embedding)) => {
+                Some((tags, clip_embedding, dino_embedding)) => {
                     for (tag, score) in tags {
                         wd_ids.push(id);
                         tag_names.push(tag.name.as_str());
                         scores.push(score);
                     }
-                    clip_ids.push(id);
-                    embeddings.push(HalfVector::from_f32_slice(&embedding));
+                    embed_ids.push(id);
+                    clip_embeddings.push(HalfVector::from_f32_slice(&clip_embedding));
+                    dino_embeddings.push(HalfVector::from_f32_slice(&dino_embedding));
                     completed_ids.push(id);
                 }
                 None => failed_ids.push(id),
@@ -375,12 +403,16 @@ async fn record(
 
         sqlx::query!(
             r#"
-            UPDATE images SET clip_embedding = embeddings.embedding
-            FROM unnest($1::BIGINT[], $2::halfvec[]) AS embeddings (id, embedding)
+            UPDATE images
+            SET dinov3_embedding = embeddings.dinov3_embedding,
+                clip_embedding = embeddings.clip_embedding
+            FROM unnest($1::BIGINT[], $2::halfvec[], $3::halfvec[])
+                AS embeddings(id, dinov3_embedding, clip_embedding)
             WHERE embeddings.id = images.id
         "#,
-            &clip_ids,
-            &embeddings as _
+            &embed_ids,
+            &dino_embeddings as _,
+            &clip_embeddings as _
         )
         .execute(&pool)
         .await?;
