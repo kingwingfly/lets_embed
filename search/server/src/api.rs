@@ -106,8 +106,7 @@ pub async fn search_sse(
             }
             Mode::Clip => {
                 match engine.search_clip([q.as_str()], limit, offset).await {
-                    Ok(mut results) => {
-                        let images = results.pop().unwrap_or_default();
+                    Ok(images) => {
                         let count = images.len();
                         for img in images {
                             let item = ImageItem {

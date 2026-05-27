@@ -4554,6 +4554,7 @@ name = "search_engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dinov3",
  "ort",
  "parking_lot",
  "pgvector",

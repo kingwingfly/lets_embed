@@ -22,5 +22,11 @@ pub struct Cli {
     )]
     pub tokenizer: PathBuf,
 
+    #[arg(
+        long,
+        default_value = "models/dinov3-vitb16-pretrain-lvd1689m/onnx/model.onnx"
+    )]
+    pub dinov3_model: PathBuf,
+
     pub prefix: PathBuf,
 }

@@ -16,14 +16,14 @@ async fn main() -> anyhow::Result<()> {
 
     let args = cli::Cli::parse();
 
-    // Leptos 配置（读取 Cargo.toml [package.metadata.leptos]，再覆盖 site_addr）
     let conf = get_configuration(None)?;
     let mut leptos_options = conf.leptos_options;
     leptos_options.site_addr = format!("{}:{}", args.host, args.port).parse()?;
 
-    // 初始化 engine
-    let engine =
-        Arc::new(search_engine::Engine::new(&args.clip_text_model, &args.tokenizer).await?);
+    let engine = Arc::new(
+        search_engine::Engine::new(&args.clip_text_model, &args.tokenizer, &args.dinov3_model)
+            .await?,
+    );
 
     let app_state = state::AppState {
         leptos_options: leptos_options.clone(),
