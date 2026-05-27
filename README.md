@@ -67,7 +67,7 @@ Moreover, `greptime db` [dashboard config file](assets/dashboard.json) is provid
 
 # Wd-tags Translation (zh_CN for example)
 
-Add zh_CN translations to wd_tags.
+Add translations/alias_names to wd_tags.
 
 ```sh
 # (optional) use scraper to get translations (aliases) of wd tagger selected tags
@@ -78,7 +78,7 @@ cargo run --example translations2db
 
 # Search (full-stack app based on axum/sqlx and **leptos**)
 
-After infer/embed, you can do search on the data:
+After inferring/embedding, you can do search on the data:
 ```sh
 cargo binstall --locked cargo-leptos
 
