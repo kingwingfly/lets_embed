@@ -11,10 +11,7 @@ pub fn ImageDetails() -> impl IntoView {
     let id = move || params.with(|p| p.get("id"));
 
     let details = Resource::new(id, async |id| {
-        let id = id
-            .and_then(|id| id.parse::<i64>().ok())
-            .ok_or::<ServerFnError>(ServerFnError::Args("invalid id".to_string()))?;
-        fetch_image_details(id).await
+        fetch_image_details(id).await.map_err(|e| e.to_string())
     });
 
     view! {
@@ -52,7 +49,7 @@ pub fn ImageDetails() -> impl IntoView {
 }
 
 #[server]
-async fn fetch_image_details(id: i64) -> Result<ImageDetailsData, ServerFnError> {
+async fn fetch_image_details(id: Option<String>) -> Result<ImageDetailsData, ServerFnError> {
     use crate::state::AppState;
 
     use std::sync::Arc;
@@ -60,6 +57,10 @@ async fn fetch_image_details(id: i64) -> Result<ImageDetailsData, ServerFnError>
     use axum::extract::State;
     use leptos_axum::extract_with_state;
     use search_engine::Engine;
+
+    let id = id
+        .and_then(|id| id.parse().ok())
+        .ok_or::<ServerFnError>(ServerFnError::Args("invalid id".to_string()))?;
 
     let state = expect_context::<AppState>();
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
