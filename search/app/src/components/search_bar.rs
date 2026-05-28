@@ -62,7 +62,7 @@ pub fn SearchBar() -> impl IntoView {
                     <input
                         class="w-full bg-gray-200 rounded-lg py-2 px-4 outline-none"
                         placeholder=move || match mode.get() {
-                            Mode::Tag => "tag1 tag2 -exclude_tag ...",
+                            Mode::Tag => "regex to match tags",
                             Mode::Clip => "Describe the image...",
                         }
                         prop:value=move || q_input.get()

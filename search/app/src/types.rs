@@ -47,19 +47,3 @@ pub struct DoneEvent {
 pub struct ErrorEvent {
     pub message: String,
 }
-
-/// parse `foo bar -baz` query
-pub fn parse_tag_query(q: &str) -> (Vec<String>, Vec<String>) {
-    let mut tags = Vec::new();
-    let mut not_tags = Vec::new();
-    for tok in q.split_whitespace() {
-        if let Some(rest) = tok.strip_prefix('-') {
-            if !rest.is_empty() {
-                not_tags.push(rest.to_string());
-            }
-        } else {
-            tags.push(tok.to_string());
-        }
-    }
-    (tags, not_tags)
-}

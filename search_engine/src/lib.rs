@@ -13,7 +13,7 @@ use futures::{Stream, StreamExt as _};
 use ort::session::Session;
 use parking_lot::Mutex;
 use pgvector::HalfVector;
-use sqlx::{PgPool, Postgres};
+use sqlx::PgPool;
 use tokenizers::{EncodeInput, Tokenizer};
 
 #[derive(Debug)]
@@ -47,74 +47,45 @@ impl Engine {
         })
     }
 
-    pub async fn search_image_tag<'a, T>(
+    pub async fn search_image_tag<'a>(
         &'a self,
-        tags: impl IntoIterator<Item = T>,
-        not_tags: impl IntoIterator<Item = T>,
+        tag_re: impl AsRef<str>,
         limit: i64,
         offset: i64,
-    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a>
-    where
-        T: 'a,
-        for<'t> Vec<T>: sqlx::Type<Postgres> + sqlx::Encode<'t, Postgres>,
-    {
+    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a> {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
         }
 
-        let tags = tags.into_iter().collect::<Vec<_>>();
-        let not_tags = not_tags.into_iter().collect::<Vec<_>>();
-        if tags.is_empty() && not_tags.is_empty() {
-            bail!("limit and offset should not be empty at the same time")
+        let tag_re = tag_re.as_ref().to_owned();
+        if tag_re.is_empty() {
+            bail!("tag should not be empty")
         }
 
         let images = sqlx::query_as!(
             Image,
             r#"
             WITH
-            pos_patterns AS (
-                SELECT ord AS pat_idx, pattern
-                FROM unnest($1::TEXT[]) WITH ORDINALITY AS p(pattern, ord)
-            ),
             pos_tags AS (
-                SELECT DISTINCT pp.pat_idx, wt.id AS tag_id
-                FROM pos_patterns pp
-                JOIN wd_tags wt
-                    ON wt.name = pp.pattern
-                    OR EXISTS (SELECT 1 FROM unnest(wt.translations) tr WHERE tr = pp.pattern)
-            ),
-            neg_tags AS (
                 SELECT DISTINCT wt.id AS tag_id
-                FROM unnest($2::TEXT[]) AS pattern
-                JOIN wd_tags wt
-                    ON wt.name = pattern
-                    OR EXISTS (SELECT 1 FROM unnest(wt.translations) tr WHERE tr = pattern)
+                FROM wd_tags wt
+                WHERE wt.name ~* $1::TEXT
+                    OR EXISTS (SELECT 1 FROM unnest(wt.translations) tr WHERE tr ~*  $1::TEXT)
             ),
             img_match AS (
                 SELECT wti.image_id, MAX(wti.score) AS max_score
                 FROM wd_tag_images wti
                 JOIN pos_tags pt ON pt.tag_id = wti.wd_tag_id
                 GROUP BY wti.image_id
-                HAVING count(pt.pat_idx) = (SELECT count(*) FROM pos_patterns)
-            ),
-            candidates AS (
-                SELECT im.image_id, im.max_score
-                FROM img_match im
-                WHERE NOT EXISTS (
-                        SELECT 1
-                        FROM wd_tag_images wti
-                        JOIN neg_tags nt ON nt.tag_id = wti.wd_tag_id
-                        WHERE wti.image_id = im.image_id
-                    )
+                HAVING count(DISTINCT pt.tag_id) = (SELECT count(*) FROM pos_tags)
             )
             SELECT i.id, i.name, i.width, i.height
-            FROM candidates c
+            FROM img_match c
             JOIN images i ON i.id = c.image_id
             ORDER BY c.max_score DESC
-            LIMIT $3 OFFSET $4;
+            LIMIT $2 OFFSET $3;
             "#,
-            tags as _,
-            not_tags as _,
+            tag_re,
             limit,
             offset
         )

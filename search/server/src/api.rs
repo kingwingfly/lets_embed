@@ -1,5 +1,5 @@
 use crate::state::AppState;
-use app::types::{DoneEvent, ErrorEvent, ImageItem, Mode, parse_tag_query};
+use app::types::{DoneEvent, ErrorEvent, ImageItem, Mode};
 use axum::{
     extract::{Query, State},
     response::sse::{Event, KeepAlive, Sse},
@@ -49,10 +49,8 @@ pub async fn search_sse(
         match mode {
             Mode::Tag | Mode::Clip => {
                 let res = match mode {
-                     Mode::Tag => {
-                         let (tags, not_tags) = parse_tag_query(&q);
-                         engine.search_image_tag(tags, not_tags, limit, offset).await.map(|s| Box::pin(s) as Pin<Box<dyn Stream<Item = search_engine::Image> + Send>>)
-                     }
+                     Mode::Tag =>
+                         engine.search_image_tag(q, limit, offset).await.map(|s| Box::pin(s) as Pin<Box<dyn Stream<Item = search_engine::Image> + Send>>),
                      Mode::Clip => engine.search_clip([q.as_str()], limit, offset).await.map(|s| Box::pin(s) as _),
                      _ => unreachable!()
                 };
