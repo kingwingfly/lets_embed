@@ -39,7 +39,7 @@ pub fn Results() -> impl IntoView {
                 m.get("q").unwrap_or_default(),
                 m.get("limit")
                     .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(20)
+                    .unwrap_or(50)
                     .max(1),
             )
         })
@@ -245,7 +245,7 @@ pub fn Results() -> impl IntoView {
                         </For>
                     </div>
                 </For>
-            </div>columns
+            </div>
 
             <div node_ref=sentinel class="h-10 w-full"></div>
 

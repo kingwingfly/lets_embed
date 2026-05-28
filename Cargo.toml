@@ -9,6 +9,7 @@ members = [
     "search/app",
     "search/frontend",
     "search/server",
+    "search_types",
 ]
 resolver = "3"
 
@@ -21,7 +22,7 @@ documentation = "https://github.com/kingwingfly/lets_embed"
 
 [workspace.dependencies]
 # runtime
-tokio = { version = "1", features = ["rt-multi-thread", "parking_lot", "macros"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "parking_lot", "macros"] }
 futures = "0.3"
 tokio-util = "0.7"
 tokio-stream = { version = "0.1", features = ["io-util"] }
@@ -41,7 +42,7 @@ bytes = "1.11"
 # http
 url = "2.5"
 # db
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "derive", "migrate"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "macros", "derive", "migrate"] }
 pgvector = { version = "0.4", features = ["sqlx", "halfvec"] }
 # util
 tokenizers = "0.23"

@@ -1,6 +1,5 @@
 mod api;
 mod cli;
-mod state;
 
 use app::*;
 use axum::{Router, routing::get};
@@ -36,10 +35,18 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/api/search", get(api::search_sse))
         .nest_service("/images", ServeDir::new(&args.prefix))
-        .leptos_routes(&app_state, routes, {
-            let opts = leptos_options.clone();
-            move || shell(opts.clone())
-        })
+        .leptos_routes_with_context(
+            &app_state,
+            routes,
+            {
+                let app_state = app_state.clone();
+                move || provide_context(app_state.clone())
+            },
+            {
+                let opts = leptos_options.clone();
+                move || shell(opts.clone())
+            },
+        )
         .fallback(leptos_axum::file_and_error_handler::<state::AppState, _>(
             shell,
         ))

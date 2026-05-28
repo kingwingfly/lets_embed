@@ -1,4 +1,5 @@
-use crate::state::AppState;
+use std::{convert::Infallible, pin::Pin, sync::Arc, time::Duration};
+
 use app::types::{DoneEvent, ErrorEvent, ImageItem, Mode};
 use axum::{
     extract::{Query, State},
@@ -6,8 +7,8 @@ use axum::{
 };
 use futures::{Stream, StreamExt as _};
 use sanitize_filename::sanitize;
+use search_engine::{Engine, search_types};
 use serde::Deserialize;
-use std::{convert::Infallible, pin::Pin, time::Duration};
 
 #[derive(Debug, Deserialize)]
 pub struct SearchParams {
@@ -29,10 +30,9 @@ fn default_limit() -> i64 {
 }
 
 pub async fn search_sse(
-    State(state): State<AppState>,
+    State(engine): State<Arc<Engine>>,
     Query(p): Query<SearchParams>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let engine = state.engine.clone();
     let mode = Mode::parse(&p.mode);
     let limit = p.limit.max(1);
     let offset = p.offset.max(0);
@@ -52,7 +52,7 @@ pub async fn search_sse(
                      Mode::Tag =>
                         engine.search_image_by_tag(q, limit, offset)
                             .await
-                            .map(|s| Box::pin(s) as Pin<Box<dyn Stream<Item = search_engine::Image> + Send>>),
+                            .map(|s| Box::pin(s) as Pin<Box<dyn Stream<Item = search_types::Image> + Send>>),
                      Mode::Clip =>
                         engine.search_clip([q.as_str()], limit, offset)
                             .await

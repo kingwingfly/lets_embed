@@ -1,6 +1,7 @@
 use crate::types::Mode;
 use leptos::prelude::*;
 use leptos_router::NavigateOptions;
+use leptos_router::components::Outlet;
 use leptos_router::hooks::{use_navigate, use_query_map};
 
 #[component]
@@ -64,6 +65,7 @@ pub fn SearchBar() -> impl IntoView {
                         placeholder=move || match mode.get() {
                             Mode::Tag => "regex to match tags",
                             Mode::Clip => "Describe the image...",
+                            _ => "Describe the image...",
                         }
                         prop:value=move || q_input.get()
                         on:input=move |ev| q_input.set(event_target_value(&ev))
@@ -84,6 +86,9 @@ pub fn SearchBar() -> impl IntoView {
                 </form>
             </div>
             <hr class="w-full h-1 bg-gray-200 border-0" />
+        </div>
+        <div class="w-full h-full">
+            <Outlet />
         </div>
     }
 }

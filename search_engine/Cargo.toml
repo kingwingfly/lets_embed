@@ -18,15 +18,13 @@ pgvector.workspace = true
 ort.workspace = true
 tokenizers.workspace = true
 
+search_types = { path = "../search_types" }
+
 siglip2 = { path = "../siglip2" }
 dinov3 = { path = "../dinov3" }
 
 parking_lot.workspace = true
-serde = { workspace = true, optional = true }
-
-[dev-dependencies]
-tokio.workspace = true
 
 [features]
 default = []
-serde = ['dep:serde']
+serde = ["search_types/serde"]

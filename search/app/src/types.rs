@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum Mode {
     Tag,
     Clip,
+    Similar,
 }
 
 impl Mode {
@@ -13,11 +14,13 @@ impl Mode {
         match self {
             Mode::Tag => "tag",
             Mode::Clip => "clip",
+            Mode::Similar => "similar",
         }
     }
     pub fn parse(s: &str) -> Self {
         match s {
             "clip" => Mode::Clip,
+            "similar" => Mode::Similar,
             _ => Mode::Tag,
         }
     }

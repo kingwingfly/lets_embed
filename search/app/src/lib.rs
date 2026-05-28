@@ -1,12 +1,15 @@
 pub mod components;
 pub mod types;
 
-use crate::components::{Results, SearchBar};
+#[cfg(feature = "ssr")]
+pub mod state;
+
+use crate::components::{ImageDetails, Results, SearchBar};
 use leptos::prelude::*;
 use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
 use leptos_router::{
-    StaticSegment,
-    components::{Route, Router, Routes},
+    components::{ParentRoute, Route, Router, Routes},
+    path,
 };
 
 pub fn shell(options: LeptosOptions) -> impl IntoView {
@@ -36,17 +39,12 @@ pub fn App() -> impl IntoView {
         <Router>
             <main class="bg-black min-h-screen w-screen">
                 <Routes fallback=|| "Page not found.".into_view()>
-                    <Route path=StaticSegment("") view=HomePage/>
+                    <ParentRoute path=path!("") view=SearchBar>
+                        <Route path=path!("/details/:id") view=ImageDetails/>
+                        <Route path=path!("") view=Results/>
+                    </ParentRoute>
                 </Routes>
             </main>
         </Router>
-    }
-}
-
-#[component]
-fn HomePage() -> impl IntoView {
-    view! {
-        <SearchBar />
-        <Results />
     }
 }

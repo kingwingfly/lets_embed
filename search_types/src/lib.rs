@@ -1,0 +1,30 @@
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Image {
+    pub id: i64,
+    pub name: String,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Post {
+    pub id: i64,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Tag {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ImageDetails {
+    pub image: Image,
+    pub post: Post,
+    pub tags: Vec<Tag>,
+}

@@ -13,8 +13,11 @@ use futures::{Stream, StreamExt as _};
 use ort::session::Session;
 use parking_lot::Mutex;
 use pgvector::HalfVector;
+use search_types::{Image, ImageDetails, Post, Tag};
 use sqlx::PgPool;
 use tokenizers::{EncodeInput, Tokenizer};
+
+pub use search_types;
 
 #[derive(Debug)]
 pub struct Engine {
@@ -275,20 +278,47 @@ impl Engine {
 
         Ok(res)
     }
-}
 
-#[derive(Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Image {
-    pub id: i64,
-    pub name: String,
-    pub width: i32,
-    pub height: i32,
-}
+    pub async fn image_details(&self, id: i64) -> anyhow::Result<ImageDetails> {
+        let image = sqlx::query_as!(
+            Image,
+            r#"
+            SELECT id, name, width, height
+            FROM images
+            WHERE id=$1
+            "#,
+            id
+        )
+        .fetch_one(&self.pool)
+        .await?;
 
-#[derive(Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Post {
-    pub id: i64,
-    pub title: String,
+        let post = sqlx::query_as!(
+            Post,
+            r#"
+            SELECT p.id, p.title
+            FROM posts p
+            JOIN post_images pi ON p.id=pi.post_id
+            WHERE pi.image_id=$1
+            "#,
+            id
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let tags = sqlx::query_as!(
+            Tag,
+            r#"
+            SELECT wt.id, wt.name
+            FROM wd_tags wt
+            JOIN wd_tag_images wti ON wt.id=wti.wd_tag_id
+            WHERE wti.image_id=$1
+            ORDER BY wti.score DESC
+            "#,
+            id
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(ImageDetails { image, post, tags })
+    }
 }
