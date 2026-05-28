@@ -229,7 +229,7 @@ impl Engine {
 
     pub async fn search_dinov3<'a, R: Read + Seek>(
         &'a self,
-        images: impl IntoIterator<Item = R>,
+        images: impl IntoIterator<Item = R> + Send + 'static,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a> {
@@ -237,10 +237,15 @@ impl Engine {
             bail!("both limit and offset should >= 0")
         }
 
-        let converted = images
-            .into_iter()
-            .map(|i| dinov3::convert_image(i))
-            .try_collect::<Vec<_>>()?;
+        let converted = tokio::task::spawn_blocking(move || {
+            images
+                .into_iter()
+                .map(|i| dinov3::convert_image(i))
+                .try_collect::<Vec<_>>()
+        })
+        .await
+        .unwrap()?;
+
         let embeddings = dinov3::infer_vision(&mut self.dinov3_session.lock(), converted)?
             .into_iter()
             .map(|v| HalfVector::from_f32_slice(&v))

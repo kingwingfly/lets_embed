@@ -14,7 +14,7 @@ pub fn SearchBar() -> impl IntoView {
             m.get("q").unwrap_or_default(),
             m.get("limit")
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(20),
+                .unwrap_or(50),
         )
     });
 

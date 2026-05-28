@@ -1,7 +1,7 @@
 use std::iter::repeat_with;
 
 use crate::{
-    components::lightbox::Lightbox,
+    components::{lightbox::Lightbox, viewer::Viewer},
     types::{DoneEvent, ErrorEvent, ImageItem, Mode, PostItem},
 };
 use leptos::prelude::*;
@@ -98,7 +98,7 @@ pub fn Results() -> impl IntoView {
     let loading = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let lightbox: RwSignal<Option<PostItem>> = RwSignal::new(None);
-    let viewer: RwSignal<Option<String>> = RwSignal::new(None);
+    let viewer: RwSignal<Option<ImageItem>> = RwSignal::new(None);
 
     let active: StoredValue<Option<ActiveSse>, LocalStorage> = StoredValue::new_local(None);
 
@@ -132,12 +132,11 @@ pub fn Results() -> impl IntoView {
             Item::Post(p) => {
                 let cover = p.images.first().cloned();
                 let count = p.images.len();
-                let p_for_click = p.clone();
                 view! {
                     <div class="mb-2 break-inside-avoid">
                         <div
                             class="relative cursor-pointer group rounded overflow-hidden bg-gray-900"
-                            on:click=move |_| lightbox.set(Some(p_for_click.clone()))
+                            on:click=move |_| lightbox.set(Some(p.clone()))
                         >
                             {cover.map(|c| view! {
                                 <img
@@ -160,7 +159,6 @@ pub fn Results() -> impl IntoView {
             }
             Item::Image(im) => {
                 let url = format!("/images/{}.webp", encode(&im.name));
-                let url_for_click = url.clone();
                 view! {
                     <div class="mb-2 break-inside-avoid">
                         <img
@@ -168,7 +166,7 @@ pub fn Results() -> impl IntoView {
                             decoding="async"
                             class="w-full h-auto block bg-gray-900 cursor-zoom-in"
                             src=url
-                            on:click=move |_| viewer.set(Some(url_for_click.clone()))
+                            on:click=move |_| viewer.set(Some(im.clone()))
                         />
                     </div>
                 }
@@ -205,30 +203,17 @@ pub fn Results() -> impl IntoView {
     };
 
     let lightbox_view = move || {
-        lightbox.get().map(|p| {
+        lightbox.get().map(|post| {
             view! {
-                <Lightbox post=p lightbox=lightbox viewer=viewer />
+                <Lightbox post lightbox viewer />
             }
         })
     };
 
     let viewer_view = move || {
-        viewer.get().map(|url| view! {
-            <div
-                class="fixed inset-0 bg-black/95 z-[60] flex items-center justify-center cursor-zoom-out p-2"
-                on:click=move |ev| { ev.stop_propagation(); viewer.set(None); }
-            >
-                <img
-                    src=url
-                    class="max-w-full max-h-full object-contain select-none"
-                    on:click=move |_| viewer.set(None)
-                />
-                <button
-                    class="absolute top-2 right-2 text-white bg-black/60 hover:bg-black/80 rounded-full w-10 h-10 text-2xl"
-                    on:click=move |_| viewer.set(None)
-                >"×"</button>
-            </div>
-        })
+        view! {
+            <Viewer viewer />
+        }
     };
 
     view! {

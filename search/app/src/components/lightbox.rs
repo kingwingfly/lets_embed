@@ -1,4 +1,4 @@
-use crate::types::PostItem;
+use crate::types::{ImageItem, PostItem};
 use leptos::prelude::*;
 use leptos_use::use_intersection_observer;
 use urlencoding::encode;
@@ -9,7 +9,7 @@ const PAGE: usize = 20;
 pub fn Lightbox(
     post: PostItem,
     lightbox: RwSignal<Option<PostItem>>,
-    viewer: RwSignal<Option<String>>,
+    viewer: RwSignal<Option<ImageItem>>,
 ) -> impl IntoView {
     let total = post.images.len();
     let images = StoredValue::new(post.images.clone());
@@ -35,7 +35,7 @@ pub fn Lightbox(
                 .take(v)
                 .map(|im| {
                     let url = format!("/images/{}.webp", encode(&im.name));
-                    let url_for_click = url.clone();
+                    let im = im.clone();
                     view! {
                         <div class="relative aspect-square overflow-hidden rounded bg-gray-800">
                             <img
@@ -43,7 +43,7 @@ pub fn Lightbox(
                                 decoding="async"
                                 class="absolute inset-0 w-full h-full object-cover cursor-zoom-in"
                                 src=url
-                                on:click=move |_| viewer.set(Some(url_for_click.clone()))
+                                on:click=move |_| viewer.set(Some(im.clone()))
                             />
                         </div>
                     }

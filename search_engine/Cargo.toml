@@ -8,6 +8,7 @@ repository.workspace = true
 documentation.workspace = true
 
 [dependencies]
+tokio.workspace = true
 futures.workspace = true
 
 anyhow.workspace = true
