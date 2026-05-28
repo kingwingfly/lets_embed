@@ -209,12 +209,14 @@ impl Engine {
         let res = sqlx::query_as!(
             Image,
             r#"
+            WITH qs AS (
+                SELECT q FROM
+                unnest($1::halfvec[]) AS _(q)
+            )
             SELECT id, name, width, height
             FROM images i
-            ORDER BY (
-                SELECT MAX(i.clip_embedding <=> q.vec)
-                FROM unnest($1::halfvec[]) AS q(vec)
-            )
+            CROSS JOIN qs
+            ORDER BY i.clip_embedding <=> qs.q
             LIMIT $2 OFFSET $3
             "#,
             &text_embeddings as _,
@@ -254,12 +256,14 @@ impl Engine {
         let res = sqlx::query_as!(
             Image,
             r#"
+            WITH qs AS (
+                SELECT q FROM
+                unnest($1::halfvec[]) AS _(q)
+            )
             SELECT id, name, width, height
             FROM images i
-            ORDER BY (
-                SELECT MAX(i.dinov3_embedding <=> q.vec)
-                FROM unnest($1::halfvec[]) AS q(vec)
-            )
+            CROSS JOIN qs
+            ORDER BY i.dinov3_embedding <=> qs.q
             LIMIT $2 OFFSET $3
             "#,
             &embeddings as _,
