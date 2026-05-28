@@ -211,9 +211,11 @@ pub fn Results() -> impl IntoView {
     };
 
     let viewer_view = move || {
-        view! {
-            <Viewer viewer />
-        }
+        viewer.get().map(|image| {
+            view! {
+                <Viewer image viewer />
+            }
+        })
     };
 
     view! {
@@ -243,7 +245,7 @@ pub fn Results() -> impl IntoView {
                         </For>
                     </div>
                 </For>
-            </div>
+            </div>columns
 
             <div node_ref=sentinel class="h-10 w-full"></div>
 
