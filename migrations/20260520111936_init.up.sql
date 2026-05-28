@@ -1,5 +1,9 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 
+SET hnsw.ef_search = 1000;
+SET hnsw.iterative_scan = strict_order;
+SET hnsw.max_scan_tuples = 2000;
+
 CREATE TYPE process_status AS ENUM ('pending', 'processing', 'completed');
 
 CREATE TYPE image AS (

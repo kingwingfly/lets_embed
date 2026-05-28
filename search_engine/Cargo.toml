@@ -8,6 +8,8 @@ repository.workspace = true
 documentation.workspace = true
 
 [dependencies]
+futures.workspace = true
+
 anyhow.workspace = true
 sqlx.workspace = true
 pgvector.workspace = true

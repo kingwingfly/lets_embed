@@ -1,13 +1,13 @@
 use crate::state::AppState;
-use app::types::{DoneEvent, ErrorEvent, ImageItem, Mode, PostItem, parse_tag_query};
+use app::types::{DoneEvent, ErrorEvent, ImageItem, Mode, parse_tag_query};
 use axum::{
     extract::{Query, State},
     response::sse::{Event, KeepAlive, Sse},
 };
-use futures::Stream;
+use futures::{Stream, StreamExt as _};
 use sanitize_filename::sanitize;
 use serde::Deserialize;
-use std::{convert::Infallible, time::Duration};
+use std::{convert::Infallible, pin::Pin, time::Duration};
 
 #[derive(Debug, Deserialize)]
 pub struct SearchParams {
@@ -47,79 +47,33 @@ pub async fn search_sse(
         };
 
         match mode {
-            Mode::Tag => {
-                let (tags, not_tags) = parse_tag_query(&q);
-                match engine.search_tag(tags, not_tags, limit, offset).await {
-                    Ok((posts, images)) => {
-                        let total = posts.len() + images.len();
+            Mode::Tag | Mode::Clip => {
+                let res = match mode {
+                     Mode::Tag => {
+                         let (tags, not_tags) = parse_tag_query(&q);
+                         engine.search_image_tag(tags, not_tags, limit, offset).await.map(|s| Box::pin(s) as Pin<Box<dyn Stream<Item = search_engine::Image> + Send>>)
+                     }
+                     Mode::Clip => engine.search_clip([q.as_str()], limit, offset).await.map(|s| Box::pin(s) as _),
+                     _ => unreachable!()
+                };
+                match res {
+                    Ok(mut images) => {
+                        let mut count = 0;
 
-                        for post in posts {
-                            match engine.list(post.id).await {
-                                Ok(imgs) => {
-                                    let item = PostItem {
-                                        id: post.id,
-                                        title: sanitize(post.title),
-                                        images: imgs.into_iter()
-                                            .map(|i| ImageItem {
-                                                id: i.id,
-                                                name: sanitize(i.name),
-                                                width: i.width as u32,
-                                                height: i.height as u32,
-                                            })
-                                            .collect(),
-                                    };
-                                    yield Ok(Event::default()
-                                        .event("post")
-                                        .json_data(item)
-                                        .unwrap());
-                                }
-                                Err(e) => {
-                                    yield Ok(send_err(e.to_string()));
-                                    return;
-                                }
-                            }
-                        }
-
-                        for img in images {
+                        while let Some(img) = images.next().await {
                             let item = ImageItem {
                                 id: img.id,
                                 name: sanitize(img.name),
                                 width: img.width as u32,
                                 height: img.height as u32,
                             };
+                            count += 1;
                             yield Ok(Event::default()
                                 .event("image")
                                 .json_data(item)
                                 .unwrap());
                         }
 
-                        let has_more = (total as i64) >= limit;
-                        yield Ok(Event::default()
-                            .event("done")
-                            .json_data(DoneEvent { has_more })
-                            .unwrap());
-                    }
-                    Err(e) => {
-                        yield Ok(send_err(e.to_string()));
-                    }
-                }
-            }
-            Mode::Clip => {
-                match engine.search_clip([q.as_str()], limit, offset).await {
-                    Ok(images) => {
-                        let count = images.len();
-                        for img in images {
-                            let item = ImageItem {
-                                id: img.id,
-                                name: sanitize(img.name),
-                                width: img.width as u32,
-                                height: img.height as u32,
-                            };
-                            yield Ok(Event::default()
-                                .event("image")
-                                .json_data(item)
-                                .unwrap());
-                        }
                         let has_more = (count as i64) >= limit;
                         yield Ok(Event::default()
                             .event("done")
@@ -131,6 +85,7 @@ pub async fn search_sse(
                     }
                 }
             }
+            _ => {}
         }
     };
 

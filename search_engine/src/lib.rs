@@ -2,12 +2,14 @@
 
 use std::{
     env,
+    future::ready,
     io::{Read, Seek},
     path::Path,
     sync::Arc,
 };
 
 use anyhow::{Ok, bail};
+use futures::{Stream, StreamExt as _};
 use ort::session::Session;
 use parking_lot::Mutex;
 use pgvector::HalfVector;
@@ -45,15 +47,16 @@ impl Engine {
         })
     }
 
-    pub async fn search_tag<T>(
-        &self,
+    pub async fn search_image_tag<'a, T>(
+        &'a self,
         tags: impl IntoIterator<Item = T>,
         not_tags: impl IntoIterator<Item = T>,
         limit: i64,
         offset: i64,
-    ) -> anyhow::Result<(Vec<Post>, Vec<Image>)>
+    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a>
     where
-        for<'a> &'a [T]: sqlx::Type<Postgres> + sqlx::Encode<'a, Postgres>,
+        T: 'a,
+        for<'t> Vec<T>: sqlx::Type<Postgres> + sqlx::Encode<'t, Postgres>,
     {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
@@ -65,124 +68,68 @@ impl Engine {
             bail!("limit and offset should not be empty at the same time")
         }
 
-        let posts = sqlx::query_as!(
-            Post,
-            r#"
-            SELECT DISTINCT ON (p.id) p.id, p.title
-                FROM posts p
-                WHERE (
-                    NOT EXISTS (
-                        SELECT 1
-                        FROM unnest($1::TEXT[]) AS pattern
-                        WHERE NOT (
-                            EXISTS (
-                                SELECT 1
-                                FROM tag_posts tp
-                                JOIN tags t ON t.id = tp.tag_id
-                                WHERE tp.post_id = p.id
-                                    AND t.name ~* pattern
-                            )
-                            OR EXISTS (
-                                SELECT 1
-                                FROM author_posts ap
-                                JOIN authors a ON a.id = ap.author_id
-                                WHERE ap.post_id = p.id
-                                    AND a.name ~* pattern
-                            )
-                        )
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM tag_posts tp
-                        JOIN tags t ON t.id = tp.tag_id
-                        WHERE tp.post_id = p.id
-                            AND t.name ~* ANY($2::TEXT[])
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1
-                        FROM author_posts ap
-                        JOIN authors a ON a.id = ap.author_id
-                        WHERE ap.post_id = p.id
-                            AND a.name ~* ANY($2::TEXT[])
-                    )
-                )
-                LIMIT $3 OFFSET $4
-            "#,
-            tags.as_slice() as _,
-            not_tags.as_slice() as _,
-            limit,
-            offset
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
         let images = sqlx::query_as!(
             Image,
             r#"
-            SELECT i.id, i.name, i.width, i.height
-                FROM images i
-                JOIN (
-                    SELECT wti.image_id, MAX(wti.score) AS max_score
-                    FROM wd_tag_images wti
-                    JOIN wd_tags wt ON wt.id = wti.wd_tag_id
-                    WHERE wt.name ~* ANY($1::TEXT[])
-                        OR EXISTS (
-                            SELECT 1 FROM unnest(wt.translations) AS tr
-                            WHERE tr ~* ANY($1::TEXT[])
-                        )
-                    GROUP BY wti.image_id
-                ) sub ON sub.image_id = i.id
-                WHERE
-                    NOT EXISTS (
-                        SELECT 1
-                        FROM unnest($1::TEXT[]) AS pattern
-                        WHERE NOT EXISTS (
-                            SELECT 1
-                            FROM wd_tag_images wti
-                            JOIN wd_tags wt ON wt.id = wti.wd_tag_id
-                            WHERE wti.image_id = i.id
-                                AND (
-                                    wt.name ~* pattern
-                                    OR EXISTS (
-                                        SELECT 1 FROM unnest(wt.translations) AS tr
-                                        WHERE tr ~* pattern
-                                    )
-                                )
-                        )
-                    )
-                    AND NOT EXISTS (
+            WITH
+            pos_patterns AS (
+                SELECT ord AS pat_idx, pattern
+                FROM unnest($1::TEXT[]) WITH ORDINALITY AS p(pattern, ord)
+            ),
+            pos_tags AS (
+                SELECT DISTINCT pp.pat_idx, wt.id AS tag_id
+                FROM pos_patterns pp
+                JOIN wd_tags wt
+                    ON wt.name = pp.pattern
+                    OR EXISTS (SELECT 1 FROM unnest(wt.translations) tr WHERE tr = pp.pattern)
+            ),
+            neg_tags AS (
+                SELECT DISTINCT wt.id AS tag_id
+                FROM unnest($2::TEXT[]) AS pattern
+                JOIN wd_tags wt
+                    ON wt.name = pattern
+                    OR EXISTS (SELECT 1 FROM unnest(wt.translations) tr WHERE tr = pattern)
+            ),
+            img_match AS (
+                SELECT wti.image_id, MAX(wti.score) AS max_score
+                FROM wd_tag_images wti
+                JOIN pos_tags pt ON pt.tag_id = wti.wd_tag_id
+                GROUP BY wti.image_id
+                HAVING count(pt.pat_idx) = (SELECT count(*) FROM pos_patterns)
+            ),
+            candidates AS (
+                SELECT im.image_id, im.max_score
+                FROM img_match im
+                WHERE NOT EXISTS (
                         SELECT 1
                         FROM wd_tag_images wti
-                        JOIN wd_tags wt ON wt.id = wti.wd_tag_id
-                        WHERE wti.image_id = i.id
-                            AND (
-                                wt.name ~* ANY($2::TEXT[])
-                                OR EXISTS (
-                                    SELECT 1 FROM unnest(wt.translations) AS tr
-                                    WHERE tr ~* ANY($2::TEXT[])
-                                )
-                            )
+                        JOIN neg_tags nt ON nt.tag_id = wti.wd_tag_id
+                        WHERE wti.image_id = im.image_id
                     )
-                ORDER BY sub.max_score DESC
-                LIMIT $3 OFFSET $4
-                "#,
-            tags.as_slice() as _,
-            not_tags.as_slice() as _,
+            )
+            SELECT i.id, i.name, i.width, i.height
+            FROM candidates c
+            JOIN images i ON i.id = c.image_id
+            ORDER BY c.max_score DESC
+            LIMIT $3 OFFSET $4;
+            "#,
+            tags as _,
+            not_tags as _,
             limit,
             offset
         )
-        .fetch_all(&self.pool)
-        .await?;
+        .fetch(&self.pool)
+        .filter_map(|res| ready(res.ok()));
 
-        Ok((posts, images))
+        Ok(images)
     }
 
-    pub async fn search_clip<'s>(
-        &self,
+    pub async fn search_clip<'a, 's>(
+        &'a self,
         describes: impl IntoIterator<Item = impl Into<EncodeInput<'s>> + Send + 's>,
         limit: i64,
         offset: i64,
-    ) -> anyhow::Result<Vec<Image>> {
+    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a> {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
         }
@@ -195,25 +142,6 @@ impl Engine {
         .into_iter()
         .map(|embedding| HalfVector::from_f32_slice(&embedding))
         .collect::<Vec<_>>();
-
-        let mut xact = self.pool.begin().await?;
-
-        sqlx::query(
-            format!(
-                "SET LOCAL hnsw.ef_search = {}",
-                (limit * 4).clamp(100, 1000)
-            )
-            .as_str(),
-        )
-        .execute(&mut *xact)
-        .await?;
-
-        sqlx::query!("SET LOCAL hnsw.iterative_scan = strict_order")
-            .execute(&mut *xact)
-            .await?;
-        sqlx::query!("SET LOCAL hnsw.max_scan_tuples = 20000")
-            .execute(&mut *xact)
-            .await?;
 
         let res = sqlx::query_as!(
             Image,
@@ -230,20 +158,18 @@ impl Engine {
             limit,
             offset
         )
-        .fetch_all(&mut *xact)
-        .await?;
-
-        xact.commit().await?;
+        .fetch(&self.pool)
+        .filter_map(|res| ready(res.ok()));
 
         Ok(res)
     }
 
-    pub async fn search_dinov3<R: Read + Seek>(
-        &self,
+    pub async fn search_dinov3<'a, R: Read + Seek>(
+        &'a self,
         images: impl IntoIterator<Item = R>,
         limit: i64,
         offset: i64,
-    ) -> anyhow::Result<Vec<Image>> {
+    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a> {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
         }
@@ -256,25 +182,6 @@ impl Engine {
             .into_iter()
             .map(|v| HalfVector::from_f32_slice(&v))
             .collect::<Vec<_>>();
-
-        let mut xact = self.pool.begin().await?;
-
-        sqlx::query(
-            format!(
-                "SET LOCAL hnsw.ef_search = {}",
-                (limit * 4).clamp(100, 1000)
-            )
-            .as_str(),
-        )
-        .execute(&mut *xact)
-        .await?;
-
-        sqlx::query!("SET LOCAL hnsw.iterative_scan = strict_order")
-            .execute(&mut *xact)
-            .await?;
-        sqlx::query!("SET LOCAL hnsw.max_scan_tuples = 20000")
-            .execute(&mut *xact)
-            .await?;
 
         let res = sqlx::query_as!(
             Image,
@@ -291,29 +198,10 @@ impl Engine {
             limit,
             offset
         )
-        .fetch_all(&mut *xact)
-        .await?;
-
-        xact.commit().await?;
+        .fetch(&self.pool)
+        .filter_map(|res| ready(res.ok()));
 
         Ok(res)
-    }
-
-    pub async fn list(&self, post_id: i64) -> anyhow::Result<Vec<Image>> {
-        sqlx::query_as!(
-            Image,
-            r#"
-            SELECT id, name, width, height
-            FROM images i
-            JOIN post_images pi
-            ON i.id = pi.image_id
-            WHERE pi.post_id = $1
-            "#,
-            post_id
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(Into::into)
     }
 }
 

@@ -4555,6 +4555,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dinov3",
+ "futures",
  "ort",
  "parking_lot",
  "pgvector",
