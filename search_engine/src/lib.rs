@@ -47,7 +47,99 @@ impl Engine {
         })
     }
 
-    pub async fn search_image_tag<'a>(
+    pub async fn search_post_by_author<'a>(
+        &'a self,
+        author_re: impl AsRef<str>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<impl Stream<Item = Post> + Send + 'a> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
+
+        let author_re = author_re.as_ref().to_owned();
+        if author_re.is_empty() {
+            bail!("tag should not be empty")
+        }
+
+        let posts = sqlx::query_as!(
+            Post,
+            r#"
+            WITH
+            pos_authors AS (
+                SELECT DISTINCT a.id AS author_id
+                FROM authors a
+                WHERE a.name ~* $1::TEXT
+            ),
+            post_match AS (
+                SELECT ap.post_id
+                FROM author_posts ap
+                JOIN pos_authors pa ON pa.author_id = ap.author_id
+                GROUP BY ap.post_id
+                HAVING count(DISTINCT pa.author_id) = (SELECT count(*) FROM pos_authors)
+            )
+            SELECT p.id, p.title
+            FROM post_match pm
+            JOIN posts p ON p.id = pm.post_id
+            LIMIT $2 OFFSET $3;
+            "#,
+            author_re,
+            limit,
+            offset
+        )
+        .fetch(&self.pool)
+        .filter_map(|res| ready(res.ok()));
+
+        Ok(posts)
+    }
+
+    pub async fn search_post_by_tag<'a>(
+        &'a self,
+        tag_re: impl AsRef<str>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<impl Stream<Item = Post> + Send + 'a> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
+
+        let tag_re = tag_re.as_ref().to_owned();
+        if tag_re.is_empty() {
+            bail!("tag should not be empty")
+        }
+
+        let posts = sqlx::query_as!(
+            Post,
+            r#"
+            WITH
+            pos_tags AS (
+                SELECT DISTINCT t.id AS tag_id
+                FROM tags t
+                WHERE t.name ~* $1::TEXT
+            ),
+            post_match AS (
+                SELECT tp.post_id
+                FROM tag_posts tp
+                JOIN pos_tags pt ON pt.tag_id = tp.tag_id
+                GROUP BY tp.post_id
+                HAVING count(DISTINCT pt.tag_id) = (SELECT count(*) FROM pos_tags)
+            )
+            SELECT p.id, p.title
+            FROM post_match pm
+            JOIN posts p ON p.id = pm.post_id
+            LIMIT $2 OFFSET $3;
+            "#,
+            tag_re,
+            limit,
+            offset
+        )
+        .fetch(&self.pool)
+        .filter_map(|res| ready(res.ok()));
+
+        Ok(posts)
+    }
+
+    pub async fn search_image_by_tag<'a>(
         &'a self,
         tag_re: impl AsRef<str>,
         limit: i64,
@@ -80,9 +172,9 @@ impl Engine {
                 HAVING count(DISTINCT pt.tag_id) = (SELECT count(*) FROM pos_tags)
             )
             SELECT i.id, i.name, i.width, i.height
-            FROM img_match c
-            JOIN images i ON i.id = c.image_id
-            ORDER BY c.max_score DESC
+            FROM img_match im
+            JOIN images i ON i.id = im.image_id
+            ORDER BY im.max_score DESC
             LIMIT $2 OFFSET $3;
             "#,
             tag_re,

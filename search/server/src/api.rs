@@ -50,7 +50,7 @@ pub async fn search_sse(
             Mode::Tag | Mode::Clip => {
                 let res = match mode {
                      Mode::Tag =>
-                         engine.search_image_tag(q, limit, offset).await.map(|s| Box::pin(s) as Pin<Box<dyn Stream<Item = search_engine::Image> + Send>>),
+                         engine.search_image_by_tag(q, limit, offset).await.map(|s| Box::pin(s) as Pin<Box<dyn Stream<Item = search_engine::Image> + Send>>),
                      Mode::Clip => engine.search_clip([q.as_str()], limit, offset).await.map(|s| Box::pin(s) as _),
                      _ => unreachable!()
                 };
