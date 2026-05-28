@@ -9,7 +9,7 @@ use sqlx::{PgPool, prelude::Type};
 async fn main() -> anyhow::Result<()> {
     let mut file = std::fs::File::open("assets/translations.json")?;
 
-    let translations: Vec<Tranlation> = serde_json::from_reader(&mut file)?;
+    let translations: Vec<Translation> = serde_json::from_reader(&mut file)?;
 
     let pool = PgPool::connect_lazy(
         env::var("DATABASE_URL")
@@ -38,8 +38,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 #[derive(Debug, Deserialize, Type)]
-#[sqlx(type_name = "tranlation")]
-struct Tranlation {
+#[sqlx(type_name = "translation")]
+struct Translation {
     name: String,
     translations: Vec<String>,
 }
