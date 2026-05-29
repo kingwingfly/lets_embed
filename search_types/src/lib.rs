@@ -25,6 +25,6 @@ pub struct Tag {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ImageDetails {
     pub image: Image,
-    pub post: Post,
+    pub post: Option<Post>,
     pub tags: Vec<Tag>,
 }

@@ -15,36 +15,39 @@ pub fn ImageDetails() -> impl IntoView {
             async move { fetch_image_details(id()).await.map_err(|e| e.to_string()) },
         );
 
-    view! {
-        <div class="flex flex-col md:flex-row w-full h-full">
-            <div class="flex w-full h-full justify-center items-center">
-                <Transition fallback=move || "fetching image details".into_view()>
-                    {
-                        move || {
-                            details.get().map(|details|
-                                match details {
-                                    Ok(details) => {
-                                        let url = format!("/images/{}.webp", encode(&details.image.name));
-                                        view! {
-                                            <img
-                                                loading="lazy"
-                                                decoding="async"
-                                                class="w-full h-full block bg-gray-900 cursor-zoom-in"
-                                                src=url
-                                            />
-                                        }
-                                        .into_any()
-                                    }
-                                    Err(e) => e.to_string().into_any(),
-                                }
-                            )
-                        }
-                    }
-                </Transition>
-            </div>
+    let render_details = |ImageDetailsData { image, post, tags }| {
+        let src = format!("/images/{}.webp", encode(&image.name));
+        view! {
             <div class="w-full h-full">
-                <Results />
+                {
+                    post.map(|post| view! {<div class="text-white text-2xl font-bold text-center">{ post.title }</div>})
+                }
+                <img
+                    loading="lazy"
+                    decoding="async"
+                    class="flex-1 object-contain bg-gray-900 select-none"
+                    src=src
+                    alt=image.name
+                />
             </div>
+        }
+    };
+
+    view! {
+        <div class="grid md:grid-cols-2 w-full h-full">
+            <Transition fallback=move || "fetching image details".into_view()>
+                {
+                    move || {
+                        details.get().map(|details|
+                            match details {
+                                Ok(details) => render_details(details).into_any(),
+                                Err(e) => e.to_string().into_any(),
+                            }
+                        )
+                    }
+                }
+            </Transition>
+            <Results />
         </div>
     }
 }

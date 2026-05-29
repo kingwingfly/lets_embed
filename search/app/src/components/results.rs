@@ -9,7 +9,7 @@ use crate::{
 use leptos::prelude::*;
 use leptos_router::hooks::use_query_map;
 use leptos_use::{
-    UseWindowSizeReturn, signal_debounced, use_intersection_observer, use_window_size,
+    UseElementSizeReturn, signal_debounced, use_element_size, use_intersection_observer,
 };
 use urlencoding::encode;
 use wasm_bindgen::{JsCast, prelude::Closure};
@@ -47,8 +47,10 @@ pub fn Results() -> impl IntoView {
         })
     });
 
-    let UseWindowSizeReturn { width, .. } = use_window_size();
+    let size_el = NodeRef::<leptos::html::Div>::new();
+    let UseElementSizeReturn { width, .. } = use_element_size(size_el);
     let width: Signal<f64> = signal_debounced(width, 1000.0);
+    let width = Memo::new(move |_| width()); // needed to prevent flex shake
 
     let columns: RwSignal<Vec<Column>> = RwSignal::new(vec![]);
 
@@ -147,7 +149,7 @@ pub fn Results() -> impl IntoView {
                                 <img
                                     loading="lazy"
                                     decoding="async"
-                                    class="w-full h-auto block group-hover:opacity-90"
+                                    class="w-full h-auto block group-hover:opacity-90 select-none"
                                     src=format!("/images/{}.webp", encode(&c.name))
                                 />
                             })}
@@ -224,9 +226,9 @@ pub fn Results() -> impl IntoView {
     };
 
     view! {
-        <div class="px-2 pb-8">
+        <div class="flex flex-col w-full h-full px-2 pb-8 overflow-y-auto">
             {error_view}
-            <div class="flex">
+            <div node_ref=size_el class="flex w-full">
                 <For
                     each=move || columns.get().into_iter().enumerate()
                     key=|(i, _)| *i

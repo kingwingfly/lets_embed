@@ -23,6 +23,7 @@ async fn main() -> anyhow::Result<()> {
         search_engine::Engine::new(&args.clip_text_model, &args.tokenizer, &args.dinov3_model)
             .await?,
     );
+    tracing::info!("search engine loaded");
 
     let app_state = state::AppState {
         leptos_options: leptos_options.clone(),

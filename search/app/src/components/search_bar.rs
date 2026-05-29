@@ -48,9 +48,9 @@ pub fn SearchBar() -> impl IntoView {
     view! {
         <div class="flex flex-col w-full sticky top-0 z-40 bg-black">
             <div class="flex flex-col md:flex-row w-full items-center gap-2 py-2">
-                <div class="text-white text-3xl font-bold text-center w-full md:w-1/4 max-w-64 shrink-0">
+                <a href="/" class="text-white text-3xl font-bold text-center w-full md:w-1/4 max-w-64 shrink-0">
                     "Let's Embed"
-                </div>
+                </a>
                 <form class="flex w-full items-center gap-2 px-4" on:submit=submit>
                     <div class="flex gap-1 bg-gray-800 rounded-lg p-1 shrink-0">
                         <button type="button"
@@ -87,8 +87,6 @@ pub fn SearchBar() -> impl IntoView {
             </div>
             <hr class="w-full h-1 bg-gray-200 border-0" />
         </div>
-        <div class="w-full h-full">
-            <Outlet />
-        </div>
+        <Outlet />
     }
 }

@@ -286,6 +286,7 @@ impl Engine {
             SELECT id, name, width, height
             FROM images
             WHERE id=$1
+            LIMIT 1
             "#,
             id
         )
@@ -299,10 +300,11 @@ impl Engine {
             FROM posts p
             JOIN post_images pi ON p.id=pi.post_id
             WHERE pi.image_id=$1
+            LIMIT 1
             "#,
             id
         )
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
 
         let tags = sqlx::query_as!(

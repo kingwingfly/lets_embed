@@ -12,7 +12,7 @@ leptos = { version = "0.8", features = ["nightly"] }
 leptos_meta = { version = "0.8", features = [] }
 leptos_router = { version = "0.8", features = ["nightly"] }
 leptos-use = { version = "0.18", default-features = false, features = [
-    "use_intersection_observer", "use_window_size", "signal_debounced"
+    "use_intersection_observer", "use_element_size", "signal_debounced"
 ] }
 
 search_types = { path = "../../search_types", features = ["serde"] }

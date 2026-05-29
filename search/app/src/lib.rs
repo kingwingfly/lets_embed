@@ -23,7 +23,7 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
                 <HydrationScripts options />
                 <MetaTags/>
             </head>
-            <body>
+            <body class="bg-black">
                 <App/>
             </body>
         </html>
@@ -37,7 +37,7 @@ pub fn App() -> impl IntoView {
         <Title formatter=|text| format!("{text} - Let's Embed")/>
         <Stylesheet href="/pkg/search.css"/>
         <Router>
-            <main class="bg-black min-h-screen w-screen">
+            <main class="bg-black h-screen w-screen">
                 <Routes fallback=|| "Page not found.".into_view()>
                     <ParentRoute path=path!("") view=SearchBar>
                         <Route path=path!("/details/:id") view=ImageDetails/>
