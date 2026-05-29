@@ -36,7 +36,12 @@ pub fn ImageDetails() -> impl IntoView {
         })
     };
 
-    let render_details = move |ImageDetailsData { image, post, tags }| {
+    let render_details = move |ImageDetailsData {
+                                   image,
+                                   post,
+                                   authors,
+                                   tags,
+                               }| {
         view! {
             <div class="flex flex-col md:flex-row w-full gap-3 md:gap-4 p-3 md:p-4 md:h-[72vh]">
                 <div class="w-full h-[45vh] md:h-full md:flex-1 md:min-w-0 shrink-0
@@ -65,6 +70,22 @@ pub fn ImageDetails() -> impl IntoView {
                                 flex flex-wrap content-start gap-2 p-2 bg-white/5 rounded-lg
                                 scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
                         {
+                            authors.into_iter().map(|author| {
+                                let href = format!("/?mode=author&q={}&limit=50", encode(&author.name));
+                                view! {
+                                    <a href=href>
+                                        <span class="px-3 py-1 text-xs md:text-sm font-medium text-white
+                                                    bg-gradient-to-r from-indigo-500 to-purple-500
+                                                    rounded-full shadow-sm whitespace-nowrap
+                                                    hover:scale-[1.5] transition-transform cursor-pointer">
+                                            { author.name }
+                                        </span>
+                                    </a>
+                                }
+                            })
+                            .collect_view()
+                        }
+                        {
                             tags.into_iter().map(|tag| {
                                 let href = format!("/?mode=tag&q={}&limit=50", encode(&tag.name));
                                 view! {
@@ -72,7 +93,7 @@ pub fn ImageDetails() -> impl IntoView {
                                         <span class="px-3 py-1 text-xs md:text-sm font-medium text-white
                                                     bg-gradient-to-r from-indigo-500 to-purple-500
                                                     rounded-full shadow-sm whitespace-nowrap
-                                                    hover:scale-105 transition-transform cursor-pointer">
+                                                    hover:scale-[1.5] transition-transform cursor-pointer">
                                             { tag.name }
                                         </span>
                                     </a>

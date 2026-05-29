@@ -13,7 +13,7 @@ use futures::{Stream, StreamExt as _};
 use ort::session::Session;
 use parking_lot::Mutex;
 use pgvector::HalfVector;
-use search_types::{Image, ImageDetails, Post, Tag};
+use search_types::{Author, Image, ImageDetails, Post, Tag};
 use sqlx::PgPool;
 use tokenizers::{EncodeInput, Tokenizer};
 
@@ -52,7 +52,7 @@ impl Engine {
 
     pub async fn search_post_by_author<'a>(
         &'a self,
-        author_re: impl AsRef<str>,
+        author: impl AsRef<str>,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<impl Stream<Item = Post> + Send + 'a> {
@@ -60,9 +60,9 @@ impl Engine {
             bail!("both limit and offset should >= 0")
         }
 
-        let author_re = author_re.as_ref().to_owned();
-        if author_re.is_empty() {
-            bail!("tag should not be empty")
+        let author = author.as_ref().to_owned();
+        if author.is_empty() {
+            bail!("author name should not be empty")
         }
 
         let posts = sqlx::query_as!(
@@ -72,21 +72,19 @@ impl Engine {
             pos_authors AS (
                 SELECT DISTINCT a.id AS author_id
                 FROM authors a
-                WHERE a.name ~* $1::TEXT
+                WHERE a.name ILIKE '%' || $1::TEXT || '%'
             ),
             post_match AS (
                 SELECT ap.post_id
                 FROM author_posts ap
                 JOIN pos_authors pa ON pa.author_id = ap.author_id
-                GROUP BY ap.post_id
-                HAVING count(DISTINCT pa.author_id) = (SELECT count(*) FROM pos_authors)
             )
             SELECT p.id, p.title
             FROM post_match pm
             JOIN posts p ON p.id = pm.post_id
             LIMIT $2 OFFSET $3;
             "#,
-            author_re,
+            author,
             limit,
             offset
         )
@@ -98,7 +96,7 @@ impl Engine {
 
     pub async fn search_post_by_tag<'a>(
         &'a self,
-        tag_re: impl AsRef<str>,
+        tag: impl AsRef<str>,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<impl Stream<Item = Post> + Send + 'a> {
@@ -106,8 +104,8 @@ impl Engine {
             bail!("both limit and offset should >= 0")
         }
 
-        let tag_re = tag_re.as_ref().to_owned();
-        if tag_re.is_empty() {
+        let tag = tag.as_ref().to_owned();
+        if tag.is_empty() {
             bail!("tag should not be empty")
         }
 
@@ -118,21 +116,19 @@ impl Engine {
             pos_tags AS (
                 SELECT DISTINCT t.id AS tag_id
                 FROM tags t
-                WHERE t.name ~* $1::TEXT
+                WHERE t.name ILIKE '%' || $1::TEXT || '%'
             ),
             post_match AS (
                 SELECT tp.post_id
                 FROM tag_posts tp
                 JOIN pos_tags pt ON pt.tag_id = tp.tag_id
-                GROUP BY tp.post_id
-                HAVING count(DISTINCT pt.tag_id) = (SELECT count(*) FROM pos_tags)
             )
             SELECT p.id, p.title
             FROM post_match pm
             JOIN posts p ON p.id = pm.post_id
             LIMIT $2 OFFSET $3;
             "#,
-            tag_re,
+            tag,
             limit,
             offset
         )
@@ -144,7 +140,7 @@ impl Engine {
 
     pub async fn search_image_by_tag<'a>(
         &'a self,
-        tag_re: impl AsRef<str>,
+        tag: impl AsRef<str>,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a> {
@@ -152,8 +148,8 @@ impl Engine {
             bail!("both limit and offset should >= 0")
         }
 
-        let tag_re = tag_re.as_ref().to_owned();
-        if tag_re.is_empty() {
+        let tag = tag.as_ref().to_owned();
+        if tag.is_empty() {
             bail!("tag should not be empty")
         }
 
@@ -164,15 +160,14 @@ impl Engine {
             pos_tags AS (
                 SELECT DISTINCT wt.id AS tag_id
                 FROM wd_tags wt
-                WHERE wt.name ~* $1::TEXT
-                    OR EXISTS (SELECT 1 FROM unnest(wt.translations) tr WHERE tr ~*  $1::TEXT)
+                WHERE wt.name ILIKE '%' || $1::TEXT || '%'
+                    OR EXISTS (SELECT 1 FROM unnest(wt.translations) tr WHERE tr ILIKE '%' || $1::TEXT || '%')
             ),
             img_match AS (
                 SELECT wti.image_id, MAX(wti.score) AS max_score
                 FROM wd_tag_images wti
                 JOIN pos_tags pt ON pt.tag_id = wti.wd_tag_id
                 GROUP BY wti.image_id
-                HAVING count(DISTINCT pt.tag_id) = (SELECT count(*) FROM pos_tags)
             )
             SELECT i.id, i.name, i.width, i.height
             FROM img_match im
@@ -180,7 +175,7 @@ impl Engine {
             ORDER BY im.max_score DESC
             LIMIT $2 OFFSET $3;
             "#,
-            tag_re,
+            tag,
             limit,
             offset
         )
@@ -323,6 +318,24 @@ impl Engine {
         .fetch_optional(&self.pool)
         .await?;
 
+        let authors = match post.as_ref() {
+            Some(post) => {
+                sqlx::query_as!(
+                    Author,
+                    r#"
+                    SELECT id, name
+                    FROM authors a
+                    JOIN author_posts ap ON a.id=ap.author_id
+                    WHERE ap.post_id=$1
+                    "#,
+                    &post.id
+                )
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => vec![],
+        };
+
         let tags = sqlx::query_as!(
             Tag,
             r#"
@@ -337,6 +350,11 @@ impl Engine {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(ImageDetails { image, post, tags })
+        Ok(ImageDetails {
+            image,
+            post,
+            authors,
+            tags,
+        })
     }
 }

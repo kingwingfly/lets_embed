@@ -3,7 +3,7 @@ use std::{
     sync::Arc, time::Duration,
 };
 
-use app::types::{DoneEvent, ErrorEvent, ImageItem, Mode};
+use app::types::{DoneEvent, ErrorEvent, ImageItem, Mode, PostItem};
 use axum::{
     extract::{Query, State},
     response::sse::{Event, KeepAlive, Sse},
@@ -65,7 +65,7 @@ pub async fn search_sse(
                 };
                 match res {
                     Ok(mut images) => {
-                        let mut count = 0;
+                        let mut count = 0i64;
 
                         while let Some(img) = images.next().await {
                             let item = ImageItem {
@@ -77,6 +77,43 @@ pub async fn search_sse(
                             count += 1;
                             yield Ok(Event::default()
                                 .event("image")
+                                .json_data(item)
+                                .unwrap());
+                        }
+
+                        yield Ok(Event::default()
+                            .event("done")
+                            .json_data(DoneEvent { has_more: count >= limit })
+                            .unwrap());
+                    }
+                    Err(e) => yield Ok(send_err(e.to_string())),
+                }
+            }
+            Mode::Author => {
+                match engine.search_post_by_author(q, limit, offset).await {
+                    Ok(mut posts) => {
+                        let mut count = 0;
+
+                        while let Some(post) = posts.next().await {
+                            let images = match engine.list_post_images(post.id).await {
+                                Ok(images) =>
+                                    images.into_iter().map(|img| ImageItem {
+                                        id: img.id,
+                                        name: sanitize(img.name),
+                                        width: img.width as u32,
+                                        height: img.height as u32,
+                                    })
+                                    .collect(),
+                                Err(_) => continue
+                            };
+                            let item = PostItem {
+                                id: post.id,
+                                title: sanitize(post.title),
+                                images,
+                            };
+                            count += 1;
+                            yield Ok(Event::default()
+                                .event("post")
                                 .json_data(item)
                                 .unwrap());
                         }

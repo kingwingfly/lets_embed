@@ -57,6 +57,9 @@ pub fn SearchBar() -> impl IntoView {
                             class=move || tab_cls(Mode::Tag)
                             on:click=move |_| mode.set(Mode::Tag)>"Tag"</button>
                         <button type="button"
+                            class=move || tab_cls(Mode::Author)
+                            on:click=move |_| mode.set(Mode::Author)>"Author"</button>
+                        <button type="button"
                             class=move || tab_cls(Mode::Clip)
                             on:click=move |_| mode.set(Mode::Clip)>"CLIP"</button>
                         <button type="button"
@@ -67,6 +70,7 @@ pub fn SearchBar() -> impl IntoView {
                         class="w-full bg-gray-200 rounded-lg py-2 px-4 outline-none"
                         placeholder=move || match mode.get() {
                             Mode::Tag => "Regex to match tags",
+                            Mode::Author => "Regex to match author name",
                             Mode::Clip => "Describe the image...",
                             Mode::Similar => "Image ID",
                         }

@@ -23,8 +23,16 @@ pub struct Tag {
 
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Author {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ImageDetails {
     pub image: Image,
     pub post: Option<Post>,
+    pub authors: Vec<Author>,
     pub tags: Vec<Tag>,
 }
