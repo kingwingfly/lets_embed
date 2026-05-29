@@ -51,8 +51,11 @@ pub fn SearchBar() -> impl IntoView {
                 <a href="/" class="text-white text-3xl font-bold text-center w-full md:w-1/4 max-w-64 shrink-0">
                     "Let's Embed"
                 </a>
-                <form class="flex w-full items-center gap-2 px-4" on:submit=submit>
-                    <div class="flex gap-1 bg-gray-800 rounded-lg p-1 shrink-0">
+                <form
+                    class="flex flex-col md:flex-row w-full items-stretch md:items-center gap-2 px-4"
+                    on:submit=submit
+                >
+                    <div class="flex gap-1 bg-gray-800 rounded-lg p-1 shrink-0 self-center md:self-auto">
                         <button type="button"
                             class=move || tab_cls(Mode::Tag)
                             on:click=move |_| mode.set(Mode::Tag)>"Tag"</button>
@@ -66,30 +69,32 @@ pub fn SearchBar() -> impl IntoView {
                             class=move || tab_cls(Mode::Similar)
                             on:click=move |_| mode.set(Mode::Similar)>"DINO"</button>
                     </div>
-                    <input
-                        class="w-full bg-gray-200 rounded-lg py-2 px-4 outline-none"
-                        placeholder=move || match mode.get() {
-                            Mode::Tag => "Regex to match tags",
-                            Mode::Author => "Regex to match author name",
-                            Mode::Clip => "Describe the image...",
-                            Mode::Similar => "Image ID",
-                        }
-                        prop:value=move || q_input.get()
-                        on:input=move |ev| q_input.set(event_target_value(&ev))
-                    />
-                    <input type="number" min="1"
-                        class="w-20 bg-gray-200 rounded-lg py-2 px-2 outline-none"
-                        prop:value=move || limit.get().to_string()
-                        on:change=move |ev| {
-                            if let Ok(v) = event_target_value(&ev).parse::<usize>() && v >= 1 {
-                                limit.set(v);
+                    <div class="flex w-full items-center gap-2 min-w-0">
+                        <input
+                            class="w-full min-w-0 bg-gray-200 rounded-lg py-2 px-4 outline-none"
+                            placeholder=move || match mode.get() {
+                                Mode::Tag => "Regex to match tags",
+                                Mode::Author => "Regex to match author name",
+                                Mode::Clip => "Describe the image...",
+                                Mode::Similar => "Image ID",
                             }
-                        }
-                    />
-                    <button type="submit"
-                        class="shrink-0 bg-gray-500 text-white rounded-lg py-2 px-4 hover:bg-gray-400">
-                        "Search"
-                    </button>
+                            prop:value=move || q_input.get()
+                            on:input=move |ev| q_input.set(event_target_value(&ev))
+                        />
+                        <input type="number" min="1"
+                            class="w-16 sm:w-20 shrink-0 bg-gray-200 rounded-lg py-2 px-2 outline-none"
+                            prop:value=move || limit.get().to_string()
+                            on:change=move |ev| {
+                                if let Ok(v) = event_target_value(&ev).parse::<usize>() && v >= 1 {
+                                    limit.set(v);
+                                }
+                            }
+                        />
+                        <button type="submit"
+                            class="shrink-0 bg-gray-500 text-white rounded-lg py-2 px-4 hover:bg-gray-400">
+                            "Search"
+                        </button>
+                    </div>
                 </form>
             </div>
             <hr class="w-full h-1 bg-gray-200 border-0" />
