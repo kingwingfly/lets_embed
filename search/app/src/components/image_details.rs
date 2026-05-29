@@ -1,6 +1,6 @@
 use crate::{
-    components::{Results, Viewer},
-    types::ImageItem,
+    components::{Lightbox, Results, Viewer},
+    types::{ImageItem, PostItem},
 };
 
 use leptos::prelude::*;
@@ -23,11 +23,32 @@ pub fn ImageDetails() -> impl IntoView {
             .post
             .map(|p| p.id)
             .ok_or("this image belongs to no post".to_string())?;
-        list_post_images(post_id).await.map_err(|e| e.to_string())
+        list_post_images(post_id)
+            .await
+            .map_err(|e| e.to_string())
+            .map(|images| {
+                images
+                    .into_iter()
+                    .map(|image| ImageItem {
+                        id: image.id,
+                        name: image.name.clone(),
+                        width: image.width as u32,
+                        height: image.height as u32,
+                    })
+                    .collect::<Vec<_>>()
+            })
     });
 
+    let lightbox: RwSignal<Option<PostItem>> = RwSignal::new(None);
     let viewer: RwSignal<Option<ImageItem>> = RwSignal::new(None);
 
+    let lightbox_view = move || {
+        lightbox.get().map(|post| {
+            view! {
+                <Lightbox post lightbox viewer />
+            }
+        })
+    };
     let viewer_view = move || {
         viewer.get().map(|image| {
             view! {
@@ -58,11 +79,22 @@ pub fn ImageDetails() -> impl IntoView {
                 <div class="w-full md:w-96 lg:w-[28rem] xl:w-[32rem] md:shrink-0
                             md:h-full flex flex-col gap-3 md:min-h-0">
                     {
-                        post.map(|post| view! {
-                            <div class="text-white text-xl md:text-2xl font-bold text-center shrink-0
-                                        px-3 py-2 md:py-3 bg-white/10 rounded-lg line-clamp-2">
-                                { post.title }
-                            </div>
+                        post.map(|post| {
+                            let post_item = post_images.get().map(|images| {
+                                PostItem {
+                                    id: post.id,
+                                    title: post.title.clone(),
+                                    images: images.unwrap_or_default()
+                                }
+                            });
+                            view! {
+                                <div class="text-white text-xl md:text-2xl font-bold text-center shrink-0
+                                            px-3 py-2 md:py-3 bg-white/10 rounded-lg line-clamp-2 cursor-pointer"
+                                    on:click=move |_| lightbox.set(post_item.clone())
+                                >
+                                    { post.title }
+                                </div>
+                            }
                         })
                     }
 
@@ -124,9 +156,7 @@ pub fn ImageDetails() -> impl IntoView {
                                                                 transition-all"
                                                         src=format!("/images/{}.webp", encode(&image.name))
                                                         alt=image.name.clone()
-                                                        on:click=move |_| viewer.set(Some(ImageItem
-                                                            { id: image.id, name: image.name.clone(), width: image.width as u32, height: image.height as u32 }
-                                                        ))
+                                                        on:click=move |_| viewer.set(Some(image.clone()))
                                                     />
                                                 })
                                                 .collect_view()
@@ -163,6 +193,7 @@ pub fn ImageDetails() -> impl IntoView {
                 <Results />
             </div>
 
+            {lightbox_view}
             {viewer_view}
         </div>
     }
