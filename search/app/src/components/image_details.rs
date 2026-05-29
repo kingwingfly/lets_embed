@@ -10,9 +10,10 @@ pub fn ImageDetails() -> impl IntoView {
     let params = use_params_map();
     let id = move || params.with(|p| p.get("id"));
 
-    let details = Resource::new(id, async |id| {
-        fetch_image_details(id).await.map_err(|e| e.to_string())
-    });
+    let details =
+        OnceResource::new(
+            async move { fetch_image_details(id()).await.map_err(|e| e.to_string()) },
+        );
 
     view! {
         <div class="flex flex-col md:flex-row w-full h-full">

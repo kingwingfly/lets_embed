@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "ssr", allow(unused))]
+
 use std::iter::repeat_with;
 
 use crate::{
@@ -100,8 +102,10 @@ pub fn Results() -> impl IntoView {
     let lightbox: RwSignal<Option<PostItem>> = RwSignal::new(None);
     let viewer: RwSignal<Option<ImageItem>> = RwSignal::new(None);
 
+    #[cfg(feature = "hydrate")]
     let active: StoredValue<Option<ActiveSse>, LocalStorage> = StoredValue::new_local(None);
 
+    #[cfg(feature = "hydrate")]
     Effect::new(move |_| {
         let _ = params.get();
         columns.update(|cs| {
@@ -118,6 +122,7 @@ pub fn Results() -> impl IntoView {
 
     let sentinel = NodeRef::<leptos::html::Div>::new();
 
+    #[cfg(feature = "hydrate")]
     use_intersection_observer(sentinel, move |entries, _| {
         if !entries[0].is_intersecting() || loading.get_untracked() || !has_more.get_untracked() {
             return;
