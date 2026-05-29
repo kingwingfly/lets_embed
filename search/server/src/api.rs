@@ -1,4 +1,7 @@
-use std::{convert::Infallible, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet, convert::Infallible, fs::File, io::BufReader, path::PathBuf, pin::Pin,
+    sync::Arc, time::Duration,
+};
 
 use app::types::{DoneEvent, ErrorEvent, ImageItem, Mode};
 use axum::{
@@ -31,6 +34,7 @@ fn default_limit() -> i64 {
 
 pub async fn search_sse(
     State(engine): State<Arc<Engine>>,
+    State(path): State<Arc<PathBuf>>,
     Query(p): Query<SearchParams>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mode = Mode::parse(&p.mode);
@@ -83,9 +87,62 @@ pub async fn search_sse(
                             .json_data(DoneEvent { has_more })
                             .unwrap());
                     }
-                    Err(e) => {
-                        yield Ok(send_err(e.to_string()));
+                    Err(e) => yield Ok(send_err(e.to_string())),
+                }
+            }
+            Mode::Similar => {
+                match q.parse::<i64>() {
+                    Ok(id) => {
+                        match engine.image_details(id).await {
+                            Ok(details) => {
+                                let post_images = match details.post.map(|p| p.id) {
+                                    Some(post_id) => engine.list_post_images(post_id).await.ok(),
+                                    None => None
+                                };
+                                let post_image_ids = post_images.map(|post_images| post_images.into_iter().map(|i| i.id).collect::<HashSet<_>>());
+                                let mut path = (*path).to_owned();
+                                path.push(sanitize(details.image.name));
+                                path.add_extension("webp");
+                                match File::open(path) {
+                                    Ok(file) => {
+                                        let reader = BufReader::new(file);
+                                        match engine.search_dinov3([reader], limit, offset).await {
+                                            Ok(mut images) => {
+                                                let mut count = 0;
+
+                                                while let Some(img) = images.next().await {
+                                                    count += 1;
+                                                    if post_image_ids.as_ref().is_some_and(|ids| ids.contains(&img.id)) {
+                                                        continue;
+                                                    }
+                                                    let item = ImageItem {
+                                                        id: img.id,
+                                                        name: sanitize(img.name),
+                                                        width: img.width as u32,
+                                                        height: img.height as u32,
+                                                    };
+                                                    yield Ok(Event::default()
+                                                        .event("image")
+                                                        .json_data(item)
+                                                        .unwrap());
+                                                }
+
+                                                let has_more = (count as i64) >= limit;
+                                                yield Ok(Event::default()
+                                                    .event("done")
+                                                    .json_data(DoneEvent { has_more })
+                                                    .unwrap());
+                                            }
+                                            Err(e) => yield Ok(send_err(e.to_string())),
+                                        }
+                                    },
+                                    Err(e) => yield Ok(send_err(e.to_string())),
+                                }
+                            }
+                            Err(e) => yield Ok(send_err(e.to_string())),
+                        }
                     }
+                    Err(e) => yield Ok(send_err(e.to_string())),
                 }
             }
             _ => {}

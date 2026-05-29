@@ -1,8 +1,11 @@
-use crate::components::Results;
+use crate::{
+    components::{Results, Viewer},
+    types::ImageItem,
+};
 
 use leptos::prelude::*;
 use leptos_router::hooks::use_params_map;
-use search_types::ImageDetails as ImageDetailsData;
+use search_types::{Image, ImageDetails as ImageDetailsData};
 use urlencoding::encode;
 
 #[component]
@@ -14,40 +17,132 @@ pub fn ImageDetails() -> impl IntoView {
         OnceResource::new(
             async move { fetch_image_details(id()).await.map_err(|e| e.to_string()) },
         );
+    let post_images = OnceResource::new(async move {
+        let details = details.await?;
+        let post_id = details
+            .post
+            .map(|p| p.id)
+            .ok_or("this image belongs to no post".to_string())?;
+        list_post_images(post_id).await.map_err(|e| e.to_string())
+    });
 
-    let render_details = |ImageDetailsData { image, post, tags }| {
-        let src = format!("/images/{}.webp", encode(&image.name));
+    let viewer: RwSignal<Option<ImageItem>> = RwSignal::new(None);
+
+    let viewer_view = move || {
+        viewer.get().map(|image| {
+            view! {
+                <Viewer image viewer />
+            }
+        })
+    };
+
+    let render_details = move |ImageDetailsData { image, post, tags }| {
         view! {
-            <div class="flex flex-col w-full h-full min-h-0 overflow-hidden">
-                {
-                    post.map(|post| view! {<div class="text-white text-2xl font-bold text-center shrink-0">{ post.title }</div>})
-                }
-                <img
-                    loading="lazy"
-                    decoding="async"
-                    class="flex-1 min-h-0 w-full object-contain bg-gray-900 select-none"
-                    src=src
-                    alt=image.name
-                />
+            <div class="flex flex-col md:flex-row w-full gap-3 md:gap-4 p-3 md:p-4 md:h-[72vh]">
+                <div class="w-full h-[45vh] md:h-full md:flex-1 md:min-w-0 shrink-0
+                            flex items-center justify-center bg-black/30 rounded-lg overflow-hidden">
+                    <img
+                        loading="lazy"
+                        decoding="async"
+                        class="max-w-full max-h-full object-contain select-none"
+                        src=format!("/images/{}.webp", encode(&image.name))
+                        alt=image.name
+                    />
+                </div>
+
+                <div class="w-full md:w-96 lg:w-[28rem] xl:w-[32rem] md:shrink-0
+                            md:h-full flex flex-col gap-3 md:min-h-0">
+                    {
+                        post.map(|post| view! {
+                            <div class="text-white text-xl md:text-2xl font-bold text-center shrink-0
+                                        px-3 py-2 md:py-3 bg-white/10 rounded-lg line-clamp-2">
+                                { post.title }
+                            </div>
+                        })
+                    }
+
+                    <div class="shrink-0 max-h-24 md:max-h-32 overflow-y-auto
+                                flex flex-wrap content-start gap-2 p-2 bg-white/5 rounded-lg
+                                scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
+                        {
+                            tags.into_iter().map(|tag| {
+                                let href = format!("/?mode=tag&q={}&limit=50", encode(&tag.name));
+                                view! {
+                                    <a href=href>
+                                        <span class="px-3 py-1 text-xs md:text-sm font-medium text-white
+                                                    bg-gradient-to-r from-indigo-500 to-purple-500
+                                                    rounded-full shadow-sm whitespace-nowrap
+                                                    hover:scale-105 transition-transform cursor-pointer">
+                                            { tag.name }
+                                        </span>
+                                    </a>
+                                }
+                            })
+                            .collect_view()
+                        }
+                    </div>
+
+                    <Transition fallback=move || view! { <div class="flex-1 min-h-0" /> }>
+                        {
+                            move || {
+                                post_images.get().map(|images| match images {
+                                    Ok(images) => view! {
+                                        <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-2 lg:grid-cols-3
+                                                gap-2 pr-1
+                                                max-h-[40vh] overflow-y-auto
+                                                md:max-h-none md:flex-1 md:min-h-0
+                                                scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
+                                            {
+                                                images.into_iter().map(|image| view! {
+                                                    <img
+                                                        loading="lazy"
+                                                        decoding="async"
+                                                        class="w-full aspect-square object-cover rounded-md
+                                                                select-none cursor-zoom-in
+                                                                hover:opacity-80 hover:scale-[1.02]
+                                                                transition-all"
+                                                        src=format!("/images/{}.webp", encode(&image.name))
+                                                        alt=image.name.clone()
+                                                        on:click=move |_| viewer.set(Some(ImageItem
+                                                            { id: image.id, name: image.name.clone(), width: image.width as u32, height: image.height as u32 }
+                                                        ))
+                                                    />
+                                                })
+                                                .collect_view()
+                                            }
+                                        </div>
+                                    }.into_any(),
+                                    Err(e) => e.to_string().into_any(),
+                                })
+                            }
+                        }
+                    </Transition>
+                </div>
             </div>
         }
     };
 
     view! {
-        <div class="grid md:grid-cols-2 w-full h-full">
-            <Transition fallback=move || view! { <div class="w-full h-full" /> }>
+        <div class="w-full min-h-full flex flex-col">
+            <Transition fallback=move || view! { <div class="w-full" style="height: 72vh;" /> }>
                 {
                     move || {
-                        details.get().map(|details|
-                            match details {
-                                Ok(details) => render_details(details).into_any(),
-                                Err(e) => e.to_string().into_any(),
-                            }
-                        )
+                        details.get().map(|details| match details {
+                            Ok(details) => render_details(details).into_any(),
+                            Err(e) => view! {
+                                <div class="text-red-400 p-4">{ e.to_string() }</div>
+                            }.into_any(),
+                        })
                     }
                 }
             </Transition>
-            <Results />
+
+            <div class="w-full px-3 md:px-4 pb-4 mt-2">
+                <h2 class="text-white text-lg md:text-xl font-semibold mb-3">"Similar"</h2>
+                <Results />
+            </div>
+
+            {viewer_view}
         </div>
     }
 }
@@ -71,6 +166,25 @@ async fn fetch_image_details(id: Option<String>) -> Result<ImageDetailsData, Ser
 
     engine
         .image_details(id)
+        .await
+        .map_err(|e| ServerFnError::Response(e.to_string()))
+}
+
+#[server]
+async fn list_post_images(post_id: i64) -> Result<Vec<Image>, ServerFnError> {
+    use crate::state::AppState;
+
+    use std::sync::Arc;
+
+    use axum::extract::State;
+    use leptos_axum::extract_with_state;
+    use search_engine::Engine;
+
+    let state = expect_context::<AppState>();
+    let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
+
+    engine
+        .list_post_images(post_id)
         .await
         .map_err(|e| ServerFnError::Response(e.to_string()))
 }

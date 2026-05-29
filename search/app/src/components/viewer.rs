@@ -6,7 +6,7 @@ use crate::types::ImageItem;
 #[component]
 pub fn Viewer(image: ImageItem, viewer: RwSignal<Option<ImageItem>>) -> impl IntoView {
     let src = format!("/images/{}.webp", encode(&image.name));
-    let href = format!("/details/{}", image.id);
+    let href = format!("/details/{id}?mode=similar&q={id}&limit=50", id = image.id);
     view! {
         <div
             class="fixed inset-0 bg-black/95 z-[60] grid place-items-center cursor-zoom-out p-2"

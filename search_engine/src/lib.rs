@@ -279,6 +279,22 @@ impl Engine {
         Ok(res)
     }
 
+    pub async fn list_post_images(&self, post_id: i64) -> anyhow::Result<Vec<Image>> {
+        sqlx::query_as!(
+            Image,
+            r#"
+            SELECT id, name, width, height
+            FROM images i
+            JOIN post_images pi ON i.id=pi.image_id
+            WHERE pi.post_id=$1
+            "#,
+            post_id
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
     pub async fn image_details(&self, id: i64) -> anyhow::Result<ImageDetails> {
         let image = sqlx::query_as!(
             Image,

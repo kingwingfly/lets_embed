@@ -50,6 +50,7 @@ pub fn Results() -> impl IntoView {
     let size_el = NodeRef::<leptos::html::Div>::new();
     let UseElementSizeReturn { width, .. } = use_element_size(size_el);
     let width: Signal<f64> = signal_debounced(width, 250.0);
+    let width = Memo::new(move |_| width());
 
     let columns: RwSignal<Vec<Column>> = RwSignal::new(vec![]);
 
@@ -148,7 +149,7 @@ pub fn Results() -> impl IntoView {
                                 <img
                                     loading="lazy"
                                     decoding="async"
-                                    class="w-full h-auto block group-hover:opacity-90 select-none"
+                                    class="w-full h-auto block bg-gray-900 select-none hover:opacity-80 hover:scale-[1.02] transition-all"
                                     src=format!("/images/{}.webp", encode(&c.name))
                                 />
                             })}
@@ -166,11 +167,11 @@ pub fn Results() -> impl IntoView {
             Item::Image(im) => {
                 let url = format!("/images/{}.webp", encode(&im.name));
                 view! {
-                    <div class="mb-2 break-inside-avoid">
+                    <div class="m-1">
                         <img
                             loading="lazy"
                             decoding="async"
-                            class="w-full h-auto block bg-gray-900 cursor-zoom-in"
+                            class="w-full h-auto block bg-gray-900 cursor-zoom-in select-none hover:opacity-80 hover:scale-[1.02] transition-all"
                             src=url
                             on:click=move |_| viewer.set(Some(im.clone()))
                         />
@@ -184,7 +185,7 @@ pub fn Results() -> impl IntoView {
     let error_view = move || {
         error.get().map(|e| {
             view! {
-                <div class="w-full h-fit text-red-400 p-4 text-center">
+                <div class="w-full text-red-400 p-4 text-center">
                     {format!("Error: {e}")}
                 </div>
             }
@@ -194,7 +195,7 @@ pub fn Results() -> impl IntoView {
     let loading_view = move || {
         loading.get().then(|| {
             view! {
-                <div class="w-full h-fit text-gray-400 p-4 text-center">"Loading..."</div>
+                <div class="w-full text-gray-400 p-4 text-center">"Loading..."</div>
             }
         })
     };
@@ -203,7 +204,7 @@ pub fn Results() -> impl IntoView {
         (!loading.get() && !has_more.get() && !columns.read().iter().all(|c| c.items.is_empty()))
             .then(|| {
                 view! {
-                    <div class="w-full h-fit text-gray-500 p-4 text-center">"-- End --"</div>
+                    <div class="w-full text-gray-500 p-4 text-center">"-- End --"</div>
                 }
             })
     };
@@ -225,7 +226,7 @@ pub fn Results() -> impl IntoView {
     };
 
     view! {
-        <div node_ref=size_el class="w-full h-full flex flex-col overflow-y-auto">
+        <div node_ref=size_el class="w-full flex flex-col">
             {error_view}
             <div class="flex w-full h-fit">
                 <For

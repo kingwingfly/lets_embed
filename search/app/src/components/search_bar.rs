@@ -59,13 +59,16 @@ pub fn SearchBar() -> impl IntoView {
                         <button type="button"
                             class=move || tab_cls(Mode::Clip)
                             on:click=move |_| mode.set(Mode::Clip)>"CLIP"</button>
+                        <button type="button"
+                            class=move || tab_cls(Mode::Similar)
+                            on:click=move |_| mode.set(Mode::Similar)>"DINO"</button>
                     </div>
                     <input
                         class="w-full bg-gray-200 rounded-lg py-2 px-4 outline-none"
                         placeholder=move || match mode.get() {
-                            Mode::Tag => "regex to match tags",
+                            Mode::Tag => "Regex to match tags",
                             Mode::Clip => "Describe the image...",
-                            _ => "Describe the image...",
+                            Mode::Similar => "Image ID",
                         }
                         prop:value=move || q_input.get()
                         on:input=move |ev| q_input.set(event_target_value(&ev))
