@@ -37,7 +37,7 @@ pub fn App() -> impl IntoView {
         <Title formatter=|text| format!("{text} - Let's Embed")/>
         <Stylesheet href="/pkg/search.css"/>
         <Router>
-            <main class="bg-black h-screen w-screen">
+            <main class="bg-black h-screen w-screen max-h-screen max-w-screen">
                 <Routes fallback=|| "Page not found.".into_view()>
                     <ParentRoute path=path!("") view=SearchBar>
                         <Route path=path!("/details/:id") view=ImageDetails/>

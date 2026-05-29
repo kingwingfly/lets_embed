@@ -49,14 +49,13 @@ pub fn Results() -> impl IntoView {
 
     let size_el = NodeRef::<leptos::html::Div>::new();
     let UseElementSizeReturn { width, .. } = use_element_size(size_el);
-    let width: Signal<f64> = signal_debounced(width, 1000.0);
-    let width = Memo::new(move |_| width()); // needed to prevent flex shake
+    let width: Signal<f64> = signal_debounced(width, 250.0);
 
     let columns: RwSignal<Vec<Column>> = RwSignal::new(vec![]);
 
     Effect::new(move || {
         let width = width();
-        let column_count = ((width / COLUMN_WIDTH as f64).round() as usize).min(16);
+        let column_count = ((width / COLUMN_WIDTH as f64).round() as usize).max(1);
         let column_width = (width / column_count as f64).round() as u32;
         let mut new = repeat_with(|| Column {
             items: vec![],
@@ -185,7 +184,7 @@ pub fn Results() -> impl IntoView {
     let error_view = move || {
         error.get().map(|e| {
             view! {
-                <div class="text-red-400 p-4 text-center">
+                <div class="w-full h-fit text-red-400 p-4 text-center">
                     {format!("Error: {e}")}
                 </div>
             }
@@ -195,7 +194,7 @@ pub fn Results() -> impl IntoView {
     let loading_view = move || {
         loading.get().then(|| {
             view! {
-                <div class="text-gray-400 p-4 text-center">"Loading..."</div>
+                <div class="w-full h-fit text-gray-400 p-4 text-center">"Loading..."</div>
             }
         })
     };
@@ -204,7 +203,7 @@ pub fn Results() -> impl IntoView {
         (!loading.get() && !has_more.get() && !columns.read().iter().all(|c| c.items.is_empty()))
             .then(|| {
                 view! {
-                    <div class="text-gray-500 p-4 text-center">"-- End --"</div>
+                    <div class="w-full h-fit text-gray-500 p-4 text-center">"-- End --"</div>
                 }
             })
     };
@@ -226,9 +225,9 @@ pub fn Results() -> impl IntoView {
     };
 
     view! {
-        <div class="flex flex-col w-full h-full px-2 pb-8 overflow-y-auto">
+        <div node_ref=size_el class="w-full h-full flex flex-col overflow-y-auto">
             {error_view}
-            <div node_ref=size_el class="flex w-full">
+            <div class="flex w-full h-fit">
                 <For
                     each=move || columns.get().into_iter().enumerate()
                     key=|(i, _)| *i
@@ -254,7 +253,7 @@ pub fn Results() -> impl IntoView {
                 </For>
             </div>
 
-            <div node_ref=sentinel class="h-10 w-full"></div>
+            <div node_ref=sentinel class="w-full min-h-10"></div>
 
             {loading_view}
             {end_view}

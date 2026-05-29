@@ -8,7 +8,7 @@ use urlencoding::encode;
 #[component]
 pub fn ImageDetails() -> impl IntoView {
     let params = use_params_map();
-    let id = move || params.with(|p| p.get("id"));
+    let id = Memo::new(move |_| params.with(|p| p.get("id")));
 
     let details =
         OnceResource::new(
@@ -18,14 +18,14 @@ pub fn ImageDetails() -> impl IntoView {
     let render_details = |ImageDetailsData { image, post, tags }| {
         let src = format!("/images/{}.webp", encode(&image.name));
         view! {
-            <div class="w-full h-full">
+            <div class="flex flex-col w-full h-full min-h-0 overflow-hidden">
                 {
-                    post.map(|post| view! {<div class="text-white text-2xl font-bold text-center">{ post.title }</div>})
+                    post.map(|post| view! {<div class="text-white text-2xl font-bold text-center shrink-0">{ post.title }</div>})
                 }
                 <img
                     loading="lazy"
                     decoding="async"
-                    class="flex-1 object-contain bg-gray-900 select-none"
+                    class="flex-1 min-h-0 w-full object-contain bg-gray-900 select-none"
                     src=src
                     alt=image.name
                 />
@@ -35,7 +35,7 @@ pub fn ImageDetails() -> impl IntoView {
 
     view! {
         <div class="grid md:grid-cols-2 w-full h-full">
-            <Transition fallback=move || "fetching image details".into_view()>
+            <Transition fallback=move || view! { <div class="w-full h-full" /> }>
                 {
                     move || {
                         details.get().map(|details|

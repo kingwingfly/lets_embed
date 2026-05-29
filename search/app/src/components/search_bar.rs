@@ -46,7 +46,7 @@ pub fn SearchBar() -> impl IntoView {
     };
 
     view! {
-        <div class="flex flex-col w-full sticky top-0 z-40 bg-black">
+        <div class="flex flex-col w-full h-fit sticky top-0 z-40 bg-black">
             <div class="flex flex-col md:flex-row w-full items-center gap-2 py-2">
                 <a href="/" class="text-white text-3xl font-bold text-center w-full md:w-1/4 max-w-64 shrink-0">
                     "Let's Embed"
