@@ -134,6 +134,7 @@ dependencies = [
  "leptos_axum",
  "leptos_meta",
  "leptos_router",
+ "sanitize-filename",
  "search_engine",
  "search_types",
  "serde",
