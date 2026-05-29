@@ -56,7 +56,7 @@ pub fn Results() -> impl IntoView {
 
     Effect::new(move || {
         let width = width();
-        let column_count = ((width / COLUMN_WIDTH as f64).round() as usize).max(1);
+        let column_count = ((width / COLUMN_WIDTH as f64).round() as usize).max(2);
         let column_width = (width / column_count as f64).round() as u32;
         let mut new = repeat_with(|| Column {
             items: vec![],

@@ -73,8 +73,8 @@ pub fn SearchBar() -> impl IntoView {
                         <input
                             class="w-full min-w-0 bg-gray-200 rounded-lg py-2 px-4 outline-none"
                             placeholder=move || match mode.get() {
-                                Mode::Tag => "Regex to match tags",
-                                Mode::Author => "Regex to match author name",
+                                Mode::Tag => "One tag",
+                                Mode::Author => "One author name",
                                 Mode::Clip => "Describe the image...",
                                 Mode::Similar => "Image ID",
                             }
