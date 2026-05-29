@@ -1,7 +1,4 @@
-use std::{
-    collections::HashSet, convert::Infallible, fs::File, io::BufReader, path::PathBuf, pin::Pin,
-    sync::Arc, time::Duration,
-};
+use std::{collections::HashSet, convert::Infallible, pin::Pin, sync::Arc, time::Duration};
 
 use app::types::{DoneEvent, ErrorEvent, ImageItem, Mode, PostItem};
 use axum::{
@@ -34,7 +31,6 @@ fn default_limit() -> i64 {
 
 pub async fn search_sse(
     State(engine): State<Arc<Engine>>,
-    State(path): State<Arc<PathBuf>>,
     Query(p): Query<SearchParams>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mode = Mode::parse(&p.mode);
@@ -92,7 +88,7 @@ pub async fn search_sse(
             Mode::Author => {
                 match engine.search_post_by_author(q, limit, offset).await {
                     Ok(mut posts) => {
-                        let mut count = 0;
+                        let mut count = 0i64;
 
                         while let Some(post) = posts.next().await {
                             let images = match engine.list_post_images(post.id).await {
@@ -118,10 +114,9 @@ pub async fn search_sse(
                                 .unwrap());
                         }
 
-                        let has_more = (count as i64) >= limit;
                         yield Ok(Event::default()
                             .event("done")
-                            .json_data(DoneEvent { has_more })
+                            .json_data(DoneEvent { has_more: count >= limit })
                             .unwrap());
                     }
                     Err(e) => yield Ok(send_err(e.to_string())),
@@ -141,14 +136,8 @@ pub async fn search_sse(
                         None => None,
                     };
 
-                    let mut path = (*path).to_owned();
-                    path.push(sanitize(details.image.name));
-                    path.add_extension("webp");
-
-                    let file = File::open(&path).map_err(|e| e.to_string())?;
-                    let reader = BufReader::new(file);
                     let images = engine
-                        .search_dinov3([reader], limit, offset)
+                        .search_dinov3_by_id([id], limit, offset)
                         .await
                         .map_err(|e| e.to_string())?;
 
