@@ -88,7 +88,13 @@ pub fn ImageDetails() -> impl IntoView {
                         decoding="async"
                         class="max-w-full max-h-full object-contain select-none"
                         src=format!("/images/{}.webp", encode(&image.name))
-                        alt=image.name
+                        alt=image.name.clone()
+                        on:click=move |_| viewer.set(Some(ImageItem {
+                            id: image.id,
+                            name: image.name.clone(),
+                            width: image.width as u32,
+                            height: image.height as u32,
+                        }))
                     />
                 </div>
 
