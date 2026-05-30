@@ -57,8 +57,8 @@ pub fn ImageDetails() -> impl IntoView {
         })
     };
 
-    let render_pill = |name, mode, gradient| {
-        let href = format!("/?mode={}&q={}&limit=50", mode, encode(name));
+    let render_pill = |name: String, mode, gradient| {
+        let href = format!("/?mode={}&q={}&limit=50", mode, encode(name.as_str()));
         let class = format!(
             "inline-block px-3 py-1 text-xs md:text-sm font-medium text-white \
              bg-gradient-to-r {} \
@@ -119,13 +119,13 @@ pub fn ImageDetails() -> impl IntoView {
                                 scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
                         {
                             authors.into_iter().map(|author|
-                                render_pill(&author.name, "author", "from-sky-500 to-cyan-500")
+                                render_pill(author.name, "author", "from-sky-500 to-cyan-500")
                             )
                             .collect_view()
                         }
                         {
                             tags.into_iter().map(|tag| {
-                                render_pill(&tag.name, "tag", "from-indigo-500 to-purple-500")
+                                render_pill(tag.name, "tag", "from-indigo-500 to-purple-500")
                             })
                             .collect_view()
                         }
