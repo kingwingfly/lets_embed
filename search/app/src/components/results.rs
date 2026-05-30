@@ -1,12 +1,10 @@
-#![cfg_attr(feature = "ssr", allow(unused))]
-
 use std::iter::repeat_with;
 
 use crate::{
     components::{lightbox::Lightbox, viewer::Viewer},
     types::{DoneEvent, ErrorEvent, ImageItem, Mode, PostItem},
 };
-use leptos::prelude::*;
+use leptos::{prelude::*, reactive::send_wrapper_ext::SendOption};
 use leptos_router::hooks::use_query_map;
 use leptos_use::{
     UseElementSizeReturn, signal_debounced, use_element_size, use_intersection_observer,
@@ -104,10 +102,8 @@ pub fn Results() -> impl IntoView {
     let lightbox: RwSignal<Option<PostItem>> = RwSignal::new(None);
     let viewer: RwSignal<Option<ImageItem>> = RwSignal::new(None);
 
-    #[cfg(feature = "hydrate")]
-    let active: StoredValue<Option<ActiveSse>, LocalStorage> = StoredValue::new_local(None);
+    let active: StoredValue<SendOption<ActiveSse>> = StoredValue::new(SendOption::new_local(None));
 
-    #[cfg(feature = "hydrate")]
     Effect::new(move |_| {
         let _ = params.get();
         columns.update(|cs| {
@@ -124,7 +120,6 @@ pub fn Results() -> impl IntoView {
 
     let sentinel = NodeRef::<leptos::html::Div>::new();
 
-    #[cfg(feature = "hydrate")]
     use_intersection_observer(sentinel, move |entries, _| {
         if !entries[0].is_intersecting() || loading.get_untracked() || !has_more.get_untracked() {
             return;
@@ -287,14 +282,14 @@ fn load_page(
     has_more: RwSignal<bool>,
     loading: RwSignal<bool>,
     error: RwSignal<Option<String>>,
-    active: StoredValue<Option<ActiveSse>, LocalStorage>,
+    active: StoredValue<SendOption<ActiveSse>>,
 ) {
     let (mode, q, limit) = params.get_untracked();
     if q.trim().is_empty() {
         return;
     }
 
-    active.update_value(|v| *v = None);
+    active.set_value(SendOption::new_local(None));
 
     let url = format!(
         "/api/search?mode={}&q={}&limit={}&offset={}",
@@ -369,7 +364,7 @@ fn load_page(
             .unwrap_or(DoneEvent { has_more: false });
         has_more.set(d.has_more);
         loading.set(false);
-        active.set_value(None);
+        active.set_value(SendOption::new_local(None));
     }) as Box<dyn FnMut(_)>);
     es.add_event_listener_with_callback("done", cb.as_ref().unchecked_ref())
         .ok();
@@ -386,7 +381,7 @@ fn load_page(
         error.set(Some(msg));
         loading.set(false);
         has_more.set(false);
-        active.set_value(None);
+        active.set_value(SendOption::new_local(None));
     }) as Box<dyn FnMut(_)>);
     es.add_event_listener_with_callback("error", cb.as_ref().unchecked_ref())
         .ok();
@@ -402,5 +397,5 @@ fn load_page(
         _closures: closures,
         _err_closure: onerror,
     };
-    active.update_value(|v| *v = Some(new_sse));
+    active.set_value(SendOption::new_local(Some(new_sse)));
 }
