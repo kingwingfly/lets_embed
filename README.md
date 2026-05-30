@@ -28,7 +28,7 @@ ORT_CUDA_VERSION=13 ORT_DYLIB_PATH=/path/to/libonnxruntime.so cargo run --exampl
 ORT_CUDA_VERSION=13 ORT_DYLIB_PATH=/path/to/libonnxruntime.so cargo run --example infer_tag
 ```
 
-# Distribute infer
+# Distributed inference
 
 Based on `wd-tagger`, `dinov3` and `siglip2`, the tags and vision embeddings are stored into db.
 
@@ -65,7 +65,7 @@ Visit `127.0.0.1:4000/dashboard` to see the training process.
 
 Moreover, `greptime db` [dashboard config file](assets/dashboard.json) is provided.
 
-# Wd-tags Translation (zh_CN for example)
+# Wd-tags Translation
 
 Add translations/alias_names to wd_tags.
 
