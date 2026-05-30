@@ -144,6 +144,7 @@ pub fn Results() -> impl IntoView {
                                 <img
                                     loading="lazy"
                                     decoding="async"
+                                    style=format!("aspect-ratio: {} / {}", c.width, c.height)
                                     class="w-full h-auto block bg-gray-900 select-none hover:opacity-80 hover:scale-[1.02] transition-all"
                                     src=format!("/images/{}.webp", encode(&c.name))
                                 />
@@ -166,6 +167,7 @@ pub fn Results() -> impl IntoView {
                         <img
                             loading="lazy"
                             decoding="async"
+                            style=format!("aspect-ratio: {} / {}", im.width, im.height)
                             class="w-full h-auto block bg-gray-900 cursor-zoom-in select-none hover:opacity-80 hover:scale-[1.02] transition-all"
                             src=url
                             on:click=move |_| viewer.set(Some(im.clone()))
