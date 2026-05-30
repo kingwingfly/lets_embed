@@ -57,6 +57,22 @@ pub fn ImageDetails() -> impl IntoView {
         })
     };
 
+    let render_pill = |name, mode, gradient| {
+        let href = format!("/?mode={}&q={}&limit=50", mode, encode(name));
+        let class = format!(
+            "inline-block px-3 py-1 text-xs md:text-sm font-medium text-white \
+             bg-gradient-to-r {} \
+             rounded-full shadow-sm whitespace-nowrap \
+             hover:scale-[1.1] transition-transform cursor-pointer",
+            gradient
+        );
+        view! {
+            <a href=href>
+                <span class=class>{ name }</span>
+            </a>
+        }
+    };
+
     let render_details = move |ImageDetailsData {
                                    image,
                                    post,
@@ -102,34 +118,14 @@ pub fn ImageDetails() -> impl IntoView {
                                 flex flex-wrap content-start gap-2 p-2 bg-white/5 rounded-lg
                                 scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
                         {
-                            authors.into_iter().map(|author| {
-                                let href = format!("/?mode=author&q={}&limit=50", encode(&author.name));
-                                view! {
-                                    <a href=href>
-                                        <span class="px-3 py-1 text-xs md:text-sm font-medium text-white
-                                                    bg-gradient-to-r from-indigo-500 to-purple-500
-                                                    rounded-full shadow-sm whitespace-nowrap
-                                                    hover:scale-[1.5] transition-transform cursor-pointer">
-                                            { author.name }
-                                        </span>
-                                    </a>
-                                }
-                            })
+                            authors.into_iter().map(|author|
+                                render_pill(&author.name, "author", "from-sky-500 to-cyan-500")
+                            )
                             .collect_view()
                         }
                         {
                             tags.into_iter().map(|tag| {
-                                let href = format!("/?mode=tag&q={}&limit=50", encode(&tag.name));
-                                view! {
-                                    <a href=href>
-                                        <span class="px-3 py-1 text-xs md:text-sm font-medium text-white
-                                                    bg-gradient-to-r from-indigo-500 to-purple-500
-                                                    rounded-full shadow-sm whitespace-nowrap
-                                                    hover:scale-[1.5] transition-transform cursor-pointer">
-                                            { tag.name }
-                                        </span>
-                                    </a>
-                                }
+                                render_pill(&tag.name, "tag", "from-indigo-500 to-purple-500")
                             })
                             .collect_view()
                         }

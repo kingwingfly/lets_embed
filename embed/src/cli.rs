@@ -55,11 +55,11 @@ pub struct EmbedCli {
     #[arg(long, alias = "tk", default_value_t = 36)]
     top_k: usize,
 
-    /// wd-tagger threshold
+    /// wd-tagger threshold for general tags
     #[arg(long, alias = "gth", default_value_t = 0.3)]
     general_threshold: f32,
 
-    /// wd-tagger threshold
+    /// wd-tagger threshold for character tags
     #[arg(long, alias = "cth", default_value_t = 0.75)]
     character_threshold: f32,
 
