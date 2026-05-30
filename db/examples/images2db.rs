@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
                 reader.read_object_borrowed_names(|mut reader| {
                     match reader.read_name()? {
                         "title" => meta.title = reader.read_string()?,
-                        "cosplayers" => {
+                        "authors" | "cosplayers" => {
                             let mut items = vec![];
                             reader.read_array_items(|reader| {
                                 items.push(reader.read_string()?);
