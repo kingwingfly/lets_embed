@@ -48,7 +48,7 @@ impl ProxyHttp for Ingress {
         };
 
         verify(jwt, &self.policy_aud)
-            .map_err(|e| Error::because(ErrorType::HTTPStatus(401), "unauthorized", e))?;
+            .map_err(|e| Error::because(ErrorType::HTTPStatus(403), "forbidden", e))?;
 
         Ok(false)
     }
