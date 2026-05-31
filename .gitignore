@@ -5,3 +5,4 @@ gtdata
 models
 .venv
 rustc-ice*
+.env.local

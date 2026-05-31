@@ -10,6 +10,7 @@ members = [
     "search/frontend",
     "search/server",
     "search_types",
+    "gateway",
 ]
 resolver = "3"
 

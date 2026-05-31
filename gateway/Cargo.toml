@@ -1,0 +1,23 @@
+[package]
+name = "gateway"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[dependencies]
+pingora = { version = "0.8.0", features = ["proxy"] }
+async-trait = "0.1"
+
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+reqwest = { version = "0.13", features = ["json", "blocking"] }
+serde.workspace = true
+serde_json.workspace = true
+arc-swap = "1.9"
+aws-lc-rs = "1.17"
+base64 = "0.22"
