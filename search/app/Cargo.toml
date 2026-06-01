@@ -30,7 +30,7 @@ web-sys = { version = "0.3", features = [
 
 tokio = { workspace = true, optional = true }
 search_engine = { path = "../../search_engine", optional = true, features = ["serde"] }
-axum = { version = "0.8", optional = true, features = ["macros"] }
+axum = { workspace = true, optional = true, features = ["macros"] }
 leptos_axum = { version = "0.8", optional = true }
 sanitize-filename = { workspace = true, optional = true }
 
