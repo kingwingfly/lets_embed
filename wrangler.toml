@@ -9,6 +9,10 @@ command = "cargo install -q \"worker-build@^0.8\" && worker-build --profile wasm
 enabled = true
 invocation_logs = true
 
+[vars]
+CF_ACCESS_TEAM_DOMAIN = "kingwingfly.cloudflareaccess.com"
+CF_ACCESS_AUD = "5700459f509f888154922a3f93bbf18d7dbd6b4be7fa472716693eb2fefb6ba5"
+
 [[secrets_store_secrets]]
 binding = "lets-embed-client-id"
 store_id = "93d561f5fef7447eb3e1fd77e6445903"
@@ -18,3 +22,17 @@ secret_name = "lets-embed-client-id"
 binding = "lets-embed-client-secret"
 store_id = "93d561f5fef7447eb3e1fd77e6445903"
 secret_name = "lets-embed-client-secret"
+
+[[secrets_store_secrets]]
+binding = "lets-embed-jwt-secret"
+store_id = "93d561f5fef7447eb3e1fd77e6445903"
+secret_name = "lets-embed-jwt-secret"
+
+[[kv_namespaces]]
+binding = "JWKS_CACHE"
+id = "95b240d71a024088ae4c2c36422e1372"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "lets-embed"
+database_id = "ee6985fc-ed13-414f-8f85-8727c86f3b48"

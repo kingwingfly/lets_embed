@@ -11,7 +11,15 @@ documentation.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-worker = { version = "0.8", features = ["http", "axum"] }
-axum = { workspace = true, features = ["macros"] }
+worker = { version = "0.8", features = ["http", "axum", "d1"] }
+axum = { workspace = true, features = ["macros", "form"] }
 tower-service = "0.3"
 tower-cookies = "0.11"
+uuid = { version = "1", features = ["v4", "js"] }
+getrandom = { version = "0.2", features = ["js"] }
+serde.workspace = true
+serde_json.workspace = true
+hmac = "0.13"
+sha2 = "0.11"
+rsa = { version = "0.10.0-rc.18", features = ["sha2"] }
+base64 = "0.22"
