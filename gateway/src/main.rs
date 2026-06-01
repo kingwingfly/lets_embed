@@ -10,6 +10,8 @@ use async_trait::async_trait;
 use pingora::prelude::*;
 use tracing_subscriber::EnvFilter;
 
+const ADDR: &str = "0.0.0.0:8080";
+
 struct Ingress {
     upstream: HttpPeer,
     #[cfg(feature = "validate-jwt")]
@@ -128,8 +130,9 @@ fn main() {
             policy_aud,
         },
     );
-    ingress.add_tcp("127.0.0.1:8080");
+    ingress.add_tcp(ADDR);
     my_server.add_service(ingress);
 
+    tracing::info!("listening on {ADDR}");
     my_server.run_forever();
 }
