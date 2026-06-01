@@ -13,12 +13,12 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
-pub struct Keys {
+struct Keys {
     keys: Vec<Key>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Key {
+struct Key {
     kid: String,
     n: String,
     e: String,
@@ -78,8 +78,8 @@ pub fn keys() -> Option<Arc<KeyMap>> {
 
         tracing::info!(url, "Fetching certs");
 
-        let keys = init_keys(&url);
-        let keys = Arc::new(ArcSwap::from_pointee(keys?));
+        let keys = init_keys(&url)?;
+        let keys = Arc::new(ArcSwap::from_pointee(keys));
 
         thread::spawn({
             let keys = keys.clone();
@@ -105,7 +105,7 @@ struct JwtKeyInfo {
 }
 
 #[derive(Debug, Deserialize)]
-struct JwtKeyClaim {
+struct JwtClaim {
     aud: HashSet<String>,
     exp: u64,
     iss: String,
@@ -136,7 +136,7 @@ pub fn verify(jwt: impl AsRef<[u8]>, expected_aud: impl AsRef<str>) -> anyhow::R
     pub_key.verify_sig(signing_input.as_bytes(), &sig)?;
 
     let claim = URL_SAFE_NO_PAD.decode(claim_b64)?;
-    let JwtKeyClaim { aud, exp, iss, .. } = serde_json::from_slice(&claim)?;
+    let JwtClaim { aud, exp, iss, .. } = serde_json::from_slice(&claim)?;
 
     if !aud.contains(expected_aud.as_ref()) {
         bail!("aud mismatch");
