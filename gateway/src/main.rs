@@ -1,19 +1,18 @@
-#![feature(iterator_try_collect, duration_constructors)]
+#![cfg_attr(
+    feature = "validate-jwt",
+    feature(iterator_try_collect, duration_constructors)
+)]
 
+#[cfg(feature = "validate-jwt")]
 mod jwt;
-
-use std::env;
-
-use jwt::verify;
 
 use async_trait::async_trait;
 use pingora::prelude::*;
 use tracing_subscriber::EnvFilter;
 
-use crate::jwt::keys;
-
 struct Ingress {
     upstream: HttpPeer,
+    #[cfg(feature = "validate-jwt")]
     policy_aud: String,
 }
 
@@ -31,14 +30,12 @@ impl ProxyHttp for Ingress {
         Ok(Box::new(self.upstream.clone()))
     }
 
+    #[cfg(feature = "validate-jwt")]
     #[tracing::instrument(skip_all)]
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool>
     where
         Self::CTX: Send + Sync,
     {
-        if !session.req_header().uri.path().starts_with("/admin") {
-            return Ok(false);
-        }
         let Some(jwt) = session
             .get_header("Cf-Access-Jwt-Assertion")
             .map(|value| value.as_bytes())
@@ -47,10 +44,55 @@ impl ProxyHttp for Ingress {
             return Ok(true);
         };
 
-        verify(jwt, &self.policy_aud)
+        jwt::verify(jwt, &self.policy_aud)
             .map_err(|e| Error::because(ErrorType::HTTPStatus(403), "forbidden", e))?;
 
         Ok(false)
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn response_filter(
+        &self,
+        _session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let content_type = upstream_response
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| {
+                v.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase()
+            });
+
+        let Some(content_type) = content_type else {
+            return Ok(());
+        };
+
+        let cache_control = match content_type.as_str() {
+            t if t.starts_with("image/") => Some("public, max-age=31536000, immutable"), // 1 year
+
+            "text/html"
+            | "text/css"
+            | "application/javascript"
+            | "text/javascript"
+            | "application/wasm" => Some("public, max-age=2592000"), // 30 days
+
+            _ => None,
+        };
+
+        if let Some(value) = cache_control {
+            upstream_response.insert_header(http::header::CACHE_CONTROL, value)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -62,12 +104,14 @@ fn main() {
         )
         .init();
 
-    if keys().is_none() {
+    #[cfg(feature = "validate-jwt")]
+    if jwt::keys().is_none() {
         tracing::error!("Failed to get pub keys");
         return;
     }
 
-    let Ok(policy_aud) = env::var("POLICY_AUD") else {
+    #[cfg(feature = "validate-jwt")]
+    let Ok(policy_aud) = std::env::var("POLICY_AUD") else {
         tracing::error!(env_var = "POLICY_AUD", "Not presented");
         return;
     };
@@ -80,6 +124,7 @@ fn main() {
         &my_server.configuration,
         Ingress {
             upstream: HttpPeer::new("127.0.0.1:3000", false, "".to_string()),
+            #[cfg(feature = "validate-jwt")]
             policy_aud,
         },
     );
