@@ -161,7 +161,13 @@ async fn apply_page(State(st): State<AppState>, cookies: Cookies) -> Response {
         && let Ok(Some(row)) = db_find(&st.env, cookie.value()).await
     {
         if row.status == "denied" {
-            cookies.remove(cookie.into_owned());
+            let mut c = Cookie::new(APP_COOKIE, "");
+            c.set_path("/");
+            c.set_http_only(true);
+            c.set_secure(true);
+            c.set_same_site(SameSite::Lax);
+            c.set_max_age(CookieDuration::seconds(0)); // expires immediately
+            cookies.add(c);
         }
         return render_apply_status(&row.status).into_response();
     }
