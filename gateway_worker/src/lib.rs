@@ -157,9 +157,12 @@ async fn db_list_pending(env: &Env) -> Result<Vec<AppRow>> {
 
 #[worker::send]
 async fn apply_page(State(st): State<AppState>, cookies: Cookies) -> Response {
-    if let Some(id) = cookies.get(APP_COOKIE).map(|c| c.value().to_string())
-        && let Ok(Some(row)) = db_find(&st.env, &id).await
+    if let Some(cookie) = cookies.get(APP_COOKIE)
+        && let Ok(Some(row)) = db_find(&st.env, cookie.value()).await
     {
+        if row.status == "denied" {
+            cookies.remove(cookie.into_owned());
+        }
         return render_apply_status(&row.status).into_response();
     }
     render_apply_form().into_response()
