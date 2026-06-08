@@ -14,7 +14,7 @@ wget -O models/siglip2-so400m-patch14-384/onnx/text_model.onnx_data https://hugg
 wget -O models/siglip2-so400m-patch14-384/tokenizer.json https://huggingface.co/onnx-community/siglip2-so400m-patch14-384-ONNX/resolve/main/tokenizer.json?download=true
 wget -O models/siglip2-so400m-patch14-384/onnx/vision_model.onnx https://huggingface.co/onnx-community/siglip2-so400m-patch14-384-ONNX/resolve/main/onnx/vision_model.onnx?download=true
 
-mkdir -p mkdir -p models/dinov3-vitb16-pretrain-lvd1689m/onnx
+mkdir -p models/dinov3-vitb16-pretrain-lvd1689m/onnx
 # download facebook/dinov3-vitb16-pretrain-lvd1689m ONNX
 wget -O models/dinov3-vitb16-pretrain-lvd1689m/onnx/model.onnx https://huggingface.co/onnx-community/dinov3-vitb16-pretrain-lvd1689m-ONNX/resolve/main/onnx/model.onnx?download=true
 wget -O models/dinov3-vitb16-pretrain-lvd1689m/onnx/model.onnx_data https://huggingface.co/onnx-community/dinov3-vitb16-pretrain-lvd1689m-ONNX/resolve/main/onnx/model.onnx_data?download=true
