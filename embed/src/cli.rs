@@ -39,7 +39,7 @@ pub struct EmbedCli {
     #[arg(
         long,
         alias = "wd",
-        default_value = "models/wd-eva02-large-tagger-v3/wd-eva02-large-tagger-v3.onnx"
+        default_value = "models/wd-eva02-large-tagger-v3/onnx/wd-eva02-large-tagger-v3.onnx"
     )]
     wd_tagger_model: PathBuf,
 
