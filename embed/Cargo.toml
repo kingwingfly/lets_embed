@@ -26,13 +26,13 @@ opentelemetry-otlp = { version = "0.32", features = [] }
 opentelemetry-appender-tracing = "0.32"
 clap.workspace = true
 
-opendal = { version = "0.56", features = ["services-fs", "services-http"] }
+opendal = { version = "0.56", features = ["services-fs", "services-http", "services-s3"] }
 sqlx.workspace = true
 pgvector.workspace = true
 
+dotenvy = "0.15"
 ort.workspace = true
 url.workspace = true
-sanitize-filename.workspace = true
 sysinfo = "0.39"
 nvml-wrapper = "0.12"
 parking_lot.workspace = true

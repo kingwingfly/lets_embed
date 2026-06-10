@@ -8,13 +8,13 @@ use clap::Parser;
 use futures::{StreamExt, stream};
 use opendal::{
     Operator,
-    services::{Fs, Http},
+    layers::{RetryLayer, TimeoutLayer},
+    services::{Fs, Http, S3},
 };
 use opentelemetry::{global, metrics::Counter};
 use ort::session::Session;
 use pgvector::HalfVector;
 use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
-use sanitize_filename::sanitize;
 use sqlx::postgres::PgPool;
 use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -23,17 +23,10 @@ use wd_tagger::Tag;
 #[derive(Debug, Parser)]
 #[clap(version)]
 pub struct EmbedCli {
-    /// the postgres database of image records
-    #[arg(
-        short,
-        long,
-        default_value = "postgres://postgres:postgres@postgres:5432/postgres"
-    )]
-    database_url: String,
-
-    /// storage url of image data directory: e.g. `fs:./images`, `http://127.0.0.1:3000/path/to/images`
+    /// storage url of image data directory: e.g. `fs:./images`, `http://127.0.0.1:3000/path/to/images`,
+    /// leave none to use s3/r2
     #[arg(short, long)]
-    storage: url::Url,
+    storage: Option<url::Url>,
 
     /// wd-tagger onnx model path
     #[arg(
@@ -74,7 +67,7 @@ pub struct EmbedCli {
     /// DINOv3 onnx model path
     #[arg(
         long,
-        alias = "cv",
+        alias = "dn",
         default_value = "models/dinov3-vitb16-pretrain-lvd1689m/onnx/model.onnx"
     )]
     dinov3_model: PathBuf,
@@ -87,25 +80,75 @@ pub struct EmbedCli {
     no_quit_while_empty: bool,
 }
 
+#[derive(Debug)]
+struct Config {
+    endpoint: String,
+    bucket: String,
+    key_id: String,
+    secret: String,
+    region: String,
+}
+
+impl Config {
+    fn new() -> Result<Self, dotenvy::Error> {
+        dotenvy::dotenv().ok();
+        Ok(Self {
+            endpoint: dotenvy::var("R2_ENDPOINT").or_else(|_| dotenvy::var("S3_ENDPOINT"))?,
+            bucket: dotenvy::var("R2_BUCKET").or_else(|_| dotenvy::var("S3_BUCKET"))?,
+            key_id: dotenvy::var("R2_KEY_ID").or_else(|_| dotenvy::var("S3_KEY_ID"))?,
+            secret: dotenvy::var("R2_SECRET_KEY").or_else(|_| dotenvy::var("S3_SECRET_KEY"))?,
+            region: dotenvy::var("R2_REGION")
+                .or_else(|_| dotenvy::var("S3_REGION"))
+                .unwrap_or("auto".to_string()),
+        })
+    }
+}
+
 impl EmbedCli {
     pub async fn run(self, cancel: CancellationToken) -> anyhow::Result<()> {
-        let op = match self.storage.scheme() {
-            "fs" | "file" => {
-                let root = self.storage.path();
-                tracing::info!(dal = "fs", root, "building OpenDAL");
-                let fs = Fs::default().root(root);
-                Operator::new(fs)?.finish()
-            }
-            "http" | "https" => {
-                let endpoint = self.storage.as_str();
-                tracing::info!(dal = "http", endpoint, "building OpenDAL");
-                let http = Http::default().endpoint(endpoint);
-                Operator::new(http)?.finish()
-            }
-            _ => bail!("Unsupported storage"),
-        };
+        let pool = PgPool::connect(&dotenvy::var("DATABASE_URL")?).await?;
 
-        let pool = PgPool::connect(&self.database_url).await?;
+        let op = match self.storage {
+            Some(url) => match url.scheme() {
+                "fs" | "file" => {
+                    let root = url.path();
+                    tracing::info!(dal = "fs", root, "building OpenDAL");
+                    let fs = Fs::default().root(root);
+                    Operator::new(fs)?.finish()
+                }
+                "http" | "https" => {
+                    let endpoint = url.as_str();
+                    tracing::info!(dal = "http", endpoint, "building OpenDAL");
+                    let http = Http::default().endpoint(endpoint);
+                    Operator::new(http)?.finish()
+                }
+                _ => bail!("Unsupported storage"),
+            },
+            None => {
+                let config = Config::new()?;
+                Operator::new(
+                    S3::default()
+                        .endpoint(&config.endpoint)
+                        .bucket(&config.bucket)
+                        .region(&config.region)
+                        .access_key_id(&config.key_id)
+                        .secret_access_key(&config.secret),
+                )?
+                .layer(
+                    RetryLayer::new()
+                        .with_max_times(3)
+                        .with_min_delay(Duration::from_millis(200))
+                        .with_max_delay(Duration::from_secs(10))
+                        .with_jitter(),
+                )
+                .layer(
+                    TimeoutLayer::new()
+                        .with_timeout(Duration::from_secs(600))
+                        .with_io_timeout(Duration::from_secs(300)),
+                )
+                .finish()
+            }
+        };
 
         let tags = wd_tagger::tags(self.selected_tags)?;
         let tags = tags.leak::<'static>();
@@ -207,10 +250,9 @@ async fn convert_image(
             .map(|(id, name)| {
                 let op = op.clone();
                 async move {
-                    let filename = format!("{}.webp", sanitize(name));
                     (
                         id,
-                        op.read(filename.as_str())
+                        op.read(name.as_str())
                             .await
                             .inspect_err(|e| tracing::warn!(id, err = %e, "read image"))
                             .map(|buf| buf.to_bytes())

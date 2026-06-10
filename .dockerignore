@@ -1,0 +1,11 @@
+target
+meta.json
+pgdata
+gtdata
+models
+.venv
+rustc-ice*
+.env.local
+node_modules
+.wrangler
+gateway_worker/build
