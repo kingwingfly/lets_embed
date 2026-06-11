@@ -252,7 +252,7 @@ async fn convert_image(
                 async move {
                     (
                         id,
-                        op.read(name.as_str())
+                        op.read(&format!("{}.webp", name))
                             .await
                             .inspect_err(|e| tracing::warn!(id, err = %e, "read image"))
                             .map(|buf| buf.to_bytes())
