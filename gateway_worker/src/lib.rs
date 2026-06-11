@@ -22,7 +22,8 @@ use worker::{
     Context, Env, Error, Fetch, HttpRequest, RequestInit, Result, event, js_sys::Uint8Array,
 };
 
-const UPSTREAM: &str = "https://lets-embed-api.louisfly.icu";
+const API_UPSTREAM: &str = "https://lets-embed-api.louisfly.icu";
+const IMAGE_UPSTREAM: &str = "https://lets-embed-image.louisfly.icu";
 const TOKEN_COOKIE: &str = "gw_token";
 const APP_COOKIE: &str = "gw_app";
 const D1_BINDING: &str = "DB";
@@ -536,10 +537,13 @@ async fn proxy(
     client_id: &str,
     client_secret: &str,
 ) -> Response {
-    let mut target = UPSTREAM.to_string();
-    if let Some(pq) = uri.path_and_query() {
-        target += pq.as_str();
-    }
+    let target = match uri.path_and_query() {
+        Some(pq) if let Some(pq) = pq.as_str().strip_prefix("/image") => {
+            format!("{IMAGE_UPSTREAM}{pq}")
+        }
+        Some(pq) => format!("{API_UPSTREAM}{pq}"),
+        None => API_UPSTREAM.to_string(),
+    };
 
     let mut req_init = RequestInit::new();
     req_init.with_method(method.to_string().into());

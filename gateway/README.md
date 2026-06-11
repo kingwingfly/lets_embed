@@ -15,8 +15,7 @@ POLICY_AUD=<https://developers.cloudflare.com/cloudflare-one/access-controls/app
 
 - cloudflare worker can do everything, including jwt verification, load balance and rate limiting...
 - only cloudflare's access control (service auth) can protect resources on CDN, local pingora proxy cannot
-- `cloudflared` can validate all jwts, you can turn on this: `Enforce Access JSON Web Token (JWT) validation
-`
+- `cloudflared` can validate all jwts, you can turn on this: `Enforce Access JSON Web Token (JWT) validation`
 
 # Reasons to use this:
 

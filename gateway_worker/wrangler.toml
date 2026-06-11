@@ -1,9 +1,9 @@
 name = "gateway-worker"
-main = "gateway_worker/build/index.js"
+main = "build/index.js"
 compatibility_date = "2026-06-01"
 
 [build]
-command = "cargo install -q \"worker-build@^0.8\" && worker-build --profile wasm-release gateway_worker"
+command = "cargo install -q \"worker-build@^0.8\" && worker-build --profile wasm-release"
 
 [observability.logs]
 enabled = true

@@ -1,0 +1,38 @@
+substitutions:
+  _REPO: "us-central1-docker.pkg.dev/project-8aaff395-290a-492d-976/images"
+
+options:
+  machineType: "E2_HIGHCPU_32"
+  diskSizeGb: 100
+  env:
+    - "DOCKER_BUILDKIT=1"
+
+timeout: "3600s"
+
+steps:
+  - id: embed-cpu
+    name: "gcr.io/cloud-builders/docker"
+    args: ["build", "--target=embed-cpu", "-t=${_REPO}/embed:cpu", "."]
+
+  - id: embed-cuda12
+    name: "gcr.io/cloud-builders/docker"
+    args: ["build", "--target=embed-cuda12", "-t=${_REPO}/embed:cuda12", "."]
+
+  - id: embed-cuda13
+    name: "gcr.io/cloud-builders/docker"
+    args: ["build", "--target=embed-cuda13", "-t=${_REPO}/embed:cuda13", "."]
+
+  - id: search-cpu
+    name: "gcr.io/cloud-builders/docker"
+    args: ["build", "--target=search-cpu", "-t=${_REPO}/search:cpu", "."]
+
+  - id: search-gpu
+    name: "gcr.io/cloud-builders/docker"
+    args: ["build", "--target=search-gpu", "-t=${_REPO}/search:gpu", "."]
+
+images:
+  - "${_REPO}/embed:cpu"
+  - "${_REPO}/embed:cuda12"
+  - "${_REPO}/embed:cuda13"
+  - "${_REPO}/search:cpu"
+  - "${_REPO}/search:gpu"

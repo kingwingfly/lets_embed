@@ -28,5 +28,6 @@ pub struct Cli {
     )]
     pub dinov3_model: PathBuf,
 
-    pub prefix: PathBuf,
+    /// images path prefix
+    pub prefix: Option<PathBuf>,
 }
