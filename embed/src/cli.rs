@@ -159,7 +159,7 @@ impl EmbedCli {
 
         let mut jhs = JoinSet::new();
 
-        let (tx, rx) = mpsc::channel(self.batch_size as usize);
+        let (tx, rx) = mpsc::channel(2);
         jhs.spawn(fetch_batch(
             pool.clone(),
             self.batch_size,
@@ -167,9 +167,9 @@ impl EmbedCli {
             self.no_quit_while_empty,
             cancel,
         ));
-        let (tx, rx_) = mpsc::channel(2 * self.batch_size as usize);
+        let (tx, rx_) = mpsc::channel(2);
         jhs.spawn(convert_image(op, rx, tx));
-        let (tx, rx__) = mpsc::channel(2 * self.batch_size as usize);
+        let (tx, rx__) = mpsc::channel(2);
         jhs.spawn_blocking(move || {
             infer(
                 wd_tagger_session,
