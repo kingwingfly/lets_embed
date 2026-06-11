@@ -4,7 +4,7 @@ Model download
 ```sh
 mkdir -p models/wd-eva02-large-tagger-v3/onnx
 # download wd-tagger ONNX
-wget -O models/wd-eva02-large-tagger-v3/onnx/wd-eva02-large-tagger-v3.onnx https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/model.onnx?download=true
+wget -O models/wd-eva02-large-tagger-v3/onnx/model.onnx https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/model.onnx?download=true
 wget -O models/wd-eva02-large-tagger-v3/selected_tags.csv https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main/selected_tags.csv?download=true
 
 mkdir -p models/siglip2-so400m-patch14-384/onnx
