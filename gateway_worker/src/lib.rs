@@ -43,6 +43,7 @@ struct AppState {
     jwt_secret: Arc<Vec<u8>>,
     client_id: Arc<String>,
     client_secret: Arc<String>,
+    id_token: Arc<String>,
     team_domain: Arc<String>,
     access_aud: Arc<String>,
 }
@@ -58,6 +59,7 @@ async fn router(env: Env, _ctx: Context) -> Result<Router> {
     let client_id = secret(&env, "lets-embed-client-id").await?;
     let client_secret = secret(&env, "lets-embed-client-secret").await?;
     let jwt_secret = secret(&env, "lets-embed-jwt-secret").await?;
+    let id_token = secret(&env, "lets-embed-api-id-token").await?;
     let team_domain = env.var("CF_ACCESS_TEAM_DOMAIN")?.to_string();
     let access_aud = env.var("CF_ACCESS_AUD")?.to_string();
 
@@ -66,6 +68,7 @@ async fn router(env: Env, _ctx: Context) -> Result<Router> {
         jwt_secret: Arc::new(jwt_secret.into_bytes()),
         client_id: Arc::new(client_id),
         client_secret: Arc::new(client_secret),
+        id_token: Arc::new(id_token),
         team_domain: Arc::new(team_domain),
         access_aud: Arc::new(access_aud),
     };
@@ -464,7 +467,16 @@ async fn gateway(
     if let Some(tok) = cookies.get(TOKEN_COOKIE)
         && jwt_verify(tok.value(), &st.jwt_secret, now).is_some()
     {
-        return proxy(uri, method, headers, body, &st.client_id, &st.client_secret).await;
+        return proxy(
+            uri,
+            method,
+            headers,
+            body,
+            &st.client_id,
+            &st.client_secret,
+            &st.id_token,
+        )
+        .await;
     }
 
     // 2) app cookie & approved → sign JWT，redirect
@@ -536,6 +548,7 @@ async fn proxy(
     body: Bytes,
     client_id: &str,
     client_secret: &str,
+    id_token: &str,
 ) -> Response {
     let target = match uri.path_and_query() {
         Some(pq) if let Some(pq) = pq.as_str().strip_prefix("/image") => {
@@ -570,6 +583,9 @@ async fn proxy(
     let _ = req_init
         .headers
         .set("CF-Access-Client-Secret", client_secret);
+    let _ = req_init
+        .headers
+        .set("X-Serverless-Authorization", &format!("Bearer {id_token}"));
 
     let request = match worker::Request::new_with_init(&target, &req_init) {
         Ok(r) => r,

@@ -28,6 +28,11 @@ binding = "lets-embed-jwt-secret"
 store_id = "93d561f5fef7447eb3e1fd77e6445903"
 secret_name = "lets-embed-jwt-secret"
 
+[[secrets_store_secrets]]
+binding = "lets-embed-api-id-token"
+store_id = "93d561f5fef7447eb3e1fd77e6445903"
+secret_name = "lets-embed-api-id-token"
+
 [[kv_namespaces]]
 binding = "JWKS_CACHE"
 id = "95b240d71a024088ae4c2c36422e1372"

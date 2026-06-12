@@ -1,7 +1,6 @@
 #![feature(iterator_try_collect)]
 
 use std::{
-    env,
     future::ready,
     io::{Read, Seek},
     path::Path,
@@ -33,12 +32,8 @@ impl Engine {
         tokenizer_config_path: impl AsRef<Path>,
         dinov3_model_path: impl AsRef<Path>,
     ) -> anyhow::Result<Self> {
-        let pool = PgPool::connect(
-            env::var("DATABASE_URL")
-                .unwrap_or("postgres://postgres:postgres@postgres:5432/postgres".to_string())
-                .as_str(),
-        )
-        .await?;
+        dotenvy::dotenv().ok();
+        let pool = PgPool::connect(&dotenvy::var("DATABASE_URL").unwrap()).await?;
         let clip_text_session = siglip2::model(clip_text_model_path)?;
         let tokenizer = siglip2::tokenizer(tokenizer_config_path)?;
         let dinov3_session = dinov3::model(dinov3_model_path)?;

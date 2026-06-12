@@ -44,7 +44,7 @@ RUN rustup target add wasm32-unknown-unknown && \
     curl -fL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash && \
     cargo binstall --locked --no-confirm cargo-leptos
 RUN cargo leptos build --release
-RUN cargo build -p gateway --release
+RUN cargo build -p gateway -F validate-jwt --release
 
 ############################################################
 # embed runtimes
@@ -84,6 +84,9 @@ ENTRYPOINT ["embed"]
 # search runtimes
 ############################################################
 FROM debian:bookworm-slim AS search-cpu
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 COPY --from=ort-cpu /opt/onnxruntime /opt/onnxruntime
 COPY --from=search-builder /app/target/release/server /usr/local/bin/server
 COPY --from=search-builder /app/target/release/gateway /usr/local/bin/gateway
@@ -109,10 +112,13 @@ WORKDIR /app
 RUN useradd -r -u 10001 appuser
 USER appuser
 ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so \
-    SITE_ROOT=/site
+    SITE_DIR=/site
 ENTRYPOINT ["start.sh"]
 
 FROM nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04 AS search-gpu
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 COPY --from=ort-cuda13 /opt/onnxruntime /opt/onnxruntime
 COPY --from=search-builder /app/target/release/server /usr/local/bin/server
 COPY --from=search-builder /app/target/release/gateway /usr/local/bin/gateway
@@ -138,5 +144,5 @@ WORKDIR /app
 RUN useradd -r -u 10001 appuser
 USER appuser
 ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so \
-    SITE_ROOT=/site
+    SITE_DIR=/site
 ENTRYPOINT ["start.sh"]
