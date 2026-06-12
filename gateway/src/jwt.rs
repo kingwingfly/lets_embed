@@ -105,8 +105,24 @@ struct JwtKeyInfo {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum Audience {
+    Single(String),
+    Multiple(HashSet<String>),
+}
+
+impl Audience {
+    pub fn contains(&self, expected: &str) -> bool {
+        match self {
+            Audience::Single(s) => s == expected,
+            Audience::Multiple(v) => v.contains(expected),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct JwtClaim {
-    aud: HashSet<String>,
+    aud: Audience,
     exp: u64,
     iss: String,
 }

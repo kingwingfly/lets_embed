@@ -112,7 +112,7 @@ WORKDIR /app
 RUN useradd -r -u 10001 appuser
 USER appuser
 ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so \
-    SITE_DIR=/site
+    LEPTOS_SITE_ROOT=/site
 ENTRYPOINT ["start.sh"]
 
 FROM nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04 AS search-gpu
@@ -144,5 +144,5 @@ WORKDIR /app
 RUN useradd -r -u 10001 appuser
 USER appuser
 ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so \
-    SITE_DIR=/site
+    LEPTOS_SITE_ROOT=/site
 ENTRYPOINT ["start.sh"]

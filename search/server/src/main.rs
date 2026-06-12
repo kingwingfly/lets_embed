@@ -10,10 +10,16 @@ use leptos::prelude::*;
 use leptos_axum::{LeptosRoutes, generate_route_list};
 use std::sync::Arc;
 use tower_http::{services::ServeDir, trace::TraceLayer};
+use tracing_subscriber::{
+    EnvFilter, Registry, layer::SubscriberExt as _, util::SubscriberInitExt as _,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    Registry::default()
+        .with(tracing_subscriber::fmt::layer())
+        .with(EnvFilter::try_from_default_env().unwrap_or("server=info,search_engine=info".into()))
+        .init();
 
     let args = cli::Cli::parse();
 
