@@ -538,7 +538,7 @@ async fn proxy(
     client_secret: &str,
 ) -> Response {
     let target = match uri.path_and_query() {
-        Some(pq) if let Some(pq) = pq.as_str().strip_prefix("/image") => {
+        Some(pq) if let Some(pq) = pq.as_str().strip_prefix("/images") => {
             format!("{IMAGE_UPSTREAM}{pq}")
         }
         Some(pq) => format!("{API_UPSTREAM}{pq}"),
