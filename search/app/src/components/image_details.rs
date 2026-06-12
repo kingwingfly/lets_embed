@@ -209,7 +209,6 @@ async fn fetch_image_details(id: Option<String>) -> Result<ImageDetailsData, Ser
 
     use axum::extract::State;
     use leptos_axum::extract_with_state;
-    use sanitize_filename::sanitize;
     use search_engine::Engine;
 
     let id = id
@@ -222,10 +221,6 @@ async fn fetch_image_details(id: Option<String>) -> Result<ImageDetailsData, Ser
     engine
         .image_details(id)
         .await
-        .map(|mut details| {
-            details.image.name = sanitize(&details.image.name);
-            details
-        })
         .map_err(|e| ServerFnError::Response(e.to_string()))
 }
 
@@ -237,7 +232,6 @@ async fn list_post_images(post_id: i64) -> Result<Vec<Image>, ServerFnError> {
 
     use axum::extract::State;
     use leptos_axum::extract_with_state;
-    use sanitize_filename::sanitize;
     use search_engine::Engine;
 
     let state = expect_context::<AppState>();
@@ -246,11 +240,5 @@ async fn list_post_images(post_id: i64) -> Result<Vec<Image>, ServerFnError> {
     engine
         .list_post_images(post_id)
         .await
-        .map(|mut images| {
-            images
-                .iter_mut()
-                .for_each(|image| image.name = sanitize(&image.name));
-            images
-        })
         .map_err(|e| ServerFnError::Response(e.to_string()))
 }

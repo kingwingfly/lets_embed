@@ -27,4 +27,3 @@ app = { path = "../app", features = ["ssr"] }
 
 clap.workspace = true
 serde.workspace = true
-sanitize-filename.workspace = true

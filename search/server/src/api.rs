@@ -6,7 +6,6 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
 };
 use futures::{Stream, StreamExt as _};
-use sanitize_filename::sanitize;
 use search_engine::{Engine, search_types};
 use serde::Deserialize;
 
@@ -66,7 +65,7 @@ pub async fn search_sse(
                         while let Some(img) = images.next().await {
                             let item = ImageItem {
                                 id: img.id,
-                                name: sanitize(img.name),
+                                name: img.name,
                                 width: img.width as u32,
                                 height: img.height as u32,
                             };
@@ -95,7 +94,7 @@ pub async fn search_sse(
                                 Ok(images) =>
                                     images.into_iter().map(|img| ImageItem {
                                         id: img.id,
-                                        name: sanitize(img.name),
+                                        name: img.name,
                                         width: img.width as u32,
                                         height: img.height as u32,
                                     })
@@ -104,7 +103,7 @@ pub async fn search_sse(
                             };
                             let item = PostItem {
                                 id: post.id,
-                                title: sanitize(post.title),
+                                title: post.title,
                                 images,
                             };
                             count += 1;
@@ -156,7 +155,7 @@ pub async fn search_sse(
                             }
                             let item = ImageItem {
                                 id: img.id,
-                                name: sanitize(img.name),
+                                name: img.name,
                                 width: img.width as u32,
                                 height: img.height as u32,
                             };

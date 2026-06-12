@@ -10,17 +10,17 @@ options:
 timeout: "3600s"
 
 steps:
-  - id: embed-cpu
-    name: "gcr.io/cloud-builders/docker"
-    args: ["build", "--target=embed-cpu", "-t=${_REPO}/embed:cpu", "."]
+  # - id: embed-cpu
+  #   name: "gcr.io/cloud-builders/docker"
+  #   args: ["build", "--target=embed-cpu", "-t=${_REPO}/embed:cpu", "."]
 
-  - id: embed-cuda12
-    name: "gcr.io/cloud-builders/docker"
-    args: ["build", "--target=embed-cuda12", "-t=${_REPO}/embed:cuda12", "."]
+  # - id: embed-cuda12
+  #   name: "gcr.io/cloud-builders/docker"
+  #   args: ["build", "--target=embed-cuda12", "-t=${_REPO}/embed:cuda12", "."]
 
-  - id: embed-cuda13
-    name: "gcr.io/cloud-builders/docker"
-    args: ["build", "--target=embed-cuda13", "-t=${_REPO}/embed:cuda13", "."]
+  # - id: embed-cuda13
+  #   name: "gcr.io/cloud-builders/docker"
+  #   args: ["build", "--target=embed-cuda13", "-t=${_REPO}/embed:cuda13", "."]
 
   - id: search-cpu
     name: "gcr.io/cloud-builders/docker"
@@ -31,8 +31,8 @@ steps:
     args: ["build", "--target=search-gpu", "-t=${_REPO}/search:gpu", "."]
 
 images:
-  - "${_REPO}/embed:cpu"
-  - "${_REPO}/embed:cuda12"
-  - "${_REPO}/embed:cuda13"
+  # - "${_REPO}/embed:cpu"
+  # - "${_REPO}/embed:cuda12"
+  # - "${_REPO}/embed:cuda13"
   - "${_REPO}/search:cpu"
   - "${_REPO}/search:gpu"

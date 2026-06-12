@@ -32,9 +32,8 @@ tokio = { workspace = true, optional = true }
 search_engine = { path = "../../search_engine", optional = true, features = ["serde"] }
 axum = { workspace = true, optional = true, features = ["macros"] }
 leptos_axum = { version = "0.8", optional = true }
-sanitize-filename = { workspace = true, optional = true }
 
 [features]
 default = []
 hydrate = ["leptos/hydrate"]
-ssr = ["leptos/ssr", "leptos_meta/ssr", "leptos_router/ssr", "leptos-use/ssr", "dep:tokio", "dep:search_engine", "dep:axum", "dep:leptos_axum", "dep:sanitize-filename"]
+ssr = ["leptos/ssr", "leptos_meta/ssr", "leptos_router/ssr", "leptos-use/ssr", "dep:tokio", "dep:search_engine", "dep:axum", "dep:leptos_axum"]
