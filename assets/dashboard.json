@@ -207,7 +207,7 @@
                 "kind": "Panel",
                 "spec": {
                     "display": {
-                        "name": "completed"
+                        "name": "completed_rate_sum"
                     },
                     "plugin": {
                         "kind": "TimeSeriesChart",
@@ -224,19 +224,7 @@
                                 "plugin": {
                                     "kind": "PrometheusTimeSeriesQuery",
                                     "spec": {
-                                        "query": "infer_complete_total",
-                                        "seriesNameFormat": "{{ hostname }}"
-                                    }
-                                }
-                            }
-                        },
-                        {
-                            "kind": "TimeSeriesQuery",
-                            "spec": {
-                                "plugin": {
-                                    "kind": "PrometheusTimeSeriesQuery",
-                                    "spec": {
-                                        "query": "sum(infer_complete_total)",
+                                        "query": "sum(rate(infer_complete_total[1m])) * 60",
                                         "seriesNameFormat": "sum"
                                     }
                                 }
@@ -268,18 +256,6 @@
                                     "spec": {
                                         "query": "rate(infer_complete_total[1m]) * 60",
                                         "seriesNameFormat": "{{ hostname }}"
-                                    }
-                                }
-                            }
-                        },
-                        {
-                            "kind": "TimeSeriesQuery",
-                            "spec": {
-                                "plugin": {
-                                    "kind": "PrometheusTimeSeriesQuery",
-                                    "spec": {
-                                        "query": "sum(rate(infer_complete_total[1m])) * 60",
-                                        "seriesNameFormat": "sum"
                                     }
                                 }
                             }
