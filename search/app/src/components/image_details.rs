@@ -1,12 +1,12 @@
 use crate::{
     components::{Lightbox, Results, Viewer},
     types::{ImageItem, PostItem},
+    util::encode_path,
 };
 
 use leptos::prelude::*;
 use leptos_router::hooks::use_params_map;
 use search_types::{Image, ImageDetails as ImageDetailsData};
-use urlencoding::encode;
 
 #[component]
 pub fn ImageDetails() -> impl IntoView {
@@ -58,7 +58,7 @@ pub fn ImageDetails() -> impl IntoView {
     };
 
     let render_pill = |name: String, mode, gradient| {
-        let href = format!("/?mode={}&q={}&limit=50", mode, encode(name.as_str()));
+        let href = format!("/?mode={}&q={}&limit=50", mode, encode_path(name.as_str()));
         let class = format!(
             "inline-block px-3 py-1 text-xs md:text-sm font-medium text-white \
              bg-gradient-to-r {} \
@@ -87,7 +87,7 @@ pub fn ImageDetails() -> impl IntoView {
                         loading="lazy"
                         decoding="async"
                         class="max-w-full max-h-full object-contain select-none"
-                        src=format!("/images/{}.webp", encode(&image.name))
+                        src=format!("/images/{}.webp", encode_path(&image.name))
                         alt=image.name.clone()
                         on:click=move |_| viewer.set(Some(ImageItem {
                             id: image.id,
@@ -156,7 +156,7 @@ pub fn ImageDetails() -> impl IntoView {
                                                                 select-none cursor-zoom-in
                                                                 hover:opacity-80 hover:scale-[1.02]
                                                                 transition-all"
-                                                        src=format!("/images/{}.webp", encode(&image.name))
+                                                        src=format!("/images/{}.webp", encode_path(&image.name))
                                                         alt=image.name.clone()
                                                         on:click=move |_| viewer.set(Some(image.clone()))
                                                     />

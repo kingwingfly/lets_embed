@@ -1,7 +1,9 @@
-use crate::types::{ImageItem, PostItem};
+use crate::{
+    types::{ImageItem, PostItem},
+    util::encode_path,
+};
 use leptos::prelude::*;
 use leptos_use::use_intersection_observer;
-use urlencoding::encode;
 
 const PAGE: usize = 20;
 
@@ -34,7 +36,7 @@ pub fn Lightbox(
             imgs.iter()
                 .take(v)
                 .map(|im| {
-                    let url = format!("/images/{}.webp", encode(&im.name));
+                    let url = format!("/images/{}.webp", encode_path(&im.name));
                     let im = im.clone();
                     view! {
                         <div class="relative aspect-square overflow-hidden rounded bg-gray-800">

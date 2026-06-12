@@ -3,13 +3,14 @@ use std::iter::repeat_with;
 use crate::{
     components::{lightbox::Lightbox, viewer::Viewer},
     types::{DoneEvent, ErrorEvent, ImageItem, Mode, PostItem},
+    util::encode_path,
 };
+
 use leptos::{prelude::*, reactive::send_wrapper_ext::SendOption};
 use leptos_router::hooks::use_query_map;
 use leptos_use::{
     UseElementSizeReturn, signal_debounced, use_element_size, use_intersection_observer,
 };
-use urlencoding::encode;
 use wasm_bindgen::{JsCast, prelude::Closure};
 
 const COLUMN_WIDTH: u32 = 360;
@@ -146,7 +147,7 @@ pub fn Results() -> impl IntoView {
                                     decoding="async"
                                     style=format!("aspect-ratio: {} / {}", c.width, c.height)
                                     class="w-full h-auto block bg-gray-900 select-none hover:opacity-80 hover:scale-[1.02] transition-all"
-                                    src=format!("/images/{}.webp", encode(&c.name))
+                                    src=format!("/images/{}.webp", encode_path(&c.name))
                                 />
                             })}
                             <div class="absolute top-1 right-1 bg-black/70 text-white text-xs px-2 py-0.5 rounded">
@@ -161,7 +162,7 @@ pub fn Results() -> impl IntoView {
                 .into_any()
             }
             Item::Image(im) => {
-                let url = format!("/images/{}.webp", encode(&im.name));
+                let url = format!("/images/{}.webp", encode_path(&im.name));
                 view! {
                     <div class="m-1">
                         <img
@@ -296,7 +297,7 @@ fn load_page(
     let url = format!(
         "/api/search?mode={}&q={}&limit={}&offset={}",
         mode.as_str(),
-        encode(&q),
+        urlencoding::encode(&q),
         limit,
         offset_val,
     );

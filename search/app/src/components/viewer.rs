@@ -1,11 +1,10 @@
 use leptos::prelude::*;
-use urlencoding::encode;
 
-use crate::types::ImageItem;
+use crate::{types::ImageItem, util::encode_path};
 
 #[component]
 pub fn Viewer(image: ImageItem, viewer: RwSignal<Option<ImageItem>>) -> impl IntoView {
-    let src = format!("/images/{}.webp", encode(&image.name));
+    let src = format!("/images/{}.webp", encode_path(&image.name));
     let href = format!("/details/{id}?mode=similar&q={id}&limit=50", id = image.id);
     view! {
         <div
