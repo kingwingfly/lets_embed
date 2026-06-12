@@ -26,13 +26,18 @@ steps:
     name: "gcr.io/cloud-builders/docker"
     args: ["build", "--target=search-cpu", "-t=${_REPO}/search:cpu", "."]
 
-  - id: search-gpu
+  - id: search-cuda12
     name: "gcr.io/cloud-builders/docker"
-    args: ["build", "--target=search-gpu", "-t=${_REPO}/search:gpu", "."]
+    args: ["build", "--target=search-cuda12", "-t=${_REPO}/search:cuda12", "."]
+
+  - id: search-cuda13
+    name: "gcr.io/cloud-builders/docker"
+    args: ["build", "--target=search-cuda13", "-t=${_REPO}/search:cuda13", "."]
 
 images:
   - "${_REPO}/embed:cpu"
   - "${_REPO}/embed:cuda12"
   - "${_REPO}/embed:cuda13"
   - "${_REPO}/search:cpu"
-  - "${_REPO}/search:gpu"
+  - "${_REPO}/search:cuda12"
+  - "${_REPO}/search:cuda13"
