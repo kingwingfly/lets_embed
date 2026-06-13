@@ -20,3 +20,4 @@ POLICY_AUD=<https://developers.cloudflare.com/cloudflare-one/access-controls/app
 # Reasons to use this:
 
 - This gateway will set `Cache-Control` for response
+- You are deploying the backend on serverless environment with cloud provider's load balance (that is to say, no `cloudflared`), you can find the usage in `Dockerfile`
