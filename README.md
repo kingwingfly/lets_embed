@@ -100,3 +100,25 @@ podman run -d --name pgvector -p 5432:5432 -v ./pgdata:/var/lib/postgresql -e PO
 # to compile in CI
 cargo sqlx prepare --workspace
 ```
+
+# Serverless Deployment
+
+This project can also be deployed serverlessly.
+
+Let's use `cloudflare` + `google cloud platform` as example:
+
+Steps:
+- setup postgresql in a VM, setup password, allow login from `*` in `/etc/postgresql/.../pg_hba.conf`
+- allow visits from `cloud run` in your vpc firewall
+- create artifact repo to store images
+- use `gcloud builds` and `cloudbuild.yaml` to build and upload images
+- convert all images to `.webp` in R2 with `img2webp` in `gcloud run job` or other CPU provider
+- use `./tsv` to download models to bucket, mount it as needed
+- run `embed` with gcloud or other GPU provider
+- deploy `search` as a serverless api service in `gcloud run services`, it uses pingora to handle cloudflare jwt
+- use `domain mappings` to make service reachable at `xx-api.yourdomain.com`
+- use `cloudflare Access` service token to protect `xx-api.yourdomain.com` service
+- use `cloudflare Access` service token to protect `xx-image.yourdomain.com` service
+- use `cloudflare Access` to bypass everyone `xx.yourdomain.com` service
+- use `cloudflare Access` to protect `xx.yourdomain.com/admin` service
+- config bindings needed in `gateway_worker/wrangler.toml`,and use `gateway_worker` to control user access and protect contents
