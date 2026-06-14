@@ -161,7 +161,7 @@ async fn apply_page(State(st): State<AppState>, cookies: Cookies) -> Response {
     if let Some(cookie) = cookies.get(APP_COOKIE)
         && let Ok(Some(row)) = db_find(&st.env, cookie.value()).await
     {
-        if row.status == "denied" {
+        if matches!(row.status.as_str(), "denied" | "consumed") {
             let mut c = Cookie::new(APP_COOKIE, "");
             c.set_path("/");
             c.set_http_only(true);
@@ -696,6 +696,13 @@ fn render_apply_status(status: &str) -> Html<String> {
             "err",
             "Rejected",
             "Sorry, this application was not approved.",
+        ),
+        "consumed" => (
+            "Consumed",
+            "⌛",
+            "err",
+            "Consumed",
+            "Sorry, your permission to this site has been outdated. Refresh to apply again.",
         ),
         _ => (
             "Under Review",
