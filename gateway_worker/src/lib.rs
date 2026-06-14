@@ -478,6 +478,11 @@ async fn gateway(
             iat: now,
             exp: now + dur,
         };
+        match db_mark_issued(&st.env, &id).await {
+            Ok(1) => {}
+            _ => return Redirect::to("/apply").into_response(),
+        }
+
         let token = jwt_sign(&claims, &st.jwt_secret);
 
         let mut c = Cookie::new(TOKEN_COOKIE, token);
@@ -494,6 +499,20 @@ async fn gateway(
 
     // 3) other → /apply
     Redirect::to("/apply").into_response()
+}
+
+async fn db_mark_issued(env: &Env, id: &str) -> Result<u64> {
+    let stmt = env
+        .d1("DB")?
+        .prepare(
+            "UPDATE applications \
+             SET status = 'consumed' \
+             WHERE id = ?1 AND status = 'approved'",
+        )
+        .bind(&[id.into()])?;
+
+    let result = stmt.run().await?;
+    Ok(result.meta()?.map(|m| m.changes.unwrap_or(0)).unwrap_or(0) as u64)
 }
 
 // ---------------------------------------------------------------------------
