@@ -161,7 +161,9 @@ async fn apply_page(State(st): State<AppState>, cookies: Cookies) -> Response {
     if let Some(cookie) = cookies.get(APP_COOKIE)
         && let Ok(Some(row)) = db_find(&st.env, cookie.value()).await
     {
-        if row.status == "denied"
+        if row.status == "pending" {
+            return render_apply_status("pending").into_response();
+        } else if row.status == "denied"
             || (row.status == "consumed"
                 && !cookies.get(TOKEN_COOKIE).is_some_and(|tok| {
                     jwt_verify(tok.value(), &st.jwt_secret, now_secs()).is_some()
@@ -175,8 +177,6 @@ async fn apply_page(State(st): State<AppState>, cookies: Cookies) -> Response {
             c.set_max_age(CookieDuration::seconds(0)); // expires immediately
             cookies.add(c);
             return render_apply_status(&row.status).into_response();
-        } else if row.status == "pending" {
-            return render_apply_status("pending").into_response();
         }
         return render_apply_status("approved").into_response();
     }
