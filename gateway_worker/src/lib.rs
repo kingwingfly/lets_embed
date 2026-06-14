@@ -175,6 +175,8 @@ async fn apply_page(State(st): State<AppState>, cookies: Cookies) -> Response {
             c.set_max_age(CookieDuration::seconds(0)); // expires immediately
             cookies.add(c);
             return render_apply_status(&row.status).into_response();
+        } else if row.status == "pending" {
+            return render_apply_status("pending").into_response();
         }
         return render_apply_status("approved").into_response();
     }
