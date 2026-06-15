@@ -21,6 +21,7 @@ axum = { workspace = true, features = ["tokio", "tracing", "http1"] }
 leptos_axum = { version = "0.8" }
 tower-http = { version = "0.6", features = ["fs", "trace"] }
 async-stream = "0.3"
+base64 = "0.22"
 
 leptos = { version = "0.8", features = ["nightly", "ssr"] }
 app = { path = "../app", features = ["ssr"] }

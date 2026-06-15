@@ -69,6 +69,9 @@ pub fn SearchBar() -> impl IntoView {
                         <button type="button"
                             class=move || tab_cls(Mode::Similar)
                             on:click=move |_| mode.set(Mode::Similar)>"DINO"</button>
+                        <button type="button"
+                            class=move || tab_cls(Mode::SearchImage)
+                            on:click=move |_| mode.set(Mode::SearchImage)>"Image"</button>
                     </div>
                     <div class="flex w-full items-center gap-2 min-w-0">
                         <input
@@ -78,6 +81,7 @@ pub fn SearchBar() -> impl IntoView {
                                 Mode::Author => "One author name",
                                 Mode::Clip => "Describe the image...",
                                 Mode::Similar => "Image ID",
+                                Mode::SearchImage => "todo",
                             }
                             prop:value=move || q_input.get()
                             on:input=move |ev| q_input.set(event_target_value(&ev))

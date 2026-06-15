@@ -8,6 +8,7 @@ pub enum Mode {
     Author,
     Clip,
     Similar,
+    SearchImage,
 }
 
 impl Mode {
@@ -17,6 +18,7 @@ impl Mode {
             Mode::Author => "author",
             Mode::Clip => "clip",
             Mode::Similar => "similar",
+            Mode::SearchImage => "search_image",
         }
     }
     pub fn parse(s: &str) -> Self {
@@ -24,6 +26,7 @@ impl Mode {
             "author" => Mode::Author,
             "clip" => Mode::Clip,
             "similar" => Mode::Similar,
+            "search_image" => Mode::SearchImage,
             _ => Mode::Tag,
         }
     }

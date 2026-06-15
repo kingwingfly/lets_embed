@@ -4,9 +4,68 @@ use crate::{
     util::encode_path,
 };
 
+use leptos::ev::PointerEvent;
+use leptos::html;
 use leptos::prelude::*;
-use leptos_router::hooks::use_params_map;
+use leptos_router::hooks::{use_location, use_navigate, use_params_map};
 use search_types::{Image, ImageDetails as ImageDetailsData};
+
+/// selected region in original image coordinate
+#[derive(Clone, Copy)]
+struct Region {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+use wasm_bindgen::{JsCast, JsValue};
+use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement};
+
+fn crop_to_base64(img: &HtmlImageElement, region: Region) -> Option<String> {
+    const MAX_EDGE: f64 = 256.0;
+
+    let sw = region.w as f64;
+    let sh = region.h as f64;
+    if sw < 1.0 || sh < 1.0 {
+        return None;
+    }
+    let scale = (MAX_EDGE / sw.max(sh)).min(1.0);
+    let dw = (sw * scale).round().max(1.0);
+    let dh = (sh * scale).round().max(1.0);
+
+    let document = web_sys::window()?.document()?;
+    let canvas: HtmlCanvasElement = document.create_element("canvas").ok()?.dyn_into().ok()?;
+    canvas.set_width(dw as u32);
+    canvas.set_height(dh as u32);
+
+    let ctx: CanvasRenderingContext2d = canvas.get_context("2d").ok()??.dyn_into().ok()?;
+
+    ctx.draw_image_with_html_image_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+        img,
+        region.x as f64,
+        region.y as f64,
+        sw,
+        sh,
+        0.0,
+        0.0,
+        dw,
+        dh,
+    )
+    .ok()?;
+
+    let data_url = canvas
+        .to_data_url_with_type_and_encoder_options("image/jpeg", &JsValue::from_f64(0.8))
+        .ok()?;
+
+    let b64 = data_url.split_once(',')?.1;
+    let url_safe = b64
+        .replace('+', "-")
+        .replace('/', "_")
+        .trim_end_matches('=')
+        .to_string();
+    Some(url_safe)
+}
 
 #[component]
 pub fn ImageDetails() -> impl IntoView {
@@ -41,6 +100,15 @@ pub fn ImageDetails() -> impl IntoView {
 
     let lightbox: RwSignal<Option<PostItem>> = RwSignal::new(None);
     let viewer: RwSignal<Option<ImageItem>> = RwSignal::new(None);
+
+    let img_ref: NodeRef<html::Img> = NodeRef::new();
+    let container_ref: NodeRef<html::Div> = NodeRef::new();
+    let overlay_ref: NodeRef<html::Div> = NodeRef::new();
+    let drag_origin: RwSignal<Option<(f64, f64)>> = RwSignal::new(None);
+    let sel_box: RwSignal<Option<(f64, f64, f64, f64)>> = RwSignal::new(None);
+
+    let navigate = use_navigate();
+    let pathname = use_location().pathname;
 
     let lightbox_view = move || {
         lightbox.get().map(|post| {
@@ -79,23 +147,168 @@ pub fn ImageDetails() -> impl IntoView {
                                    authors,
                                    tags,
                                }| {
+        let image_id = image.id;
+        let image_name = image.name.clone();
+        let img_w = image.width as u32;
+        let img_h = image.height as u32;
+
+        let compute =
+            move |sx: f64, sy: f64, ex: f64, ey: f64| -> Option<(Region, (f64, f64, f64, f64))> {
+                let img = img_ref.get()?;
+                let cont = container_ref.get()?;
+                let irect = img.get_bounding_client_rect();
+                let crect = cont.get_bounding_client_rect();
+                let nat_w = img.natural_width() as f64;
+                let nat_h = img.natural_height() as f64;
+                if nat_w == 0.0 || nat_h == 0.0 {
+                    return None;
+                }
+                let scale = (irect.width() / nat_w).min(irect.height() / nat_h);
+                let disp_w = nat_w * scale;
+                let disp_h = nat_h * scale;
+                let off_x = irect.left() + (irect.width() - disp_w) / 2.0;
+                let off_y = irect.top() + (irect.height() - disp_h) / 2.0;
+
+                let to_img = |cx: f64, cy: f64| {
+                    (
+                        ((cx - off_x) / scale).clamp(0.0, nat_w),
+                        ((cy - off_y) / scale).clamp(0.0, nat_h),
+                    )
+                };
+                let (ix0, iy0) = to_img(sx, sy);
+                let (ix1, iy1) = to_img(ex, ey);
+                let x = ix0.min(ix1);
+                let y = iy0.min(iy1);
+                let w = (ix1 - ix0).abs();
+                let h = (iy1 - iy0).abs();
+
+                let lx = off_x + x * scale - crect.left();
+                let ly = off_y + y * scale - crect.top();
+                let lw = w * scale;
+                let lh = h * scale;
+
+                let region = Region {
+                    x: x.round() as u32,
+                    y: y.round() as u32,
+                    w: w.round() as u32,
+                    h: h.round() as u32,
+                };
+                Some((region, (lx, ly, lw, lh)))
+            };
+
+        let on_down = move |ev: PointerEvent| {
+            ev.prevent_default();
+            if let Some(el) = overlay_ref.get() {
+                let _ = el.set_pointer_capture(ev.pointer_id());
+            }
+            drag_origin.set(Some((ev.client_x() as f64, ev.client_y() as f64)));
+        };
+
+        let on_move = move |ev: PointerEvent| {
+            if let Some((sx, sy)) = drag_origin.get()
+                && let Some((_, lbox)) = compute(sx, sy, ev.client_x() as f64, ev.client_y() as f64)
+            {
+                sel_box.set(Some(lbox));
+            }
+        };
+
+        let nav_up = navigate.clone();
+        let click_name = image_name.clone();
+        let on_up = move |ev: PointerEvent| {
+            let Some((sx, sy)) = drag_origin.get() else {
+                return;
+            };
+            drag_origin.set(None);
+
+            let ex = ev.client_x() as f64;
+            let ey = ev.client_y() as f64;
+            let dist = ((ex - sx).powi(2) + (ey - sy).powi(2)).sqrt();
+
+            if dist < 6.0 {
+                viewer.set(Some(ImageItem {
+                    id: image_id,
+                    name: click_name.clone(),
+                    width: img_w,
+                    height: img_h,
+                }));
+                return;
+            }
+
+            if let Some((region, lbox)) = compute(sx, sy, ex, ey) {
+                if region.w < 4 || region.h < 4 {
+                    return;
+                }
+                sel_box.set(Some(lbox));
+
+                if let Some(img) = img_ref.get()
+                    && let Some(q) = crop_to_base64(&img, region)
+                {
+                    let path = pathname.get_untracked();
+                    nav_up(
+                        &format!("{path}?mode=search_image&q={q}"),
+                        Default::default(),
+                    );
+                }
+            }
+        };
+
+        let nav_clear = navigate.clone();
+        let on_clear = move |_| {
+            sel_box.set(None);
+            let path = pathname.get_untracked();
+            nav_clear(
+                &format!("{path}?mode=similar&q={image_id}"),
+                Default::default(),
+            );
+        };
+
         view! {
             <div class="flex flex-col md:flex-row w-full gap-3 md:gap-4 p-3 md:p-4 md:h-[72vh]">
-                <div class="w-full h-[45vh] md:h-full md:flex-1 md:min-w-0 shrink-0
-                            flex items-center justify-center bg-black/30 rounded-lg overflow-hidden">
+                <div
+                    node_ref=container_ref
+                    class="relative w-full h-[45vh] md:h-full md:flex-1 md:min-w-0 shrink-0
+                            flex items-center justify-center bg-black/30 rounded-lg overflow-hidden"
+                >
                     <img
+                        node_ref=img_ref
                         loading="lazy"
                         decoding="async"
                         class="max-w-full max-h-full object-contain select-none"
                         src=format!("/images/{}.webp", encode_path(&image.name))
                         alt=image.name.clone()
-                        on:click=move |_| viewer.set(Some(ImageItem {
-                            id: image.id,
-                            name: image.name.clone(),
-                            width: image.width as u32,
-                            height: image.height as u32,
-                        }))
                     />
+
+                    <div
+                        node_ref=overlay_ref
+                        class="absolute inset-0 cursor-crosshair touch-none select-none"
+                        on:pointerdown=on_down
+                        on:pointermove=on_move
+                        on:pointerup=on_up
+                        on:pointercancel=move |_| { drag_origin.set(None); }
+                    />
+
+                    {
+                        move || sel_box.get().map(|(l, t, w, h)| view! {
+                            <div
+                                class="absolute border-2 border-sky-400 bg-sky-400/20
+                                        pointer-events-none rounded-sm"
+                                style=format!("left:{l}px;top:{t}px;width:{w}px;height:{h}px;")
+                            />
+                        })
+                    }
+
+                    {
+                        move || sel_box.get().map(|_| view! {
+                            <button
+                                class="absolute top-2 right-2 z-10 w-7 h-7 flex items-center justify-center
+                                        rounded-full bg-black/60 text-white text-sm
+                                        hover:bg-black/80 transition-colors cursor-pointer"
+                                on:click=on_clear.clone()
+                            >
+                                "✕"
+                            </button>
+                        })
+                    }
                 </div>
 
                 <div class="w-full md:w-96 lg:w-[28rem] xl:w-[32rem] md:shrink-0

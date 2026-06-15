@@ -5,6 +5,7 @@ use axum::{
     extract::{Query, State},
     response::sse::{Event, KeepAlive, Sse},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::{Stream, StreamExt as _};
 use search_engine::{Engine, search_types};
 use serde::Deserialize;
@@ -169,6 +170,40 @@ pub async fn search_sse(
                             .event("done")
                             .json_data(DoneEvent { has_more: count >= limit })
                             .unwrap());
+                    }
+                }
+            }
+            Mode::SearchImage => {
+                let decoded = URL_SAFE_NO_PAD.decode(q.as_bytes());
+
+                match decoded {
+                    Err(e) => yield Ok(send_err(format!("invalid image data: {e}"))),
+                    Ok(bytes) => {
+                        // Cursor<Vec<u8>>: Read + Seek + Send + 'static，正好满足 search_dinov3 的 R
+                        let cursor = std::io::Cursor::new(bytes);
+                        match engine.search_dinov3([cursor], limit, offset).await {
+                            Err(e) => yield Ok(send_err(e.to_string())),
+                            Ok(mut images) => {
+                                let mut count = 0i64;
+                                while let Some(img) = images.next().await {
+                                    count += 1;
+                                    let item = ImageItem {
+                                        id: img.id,
+                                        name: img.name,
+                                        width: img.width as u32,
+                                        height: img.height as u32,
+                                    };
+                                    yield Ok(Event::default()
+                                        .event("image")
+                                        .json_data(item)
+                                        .unwrap());
+                                }
+                                yield Ok(Event::default()
+                                    .event("done")
+                                    .json_data(DoneEvent { has_more: count >= limit })
+                                    .unwrap());
+                            }
+                        }
                     }
                 }
             }
