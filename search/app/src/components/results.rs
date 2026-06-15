@@ -126,7 +126,8 @@ pub fn Results() -> impl IntoView {
             return;
         }
         let (_, _, limit) = params.get_untracked();
-        let next = offset.with_untracked(|old| *old + limit);
+        offset.update(|old| *old += limit);
+        let next = offset.get_untracked();
         load_page(next, params, columns, has_more, loading, error, active);
     });
 

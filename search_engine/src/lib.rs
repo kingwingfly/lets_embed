@@ -8,13 +8,13 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Ok, bail};
+use anyhow::bail;
 use futures::{Stream, StreamExt as _};
 use ort::session::Session;
 use parking_lot::Mutex;
 use pgvector::HalfVector;
 use search_types::{Author, Image, ImageDetails, Post, Tag};
-use sqlx::PgPool;
+use sqlx::{Executor as _, PgPool, postgres::PgPoolOptions};
 use tokenizers::{EncodeInput, Tokenizer};
 
 pub use search_types;
@@ -34,7 +34,18 @@ impl Engine {
         dinov3_model_path: impl AsRef<Path>,
     ) -> anyhow::Result<Self> {
         dotenvy::dotenv().ok();
-        let pool = PgPool::connect(&dotenvy::var("DATABASE_URL").unwrap()).await?;
+        let pool = PgPoolOptions::new()
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    conn.execute("SET hnsw.ef_search = 1000").await?;
+                    conn.execute("SET hnsw.iterative_scan = strict_order")
+                        .await?;
+                    conn.execute("SET hnsw.max_scan_tuples = 2000").await?;
+                    Ok(())
+                })
+            })
+            .connect(&dotenvy::var("DATABASE_URL").unwrap())
+            .await?;
         let clip_text_session = siglip2::model(clip_text_model_path)?;
         let tokenizer = siglip2::tokenizer(tokenizer_config_path)?;
         let dinov3_session = dinov3::model(dinov3_model_path)?;

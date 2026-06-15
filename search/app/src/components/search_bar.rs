@@ -88,22 +88,19 @@ pub fn SearchBar() -> impl IntoView {
         }
     };
 
-    let on_file = {
+    let on_file = move |ev: leptos::ev::Event| {
+        let input: web_sys::HtmlInputElement = event_target(&ev);
+        let Some(file) = input.files().and_then(|fs| fs.get(0)) else {
+            return;
+        };
+        file_name.set(file.name());
         let go = go.clone();
-        move |ev: leptos::ev::Event| {
-            let input: web_sys::HtmlInputElement = event_target(&ev);
-            let Some(file) = input.files().and_then(|fs| fs.get(0)) else {
-                return;
-            };
-            file_name.set(file.name());
-            let go = go.clone();
-            spawn_local(async move {
-                if let Some(b64) = encode_file(file).await {
-                    q_input.set(b64.clone());
-                    go(b64);
-                }
-            });
-        }
+        spawn_local(async move {
+            if let Some(b64) = encode_file(file).await {
+                q_input.set(b64.clone());
+                go(b64);
+            }
+        });
     };
 
     let tab_cls = move |m: Mode| {

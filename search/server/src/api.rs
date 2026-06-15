@@ -179,7 +179,6 @@ pub async fn search_sse(
                 match decoded {
                     Err(e) => yield Ok(send_err(format!("invalid image data: {e}"))),
                     Ok(bytes) => {
-                        // Cursor<Vec<u8>>: Read + Seek + Send + 'static，正好满足 search_dinov3 的 R
                         let cursor = std::io::Cursor::new(bytes);
                         match engine.search_dinov3([cursor], limit, offset).await {
                             Err(e) => yield Ok(send_err(e.to_string())),

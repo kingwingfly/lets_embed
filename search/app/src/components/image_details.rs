@@ -9,6 +9,8 @@ use leptos::html;
 use leptos::prelude::*;
 use leptos_router::hooks::{use_location, use_navigate, use_params_map};
 use search_types::{Image, ImageDetails as ImageDetailsData};
+use wasm_bindgen::{JsCast, JsValue};
+use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement};
 
 /// selected region in original image coordinate
 #[derive(Clone, Copy)]
@@ -18,9 +20,6 @@ struct Region {
     w: u32,
     h: u32,
 }
-
-use wasm_bindgen::{JsCast, JsValue};
-use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement};
 
 fn crop_to_base64(img: &HtmlImageElement, region: Region) -> Option<String> {
     const MAX_EDGE: f64 = 256.0;
