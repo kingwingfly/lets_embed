@@ -1,14 +1,14 @@
-#![feature(iterator_try_collect)]
+#![feature(iterator_try_collect, portable_simd)]
 
 use std::{
     future::ready,
-    io::{Cursor, Read, Seek},
+    io::{Read, Seek},
     path::Path,
+    simd::{StdFloat, f32x16},
     sync::Arc,
 };
 
 use anyhow::{Ok, bail};
-use bytes::Bytes;
 use futures::{Stream, StreamExt as _};
 use ort::session::Session;
 use parking_lot::Mutex;
@@ -242,25 +242,30 @@ impl Engine {
         .await
         .unwrap()?;
 
-        let embeddings = dinov3::infer_vision(&mut self.dinov3_session.lock(), converted)?
+        let embeddings = dinov3::infer_vision(&mut self.dinov3_session.lock(), converted)?;
+        let div = f32x16::splat(1.0 / embeddings.len() as f32);
+        let mut embedding = embeddings
             .into_iter()
-            .map(|v| HalfVector::from_f32_slice(&v))
-            .collect::<Vec<_>>();
+            .map(|v| <[f32; 768]>::try_from(v).unwrap())
+            .fold([f32x16::splat(0.0); 768 / 16], |mut acc, v| {
+                for (c, x) in acc.iter_mut().zip(v.chunks_exact(16)) {
+                    *c += f32x16::from_slice(x);
+                }
+                acc
+            });
+        embedding.iter_mut().for_each(|c| *c *= div);
+        let embedding =
+            HalfVector::from_f32_slice(unsafe { &*(embedding.as_ptr() as *const [f32; 768]) });
 
         let res = sqlx::query_as!(
             Image,
             r#"
-            WITH qs AS (
-                SELECT q FROM
-                unnest($1::halfvec[]) AS _(q)
-            )
             SELECT id, name, width, height
             FROM images i
-            CROSS JOIN qs
-            ORDER BY i.dinov3_embedding <=> qs.q
+            ORDER BY i.dinov3_embedding <=> $1::halfvec
             LIMIT $2 OFFSET $3
             "#,
-            &embeddings as _,
+            &embedding as _,
             limit,
             offset
         )
@@ -297,53 +302,6 @@ impl Engine {
             LIMIT $2 OFFSET $3
             "#,
             &image_ids as _,
-            limit,
-            offset
-        )
-        .fetch(&self.pool)
-        .filter_map(|res| ready(res.ok()));
-
-        Ok(res)
-    }
-
-    pub async fn search_dinov3_by_image<'a>(
-        &'a self,
-        image: Bytes,
-        limit: i64,
-        offset: i64,
-    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a> {
-        let image = dinov3::convert_image(Cursor::new(image))?;
-        let embedding = dinov3::infer_vision(&mut self.dinov3_session.lock(), vec![image])?
-            .pop()
-            .unwrap();
-        self.search_dinov3_by_embedding(&embedding, limit, offset)
-            .await
-    }
-
-    pub async fn search_dinov3_by_embedding<'a>(
-        &'a self,
-        embedding: &[f32],
-        limit: i64,
-        offset: i64,
-    ) -> anyhow::Result<impl Stream<Item = Image> + Send + use<'a>> {
-        if limit < 0 || offset < 0 {
-            bail!("both limit and offset should >= 0")
-        }
-        if embedding.len() != 768 {
-            bail!("embedding len should == 768")
-        }
-
-        let embedding = HalfVector::from_f32_slice(embedding);
-
-        let res = sqlx::query_as!(
-            Image,
-            r#"
-            SELECT id, name, width, height
-            FROM images i
-            ORDER BY i.dinov3_embedding <=> $1::halfvec(768)
-            LIMIT $2 OFFSET $3
-            "#,
-            &embedding as _,
             limit,
             offset
         )
