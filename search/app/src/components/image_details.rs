@@ -177,7 +177,7 @@ pub fn ImageDetails() -> impl IntoView {
 
     view! {
         <div class="w-full min-h-full flex flex-col">
-            <Transition fallback=move || view! { <div class="w-full" style="height: 72vh;" /> }>
+            <Transition fallback=move || view! { <div class="w-full h-[72vh]" /> }>
                 {
                     move || {
                         details.get().map(|details| match details {
