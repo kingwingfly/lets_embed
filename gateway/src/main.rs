@@ -85,7 +85,7 @@ impl ProxyHttp for Ingress {
             | "text/css"
             | "application/javascript"
             | "text/javascript"
-            | "application/wasm" => Some("public, max-age=2592000"), // 30 days
+            | "application/wasm" => Some("public, max-age=3600"), // 1h
 
             _ => None,
         };
