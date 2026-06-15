@@ -4,7 +4,7 @@ use std::{
     future::ready,
     io::{Read, Seek},
     path::Path,
-    simd::{StdFloat, f32x16},
+    simd::f32x16,
     sync::Arc,
 };
 
