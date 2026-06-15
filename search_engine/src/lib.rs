@@ -2,12 +2,13 @@
 
 use std::{
     future::ready,
-    io::{Read, Seek},
+    io::{Cursor, Read, Seek},
     path::Path,
     sync::Arc,
 };
 
 use anyhow::{Ok, bail};
+use bytes::Bytes;
 use futures::{Stream, StreamExt as _};
 use ort::session::Session;
 use parking_lot::Mutex;
@@ -305,12 +306,26 @@ impl Engine {
         Ok(res)
     }
 
+    pub async fn search_dinov3_by_image<'a>(
+        &'a self,
+        image: Bytes,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a> {
+        let image = dinov3::convert_image(Cursor::new(image))?;
+        let embedding = dinov3::infer_vision(&mut self.dinov3_session.lock(), vec![image])?
+            .pop()
+            .unwrap();
+        self.search_dinov3_by_embedding(&embedding, limit, offset)
+            .await
+    }
+
     pub async fn search_dinov3_by_embedding<'a>(
         &'a self,
         embedding: &[f32],
         limit: i64,
         offset: i64,
-    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a> {
+    ) -> anyhow::Result<impl Stream<Item = Image> + Send + use<'a>> {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
         }

@@ -24,6 +24,7 @@ siglip2 = { path = "../siglip2" }
 dinov3 = { path = "../dinov3" }
 
 parking_lot.workspace = true
+bytes.workspace = true
 dotenvy = "0.15.7"
 
 [features]
