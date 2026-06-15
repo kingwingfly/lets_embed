@@ -1,3 +1,4 @@
+use crate::components::BackToTop;
 use crate::types::Mode;
 use leptos::prelude::*;
 use leptos_router::NavigateOptions;
@@ -100,5 +101,6 @@ pub fn SearchBar() -> impl IntoView {
             <hr class="w-full h-1 bg-gray-200 border-0" />
         </div>
         <Outlet />
+        <BackToTop />
     }
 }

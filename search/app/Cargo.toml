@@ -12,7 +12,7 @@ leptos = { version = "0.8", features = ["nightly"] }
 leptos_meta = { version = "0.8", features = [] }
 leptos_router = { version = "0.8", features = ["nightly"] }
 leptos-use = { version = "0.18", default-features = false, features = [
-    "use_intersection_observer", "use_element_size", "signal_debounced"
+    "use_intersection_observer", "use_element_size", "signal_debounced", "use_window_scroll"
 ] }
 
 search_types = { path = "../../search_types", features = ["serde"] }
@@ -26,6 +26,7 @@ js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "EventSource", "MessageEvent", "Element",
     "IntersectionObserver", "IntersectionObserverEntry", "IntersectionObserverInit",
+    "ScrollToOptions", "ScrollBehavior", "Window"
 ] }
 
 tokio = { workspace = true, optional = true }
