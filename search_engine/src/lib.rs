@@ -285,7 +285,7 @@ impl Engine {
             Image,
             r#"
             WITH qs AS (
-                SELECT dinov3_embedding AS q
+                SELECT avg(dinov3_embedding) AS q
                 FROM images i
                 WHERE i.id=ANY($1::BIGINT[])
             )
@@ -296,6 +296,39 @@ impl Engine {
             LIMIT $2 OFFSET $3
             "#,
             &image_ids as _,
+            limit,
+            offset
+        )
+        .fetch(&self.pool)
+        .filter_map(|res| ready(res.ok()));
+
+        Ok(res)
+    }
+
+    pub async fn search_dinov3_by_embedding<'a>(
+        &'a self,
+        embedding: &[f32],
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
+        if embedding.len() != 768 {
+            bail!("embedding len should == 768")
+        }
+
+        let embedding = HalfVector::from_f32_slice(embedding);
+
+        let res = sqlx::query_as!(
+            Image,
+            r#"
+            SELECT id, name, width, height
+            FROM images i
+            ORDER BY i.dinov3_embedding <=> $1::halfvec(768)
+            LIMIT $2 OFFSET $3
+            "#,
+            &embedding as _,
             limit,
             offset
         )
