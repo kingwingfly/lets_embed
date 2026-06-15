@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            WITH qs AS (\n                SELECT dinov3_embedding AS q\n                FROM images i\n                WHERE i.id=ANY($1::BIGINT[])\n            )\n            SELECT id, name, width, height\n            FROM images i\n            CROSS JOIN qs\n            ORDER BY i.dinov3_embedding <=> qs.q\n            LIMIT $2 OFFSET $3\n            ",
+  "query": "\n            WITH qs AS (\n                SELECT avg(dinov3_embedding) AS q\n                FROM images i\n                WHERE i.id=ANY($1::BIGINT[])\n            )\n            SELECT id, name, width, height\n            FROM images i\n            CROSS JOIN qs\n            ORDER BY i.dinov3_embedding <=> qs.q\n            LIMIT $2 OFFSET $3\n            ",
   "describe": {
     "columns": [
       {
@@ -62,5 +62,5 @@
       false
     ]
   },
-  "hash": "fd88bc52fcfae4b2efa0bf139b44f472590075c75f0174b5f1171caa1a24b841"
+  "hash": "f10083cf66e0d23930b38b08ce84da0003d9560cd5a09cf69a97976ae6463d03"
 }
