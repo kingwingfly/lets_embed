@@ -67,7 +67,7 @@ async fn translate(
         .take_until(cancel.cancelled())
         .filter(|t| ready(!translated.contains(t.name.as_str())))
         .map(async |tag| {
-            Retry::spawn(
+            Retry::start(
                 FixedInterval::from_millis(1000).map(jitter).take(8),
                 async || translate_inner(&tag.name).await,
             )
