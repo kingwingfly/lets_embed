@@ -289,9 +289,6 @@ fn load_page(
     active: StoredValue<SendOption<ActiveSse>>,
 ) {
     let (mode, q, limit) = params.get_untracked();
-    if q.trim().is_empty() {
-        return;
-    }
 
     active.set_value(SendOption::new_local(None));
 

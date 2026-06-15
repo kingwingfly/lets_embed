@@ -57,7 +57,33 @@ impl Engine {
         })
     }
 
-    pub async fn search_post_by_author<'a>(
+    pub async fn newest_posts<'a>(
+        &'a self,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<impl Stream<Item = Post> + Send + 'a> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
+
+        let res = sqlx::query_as!(
+            Post,
+            r#"
+            SELECT id, title
+            FROM posts
+            ORDER BY id DESC
+            LIMIT $1 OFFSET $2
+            "#,
+            limit,
+            offset
+        )
+        .fetch(&self.pool)
+        .filter_map(|res| ready(res.ok()));
+
+        Ok(res)
+    }
+
+    pub async fn search_posts_by_author<'a>(
         &'a self,
         author: impl AsRef<str>,
         limit: i64,
@@ -101,7 +127,7 @@ impl Engine {
         Ok(posts)
     }
 
-    pub async fn search_post_by_tag<'a>(
+    pub async fn search_posts_by_tag<'a>(
         &'a self,
         tag: impl AsRef<str>,
         limit: i64,
@@ -145,7 +171,7 @@ impl Engine {
         Ok(posts)
     }
 
-    pub async fn search_image_by_tag<'a>(
+    pub async fn search_images_by_tag<'a>(
         &'a self,
         tag: impl AsRef<str>,
         limit: i64,

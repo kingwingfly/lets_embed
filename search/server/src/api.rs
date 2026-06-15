@@ -46,47 +46,18 @@ pub async fn search_sse(
                 .unwrap()
         };
 
-        match mode {
-            Mode::Tag | Mode::Clip => {
-                let res = match mode {
-                     Mode::Tag =>
-                        engine.search_image_by_tag(q, limit, offset)
+        match (mode, q.is_empty()) {
+            (_, true) | (Mode::Author, false)  => {
+                let res = match q.is_empty() {
+                     true =>
+                        engine.newest_posts(limit, offset)
                             .await
-                            .map(|s| Box::pin(s) as Pin<Box<dyn Stream<Item = search_types::Image> + Send>>),
-                     Mode::Clip =>
-                        engine.search_clip([q.as_str()], limit, offset)
-                            .await
+                            .map(|s| Box::pin(s) as Pin<Box<dyn Stream<Item = search_types::Post> + Send>>),
+                     false =>
+                        engine.search_posts_by_author(q, limit, offset).await
                             .map(|s| Box::pin(s) as _),
-                     _ => unreachable!()
                 };
                 match res {
-                    Ok(mut images) => {
-                        let mut count = 0i64;
-
-                        while let Some(img) = images.next().await {
-                            let item = ImageItem {
-                                id: img.id,
-                                name: img.name,
-                                width: img.width as u32,
-                                height: img.height as u32,
-                            };
-                            count += 1;
-                            yield Ok(Event::default()
-                                .event("image")
-                                .json_data(item)
-                                .unwrap());
-                        }
-
-                        yield Ok(Event::default()
-                            .event("done")
-                            .json_data(DoneEvent { has_more: count >= limit })
-                            .unwrap());
-                    }
-                    Err(e) => yield Ok(send_err(e.to_string())),
-                }
-            }
-            Mode::Author => {
-                match engine.search_post_by_author(q, limit, offset).await {
                     Ok(mut posts) => {
                         let mut count = 0i64;
 
@@ -122,7 +93,45 @@ pub async fn search_sse(
                     Err(e) => yield Ok(send_err(e.to_string())),
                 }
             }
-            Mode::Similar => {
+            (Mode::Tag | Mode::Clip, false) => {
+                let res = match mode {
+                     Mode::Tag =>
+                        engine.search_images_by_tag(q, limit, offset)
+                            .await
+                            .map(|s| Box::pin(s) as Pin<Box<dyn Stream<Item = search_types::Image> + Send>>),
+                     Mode::Clip =>
+                        engine.search_clip([q.as_str()], limit, offset)
+                            .await
+                            .map(|s| Box::pin(s) as _),
+                     _ => unreachable!()
+                };
+                match res {
+                    Ok(mut images) => {
+                        let mut count = 0i64;
+
+                        while let Some(img) = images.next().await {
+                            let item = ImageItem {
+                                id: img.id,
+                                name: img.name,
+                                width: img.width as u32,
+                                height: img.height as u32,
+                            };
+                            count += 1;
+                            yield Ok(Event::default()
+                                .event("image")
+                                .json_data(item)
+                                .unwrap());
+                        }
+
+                        yield Ok(Event::default()
+                            .event("done")
+                            .json_data(DoneEvent { has_more: count >= limit })
+                            .unwrap());
+                    }
+                    Err(e) => yield Ok(send_err(e.to_string())),
+                }
+            }
+            (Mode::Similar, false) => {
                 let prepared = async {
                     let id = q.parse::<i64>().map_err(|e| e.to_string())?;
                     let details = engine.image_details(id).await.map_err(|e| e.to_string())?;
@@ -173,7 +182,7 @@ pub async fn search_sse(
                     }
                 }
             }
-            Mode::SearchImage => {
+            (Mode::SearchImage, false) => {
                 let decoded = URL_SAFE_NO_PAD.decode(q.as_bytes());
 
                 match decoded {
