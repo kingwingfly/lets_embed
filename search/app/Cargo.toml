@@ -26,7 +26,8 @@ js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "EventSource", "MessageEvent", "Element",
     "IntersectionObserver", "IntersectionObserverEntry", "IntersectionObserverInit",
-    "ScrollToOptions", "ScrollBehavior", "Window", "DomRect", "CanvasRenderingContext2d"
+    "ScrollToOptions", "ScrollBehavior", "Window", "DomRect", "CanvasRenderingContext2d",
+    "ImageBitmap", "FileList", "File"
 ] }
 
 tokio = { workspace = true, optional = true }
