@@ -1,24 +1,20 @@
-use crate::{
-    types::{ImageItem, PostItem},
-    util::encode_path,
-};
+use crate::{components::Viewer, types::PostItem, util::encode_path};
 use leptos::prelude::*;
 use leptos_use::use_intersection_observer;
 
 const PAGE: usize = 20;
 
 #[component]
-pub fn Lightbox(
-    post: PostItem,
-    lightbox: RwSignal<Option<PostItem>>,
-    viewer: RwSignal<Option<ImageItem>>,
-) -> impl IntoView {
+pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl IntoView {
     let total = post.images.len();
     let images = StoredValue::new(post.images.clone());
     let title = post.title.clone();
 
     let visible = RwSignal::new(PAGE.min(total));
     let sentinel = NodeRef::<leptos::html::Div>::new();
+
+    let viewer = RwSignal::new(None::<usize>);
+    let viewer_open = Memo::new(move |_| viewer.get().is_some());
 
     use_intersection_observer([sentinel], move |entries, _| {
         if !entries[0].is_intersecting() {
@@ -35,9 +31,9 @@ pub fn Lightbox(
         images.with_value(|imgs| {
             imgs.iter()
                 .take(v)
-                .map(|im| {
+                .enumerate()
+                .map(|(i, im)| {
                     let url = format!("/images/{}.webp", encode_path(&im.name));
-                    let im = im.clone();
                     view! {
                         <div class="relative aspect-square overflow-hidden rounded bg-gray-800">
                             <img
@@ -45,7 +41,7 @@ pub fn Lightbox(
                                 decoding="async"
                                 class="absolute inset-0 w-full h-full object-cover cursor-zoom-in"
                                 src=url
-                                on:click=move |_| viewer.set(Some(im.clone()))
+                                on:click=move |_| viewer.set(Some(i))
                             />
                         </div>
                     }
@@ -57,7 +53,7 @@ pub fn Lightbox(
     view! {
         <div
             class="fixed inset-0 bg-black/95 z-50 overflow-y-auto cursor-zoom-out"
-            on:click=move |ev| {ev.stop_propagation(); lightbox.set(None); }
+            on:click=move |ev| { ev.stop_propagation(); lightbox.set(None); }
         >
             <div class="sticky top-0 z-10 flex items-center justify-between px-4 py-2 bg-black/80 text-white">
                 <div class="font-semibold truncate">{title}</div>
@@ -85,5 +81,9 @@ pub fn Lightbox(
                 <div class="text-gray-500 text-center pb-6">"-- End --"</div>
             })}
         </div>
+
+        {move || viewer_open.get().then(|| view! {
+            <Viewer images=images index=viewer total=total />
+        })}
     }
 }

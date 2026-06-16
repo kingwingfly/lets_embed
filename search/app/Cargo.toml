@@ -27,7 +27,7 @@ web-sys = { version = "0.3", features = [
     "EventSource", "MessageEvent", "Element",
     "IntersectionObserver", "IntersectionObserverEntry", "IntersectionObserverInit",
     "ScrollToOptions", "ScrollBehavior", "Window", "DomRect", "CanvasRenderingContext2d",
-    "ImageBitmap", "FileList", "File"
+    "ImageBitmap", "FileList", "File", "Touch", "TouchEvent", "TouchList"
 ] }
 
 tokio = { workspace = true, optional = true }

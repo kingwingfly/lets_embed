@@ -4,9 +4,7 @@ use crate::{
     util::encode_path,
 };
 
-use leptos::ev::PointerEvent;
-use leptos::html;
-use leptos::prelude::*;
+use leptos::{ev::PointerEvent, html, prelude::*};
 use leptos_router::hooks::{use_location, use_navigate, use_params_map};
 use search_types::{Image, ImageDetails as ImageDetailsData};
 use wasm_bindgen::{JsCast, JsValue};
@@ -98,7 +96,14 @@ pub fn ImageDetails() -> impl IntoView {
     });
 
     let lightbox: RwSignal<Option<PostItem>> = RwSignal::new(None);
-    let viewer: RwSignal<Option<ImageItem>> = RwSignal::new(None);
+    let viewer: RwSignal<Option<usize>> = RwSignal::new(None);
+    let post_images_store: StoredValue<Vec<ImageItem>> = StoredValue::new(Vec::new());
+    Effect::new(move |_| {
+        if let Some(Ok(imgs)) = post_images.get() {
+            post_images_store.set_value(imgs);
+        }
+    });
+    let viewer_open = Memo::new(move |_| viewer.get().is_some());
 
     let img_ref: NodeRef<html::Img> = NodeRef::new();
     let container_ref: NodeRef<html::Div> = NodeRef::new();
@@ -110,17 +115,15 @@ pub fn ImageDetails() -> impl IntoView {
     let pathname = use_location().pathname;
 
     let lightbox_view = move || {
-        lightbox.get().map(|post| {
-            view! {
-                <Lightbox post lightbox viewer />
-            }
-        })
+        lightbox
+            .get()
+            .map(|post| view! { <Lightbox post lightbox/> })
     };
+
     let viewer_view = move || {
-        viewer.get().map(|image| {
-            view! {
-                <Viewer image viewer />
-            }
+        viewer_open.get().then(|| {
+            let total = post_images_store.with_value(|v| v.len());
+            view! { <Viewer images=post_images_store index=viewer total=total /> }
         })
     };
 
@@ -150,6 +153,22 @@ pub fn ImageDetails() -> impl IntoView {
         let image_name = image.name.clone();
         let img_w = image.width as u32;
         let img_h = image.height as u32;
+
+        let post_meta = post.as_ref().map(|p| (p.id, p.title.clone()));
+        let post_store = StoredValue::new(post_meta);
+
+        let open_lightbox = move || {
+            post_store.with_value(|m| {
+                if let Some((id, title)) = m {
+                    let images = post_images_store.with_value(|v| v.clone()); // 整列表仅在打开时 clone 一次
+                    lightbox.set(Some(PostItem {
+                        id: *id,
+                        title: title.clone(),
+                        images,
+                    }));
+                }
+            });
+        };
 
         let compute =
             move |sx: f64, sy: f64, ex: f64, ey: f64| -> Option<(Region, (f64, f64, f64, f64))> {
@@ -224,12 +243,21 @@ pub fn ImageDetails() -> impl IntoView {
             let dist = ((ex - sx).powi(2) + (ey - sy).powi(2)).sqrt();
 
             if dist < 6.0 {
-                viewer.set(Some(ImageItem {
-                    id: image_id,
-                    name: click_name.clone(),
-                    width: img_w,
-                    height: img_h,
-                }));
+                let idx =
+                    post_images_store.with_value(|v| v.iter().position(|im| im.id == image_id));
+                match idx {
+                    Some(i) => viewer.set(Some(i)),
+                    None => {
+                        // post 不存在或尚未加载：退化为单张
+                        post_images_store.set_value(vec![ImageItem {
+                            id: image_id,
+                            name: click_name.clone(),
+                            width: img_w,
+                            height: img_h,
+                        }]);
+                        viewer.set(Some(0));
+                    }
+                }
                 return;
             }
 
@@ -313,23 +341,15 @@ pub fn ImageDetails() -> impl IntoView {
                 <div class="w-full md:w-96 lg:w-[28rem] xl:w-[32rem] md:shrink-0
                             md:h-full flex flex-col gap-3 md:min-h-0">
                     {
-                        post.map(|post| {
-                            let post_item = post_images.get().map(|images| {
-                                PostItem {
-                                    id: post.id,
-                                    title: post.title.clone(),
-                                    images: images.unwrap_or_default()
-                                }
-                            });
-                            view! {
-                                <div class="text-white text-xl md:text-2xl font-bold text-center shrink-0
-                                            px-3 py-2 md:py-3 bg-white/10 rounded-lg line-clamp-2 cursor-pointer"
-                                    on:click=move |_| lightbox.set(post_item.clone())
-                                >
-                                    { post.title }
-                                </div>
-                            }
-                        })
+
+                        view! {
+                            <div class="text-white text-xl md:text-2xl font-bold text-center shrink-0
+                                        px-3 py-2 md:py-3 bg-white/10 rounded-lg line-clamp-2 cursor-pointer"
+                                on:click=move |_| open_lightbox()
+                            >
+                                { post.map(|p| p.title) }
+                            </div>
+                        }
                     }
 
                     <div class="shrink-0 max-h-24 md:max-h-32 overflow-y-auto
@@ -360,7 +380,7 @@ pub fn ImageDetails() -> impl IntoView {
                                                 md:max-h-none md:flex-1 md:min-h-0
                                                 scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
                                             {
-                                                images.into_iter().map(|image| view! {
+                                                images.into_iter().enumerate().map(|(i, image)| view! {
                                                     <img
                                                         loading="lazy"
                                                         decoding="async"
@@ -370,7 +390,7 @@ pub fn ImageDetails() -> impl IntoView {
                                                                 transition-all"
                                                         src=format!("/images/{}.webp", encode_path(&image.name))
                                                         alt=image.name.clone()
-                                                        on:click=move |_| viewer.set(Some(image.clone()))
+                                                        on:click=move |_| viewer.set(Some(i))
                                                     />
                                                 })
                                                 .collect_view()

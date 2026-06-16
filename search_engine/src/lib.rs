@@ -115,6 +115,7 @@ impl Engine {
             SELECT p.id, p.title
             FROM post_match pm
             JOIN posts p ON p.id = pm.post_id
+            ORDER BY p.id DESC
             LIMIT $2 OFFSET $3;
             "#,
             author,
@@ -159,6 +160,7 @@ impl Engine {
             SELECT p.id, p.title
             FROM post_match pm
             JOIN posts p ON p.id = pm.post_id
+            ORDER BY p.id DESC
             LIMIT $2 OFFSET $3;
             "#,
             tag,

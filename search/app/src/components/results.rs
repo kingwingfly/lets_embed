@@ -101,7 +101,10 @@ pub fn Results() -> impl IntoView {
     let loading = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     let lightbox: RwSignal<Option<PostItem>> = RwSignal::new(None);
-    let viewer: RwSignal<Option<ImageItem>> = RwSignal::new(None);
+    let viewer: RwSignal<Option<usize>> = RwSignal::new(None);
+    let images: StoredValue<Vec<ImageItem>> = StoredValue::new(Vec::new());
+
+    let viewer_open = Memo::new(move |_| viewer.get().is_some());
 
     let active: StoredValue<SendOption<ActiveSse>> = StoredValue::new(SendOption::new_local(None));
 
@@ -113,10 +116,11 @@ pub fn Results() -> impl IntoView {
                 c.height = 0;
             })
         });
+        images.update_value(|v| v.clear());
         offset.set(0);
         has_more.set(true);
         error.set(None);
-        load_page(0, params, columns, has_more, loading, error, active);
+        load_page(0, params, columns, images, has_more, loading, error, active);
     });
 
     let sentinel = NodeRef::<leptos::html::Div>::new();
@@ -128,7 +132,9 @@ pub fn Results() -> impl IntoView {
         let (_, _, limit) = params.get_untracked();
         offset.update(|old| *old += limit);
         let next = offset.get_untracked();
-        load_page(next, params, columns, has_more, loading, error, active);
+        load_page(
+            next, params, columns, images, has_more, loading, error, active,
+        );
     });
 
     let render_item = move |it: Item| -> AnyView {
@@ -164,6 +170,7 @@ pub fn Results() -> impl IntoView {
             }
             Item::Image(im) => {
                 let url = format!("/images/{}.webp", encode_path(&im.name));
+                let id = im.id;
                 view! {
                     <div class="m-1">
                         <img
@@ -172,7 +179,11 @@ pub fn Results() -> impl IntoView {
                             style=format!("aspect-ratio: {} / {}", im.width, im.height)
                             class="w-full h-auto block bg-gray-900 cursor-zoom-in select-none hover:opacity-80 hover:scale-[1.02] transition-all"
                             src=url
-                            on:click=move |_| viewer.set(Some(im.clone()))
+                            on:click=move |_| {
+                                if let Some(i) = images.with_value(|v| v.iter().position(|x| x.id == id)) {
+                                    viewer.set(Some(i));
+                                }
+                            }
                         />
                     </div>
                 }
@@ -209,18 +220,15 @@ pub fn Results() -> impl IntoView {
     };
 
     let lightbox_view = move || {
-        lightbox.get().map(|post| {
-            view! {
-                <Lightbox post lightbox viewer />
-            }
-        })
+        lightbox
+            .get()
+            .map(|post| view! { <Lightbox post lightbox/> })
     };
 
     let viewer_view = move || {
-        viewer.get().map(|image| {
-            view! {
-                <Viewer image viewer />
-            }
+        viewer_open.get().then(|| {
+            let total = images.with_value(|v| v.len());
+            view! { <Viewer images=images index=viewer total=total /> }
         })
     };
 
@@ -283,6 +291,7 @@ fn load_page(
     offset_val: i64,
     params: Memo<(Mode, String, i64)>,
     columns: RwSignal<Vec<Column>>,
+    images: StoredValue<Vec<ImageItem>>,
     has_more: RwSignal<bool>,
     loading: RwSignal<bool>,
     error: RwSignal<Option<String>>,
@@ -341,6 +350,7 @@ fn load_page(
         if let Some(s) = ev.data().as_string()
             && let Ok(im) = serde_json::from_str::<ImageItem>(&s)
         {
+            images.update_value(|v| v.push(im.clone()));
             columns.update(|columns| {
                 let Some(column) = columns.iter_mut().min_by_key(|c| c.height) else {
                     return;
