@@ -129,8 +129,8 @@ RUN apt-get update && \
 COPY --from=ort-cpu /opt/onnxruntime /opt/onnxruntime
 COPY --from=search-builder /app/target/release/server /usr/local/bin/server
 COPY --from=search-builder /app/target/release/gateway /usr/local/bin/gateway
-COPY --from=search-builder /app/target/site /app/site
-COPY --from=search-builder /app/target/release/hash.txt /app/hash.txt
+COPY --from=search-builder /app/target/site /site
+COPY --from=search-builder /app/target/release/hash.txt /hash.txt
 COPY <<'EOF' /usr/local/bin/start.sh
 #!/usr/bin/env bash
 set -uo pipefail
@@ -150,9 +150,9 @@ WORKDIR /app
 RUN useradd -r -u 10001 appuser
 USER appuser
 ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so \
-    LEPTOS_SITE_ROOT=/app/site \
+    LEPTOS_SITE_ROOT=/site \
     LEPTOS_HASH_FILES=true \
-    LEPTOS_HASH_FILE_NAME=/app/hash.txt
+    LEPTOS_HASH_FILE_NAME=/hash.txt
 ENTRYPOINT ["start.sh"]
 
 FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04 AS search-cuda12
@@ -162,8 +162,8 @@ RUN apt-get update && \
 COPY --from=ort-cuda12 /opt/onnxruntime /opt/onnxruntime
 COPY --from=search-builder /app/target/release/server /usr/local/bin/server
 COPY --from=search-builder /app/target/release/gateway /usr/local/bin/gateway
-COPY --from=search-builder /app/target/site /app/site
-COPY --from=search-builder /app/target/release/hash.txt /app/hash.txt
+COPY --from=search-builder /app/target/site /site
+COPY --from=search-builder /app/target/release/hash.txt /hash.txt
 COPY <<'EOF' /usr/local/bin/start.sh
 #!/usr/bin/env bash
 set -uo pipefail
@@ -183,9 +183,9 @@ WORKDIR /app
 RUN useradd -r -u 10001 appuser
 USER appuser
 ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so \
-    LEPTOS_SITE_ROOT=/app/site \
+    LEPTOS_SITE_ROOT=/site \
     LEPTOS_HASH_FILES=true \
-    LEPTOS_HASH_FILE_NAME=/app/hash.txt
+    LEPTOS_HASH_FILE_NAME=/hash.txt
 ENTRYPOINT ["start.sh"]
 
 FROM nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04 AS search-cuda13
@@ -195,8 +195,8 @@ RUN apt-get update && \
 COPY --from=ort-cuda13 /opt/onnxruntime /opt/onnxruntime
 COPY --from=search-builder /app/target/release/server /usr/local/bin/server
 COPY --from=search-builder /app/target/release/gateway /usr/local/bin/gateway
-COPY --from=search-builder /app/target/site /app/site
-COPY --from=search-builder /app/target/release/hash.txt /app/hash.txt
+COPY --from=search-builder /app/target/site /site
+COPY --from=search-builder /app/target/release/hash.txt /hash.txt
 COPY <<'EOF' /usr/local/bin/start.sh
 #!/usr/bin/env bash
 set -uo pipefail
@@ -216,9 +216,9 @@ WORKDIR /app
 RUN useradd -r -u 10001 appuser
 USER appuser
 ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so \
-    LEPTOS_SITE_ROOT=/app/site \
+    LEPTOS_SITE_ROOT=/site \
     LEPTOS_HASH_FILES=true \
-    LEPTOS_HASH_FILE_NAME=/app/hash.txt
+    LEPTOS_HASH_FILE_NAME=/hash.txt
 ENTRYPOINT ["start.sh"]
 
 ############################################################
