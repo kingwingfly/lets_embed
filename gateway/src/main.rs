@@ -116,7 +116,7 @@ fn is_content_hashed(path: &str) -> bool {
         && parts[parts.len() - 2].len() >= 8
         && parts[parts.len() - 2]
             .chars()
-            .all(|c| c.is_ascii_alphanumeric())
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn main() {
