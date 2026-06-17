@@ -11,8 +11,8 @@ const SWIPE_RATIO: f64 = 0.05;
 pub fn Viewer(
     images: StoredValue<Vec<ImageItem>>,
     index: RwSignal<Option<usize>>,
-    total: usize,
 ) -> impl IntoView {
+    let total = images.with_value(|v| v.len());
     let track = NodeRef::<leptos::html::Div>::new();
 
     let tx = RwSignal::new(-100.0_f64);
@@ -53,19 +53,17 @@ pub fn Viewer(
                 }
             });
         }
-        animating.set(false); // 先关动画
-        tx.set(-100.0); // 再瞬移复位，内容刚好对齐，无闪烁
+        animating.set(false);
+        tx.set(-100.0);
     });
 
-    // ---- 键盘 ----
     let _ = use_event_listener(window(), ev::keydown, move |e| match e.key().as_str() {
         "ArrowLeft" => slide(-1),
         "ArrowRight" => slide(1),
-        "Escape" => index.set(None),
+        "Escape" | " " => index.set(None),
         _ => {}
     });
 
-    // ---- 触摸拖拽 ----
     let start_x = StoredValue::new(0.0_f64);
     let width = StoredValue::new(1.0_f64);
     let dragging = StoredValue::new(false);
@@ -94,10 +92,10 @@ pub fn Viewer(
             let dx = t.client_x() as f64 - start_x.get_value();
             let mut pct = dx / width.get_value() * 100.0;
             if pct > 0.0 && !has_prev() {
-                pct = 0.0; // 已是第一张，向右拖到底
+                pct = 0.0;
             }
             if pct < 0.0 && !has_next() {
-                pct = 0.0; // 已是最后一张，向左拖到底
+                pct = 0.0;
             }
             tx.set(-100.0 + pct);
         }
@@ -107,7 +105,7 @@ pub fn Viewer(
             return;
         }
         dragging.set_value(false);
-        let drag = tx.get_untracked() + 100.0; // 拖动量（%）
+        let drag = tx.get_untracked() + 100.0;
         let target = if drag <= -SWIPE_RATIO * 100.0 && has_next() {
             -200.0
         } else if drag >= SWIPE_RATIO * 100.0 && has_prev() {
@@ -115,7 +113,6 @@ pub fn Viewer(
         } else {
             -100.0
         };
-        // 没有实际位移时不要开动画，否则收不到 transitionend
         if (target - tx.get_untracked()).abs() < 0.5 {
             animating.set(false);
             tx.set(target);
@@ -137,7 +134,6 @@ pub fn Viewer(
         )
     };
 
-    // 单个 slide：只读取该张图需要的字段，不 clone 整个列表
     let view_slide = move |idx: Option<usize>| {
         let data = idx.and_then(|i| {
             images.with_value(|v| {

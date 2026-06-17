@@ -122,8 +122,7 @@ pub fn ImageDetails() -> impl IntoView {
 
     let viewer_view = move || {
         viewer_open.get().then(|| {
-            let total = post_images_store.with_value(|v| v.len());
-            view! { <Viewer images=post_images_store index=viewer total=total /> }
+            view! { <Viewer images=post_images_store index=viewer /> }
         })
     };
 
@@ -248,7 +247,6 @@ pub fn ImageDetails() -> impl IntoView {
                 match idx {
                     Some(i) => viewer.set(Some(i)),
                     None => {
-                        // post 不存在或尚未加载：退化为单张
                         post_images_store.set_value(vec![ImageItem {
                             id: image_id,
                             name: click_name.clone(),

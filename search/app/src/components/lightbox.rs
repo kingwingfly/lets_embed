@@ -7,8 +7,8 @@ const PAGE: usize = 20;
 #[component]
 pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl IntoView {
     let total = post.images.len();
-    let images = StoredValue::new(post.images.clone());
-    let title = post.title.clone();
+    let images = StoredValue::new(post.images);
+    let title = post.title;
 
     let visible = RwSignal::new(PAGE.min(total));
     let sentinel = NodeRef::<leptos::html::Div>::new();
@@ -83,7 +83,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
         </div>
 
         {move || viewer_open.get().then(|| view! {
-            <Viewer images=images index=viewer total=total />
+            <Viewer images=images index=viewer />
         })}
     }
 }

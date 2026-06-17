@@ -55,7 +55,7 @@ impl ProxyHttp for Ingress {
     #[tracing::instrument(skip_all)]
     async fn response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_response: &mut ResponseHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()>
@@ -78,14 +78,23 @@ impl ProxyHttp for Ingress {
             return Ok(());
         };
 
-        let cache_control = match content_type.as_str() {
-            t if t.starts_with("image/") => Some("public, max-age=31536000, immutable"), // 1 year
+        let path = session.req_header().uri.path();
+        let is_hashed = is_content_hashed(path);
 
-            "text/html"
-            | "text/css"
-            | "application/javascript"
-            | "text/javascript"
-            | "application/wasm" => Some("public, max-age=3600"), // 1h
+        let cache_control = match content_type.as_str() {
+            _ if is_hashed => Some("public, max-age=31536000, immutable"),
+
+            t if t.starts_with("image/") || t.starts_with("font/") => {
+                Some("public, max-age=31536000, immutable")
+            }
+
+            "text/html" => {
+                Some("no-cache, must-revalidate, s-maxage=30, stale-while-revalidate=60")
+            }
+
+            "application/javascript" | "text/javascript" | "text/css" | "application/wasm" => {
+                Some("public, max-age=0, s-maxage=300, stale-while-revalidate=60, must-revalidate")
+            }
 
             _ => None,
         };
@@ -96,6 +105,18 @@ impl ProxyHttp for Ingress {
 
         Ok(())
     }
+}
+
+fn is_content_hashed(path: &str) -> bool {
+    let Some(file) = path.rsplit('/').next() else {
+        return false;
+    };
+    let parts: Vec<&str> = file.split('.').collect();
+    parts.len() >= 3
+        && parts[parts.len() - 2].len() >= 8
+        && parts[parts.len() - 2]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric())
 }
 
 fn main() {

@@ -227,8 +227,7 @@ pub fn Results() -> impl IntoView {
 
     let viewer_view = move || {
         viewer_open.get().then(|| {
-            let total = images.with_value(|v| v.len());
-            view! { <Viewer images=images index=viewer total=total /> }
+            view! { <Viewer images=images index=viewer /> }
         })
     };
 

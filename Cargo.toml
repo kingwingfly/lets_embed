@@ -68,6 +68,8 @@ panic = "abort"
 name = "search"
 site-addr = "0.0.0.0:3000"
 
+hash-files = true
+
 tailwind-input-file = "search/style/tailwind.css"
 
 bin-package = "server"

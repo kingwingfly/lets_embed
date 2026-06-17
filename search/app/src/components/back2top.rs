@@ -12,9 +12,10 @@ pub fn BackToTop(#[prop(default = 300.0)] threshold: f64) -> impl IntoView {
         let options = ScrollToOptions::new();
         options.set_top(0.0);
         options.set_behavior(ScrollBehavior::Smooth);
-        if let Some(win) = use_window().as_ref() {
-            win.scroll_to_with_scroll_to_options(&options);
-        }
+        use_window()
+            .as_ref()
+            .unwrap() // always Some on client
+            .scroll_to_with_scroll_to_options(&options);
     };
 
     view! {
