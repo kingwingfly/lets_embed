@@ -101,20 +101,11 @@ impl Engine {
         let posts = sqlx::query_as!(
             Post,
             r#"
-            WITH
-            pos_authors AS (
-                SELECT DISTINCT a.id AS author_id
-                FROM authors a
-                WHERE a.name ILIKE '%' || $1::TEXT || '%'
-            ),
-            post_match AS (
-                SELECT ap.post_id
-                FROM author_posts ap
-                JOIN pos_authors pa ON pa.author_id = ap.author_id
-            )
-            SELECT p.id, p.title
-            FROM post_match pm
-            JOIN posts p ON p.id = pm.post_id
+            SELECT DISTINCT p.id, p.title
+            FROM authors a
+            JOIN author_posts ap ON ap.author_id = a.id
+            JOIN posts p ON p.id = ap.post_id
+            WHERE a.name ILIKE '%' || $1::TEXT || '%'
             ORDER BY p.id DESC
             LIMIT $2 OFFSET $3;
             "#,
@@ -146,20 +137,11 @@ impl Engine {
         let posts = sqlx::query_as!(
             Post,
             r#"
-            WITH
-            pos_tags AS (
-                SELECT DISTINCT t.id AS tag_id
-                FROM tags t
-                WHERE t.name ILIKE '%' || $1::TEXT || '%'
-            ),
-            post_match AS (
-                SELECT tp.post_id
-                FROM tag_posts tp
-                JOIN pos_tags pt ON pt.tag_id = tp.tag_id
-            )
-            SELECT p.id, p.title
-            FROM post_match pm
-            JOIN posts p ON p.id = pm.post_id
+            SELECT DISTINCT p.id, p.title
+            FROM tags t
+            JOIN tag_posts tp ON tp.tag_id = t.id
+            JOIN posts p ON p.id = tp.post_id
+            WHERE t.name ILIKE '%' || $1::TEXT || '%'
             ORDER BY p.id DESC
             LIMIT $2 OFFSET $3;
             "#,
@@ -193,10 +175,10 @@ impl Engine {
             r#"
             WITH
             pos_tags AS (
-                SELECT DISTINCT wt.id AS tag_id
+                SELECT wt.id AS tag_id
                 FROM wd_tags wt
                 WHERE wt.name ILIKE '%' || $1::TEXT || '%'
-                    OR EXISTS (SELECT 1 FROM unnest(wt.translations) tr WHERE tr ILIKE '%' || $1::TEXT || '%')
+                    OR array_to_string(wt.translations, E'\n') ILIKE '%' || $1::TEXT || '%'
             ),
             img_match AS (
                 SELECT wti.image_id, MAX(wti.score) AS max_score
@@ -207,7 +189,7 @@ impl Engine {
             SELECT i.id, i.name, i.width, i.height
             FROM img_match im
             JOIN images i ON i.id = im.image_id
-            ORDER BY im.max_score DESC
+            ORDER BY im.max_score DESC, im.image_id DESC
             LIMIT $2 OFFSET $3;
             "#,
             tag,

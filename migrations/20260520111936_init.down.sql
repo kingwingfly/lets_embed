@@ -2,19 +2,20 @@
 DROP INDEX idx_wd_tag_images_score;
 DROP INDEX idx_image_wd_tags_image_id;
 DROP INDEX idx_wd_tags_translations;
-DROP INDEX idx_wd_tags_name;
+DROP INDEX idx_wd_tags_translations_trgm;
+DROP INDEX idx_wd_tags_name_trgm;
 DROP TABLE wd_tag_images;
 DROP TABLE wd_tags;
 
 -- tags
 DROP INDEX idx_tag_posts_post_id;
-DROP INDEX idx_tags_name;
+DROP INDEX idx_tags_name_trgm;
 DROP TABLE tag_posts;
 DROP TABLE tags;
 
 -- authors
 DROP INDEX idx_author_posts_post_id;
-DROP INDEX idx_authors_name;
+DROP INDEX idx_authors_name_trgm;
 DROP TABLE author_posts;
 DROP TABLE authors;
 
@@ -23,12 +24,12 @@ DROP INDEX idx_post_images_image_id;
 DROP INDEX idx_images_clip;
 DROP INDEX idx_images_dinov3;
 DROP INDEX idx_images_status;
-DROP INDEX idx_images_name;
+DROP INDEX idx_images_name_trgm;
 DROP TABLE post_images;
 DROP TABLE images;
 
 -- posts
-DROP INDEX idx_posts_title;
+DROP INDEX idx_posts_title_trgm;
 DROP TABLE posts;
 
 DROP TYPE translation;
@@ -36,4 +37,5 @@ DROP TYPE meta;
 DROP TYPE image;
 DROP TYPE process_status;
 
+DROP EXTENSION pg_trgm;
 DROP EXTENSION vector;

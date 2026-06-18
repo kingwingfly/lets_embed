@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT p.id, p.title\n            FROM tags t\n            JOIN tag_posts tp ON tp.tag_id = t.id\n            JOIN posts p ON p.id = tp.post_id\n            WHERE t.name ILIKE '%' || $1::TEXT || '%'\n            ORDER BY p.id DESC\n            LIMIT $2 OFFSET $3;\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "posts",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "title",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "posts",
+            "name": "title"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "dfc90db90a93b0a15d6374592f9c10e4543440269376358161235195f6aba0be"
+}

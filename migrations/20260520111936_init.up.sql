@@ -1,4 +1,5 @@
 CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE TYPE process_status AS ENUM ('pending', 'processing', 'completed');
 
@@ -27,7 +28,7 @@ CREATE TABLE IF NOT EXISTS posts (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_posts_title ON posts(title);
+CREATE INDEX idx_posts_title_trgm ON posts USING GIN (title gin_trgm_ops);
 
 -- images
 CREATE TABLE IF NOT EXISTS images (
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS post_images (
     PRIMARY KEY (post_id, image_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_images_name ON images(name);
+CREATE INDEX idx_images_name_trgm ON images USING GIN (name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_images_status ON images (status) WHERE status = 'pending'::process_status;
 CREATE INDEX IF NOT EXISTS idx_images_dinov3 ON images USING hnsw (dinov3_embedding halfvec_cosine_ops);
 CREATE INDEX IF NOT EXISTS idx_images_clip ON images USING hnsw (clip_embedding halfvec_cosine_ops);
@@ -67,7 +68,7 @@ CREATE TABLE IF NOT EXISTS author_posts (
     PRIMARY KEY (author_id, post_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_authors_name ON authors(name);
+CREATE INDEX idx_authors_name_trgm ON authors USING GIN (name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_author_posts_post_id ON author_posts(post_id);
 
 -- tags
@@ -83,7 +84,7 @@ CREATE TABLE IF NOT EXISTS tag_posts (
     PRIMARY KEY (tag_id, post_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_tags_name ON tags(name);
+CREATE INDEX idx_tags_name_trgm ON tags USING GIN (name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_tag_posts_post_id ON tag_posts(post_id);
 
 -- wd_tags
@@ -109,7 +110,8 @@ CREATE TABLE IF NOT EXISTS wd_tag_images (
     PRIMARY KEY (wd_tag_id, image_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_wd_tags_name ON wd_tags(name);
+CREATE INDEX idx_wd_tags_name_trgm ON wd_tags USING GIN (name gin_trgm_ops);
+CREATE INDEX idx_wd_tags_translations_trgm ON wd_tags USING GIN (array_to_string(translations, E'\n') gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_wd_tags_translations ON wd_tags USING gin (translations);
 CREATE INDEX IF NOT EXISTS idx_image_wd_tags_image_id ON wd_tag_images(image_id);
 CREATE INDEX IF NOT EXISTS idx_wd_tag_images_score ON wd_tag_images(score);
