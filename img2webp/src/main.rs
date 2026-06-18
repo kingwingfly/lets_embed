@@ -45,7 +45,14 @@ async fn main() -> anyhow::Result<()> {
     let finished_paths = entries
         .take_until(cancel.cancelled())
         .filter_map(|e| ready(e.ok()))
-        .filter(|e| ready(e.metadata().is_file() && !e.path().ends_with(".webp")))
+        .filter(|e| {
+            ready(
+                e.metadata().is_file()
+                    && [".webp", ".mp4", ".mov", ".mkv", ".avi"]
+                        .into_iter()
+                        .all(|s| !e.path().ends_with(s)),
+            )
+        })
         .map(|e| e.into_parts().0)
         .map(async |path| Ok::<_, opendal::Error>((op.read(&path).await?, path)))
         .buffer_unordered(*CONCURRENT)
