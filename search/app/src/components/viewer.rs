@@ -57,11 +57,14 @@ pub fn Viewer(
         tx.set(-100.0);
     });
 
-    let _ = use_event_listener(window(), ev::keydown, move |e| match e.key().as_str() {
-        "ArrowLeft" => slide(-1),
-        "ArrowRight" => slide(1),
-        "Escape" | " " => index.set(None),
-        _ => {}
+    let _ = use_event_listener(window(), ev::keydown, move |e| {
+        e.prevent_default();
+        match e.key().as_str() {
+            "ArrowLeft" => slide(-1),
+            "ArrowRight" => slide(1),
+            "Escape" | " " => index.set(None),
+            _ => {}
+        }
     });
 
     let start_x = StoredValue::new(0.0_f64);
