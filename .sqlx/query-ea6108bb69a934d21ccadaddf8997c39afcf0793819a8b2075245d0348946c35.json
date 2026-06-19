@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT DISTINCT p.id, p.title\n            FROM authors a\n            JOIN author_posts ap ON ap.author_id = a.id\n            JOIN posts p ON p.id = ap.post_id\n            WHERE a.name ILIKE '%' || $1::TEXT || '%'\n            ORDER BY p.id DESC\n            LIMIT $2 OFFSET $3;\n            ",
+  "query": "\n            SELECT p.id, p.title\n            FROM posts p\n            WHERE p.title ILIKE ANY($1::TEXT[])\n            ORDER BY p.id DESC\n            LIMIT $2 OFFSET $3;\n            ",
   "describe": {
     "columns": [
       {
@@ -28,7 +28,7 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
+        "TextArray",
         "Int8",
         "Int8"
       ]
@@ -38,5 +38,5 @@
       false
     ]
   },
-  "hash": "23e58a2b174d4107ed9276de748c446ead9dbd4471f4c571a12318a3c55daa5c"
+  "hash": "ea6108bb69a934d21ccadaddf8997c39afcf0793819a8b2075245d0348946c35"
 }

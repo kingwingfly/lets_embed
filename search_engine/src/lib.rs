@@ -83,6 +83,42 @@ impl Engine {
         Ok(res)
     }
 
+    pub async fn search_posts_by_title<'a>(
+        &'a self,
+        title: impl AsRef<str>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<impl Stream<Item = Post> + Send + 'a> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
+
+        let title = title.as_ref().to_owned();
+        if title.is_empty() {
+            bail!("title should not be empty")
+        }
+
+        let terms: Vec<String> = title.split_whitespace().map(|t| format!("%{t}%")).collect();
+
+        let posts = sqlx::query_as!(
+            Post,
+            r#"
+            SELECT p.id, p.title
+            FROM posts p
+            WHERE p.title ILIKE ANY($1::TEXT[])
+            ORDER BY p.id DESC
+            LIMIT $2 OFFSET $3;
+            "#,
+            &terms,
+            limit,
+            offset
+        )
+        .fetch(&self.pool)
+        .filter_map(|res| ready(res.ok()));
+
+        Ok(posts)
+    }
+
     pub async fn search_posts_by_author<'a>(
         &'a self,
         author: impl AsRef<str>,
@@ -101,7 +137,7 @@ impl Engine {
         let posts = sqlx::query_as!(
             Post,
             r#"
-            SELECT DISTINCT p.id, p.title
+            SELECT p.id, p.title
             FROM authors a
             JOIN author_posts ap ON ap.author_id = a.id
             JOIN posts p ON p.id = ap.post_id
@@ -137,7 +173,7 @@ impl Engine {
         let posts = sqlx::query_as!(
             Post,
             r#"
-            SELECT DISTINCT p.id, p.title
+            SELECT p.id, p.title
             FROM tags t
             JOIN tag_posts tp ON tp.tag_id = t.id
             JOIN posts p ON p.id = tp.post_id
