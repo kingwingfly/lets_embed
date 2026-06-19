@@ -129,6 +129,8 @@ pub fn SearchBar() -> impl IntoView {
                             on:click=move |_| mode.set(Mode::Tag)>"Tag"</button>
                         <button type="button" class=move || tab_cls(Mode::Author)
                             on:click=move |_| mode.set(Mode::Author)>"Author"</button>
+                        <button type="button" class=move || tab_cls(Mode::Title)
+                            on:click=move |_| mode.set(Mode::Title)>"Title"</button>
                         <button type="button" class=move || tab_cls(Mode::Clip)
                             on:click=move |_| mode.set(Mode::Clip)>"CLIP"</button>
                         <button type="button" class=move || tab_cls(Mode::Similar)
@@ -163,6 +165,7 @@ pub fn SearchBar() -> impl IntoView {
                                         placeholder=move || match mode.get() {
                                             Mode::Tag => "One tag",
                                             Mode::Author => "One author name",
+                                            Mode::Title => "One title",
                                             Mode::Clip => "Describe the image...",
                                             Mode::Similar => "Image ID",
                                             Mode::SearchImage => "",

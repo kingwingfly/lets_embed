@@ -47,15 +47,19 @@ pub async fn search_sse(
         };
 
         match (mode, q.is_empty()) {
-            (_, true) | (Mode::Author, false)  => {
+            (_, true) | (Mode::Author, false) | (Mode::Title, false)  => {
                 let res = match q.is_empty() {
                      true =>
                         engine.newest_posts(limit, offset)
                             .await
                             .map(|s| Box::pin(s) as Pin<Box<dyn Stream<Item = search_types::Post> + Send>>),
-                     false =>
-                        engine.search_posts_by_author(q, limit, offset).await
+                     false => match mode {
+                        Mode::Author => engine.search_posts_by_author(q, limit, offset).await
                             .map(|s| Box::pin(s) as _),
+                        Mode::Title => engine.search_posts_by_title(q, limit, offset).await
+                            .map(|s| Box::pin(s) as _),
+                        _ => unreachable!()
+                     }
                 };
                 match res {
                     Ok(mut posts) => {

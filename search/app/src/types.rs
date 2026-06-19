@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum Mode {
     Tag,
     Author,
+    Title,
     Clip,
     Similar,
     SearchImage,
@@ -15,6 +16,7 @@ impl Mode {
         match self {
             Mode::Tag => "tag",
             Mode::Author => "author",
+            Mode::Title => "title",
             Mode::Clip => "clip",
             Mode::Similar => "similar",
             Mode::SearchImage => "search_image",
@@ -23,6 +25,7 @@ impl Mode {
     pub fn parse(s: &str) -> Self {
         match s {
             "author" => Mode::Author,
+            "title" => Mode::Title,
             "clip" => Mode::Clip,
             "similar" => Mode::Similar,
             "search_image" => Mode::SearchImage,
