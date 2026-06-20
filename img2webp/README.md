@@ -21,6 +21,15 @@ podman run --rm --name img2webp --env-file .env run img2webp:latest
 - `gcloud secrets create --data-file=.env`
 - run it with `gcloud run`
 
+```
+R2_ENDPOINT=
+R2_BUCKET=
+R2_KEY_ID=
+R2_SECRET_KEY=
+# S3 only
+R2_REGION=
+```
+
 # Compile
 
 For macos only:
