@@ -52,7 +52,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
 
     view! {
         <div
-            class="fixed inset-0 bg-black/95 z-50 overflow-y-auto cursor-zoom-out"
+            class="fixed inset-0 bg-black/95 z-50 overflow-y-auto overscroll-contain cursor-zoom-out"
             on:click=move |ev| { ev.stop_propagation(); lightbox.set(None); }
         >
             <div class="sticky top-0 z-10 flex items-center justify-between px-4 py-2 bg-black/80 text-white">
