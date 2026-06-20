@@ -5,6 +5,7 @@ gtdata
 models
 .venv
 rustc-ice*
+.env
 .env.local
 node_modules
 .wrangler
