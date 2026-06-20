@@ -14,7 +14,11 @@ use libvips::{
     ops::{ForeignKeep, ForeignWebpPreset, WebpsaveBufferOptions, webpsave_buffer_with_opts},
 };
 use mime_guess::{MimeGuess, mime::IMAGE};
-use opendal::Operator;
+use opendal::{
+    Operator,
+    layers::{RetryLayer, TimeoutLayer},
+    services::S3,
+};
 use tokio_util::sync::CancellationToken;
 
 static FINISHED: AtomicU64 = AtomicU64::new(0);
@@ -103,7 +107,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(debug_assertions))]
 #[derive(Debug)]
 struct Config {
     endpoint: String,
@@ -113,7 +116,6 @@ struct Config {
     region: String,
 }
 
-#[cfg(not(debug_assertions))]
 impl Config {
     fn new() -> Result<Self, dotenvy::Error> {
         dotenvy::dotenv().ok();
@@ -129,21 +131,7 @@ impl Config {
     }
 }
 
-#[cfg(debug_assertions)]
 pub async fn operator() -> anyhow::Result<Operator> {
-    use opendal::services::Fs;
-
-    let op = Operator::new(Fs::default().root("assets"))?.finish();
-    Ok(op)
-}
-
-#[cfg(not(debug_assertions))]
-pub async fn operator() -> anyhow::Result<Operator> {
-    use opendal::{
-        layers::{RetryLayer, TimeoutLayer},
-        services::S3,
-    };
-
     let config = Config::new()?;
     let op = Operator::new(
         S3::default()

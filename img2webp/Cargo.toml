@@ -9,7 +9,7 @@ bytes = "1.11.1"
 dotenvy = "0.15"
 futures = "0.3"
 libvips = "2.1"
-opendal = { version = "0.57", features = ["services-s3", "services-fs"] }
+opendal = { version = "0.57", features = ["services-s3"] }
 tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7.18"
 mime_guess = "2.0.5"
