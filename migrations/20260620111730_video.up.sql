@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS videos (
     name VARCHAR(255) UNIQUE NOT NULL CHECK (btrim(name) != ''),
     width INT NOT NULL CHECK (width > 0),
     height INT NOT NULL CHECK (height > 0),
+    duration INT NOT NULL CHECK (height > 0),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
