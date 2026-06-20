@@ -124,17 +124,23 @@ pub fn Results() -> impl IntoView {
     });
 
     let sentinel = NodeRef::<leptos::html::Div>::new();
-
+    let is_intersecting = RwSignal::new(false);
     use_intersection_observer(sentinel, move |entries, _| {
-        if !entries[0].is_intersecting() || loading.get_untracked() || !has_more.get_untracked() {
-            return;
+        is_intersecting.set(entries[0].is_intersecting());
+    });
+    Effect::new(move |_| {
+        let intersecting = is_intersecting.get();
+        let is_loading = loading.get();
+        let more = has_more.get();
+
+        if intersecting && !is_loading && more {
+            let (_, _, limit) = params.get_untracked();
+            offset.update(|old| *old += limit);
+            let next = offset.get_untracked();
+            load_page(
+                next, params, columns, images, has_more, loading, error, active,
+            );
         }
-        let (_, _, limit) = params.get_untracked();
-        offset.update(|old| *old += limit);
-        let next = offset.get_untracked();
-        load_page(
-            next, params, columns, images, has_more, loading, error, active,
-        );
     });
 
     let render_item = move |it: Item| -> AnyView {
