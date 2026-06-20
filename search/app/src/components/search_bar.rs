@@ -11,7 +11,7 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ImageBitmap};
 
 async fn encode_file(file: web_sys::File) -> Option<String> {
-    const MAX_EDGE: f64 = 384.0;
+    const MAX_EDGE: f64 = 256.0;
 
     let window = web_sys::window()?;
     let promise = window.create_image_bitmap_with_blob(&file).ok()?;
