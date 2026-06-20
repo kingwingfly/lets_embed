@@ -19,7 +19,8 @@ use tower_cookies::{
 };
 use tower_service::Service;
 use worker::{
-    Context, Env, Error, Fetch, HttpRequest, RequestInit, Result, event, js_sys::Uint8Array,
+    Context, Env, Error, Fetch, HttpRequest, Request, RequestInit, Result, event,
+    js_sys::Uint8Array,
 };
 
 const API_UPSTREAM: &str = "https://lets-embed-api.louisfly.icu";
@@ -598,7 +599,7 @@ async fn proxy(
         .headers
         .set("CF-Access-Client-Secret", client_secret);
 
-    let request = match worker::Request::new_with_init(&target, &req_init) {
+    let request = match Request::new_with_init(&target, &req_init) {
         Ok(r) => r,
         Err(e) => {
             return (

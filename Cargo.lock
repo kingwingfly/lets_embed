@@ -2628,6 +2628,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "libvips",
+ "mime_guess",
  "opendal 0.57.0",
  "tokio",
  "tokio-util",

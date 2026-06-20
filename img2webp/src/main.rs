@@ -13,6 +13,7 @@ use libvips::{
     VipsApp, VipsImage,
     ops::{ForeignKeep, ForeignWebpPreset, WebpsaveBufferOptions, webpsave_buffer_with_opts},
 };
+use mime_guess::{MimeGuess, mime::VIDEO};
 use opendal::Operator;
 use tokio_util::sync::CancellationToken;
 
@@ -46,11 +47,11 @@ async fn main() -> anyhow::Result<()> {
         .take_until(cancel.cancelled())
         .filter_map(|e| ready(e.ok()))
         .filter(|e| {
+            let mimes = MimeGuess::from_path(e.path());
             ready(
                 e.metadata().is_file()
-                    && [".webp", ".mp4", ".mov", ".mkv", ".avi"]
-                        .into_iter()
-                        .all(|s| !e.path().ends_with(s)),
+                    && !e.path().ends_with(".webp")
+                    && (mimes.is_empty() || mimes.into_iter().any(|m| m.type_() == VIDEO)),
             )
         })
         .map(|e| e.into_parts().0)
