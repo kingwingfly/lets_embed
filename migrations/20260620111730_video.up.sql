@@ -1,6 +1,5 @@
 CREATE TABLE IF NOT EXISTS videos (
     id BIGSERIAL PRIMARY KEY,
-    uid VARCHAR(255),
     name VARCHAR(255) UNIQUE NOT NULL CHECK (btrim(name) != ''),
     width INT NOT NULL CHECK (width > 0),
     height INT NOT NULL CHECK (height > 0),
