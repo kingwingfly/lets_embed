@@ -148,7 +148,8 @@ pub fn Results() -> impl IntoView {
         match it {
             Item::Post(p) => {
                 let cover = p.images.first().cloned();
-                let count = p.images.len();
+                let img_count = p.images.len();
+                let video_count = p.videos.len();
                 view! {
                     <div class="mb-2 break-inside-avoid">
                         <div
@@ -165,7 +166,7 @@ pub fn Results() -> impl IntoView {
                                 />
                             })}
                             <div class="absolute top-1 right-1 bg-black/70 text-white text-xs px-2 py-0.5 rounded">
-                                {count}" imgs"
+                                {img_count}"p"{video_count}"v"
                             </div>
                             <div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent text-white text-xs p-1 truncate">
                                 {p.title.clone()}
