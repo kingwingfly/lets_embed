@@ -6,7 +6,7 @@ use crate::{
 
 use leptos::{ev::PointerEvent, html, prelude::*};
 use leptos_router::hooks::{use_location, use_navigate, use_params_map};
-use search_types::{Image, ImageDetails as ImageDetailsData};
+use search_types::{Image, ImageDetails as ImageDetailsData, Video};
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement};
 
@@ -81,6 +81,14 @@ pub fn ImageDetails() -> impl IntoView {
             .ok_or("this image belongs to no post".to_string())?;
         list_post_images(post_id).await.map_err(|e| e.to_string())
     });
+    let post_videos = OnceResource::new(async move {
+        let details = details.await?;
+        let post_id = details
+            .post
+            .map(|p| p.id)
+            .ok_or("this image belongs to no post".to_string())?;
+        list_post_videos(post_id).await.map_err(|e| e.to_string())
+    });
 
     let lightbox: RwSignal<Option<PostItem>> = RwSignal::new(None);
     let viewer: RwSignal<Option<usize>> = RwSignal::new(None);
@@ -88,6 +96,12 @@ pub fn ImageDetails() -> impl IntoView {
     Effect::new(move |_| {
         if let Some(Ok(imgs)) = post_images.get() {
             post_images_store.set_value(imgs);
+        }
+    });
+    let post_videos_store: StoredValue<Vec<Video>> = StoredValue::new(Vec::new());
+    Effect::new(move |_| {
+        if let Some(Ok(videos)) = post_videos.get() {
+            post_videos_store.set_value(videos);
         }
     });
     let viewer_open = Memo::new(move |_| viewer.get().is_some());
@@ -143,11 +157,13 @@ pub fn ImageDetails() -> impl IntoView {
         let open_lightbox = move || {
             post_store.with_value(|m| {
                 if let Some((id, title)) = m {
-                    let images = post_images_store.with_value(|v| v.clone()); // 整列表仅在打开时 clone 一次
+                    let images = post_images_store.with_value(|v| v.clone());
+                    let videos = post_videos_store.with_value(|v| v.clone());
                     lightbox.set(Some(PostItem {
                         id: *id,
                         title: title.clone(),
                         images,
+                        videos,
                     }));
                 }
             });
@@ -348,39 +364,80 @@ pub fn ImageDetails() -> impl IntoView {
                         }
                     </div>
 
-                    <Transition fallback=move || view! { <div class="flex-1 min-h-0" /> }>
-                        {
-                            move || {
-                                post_images.get().map(|images| match images {
-                                    Ok(images) => view! {
-                                        <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-2 lg:grid-cols-3
-                                                gap-2 pr-1
-                                                max-h-[40vh] overflow-y-auto
-                                                md:max-h-none md:flex-1 md:min-h-0
-                                                scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
-                                            {
-                                                images.into_iter().enumerate().map(|(i, image)| view! {
-                                                    <img
-                                                        loading="lazy"
-                                                        decoding="async"
-                                                        class="w-full aspect-square object-cover rounded-md
-                                                                select-none cursor-zoom-in
-                                                                hover:opacity-80 hover:scale-[1.02]
-                                                                transition-all"
-                                                        src=format!("/images/{}.webp", encode_path(&image.name))
-                                                        alt=image.name.clone()
-                                                        on:click=move |_| viewer.set(Some(i))
-                                                    />
-                                                })
-                                                .collect_view()
-                                            }
-                                        </div>
-                                    }.into_any(),
-                                    Err(e) => e.to_string().into_any(),
-                                })
+                    <div class="flex-1 min-h-0 flex flex-row gap-2">
+                        <Transition fallback=move || view! { <div class="flex-1 min-h-0" /> }>
+                            {
+                                move || {
+                                    post_images.get().map(|images| match images {
+                                        Ok(images) => view! {
+                                            <div class="flex-[2] min-w-0 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-2 lg:grid-cols-3
+                                                    gap-2 pr-1
+                                                    max-h-[40vh] overflow-y-auto
+                                                    md:max-h-none md:min-h-0
+                                                    scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
+                                                {
+                                                    images.into_iter().enumerate().map(|(i, image)| view! {
+                                                        <img
+                                                            loading="lazy"
+                                                            decoding="async"
+                                                            class="w-full aspect-square object-cover rounded-md
+                                                                    select-none cursor-zoom-in
+                                                                    hover:opacity-80 hover:scale-[1.02]
+                                                                    transition-all"
+                                                            src=format!("/images/{}.webp", encode_path(&image.name))
+                                                            alt=image.name.clone()
+                                                            on:click=move |_| viewer.set(Some(i))
+                                                        />
+                                                    })
+                                                    .collect_view()
+                                                }
+                                            </div>
+                                        }.into_any(),
+                                        Err(e) => e.to_string().into_any(),
+                                    })
+                                }
                             }
-                        }
-                    </Transition>
+                        </Transition>
+
+                        <Transition fallback=|| ()>
+                            {
+                                move || {
+                                    post_videos.get().and_then(|videos| match videos {
+                                        Ok(videos) if !videos.is_empty() => Some(view! {
+                                            <div class="flex-1 min-w-0 grid grid-cols-1
+                                                    gap-2 pr-1
+                                                    max-h-[40vh] overflow-y-auto
+                                                    md:max-h-none md:min-h-0
+                                                    scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
+                                                {
+                                                    videos.into_iter().map(|v| {
+                                                        let aspect = if v.width > 0 && v.height > 0 {
+                                                            format!("aspect-ratio:{}/{};", v.width, v.height)
+                                                        } else {
+                                                            "aspect-ratio:16/9;".to_string()
+                                                        };
+                                                        view! {
+                                                            <video
+                                                                class="w-full rounded-md bg-black object-contain select-none"
+                                                                style=aspect
+                                                                controls
+                                                                playsinline
+                                                                preload="metadata"
+                                                                src=format!("/videos/{}", encode_path(&v.name))
+                                                            />
+                                                        }
+                                                    })
+                                                    .collect_view()
+                                                }
+                                            </div>
+                                        }.into_any()),
+                                        Ok(_) => None,
+                                        Err(e) => Some(e.to_string().into_any()),
+                                    })
+                                }
+                            }
+                        </Transition>
+                    </div>
                 </div>
             </div>
         }
@@ -450,6 +507,25 @@ async fn list_post_images(post_id: i64) -> Result<Vec<Image>, ServerFnError> {
 
     engine
         .list_post_images(post_id)
+        .await
+        .map_err(|e| ServerFnError::Response(e.to_string()))
+}
+
+#[server]
+async fn list_post_videos(post_id: i64) -> Result<Vec<Video>, ServerFnError> {
+    use crate::state::AppState;
+
+    use std::sync::Arc;
+
+    use axum::extract::State;
+    use leptos_axum::extract_with_state;
+    use search_engine::Engine;
+
+    let state = expect_context::<AppState>();
+    let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
+
+    engine
+        .list_post_videos(post_id)
         .await
         .map_err(|e| ServerFnError::Response(e.to_string()))
 }

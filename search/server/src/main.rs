@@ -43,7 +43,9 @@ async fn main() -> anyhow::Result<()> {
 
     let mut app = Router::new().route("/api/search", get(api::search_sse));
     if let Some(prefix) = args.prefix {
-        app = app.nest_service("/images", ServeDir::new(&prefix))
+        app = app
+            .nest_service("/images", ServeDir::new(&prefix))
+            .nest_service("/videos", ServeDir::new(&prefix))
     }
     let app = app
         .leptos_routes_with_context(

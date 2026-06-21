@@ -70,10 +70,15 @@ pub async fn search_sse(
                                 Ok(images) => images,
                                 Err(_) => continue
                             };
+                            let videos = match engine.list_post_videos(post.id).await {
+                                Ok(videos) => videos,
+                                Err(_) => continue
+                            };
                             let item = PostItem {
                                 id: post.id,
                                 title: post.title,
                                 images,
+                                videos
                             };
                             count += 1;
                             yield Ok(Event::default()

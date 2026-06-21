@@ -1,7 +1,5 @@
 //! import wd tag translations to db
 
-use std::env;
-
 use serde::Deserialize;
 use sqlx::{PgPool, prelude::Type};
 
@@ -11,8 +9,10 @@ async fn main() -> anyhow::Result<()> {
 
     let translations: Vec<Translation> = serde_json::from_reader(&mut file)?;
 
+    dotenvy::dotenv().ok();
+
     let pool = PgPool::connect_lazy(
-        env::var("DATABASE_URL")
+        dotenvy::var("DATABASE_URL")
             .unwrap_or("postgres://postgres:postgres@postgres:5432/postgres".to_string())
             .as_str(),
     )?;

@@ -30,7 +30,7 @@ opendal = { version = "0.56", features = ["services-fs", "services-http", "servi
 sqlx.workspace = true
 pgvector.workspace = true
 
-dotenvy = "0.15"
+dotenvy.workspace = true
 ort.workspace = true
 url.workspace = true
 sysinfo = "0.39"

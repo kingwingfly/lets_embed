@@ -56,6 +56,8 @@ rayon = "1.12"
 parking_lot = "0.12"
 clap = { version = "4.6", features = ["derive"] }
 sanitize-filename = "0.6"
+dotenvy = "0.15"
+
 
 [profile.wasm-release]
 inherits = "release"

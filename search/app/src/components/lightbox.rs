@@ -8,6 +8,8 @@ const PAGE: usize = 20;
 pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl IntoView {
     let total = post.images.len();
     let images = StoredValue::new(post.images);
+    let videos = StoredValue::new(post.videos);
+    let has_videos = !videos.with_value(|v| v.is_empty());
     let title = post.title;
 
     let visible = RwSignal::new(PAGE.min(total));
@@ -25,6 +27,33 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
             visible.set((cur + PAGE).min(total));
         }
     });
+
+    let render_videos = move || {
+        has_videos.then(|| {
+            videos.with_value(|vids| {
+                vids.iter()
+                    .map(|v| {
+                        let url = format!("/videos/{}", encode_path(&v.name));
+                        let aspect = if v.width > 0 && v.height > 0 {
+                            format!("aspect-ratio:{}/{};", v.width, v.height)
+                        } else {
+                            "aspect-ratio:16/9;".to_string()
+                        };
+                        view! {
+                            <video
+                                class="w-full rounded bg-black object-contain select-none"
+                                style=aspect
+                                controls
+                                playsinline
+                                preload="metadata"
+                                src=url
+                            />
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+    };
 
     let render_items = move || {
         let v = visible.get();
@@ -67,6 +96,15 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                     >"Close"</button>
                 </div>
             </div>
+
+            {has_videos.then(|| view! {
+                <div
+                    class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 p-2"
+                    on:click=move |ev| ev.stop_propagation()
+                >
+                    {render_videos}
+                </div>
+            })}
 
             <div
                 class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2 p-2"

@@ -25,6 +25,7 @@ use worker::{
 
 const API_UPSTREAM: &str = "https://lets-embed-api.louisfly.icu";
 const IMAGE_UPSTREAM: &str = "https://lets-embed-image.louisfly.icu";
+const VIDEO_UPSTREAM: &str = "https://lets-embed-video.louisfly.icu";
 const TOKEN_COOKIE: &str = "gw_token";
 const APP_COOKIE: &str = "gw_app";
 const D1_BINDING: &str = "DB";
@@ -568,6 +569,9 @@ async fn proxy(
     let target = match uri.path_and_query() {
         Some(pq) if let Some(pq) = pq.as_str().strip_prefix("/images") => {
             format!("{IMAGE_UPSTREAM}{pq}")
+        }
+        Some(pq) if let Some(pq) = pq.as_str().strip_prefix("/videos") => {
+            format!("{VIDEO_UPSTREAM}{pq}")
         }
         Some(pq) => format!("{API_UPSTREAM}{pq}"),
         None => API_UPSTREAM.to_string(),

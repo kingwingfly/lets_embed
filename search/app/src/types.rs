@@ -1,4 +1,4 @@
-use search_types::Image;
+use search_types::{Image, Video};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,10 +36,17 @@ impl Mode {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum MediaItem {
+    Image(Image),
+    Video(Video),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PostItem {
     pub id: i64,
     pub title: String,
     pub images: Vec<Image>,
+    pub videos: Vec<Video>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
