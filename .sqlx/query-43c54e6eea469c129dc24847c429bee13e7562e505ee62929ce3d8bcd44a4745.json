@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            WITH\n            pos_tags AS (\n                SELECT wt.id AS tag_id\n                FROM wd_tags wt\n                WHERE wt.name ILIKE '%' || $1::TEXT || '%'\n                    OR array_to_string(wt.translations, E'\\n') ILIKE '%' || $1::TEXT || '%'\n            ),\n            img_match AS (\n                SELECT wti.image_id, MAX(wti.score) AS max_score\n                FROM wd_tag_images wti\n                JOIN pos_tags pt ON pt.tag_id = wti.wd_tag_id\n                GROUP BY wti.image_id\n            )\n            SELECT i.id, i.name, i.width, i.height\n            FROM img_match im\n            JOIN images i ON i.id = im.image_id\n            ORDER BY im.max_score DESC, im.image_id DESC\n            LIMIT $2 OFFSET $3;\n            ",
+  "query": "\n            WITH\n            pos_tags AS (\n                SELECT wt.id AS tag_id\n                FROM wd_tags wt\n                WHERE wt.name ILIKE '%' || $1::TEXT || '%'\n                UNION\n                SELECT tt.tag_id\n                FROM wd_tag_translations tt\n                WHERE tt.translation ILIKE '%' || $1::TEXT || '%'\n            ),\n            img_match AS (\n                SELECT wti.image_id, MAX(wti.score) AS max_score\n                FROM wd_tag_images wti\n                JOIN pos_tags pt ON pt.tag_id = wti.wd_tag_id\n                GROUP BY wti.image_id\n            )\n            SELECT i.id, i.name, i.width, i.height\n            FROM img_match im\n            JOIN images i ON i.id = im.image_id\n            ORDER BY im.max_score DESC, im.image_id DESC\n            LIMIT $2 OFFSET $3\n            ",
   "describe": {
     "columns": [
       {
@@ -62,5 +62,5 @@
       false
     ]
   },
-  "hash": "e72cc2295e5a4d98ead40c3938956f72d67705668b823149cfed624e8abe7d31"
+  "hash": "43c54e6eea469c129dc24847c429bee13e7562e505ee62929ce3d8bcd44a4745"
 }
