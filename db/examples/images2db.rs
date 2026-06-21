@@ -1,7 +1,4 @@
-use std::{
-    env,
-    thread::{self, available_parallelism},
-};
+use std::thread::{self, available_parallelism};
 
 use anyhow::anyhow;
 use futures::StreamExt as _;
@@ -14,8 +11,10 @@ const BATCH_SIZE: usize = 4; // each meta has 80 or so images
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+
     let pool = PgPool::connect_lazy(
-        env::var("DATABASE_URL")
+        dotenvy::var("DATABASE_URL")
             .unwrap_or("postgres://postgres:postgres@postgres:5432/postgres".to_string())
             .as_str(),
     )?;

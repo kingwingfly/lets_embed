@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    env,
     fs::File,
     path::{Path, PathBuf},
 };
@@ -37,8 +36,9 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    dotenvy::dotenv().ok();
     let pool = PgPool::connect_lazy(
-        env::var("DATABASE_URL")
+        dotenvy::var("DATABASE_URL")
             .unwrap_or("postgres://postgres:postgres@postgres:5432/postgres".to_string())
             .as_str(),
     )?;
