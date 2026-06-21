@@ -50,6 +50,9 @@ async fn main() -> anyhow::Result<()> {
         duration,
     } in state.downloaded_medias.values()
     {
+        if title.is_empty() || key.is_empty() || *w == 0 || *h == 0 || *duration == 0.0 {
+            continue;
+        }
         let author = title.split_whitespace().next().unwrap_or("Unknown");
         sqlx::query!(
             r#"
