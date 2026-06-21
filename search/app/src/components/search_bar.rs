@@ -37,7 +37,7 @@ async fn encode_file(file: web_sys::File) -> Option<String> {
     bitmap.close();
 
     let data_url = canvas
-        .to_data_url_with_type_and_encoder_options("image/jpeg", &JsValue::from_f64(0.8))
+        .to_data_url_with_type_and_encoder_options("image/webp", &JsValue::from_f64(0.7))
         .ok()?;
     let b64 = data_url.split_once(',')?.1;
     Some(

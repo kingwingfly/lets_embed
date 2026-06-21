@@ -52,7 +52,7 @@ fn crop_to_base64(img: &HtmlImageElement, region: Region) -> Option<String> {
     .ok()?;
 
     let data_url = canvas
-        .to_data_url_with_type_and_encoder_options("image/jpeg", &JsValue::from_f64(0.8))
+        .to_data_url_with_type_and_encoder_options("image/webp", &JsValue::from_f64(0.7))
         .ok()?;
 
     let b64 = data_url.split_once(',')?.1;
