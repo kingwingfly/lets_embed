@@ -113,5 +113,5 @@ async fn main() -> anyhow::Result<()> {
         .execute(&pool)
         .await?;
     }
-    todo!()
+    Ok(())
 }
