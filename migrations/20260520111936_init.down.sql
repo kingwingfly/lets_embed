@@ -1,8 +1,10 @@
+-- wd_tag translations
+DROP INDEX IF EXISTS idx_wd_tag_translations;
+DROP TABLE IF EXISTS wd_tag_translations;
+
 -- wd_tags
 DROP INDEX IF EXISTS idx_wd_tag_images_score;
 DROP INDEX IF EXISTS idx_image_wd_tags_image_id;
-DROP INDEX IF EXISTS idx_wd_tags_translations;
-DROP INDEX IF EXISTS idx_wd_tags_translations_trgm;
 DROP INDEX IF EXISTS idx_wd_tags_name_trgm;
 DROP TABLE IF EXISTS wd_tag_images;
 DROP TABLE IF EXISTS wd_tags;

@@ -16,3 +16,4 @@ sqlx.workspace = true
 struson = { version = "0.7", features = ["simple-api"] }
 serde.workspace = true
 serde_json.workspace = true
+clap.workspace = true

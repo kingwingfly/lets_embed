@@ -91,13 +91,6 @@ CREATE INDEX IF NOT EXISTS idx_tag_posts_post_id ON tag_posts(post_id);
 CREATE TABLE IF NOT EXISTS wd_tags (
     id BIGSERIAL PRIMARY KEY,
     name VARCHAR(100) UNIQUE NOT NULL CHECK (btrim(name) != ''),
-    translations VARCHAR(100)[] CHECK (
-            translations IS NULL
-            OR (
-                array_position(translations, NULL) IS NULL
-                AND array_position(translations, '') IS NULL
-            )
-        ),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -111,7 +104,13 @@ CREATE TABLE IF NOT EXISTS wd_tag_images (
 );
 
 CREATE INDEX IF NOT EXISTS idx_wd_tags_name_trgm ON wd_tags USING GIN (name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_wd_tags_translations_trgm ON wd_tags USING GIN (array_to_string(translations, E'\n') gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_wd_tags_translations ON wd_tags USING gin (translations);
 CREATE INDEX IF NOT EXISTS idx_image_wd_tags_image_id ON wd_tag_images(image_id);
 CREATE INDEX IF NOT EXISTS idx_wd_tag_images_score ON wd_tag_images(score);
+
+-- wd_tag translations
+CREATE TABLE wd_tag_translations (
+    tag_id bigint REFERENCES wd_tags(id),
+    translation VARCHAR(100) NOT NULL,
+    PRIMARY KEY (tag_id, translation)
+);
+CREATE INDEX idx_wd_tag_translations ON wd_tag_translations USING GIN (translation gin_trgm_ops);

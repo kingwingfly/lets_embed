@@ -19,20 +19,18 @@ async fn main() -> anyhow::Result<()> {
 
     sqlx::query!(
         r#"
-        UPDATE wd_tags AS t
-        SET translations = COALESCE(
-            (
-                SELECT array_agg(DISTINCT x)
-                FROM unnest(COALESCE(t.translations, ARRAY[]::varchar[]) || v.translations::varchar[]) AS _(x)
-                WHERE btrim(x) != ''
-            ),
-            t.translations
-        )
+        INSERT INTO wd_tag_translations (tag_id, translation)
+        SELECT t.id, btrim(x)
         FROM UNNEST($1::translation[]) AS v(name, translations)
-        WHERE t.name = v.name
+        JOIN wd_tags t ON t.name = v.name
+        CROSS JOIN LATERAL unnest(v.translations) AS x
+        WHERE btrim(x) <> ''
+        ON CONFLICT (tag_id, translation) DO NOTHING
         "#,
         &translations as _
-    ).execute(&pool).await?;
+    )
+    .execute(&pool)
+    .await?;
 
     Ok(())
 }

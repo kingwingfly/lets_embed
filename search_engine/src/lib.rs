@@ -214,7 +214,10 @@ impl Engine {
                 SELECT wt.id AS tag_id
                 FROM wd_tags wt
                 WHERE wt.name ILIKE '%' || $1::TEXT || '%'
-                    OR array_to_string(wt.translations, E'\n') ILIKE '%' || $1::TEXT || '%'
+                UNION
+                SELECT tt.tag_id
+                FROM wd_tag_translations tt
+                WHERE tt.translation ILIKE '%' || $1::TEXT || '%'
             ),
             img_match AS (
                 SELECT wti.image_id, MAX(wti.score) AS max_score
@@ -226,7 +229,7 @@ impl Engine {
             FROM img_match im
             JOIN images i ON i.id = im.image_id
             ORDER BY im.max_score DESC, im.image_id DESC
-            LIMIT $2 OFFSET $3;
+            LIMIT $2 OFFSET $3
             "#,
             tag,
             limit,
