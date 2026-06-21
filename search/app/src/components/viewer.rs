@@ -1,17 +1,15 @@
 use leptos::ev;
 use leptos::prelude::*;
 use leptos_use::use_event_listener;
+use search_types::Image;
 use web_sys::TouchEvent;
 
-use crate::{types::ImageItem, util::encode_path};
+use crate::util::encode_path;
 
 const SWIPE_RATIO: f64 = 0.05;
 
 #[component]
-pub fn Viewer(
-    images: StoredValue<Vec<ImageItem>>,
-    index: RwSignal<Option<usize>>,
-) -> impl IntoView {
+pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -> impl IntoView {
     let total = images.with_value(|v| v.len());
     let track = NodeRef::<leptos::html::Div>::new();
 

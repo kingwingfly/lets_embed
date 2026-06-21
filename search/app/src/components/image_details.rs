@@ -1,6 +1,6 @@
 use crate::{
     components::{Lightbox, Results, Viewer},
-    types::{ImageItem, PostItem},
+    types::PostItem,
     util::encode_path,
 };
 
@@ -79,25 +79,12 @@ pub fn ImageDetails() -> impl IntoView {
             .post
             .map(|p| p.id)
             .ok_or("this image belongs to no post".to_string())?;
-        list_post_images(post_id)
-            .await
-            .map_err(|e| e.to_string())
-            .map(|images| {
-                images
-                    .into_iter()
-                    .map(|image| ImageItem {
-                        id: image.id,
-                        name: image.name.clone(),
-                        width: image.width as u32,
-                        height: image.height as u32,
-                    })
-                    .collect::<Vec<_>>()
-            })
+        list_post_images(post_id).await.map_err(|e| e.to_string())
     });
 
     let lightbox: RwSignal<Option<PostItem>> = RwSignal::new(None);
     let viewer: RwSignal<Option<usize>> = RwSignal::new(None);
-    let post_images_store: StoredValue<Vec<ImageItem>> = StoredValue::new(Vec::new());
+    let post_images_store: StoredValue<Vec<Image>> = StoredValue::new(Vec::new());
     Effect::new(move |_| {
         if let Some(Ok(imgs)) = post_images.get() {
             post_images_store.set_value(imgs);
@@ -149,9 +136,6 @@ pub fn ImageDetails() -> impl IntoView {
                                    tags,
                                }| {
         let image_id = image.id;
-        let image_name = image.name.clone();
-        let img_w = image.width as u32;
-        let img_h = image.height as u32;
 
         let post_meta = post.as_ref().map(|p| (p.id, p.title.clone()));
         let post_store = StoredValue::new(post_meta);
@@ -230,49 +214,46 @@ pub fn ImageDetails() -> impl IntoView {
         };
 
         let nav_up = navigate.clone();
-        let click_name = image_name.clone();
-        let on_up = move |ev: PointerEvent| {
-            let Some((sx, sy)) = drag_origin.get() else {
-                return;
-            };
-            drag_origin.set(None);
-
-            let ex = ev.client_x() as f64;
-            let ey = ev.client_y() as f64;
-            let dist = ((ex - sx).powi(2) + (ey - sy).powi(2)).sqrt();
-
-            if dist < 6.0 {
-                let idx =
-                    post_images_store.with_value(|v| v.iter().position(|im| im.id == image_id));
-                match idx {
-                    Some(i) => viewer.set(Some(i)),
-                    None => {
-                        post_images_store.set_value(vec![ImageItem {
-                            id: image_id,
-                            name: click_name.clone(),
-                            width: img_w,
-                            height: img_h,
-                        }]);
-                        viewer.set(Some(0));
-                    }
-                }
-                return;
-            }
-
-            if let Some((region, lbox)) = compute(sx, sy, ex, ey) {
-                if region.w < 4 || region.h < 4 {
+        let on_up = {
+            let image = image.clone();
+            move |ev: PointerEvent| {
+                let Some((sx, sy)) = drag_origin.get() else {
                     return;
-                }
-                sel_box.set(Some(lbox));
+                };
+                drag_origin.set(None);
 
-                if let Some(img) = img_ref.get()
-                    && let Some(q) = crop_to_base64(&img, region)
-                {
-                    let path = pathname.get_untracked();
-                    nav_up(
-                        &format!("{path}?mode=search_image&q={q}"),
-                        Default::default(),
-                    );
+                let ex = ev.client_x() as f64;
+                let ey = ev.client_y() as f64;
+                let dist = ((ex - sx).powi(2) + (ey - sy).powi(2)).sqrt();
+
+                if dist < 6.0 {
+                    let idx =
+                        post_images_store.with_value(|v| v.iter().position(|im| im.id == image_id));
+                    match idx {
+                        Some(i) => viewer.set(Some(i)),
+                        None => {
+                            post_images_store.set_value(vec![image.clone()]);
+                            viewer.set(Some(0));
+                        }
+                    }
+                    return;
+                };
+
+                if let Some((region, lbox)) = compute(sx, sy, ex, ey) {
+                    if region.w < 4 || region.h < 4 {
+                        return;
+                    }
+                    sel_box.set(Some(lbox));
+
+                    if let Some(img) = img_ref.get()
+                        && let Some(q) = crop_to_base64(&img, region)
+                    {
+                        let path = pathname.get_untracked();
+                        nav_up(
+                            &format!("{path}?mode=search_image&q={q}"),
+                            Default::default(),
+                        );
+                    }
                 }
             }
         };

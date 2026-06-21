@@ -13,7 +13,7 @@ use futures::{Stream, StreamExt as _};
 use ort::session::Session;
 use parking_lot::Mutex;
 use pgvector::HalfVector;
-use search_types::{Author, Image, ImageDetails, Post, Tag};
+use search_types::{Author, Image, ImageDetails, Post, Tag, Video, VideoDetails};
 use sqlx::{Executor as _, PgPool, postgres::PgPoolOptions};
 use tokenizers::{EncodeInput, Tokenizer};
 
@@ -452,6 +452,76 @@ impl Engine {
             post,
             authors,
             tags,
+        })
+    }
+
+    pub async fn list_post_videos(&self, post_id: i64) -> anyhow::Result<Vec<Video>> {
+        sqlx::query_as!(
+            Video,
+            r#"
+            SELECT id, name, width, height, duration
+            FROM videos v
+            JOIN post_videos pv ON v.id=pv.video_id
+            WHERE pv.post_id=$1
+            "#,
+            post_id
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn video_details(&self, id: i64) -> anyhow::Result<VideoDetails> {
+        let video = sqlx::query_as!(
+            Video,
+            r#"
+            SELECT id, name, width, height, duration
+            FROM videos
+            WHERE id=$1
+            LIMIT 1
+            "#,
+            id
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let post = sqlx::query_as!(
+            Post,
+            r#"
+            SELECT p.id, p.title
+            FROM posts p
+            JOIN post_videos pv ON p.id=pv.post_id
+            WHERE pv.video_id=$1
+            LIMIT 1
+            "#,
+            id
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let authors = match post.as_ref() {
+            Some(post) => {
+                sqlx::query_as!(
+                    Author,
+                    r#"
+                    SELECT id, name
+                    FROM authors a
+                    JOIN author_posts ap ON a.id=ap.author_id
+                    WHERE ap.post_id=$1
+                    "#,
+                    &post.id
+                )
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => vec![],
+        };
+
+        Ok(VideoDetails {
+            video,
+            post,
+            authors,
+            tags: vec![], // TODO: tag video
         })
     }
 }

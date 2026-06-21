@@ -1,3 +1,4 @@
+use search_types::Image;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,18 +36,10 @@ impl Mode {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ImageItem {
-    pub id: i64,
-    pub name: String,
-    pub width: u32,
-    pub height: u32,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PostItem {
     pub id: i64,
     pub title: String,
-    pub images: Vec<ImageItem>,
+    pub images: Vec<Image>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

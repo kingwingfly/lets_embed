@@ -2,7 +2,7 @@ use std::iter::repeat_with;
 
 use crate::{
     components::{lightbox::Lightbox, viewer::Viewer},
-    types::{DoneEvent, ErrorEvent, ImageItem, Mode, PostItem},
+    types::{DoneEvent, ErrorEvent, Mode, PostItem},
     util::encode_path,
 };
 
@@ -11,6 +11,7 @@ use leptos_router::hooks::use_query_map;
 use leptos_use::{
     UseElementSizeReturn, signal_debounced, use_element_size, use_intersection_observer,
 };
+use search_types::Image;
 use wasm_bindgen::{JsCast, prelude::Closure};
 
 const COLUMN_WIDTH: u32 = 360;
@@ -19,7 +20,7 @@ const COLUMN_PAD: u32 = 2;
 #[derive(Debug, Clone)]
 enum Item {
     Post(PostItem),
-    Image(ImageItem),
+    Image(Image),
 }
 
 #[derive(Debug, Clone)]
@@ -102,7 +103,7 @@ pub fn Results() -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let lightbox: RwSignal<Option<PostItem>> = RwSignal::new(None);
     let viewer: RwSignal<Option<usize>> = RwSignal::new(None);
-    let images: StoredValue<Vec<ImageItem>> = StoredValue::new(Vec::new());
+    let images: StoredValue<Vec<Image>> = StoredValue::new(Vec::new());
 
     let viewer_open = Memo::new(move |_| viewer.get().is_some());
 
@@ -296,7 +297,7 @@ fn load_page(
     offset_val: i64,
     params: Memo<(Mode, String, i64)>,
     columns: RwSignal<Vec<Column>>,
-    images: StoredValue<Vec<ImageItem>>,
+    images: StoredValue<Vec<Image>>,
     has_more: RwSignal<bool>,
     loading: RwSignal<bool>,
     error: RwSignal<Option<String>>,
@@ -353,7 +354,7 @@ fn load_page(
     // image
     let cb = Closure::wrap(Box::new(move |ev: web_sys::MessageEvent| {
         if let Some(s) = ev.data().as_string()
-            && let Ok(im) = serde_json::from_str::<ImageItem>(&s)
+            && let Ok(im) = serde_json::from_str::<Image>(&s)
         {
             images.update_value(|v| v.push(im.clone()));
             columns.update(|columns| {
