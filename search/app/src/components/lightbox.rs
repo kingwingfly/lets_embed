@@ -81,7 +81,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
 
     view! {
         <div
-            class="fixed inset-0 bg-black/95 z-50 overflow-hidden overscroll-contain cursor-zoom-out flex flex-col"
+            class="fixed inset-0 bg-black/95 z-50 overflow-hidden cursor-zoom-out flex flex-col"
             on:click=move |ev| { ev.stop_propagation(); lightbox.set(None); }
         >
             <div class="sticky top-0 z-10 flex items-center justify-between px-4 py-2 bg-black/80 text-white shrink-0">
@@ -101,7 +101,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                 class="flex-1 min-h-0 flex flex-col md:flex-row gap-2 p-2"
                 on:click=move |ev| ev.stop_propagation()
             >
-                <div class="flex-[2] min-w-0 overflow-y-auto
+                <div class="flex-[2] min-w-0 overflow-y-auto overscroll-contain
                         scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
                     <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-3 lg:grid-cols-4 gap-2">
                         {render_images}
@@ -115,7 +115,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                 </div>
 
                 {has_videos.then(|| view! {
-                    <div class="flex-1 min-w-0 overflow-y-auto
+                    <div class="flex-1 min-w-0 overflow-y-auto overscroll-contain
                             scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
                         <div class="grid grid-cols-1 gap-2">
                             {render_videos}
