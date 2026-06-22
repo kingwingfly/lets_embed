@@ -27,7 +27,7 @@ pub fn tokenizer(config: impl AsRef<Path>) -> anyhow::Result<Tokenizer> {
     Tokenizer::from_file(config).map_err(|e| anyhow!("{e}"))
 }
 
-pub fn model(model_path: impl AsRef<Path>) -> anyhow::Result<Session> {
+pub fn model(model_path: impl AsRef<Path>) -> ort::Result<Session> {
     let session = Session::builder()?
         .with_execution_providers([
             #[cfg(not(target_os = "macos"))]

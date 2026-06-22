@@ -10,6 +10,7 @@ documentation.workspace = true
 [dependencies]
 tokio.workspace = true
 futures.workspace = true
+tracing.workspace = true
 
 anyhow.workspace = true
 sqlx.workspace = true

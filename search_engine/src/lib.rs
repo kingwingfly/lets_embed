@@ -18,21 +18,31 @@ use sqlx::{Executor as _, PgPool, postgres::PgPoolOptions};
 use tokenizers::{EncodeInput, Tokenizer};
 
 pub use search_types;
+use tokio::task::JoinHandle;
 
 #[derive(Debug)]
 pub struct Engine {
     pool: PgPool,
-    clip_text_session: Arc<Mutex<Session>>,
-    tokenizer: Tokenizer,
-    dinov3_session: Arc<Mutex<Session>>,
+    clip_text_session: Arc<Mutex<Option<Session>>>,
+    tokenizer: Option<Tokenizer>,
+    dinov3_session: Arc<Mutex<Option<Session>>>,
 }
 
 impl Engine {
+    /// Create search engine.
+    /// This call will return immediately after connecting db and loading tokenizer,
+    /// and start loading siglip2 and dinov3 in back threads.
+    ///
+    /// The first JoinHandle is for clip_text and the second is for dinov3.
     pub async fn new(
-        clip_text_model_path: impl AsRef<Path>,
-        tokenizer_config_path: impl AsRef<Path>,
-        dinov3_model_path: impl AsRef<Path>,
-    ) -> anyhow::Result<Self> {
+        clip_text_model_path: Option<impl AsRef<Path>>,
+        tokenizer_config_path: Option<impl AsRef<Path>>,
+        dinov3_model_path: Option<impl AsRef<Path>>,
+    ) -> anyhow::Result<(
+        Self,
+        Option<JoinHandle<ort::Result<()>>>,
+        Option<JoinHandle<ort::Result<()>>>,
+    )> {
         dotenvy::dotenv().ok();
         let pool = PgPoolOptions::new()
             .after_connect(|conn, _meta| {
@@ -46,15 +56,49 @@ impl Engine {
             })
             .connect(&dotenvy::var("DATABASE_URL").unwrap())
             .await?;
-        let clip_text_session = siglip2::model(clip_text_model_path)?;
-        let tokenizer = siglip2::tokenizer(tokenizer_config_path)?;
-        let dinov3_session = dinov3::model(dinov3_model_path)?;
-        Ok(Self {
-            pool,
-            clip_text_session: Arc::new(Mutex::new(clip_text_session)),
-            tokenizer,
-            dinov3_session: Arc::new(Mutex::new(dinov3_session)),
-        })
+
+        let tokenizer = match tokenizer_config_path {
+            Some(p) => Some(siglip2::tokenizer(p)?),
+            None => None,
+        };
+        let clip_text_session = Arc::new(Mutex::new(None));
+        let dinov3_session = Arc::new(Mutex::new(None));
+
+        let jh1 = clip_text_model_path.map(|clip_text_model_path| {
+            tokio::task::spawn_blocking({
+                let clip_text_model_path = clip_text_model_path.as_ref().to_owned();
+                let clip_text_session = clip_text_session.clone();
+                move || {
+                    let session = siglip2::model(clip_text_model_path)?;
+                    let _ = clip_text_session.lock().insert(session);
+                    tracing::info!(model = "clip_text", "model session ready");
+                    Ok(())
+                }
+            })
+        });
+        let jh2 = dinov3_model_path.map(|dinov3_model_path| {
+            tokio::task::spawn_blocking({
+                let dinov3_model_path = dinov3_model_path.as_ref().to_owned();
+                let dinov3_session = dinov3_session.clone();
+                move || {
+                    let session = dinov3::model(dinov3_model_path)?;
+                    let _ = dinov3_session.lock().insert(session);
+                    tracing::info!(model = "dinov3", "model session ready");
+                    Ok(())
+                }
+            })
+        });
+
+        Ok((
+            Self {
+                pool,
+                clip_text_session,
+                tokenizer,
+                dinov3_session,
+            },
+            jh1,
+            jh2,
+        ))
     }
 
     pub async fn newest_posts<'a>(
@@ -251,14 +295,18 @@ impl Engine {
             bail!("both limit and offset should >= 0")
         }
 
-        let text_embeddings = siglip2::infer_text(
-            &self.tokenizer,
-            &mut self.clip_text_session.lock(),
-            describes,
-        )?
-        .into_iter()
-        .map(|embedding| HalfVector::from_f32_slice(&embedding))
-        .collect::<Vec<_>>();
+        let Some(tokenizer) = self.tokenizer.as_ref() else {
+            bail!("tokenizer not ready")
+        };
+        let mut opt_clip_text_session = self.clip_text_session.lock();
+        let Some(clip_text_session) = opt_clip_text_session.as_mut() else {
+            bail!("clip_text_session not ready")
+        };
+        let text_embeddings = siglip2::infer_text(tokenizer, clip_text_session, describes)?
+            .into_iter()
+            .map(|embedding| HalfVector::from_f32_slice(&embedding))
+            .collect::<Vec<_>>();
+        drop(opt_clip_text_session);
 
         let res = sqlx::query_as!(
             Image,
@@ -302,7 +350,13 @@ impl Engine {
         .await
         .unwrap()?;
 
-        let embeddings = dinov3::infer_vision(&mut self.dinov3_session.lock(), converted)?;
+        let mut opt_dinov3_session = self.dinov3_session.lock();
+        let Some(dinov3_session) = opt_dinov3_session.as_mut() else {
+            bail!("dinov3_session not ready")
+        };
+        let embeddings = dinov3::infer_vision(dinov3_session, converted)?;
+        drop(opt_dinov3_session);
+
         let div = f32x16::splat(1.0 / embeddings.len() as f32);
         let mut embedding = embeddings
             .into_iter()

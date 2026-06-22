@@ -20,7 +20,7 @@ pub const IMAGE_HEIGHT: usize = 256;
 pub const MEAN: [f64; 3] = [0.485, 0.456, 0.406];
 pub const STD: [f64; 3] = [0.229, 0.224, 0.225];
 
-pub fn model(model_path: impl AsRef<Path>) -> anyhow::Result<Session> {
+pub fn model(model_path: impl AsRef<Path>) -> ort::Result<Session> {
     let session = Session::builder()?
         .with_execution_providers([
             #[cfg(not(target_os = "macos"))]

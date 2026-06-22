@@ -27,15 +27,17 @@ async fn main() -> anyhow::Result<()> {
     let mut leptos_options = conf.leptos_options;
     leptos_options.site_addr = format!("{}:{}", args.host, args.port).parse()?;
 
-    let engine = Arc::new(
-        search_engine::Engine::new(&args.clip_text_model, &args.tokenizer, &args.dinov3_model)
-            .await?,
-    );
+    let (engine, _, _) = search_engine::Engine::new(
+        args.clip_text_model.as_ref(),
+        args.tokenizer.as_ref(),
+        args.dinov3_model.as_ref(),
+    )
+    .await?;
     tracing::info!("search engine loaded");
 
     let app_state = state::AppState {
         leptos_options: leptos_options.clone(),
-        engine,
+        engine: Arc::new(engine),
         prefix: Arc::new(args.prefix.clone()),
     };
 

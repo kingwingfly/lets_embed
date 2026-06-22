@@ -14,19 +14,19 @@ pub struct Cli {
         long,
         default_value = "models/siglip2-so400m-patch14-384/onnx/text_model.onnx"
     )]
-    pub clip_text_model: PathBuf,
+    pub clip_text_model: Option<PathBuf>,
 
     #[arg(
         long,
         default_value = "models/siglip2-so400m-patch14-384/tokenizer.json"
     )]
-    pub tokenizer: PathBuf,
+    pub tokenizer: Option<PathBuf>,
 
     #[arg(
         long,
         default_value = "models/dinov3-vitb16-pretrain-lvd1689m/onnx/model.onnx"
     )]
-    pub dinov3_model: PathBuf,
+    pub dinov3_model: Option<PathBuf>,
 
     /// images path prefix
     pub prefix: Option<PathBuf>,
