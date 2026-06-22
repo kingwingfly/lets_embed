@@ -57,6 +57,10 @@ impl Engine {
             .connect(&dotenvy::var("DATABASE_URL").unwrap())
             .await?;
 
+        if clip_text_model_path.is_some() ^ tokenizer_config_path.is_some() {
+            bail!("either both clip_text and tokenizer must be provided, or neither")
+        }
+
         let tokenizer = match tokenizer_config_path {
             Some(p) => Some(siglip2::tokenizer(p)?),
             None => None,
