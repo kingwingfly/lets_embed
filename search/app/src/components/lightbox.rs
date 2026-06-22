@@ -81,10 +81,10 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
 
     view! {
         <div
-            class="fixed inset-0 bg-black/95 z-50 overflow-y-auto overscroll-contain cursor-zoom-out"
+            class="fixed inset-0 bg-black/95 z-50 overflow-hidden overscroll-contain cursor-zoom-out flex flex-col"
             on:click=move |ev| { ev.stop_propagation(); lightbox.set(None); }
         >
-            <div class="sticky top-0 z-10 flex items-center justify-between px-4 py-2 bg-black/80 text-white">
+            <div class="sticky top-0 z-10 flex items-center justify-between px-4 py-2 bg-black/80 text-white shrink-0">
                 <div class="font-semibold truncate">{title}</div>
                 <div class="flex items-center gap-4">
                     <div class="text-sm text-gray-400">
@@ -97,27 +97,32 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                 </div>
             </div>
 
-            {has_videos.then(|| view! {
-                <div
-                    class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 p-2"
-                    on:click=move |ev| ev.stop_propagation()
-                >
-                    {render_videos}
-                </div>
-            })}
-
             <div
-                class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2 p-2"
+                class="flex-1 min-h-0 flex flex-col md:flex-row gap-2 p-2"
                 on:click=move |ev| ev.stop_propagation()
             >
-                {render_images}
+                <div class="flex-[2] min-w-0 overflow-y-auto
+                        scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
+                    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-3 lg:grid-cols-4 gap-2">
+                        {render_images}
+                    </div>
+
+                    <div node_ref=sentinel class="h-12 w-full"></div>
+
+                    {move || (visible.get() >= total).then(|| view! {
+                        <div class="text-gray-500 text-center pb-6">"-- End --"</div>
+                    })}
+                </div>
+
+                {has_videos.then(|| view! {
+                    <div class="flex-1 min-w-0 overflow-y-auto
+                            scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
+                        <div class="grid grid-cols-1 gap-2">
+                            {render_videos}
+                        </div>
+                    </div>
+                })}
             </div>
-
-            <div node_ref=sentinel class="h-12 w-full"></div>
-
-            {move || (visible.get() >= total).then(|| view! {
-                <div class="text-gray-500 text-center pb-6">"-- End --"</div>
-            })}
         </div>
 
         {move || viewer_open.get().then(|| view! {
