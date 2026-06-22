@@ -55,7 +55,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
         })
     };
 
-    let render_items = move || {
+    let render_images = move || {
         let v = visible.get();
         images.with_value(|imgs| {
             imgs.iter()
@@ -110,7 +110,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                 class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2 p-2"
                 on:click=move |ev| ev.stop_propagation()
             >
-                {render_items}
+                {render_images}
             </div>
 
             <div node_ref=sentinel class="h-12 w-full"></div>
