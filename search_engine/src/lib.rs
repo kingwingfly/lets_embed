@@ -146,18 +146,16 @@ impl Engine {
             bail!("title should not be empty")
         }
 
-        let terms: Vec<String> = title.split_whitespace().map(|t| format!("%{t}%")).collect();
-
         let posts = sqlx::query_as!(
             Post,
             r#"
             SELECT p.id, p.title
             FROM posts p
-            WHERE p.title ILIKE ANY($1::TEXT[])
+            WHERE p.title % $1::TEXT
             ORDER BY p.id DESC
             LIMIT $2 OFFSET $3;
             "#,
-            &terms,
+            &title,
             limit,
             offset
         )
