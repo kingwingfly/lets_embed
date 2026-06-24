@@ -373,14 +373,25 @@ impl Engine {
             bail!("clip_text_session not enabled")
         };
         let clip_text_session = clip_text_lazy.session().await?;
-        let text_embeddings = tokio::task::spawn_blocking(move || {
+        let embedding = tokio::task::spawn_blocking(move || {
             let mut clip_text_session = clip_text_session.blocking_lock();
-            let text_embeddings =
-                siglip2::infer_text(&tokenizer, &mut clip_text_session, describes)?
-                    .into_iter()
-                    .map(|embedding| HalfVector::from_f32_slice(&embedding))
-                    .collect::<Vec<_>>();
-            anyhow::Ok(text_embeddings)
+            let embeddings = siglip2::infer_text(&tokenizer, &mut clip_text_session, describes)?
+                .into_iter()
+                .collect::<Vec<_>>();
+            let div = f32x16::splat(1.0 / embeddings.len() as f32);
+            let mut embedding = embeddings
+                .into_iter()
+                .map(|v| <[f32; siglip2::EMBED_DIM]>::try_from(v).unwrap())
+                .fold([f32x16::splat(0.0); 768 / 16], |mut acc, v| {
+                    for (c, x) in acc.iter_mut().zip(v.chunks_exact(16)) {
+                        *c += f32x16::from_slice(x);
+                    }
+                    acc
+                });
+            embedding.iter_mut().for_each(|c| *c *= div);
+            let embedding =
+                HalfVector::from_f32_slice(unsafe { &*(embedding.as_ptr() as *const [f32; 768]) });
+            anyhow::Ok(embedding)
         })
         .await
         .unwrap()?;
@@ -388,17 +399,12 @@ impl Engine {
         let res = sqlx::query_as!(
             Image,
             r#"
-            WITH qs AS (
-                SELECT q FROM
-                unnest($1::halfvec[]) AS _(q)
-            )
             SELECT id, name, width, height
             FROM images i
-            CROSS JOIN qs
-            ORDER BY i.clip_embedding <=> qs.q
+            ORDER BY i.clip_embedding <=> $1::halfvec
             LIMIT $2 OFFSET $3
             "#,
-            &text_embeddings as _,
+            &embedding as _,
             limit,
             offset
         )
@@ -438,7 +444,7 @@ impl Engine {
             let div = f32x16::splat(1.0 / embeddings.len() as f32);
             let mut embedding = embeddings
                 .into_iter()
-                .map(|v| <[f32; 768]>::try_from(v).unwrap())
+                .map(|v| <[f32; dinov3::EMBED_DIM]>::try_from(v).unwrap())
                 .fold([f32x16::splat(0.0); 768 / 16], |mut acc, v| {
                     for (c, x) in acc.iter_mut().zip(v.chunks_exact(16)) {
                         *c += f32x16::from_slice(x);
