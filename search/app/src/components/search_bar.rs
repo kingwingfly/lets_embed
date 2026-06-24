@@ -140,7 +140,9 @@ pub fn SearchBar() -> impl IntoView {
                     class="flex flex-col md:flex-row w-full items-stretch md:items-center gap-2 px-4"
                     on:submit=submit
                 >
-                    <div class="flex gap-1 bg-gray-800 rounded-lg p-1 shrink-0 self-center md:self-auto">
+                    <div class="flex gap-1 bg-gray-800 rounded-lg p-1 shrink-0 self-center
+                        overflow-x-auto scrollbar-none overscroll-contain scrollbar-gutter-auto md:self-auto"
+                    >
                         <button type="button" class=move || tab_cls(Mode::Tag)
                             on:click=move |_| mode.set(Mode::Tag)>"Tag"</button>
                         <button type="button" class=move || tab_cls(Mode::Author)
@@ -186,7 +188,7 @@ pub fn SearchBar() -> impl IntoView {
                                 }.into_any()
                             } else if mode.get() == Mode::Random {
                                 view! {
-                                    <div class="flex gap-1 bg-gray-800 rounded-lg p-1 shrink-0 self-center md:self-auto">
+                                    <div class="w-full min-w-0 flex gap-1 bg-gray-800 rounded-lg p-1 shrink-0 self-center md:self-auto">
                                         <button type="button" class=move || random_cls("posts")
                                             on:click={
                                                 let go = go.clone();
