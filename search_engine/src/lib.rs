@@ -3,29 +3,109 @@
 use std::{
     future::ready,
     io::{Read, Seek},
-    path::Path,
+    path::{Path, PathBuf},
     simd::f32x16,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::bail;
 use futures::{Stream, StreamExt as _};
 use ort::session::Session;
-use parking_lot::Mutex;
 use pgvector::HalfVector;
 use search_types::{Author, Image, ImageDetails, Post, Tag, Video, VideoDetails};
 use sqlx::{Executor as _, PgPool, postgres::PgPoolOptions};
 use tokenizers::{EncodeInput, Tokenizer};
 
 pub use search_types;
-use tokio::task::JoinHandle;
+use tokio::{sync::Mutex, time::Instant};
+
+#[derive(Debug)]
+struct Inner {
+    session: Option<Arc<Mutex<Session>>>,
+    last_used: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct LazyModel {
+    name: &'static str,
+    model_path: Arc<PathBuf>,
+    inner: Arc<Mutex<Inner>>,
+    idle_timeout: Option<Duration>,
+}
+
+impl LazyModel {
+    pub fn new(
+        name: &'static str,
+        model_path: impl AsRef<Path>,
+        idle_timeout: Option<Duration>,
+    ) -> Self {
+        let me = Self {
+            name,
+            model_path: Arc::new(model_path.as_ref().to_owned()),
+            inner: Arc::new(Mutex::new(Inner {
+                session: None,
+                last_used: Instant::now(),
+            })),
+            idle_timeout,
+        };
+        me.spawn_reaper();
+        me
+    }
+
+    pub async fn session(&self) -> anyhow::Result<Arc<Mutex<Session>>> {
+        let mut guard = self.inner.lock().await;
+
+        if guard.session.is_none() {
+            let path = self.model_path.as_ref().clone();
+            let session = tokio::task::spawn_blocking(move || siglip2::model(path))
+                .await
+                .unwrap()?;
+            tracing::info!(model = self.name, "model session ready");
+            guard.session = Some(Arc::new(Mutex::new(session)));
+        }
+
+        guard.last_used = Instant::now();
+        Ok(guard.session.clone().unwrap())
+    }
+
+    fn spawn_reaper(&self) {
+        let Some(idle_timeout) = self.idle_timeout else {
+            return;
+        };
+        let inner = self.inner.clone();
+        let name = self.name;
+
+        tokio::spawn(async move {
+            loop {
+                let wait = {
+                    let mut guard = inner.lock().await;
+                    match &guard.session {
+                        Some(_) => {
+                            let elapsed = guard.last_used.elapsed();
+                            if elapsed >= idle_timeout {
+                                guard.session = None;
+                                tracing::info!(model = name, "model session unloaded (idle)");
+                                idle_timeout
+                            } else {
+                                (idle_timeout - elapsed).max(Duration::from_secs(1))
+                            }
+                        }
+                        None => idle_timeout,
+                    }
+                };
+                tokio::time::sleep(wait).await;
+            }
+        });
+    }
+}
 
 #[derive(Debug)]
 pub struct Engine {
     pool: PgPool,
-    clip_text_session: Arc<Mutex<Option<Session>>>,
-    tokenizer: Option<Tokenizer>,
-    dinov3_session: Arc<Mutex<Option<Session>>>,
+    clip_text_session: Option<LazyModel>,
+    tokenizer: Option<Arc<Tokenizer>>,
+    dinov3_session: Option<LazyModel>,
 }
 
 impl Engine {
@@ -38,11 +118,8 @@ impl Engine {
         clip_text_model_path: Option<impl AsRef<Path>>,
         tokenizer_config_path: Option<impl AsRef<Path>>,
         dinov3_model_path: Option<impl AsRef<Path>>,
-    ) -> anyhow::Result<(
-        Self,
-        Option<JoinHandle<ort::Result<()>>>,
-        Option<JoinHandle<ort::Result<()>>>,
-    )> {
+        idle_timeout: Option<Duration>,
+    ) -> anyhow::Result<Self> {
         dotenvy::dotenv().ok();
         let pool = PgPoolOptions::new()
             .after_connect(|conn, _meta| {
@@ -62,47 +139,22 @@ impl Engine {
         }
 
         let tokenizer = match tokenizer_config_path {
-            Some(p) => Some(siglip2::tokenizer(p)?),
+            Some(p) => Some(Arc::new(siglip2::tokenizer(p)?)),
             None => None,
         };
-        let clip_text_session = Arc::new(Mutex::new(None));
-        let dinov3_session = Arc::new(Mutex::new(None));
 
-        let jh1 = clip_text_model_path.map(|clip_text_model_path| {
-            tokio::task::spawn_blocking({
-                let clip_text_model_path = clip_text_model_path.as_ref().to_owned();
-                let clip_text_session = clip_text_session.clone();
-                move || {
-                    let session = siglip2::model(clip_text_model_path)?;
-                    let _ = clip_text_session.lock().insert(session);
-                    tracing::info!(model = "clip_text", "model session ready");
-                    Ok(())
-                }
-            })
+        let clip_text_session = clip_text_model_path.map(|clip_text_model_path| {
+            LazyModel::new("clip_text", clip_text_model_path, idle_timeout)
         });
-        let jh2 = dinov3_model_path.map(|dinov3_model_path| {
-            tokio::task::spawn_blocking({
-                let dinov3_model_path = dinov3_model_path.as_ref().to_owned();
-                let dinov3_session = dinov3_session.clone();
-                move || {
-                    let session = dinov3::model(dinov3_model_path)?;
-                    let _ = dinov3_session.lock().insert(session);
-                    tracing::info!(model = "dinov3", "model session ready");
-                    Ok(())
-                }
-            })
-        });
+        let dinov3_session = dinov3_model_path
+            .map(|dinov3_model_path| LazyModel::new("dinov3", dinov3_model_path, idle_timeout));
 
-        Ok((
-            Self {
-                pool,
-                clip_text_session,
-                tokenizer,
-                dinov3_session,
-            },
-            jh1,
-            jh2,
-        ))
+        Ok(Self {
+            pool,
+            clip_text_session,
+            tokenizer,
+            dinov3_session,
+        })
     }
 
     pub async fn newest_posts<'a>(
@@ -289,7 +341,7 @@ impl Engine {
 
     pub async fn search_clip<'a, 's>(
         &'a self,
-        describes: impl IntoIterator<Item = impl Into<EncodeInput<'s>> + Send + 's>,
+        describes: impl IntoIterator<Item = impl Into<EncodeInput<'s>> + Send + 's> + Send + 'static,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a> {
@@ -297,18 +349,24 @@ impl Engine {
             bail!("both limit and offset should >= 0")
         }
 
-        let Some(tokenizer) = self.tokenizer.as_ref() else {
-            bail!("tokenizer not ready")
+        let Some(tokenizer) = self.tokenizer.clone() else {
+            bail!("tokenizer not enabled")
         };
-        let mut opt_clip_text_session = self.clip_text_session.lock();
-        let Some(clip_text_session) = opt_clip_text_session.as_mut() else {
-            bail!("clip_text_session not ready")
+        let Some(clip_text_lazy) = self.clip_text_session.clone() else {
+            bail!("clip_text_session not enabled")
         };
-        let text_embeddings = siglip2::infer_text(tokenizer, clip_text_session, describes)?
-            .into_iter()
-            .map(|embedding| HalfVector::from_f32_slice(&embedding))
-            .collect::<Vec<_>>();
-        drop(opt_clip_text_session);
+        let clip_text_session = clip_text_lazy.session().await?;
+        let text_embeddings = tokio::task::spawn_blocking(move || {
+            let mut clip_text_session = clip_text_session.blocking_lock();
+            let text_embeddings =
+                siglip2::infer_text(&tokenizer, &mut clip_text_session, describes)?
+                    .into_iter()
+                    .map(|embedding| HalfVector::from_f32_slice(&embedding))
+                    .collect::<Vec<_>>();
+            anyhow::Ok(text_embeddings)
+        })
+        .await
+        .unwrap()?;
 
         let res = sqlx::query_as!(
             Image,
@@ -352,26 +410,31 @@ impl Engine {
         .await
         .unwrap()?;
 
-        let mut opt_dinov3_session = self.dinov3_session.lock();
-        let Some(dinov3_session) = opt_dinov3_session.as_mut() else {
-            bail!("dinov3_session not ready")
+        let Some(dinov3_lazy) = self.dinov3_session.as_ref() else {
+            bail!("dinov3_session not enblaed")
         };
-        let embeddings = dinov3::infer_vision(dinov3_session, converted)?;
-        drop(opt_dinov3_session);
-
-        let div = f32x16::splat(1.0 / embeddings.len() as f32);
-        let mut embedding = embeddings
-            .into_iter()
-            .map(|v| <[f32; 768]>::try_from(v).unwrap())
-            .fold([f32x16::splat(0.0); 768 / 16], |mut acc, v| {
-                for (c, x) in acc.iter_mut().zip(v.chunks_exact(16)) {
-                    *c += f32x16::from_slice(x);
-                }
-                acc
-            });
-        embedding.iter_mut().for_each(|c| *c *= div);
-        let embedding =
-            HalfVector::from_f32_slice(unsafe { &*(embedding.as_ptr() as *const [f32; 768]) });
+        let dinov3_session = dinov3_lazy.session().await?;
+        let embedding = tokio::task::spawn_blocking(move || {
+            let mut dinov3_session = dinov3_session.blocking_lock();
+            let embeddings = dinov3::infer_vision(&mut dinov3_session, converted)?;
+            drop(dinov3_session);
+            let div = f32x16::splat(1.0 / embeddings.len() as f32);
+            let mut embedding = embeddings
+                .into_iter()
+                .map(|v| <[f32; 768]>::try_from(v).unwrap())
+                .fold([f32x16::splat(0.0); 768 / 16], |mut acc, v| {
+                    for (c, x) in acc.iter_mut().zip(v.chunks_exact(16)) {
+                        *c += f32x16::from_slice(x);
+                    }
+                    acc
+                });
+            embedding.iter_mut().for_each(|c| *c *= div);
+            let embedding =
+                HalfVector::from_f32_slice(unsafe { &*(embedding.as_ptr() as *const [f32; 768]) });
+            anyhow::Ok(embedding)
+        })
+        .await
+        .unwrap()?;
 
         let res = sqlx::query_as!(
             Image,

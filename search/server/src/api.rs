@@ -102,7 +102,7 @@ pub async fn search_sse(
                             .await
                             .map(|s| Box::pin(s) as Pin<Box<dyn Stream<Item = search_types::Image> + Send>>),
                      Mode::Clip =>
-                        engine.search_clip([q.as_str()], limit, offset)
+                        engine.search_clip([q], limit, offset)
                             .await
                             .map(|s| Box::pin(s) as _),
                      _ => unreachable!()

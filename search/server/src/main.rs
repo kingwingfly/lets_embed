@@ -8,7 +8,7 @@ use axum::{Router, routing::get};
 use clap::Parser;
 use leptos::prelude::*;
 use leptos_axum::{LeptosRoutes, generate_route_list};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::{
     EnvFilter, Registry, layer::SubscriberExt as _, util::SubscriberInitExt as _,
@@ -27,10 +27,11 @@ async fn main() -> anyhow::Result<()> {
     let mut leptos_options = conf.leptos_options;
     leptos_options.site_addr = format!("{}:{}", args.host, args.port).parse()?;
 
-    let (engine, _, _) = search_engine::Engine::new(
+    let engine = search_engine::Engine::new(
         args.clip_text_model.as_ref(),
         args.tokenizer.as_ref(),
         args.dinov3_model.as_ref(),
+        args.idle_timeout.map(Duration::from_secs),
     )
     .await?;
     tracing::info!("search engine loaded");

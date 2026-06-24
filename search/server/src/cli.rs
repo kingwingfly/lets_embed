@@ -28,6 +28,9 @@ pub struct Cli {
     )]
     pub dinov3_model: Option<PathBuf>,
 
+    #[arg(alias = "it", long)]
+    pub idle_timeout: Option<u64>,
+
     /// images path prefix
     pub prefix: Option<PathBuf>,
 }

@@ -1144,9 +1144,9 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crypto-bigint"
-version = "0.7.4"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97bb4a855e3b10f84c4e7e895a7de01db7f9a7b7eb7f73ed9773fd52ac686451"
+checksum = "1a52aa3fcda4e6302a9f48734f234d35d4721b96f8fe07d073f07ce9df4f0271"
 dependencies = [
  "cpubits",
  "ctutils",
@@ -3206,9 +3206,9 @@ dependencies = [
 
 [[package]]
 name = "link-section"
-version = "0.18.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2b1dd6fe32e55c0fc0ea9493aa57459ca3cf4ff3c857c7d0302290150da6e4f"
+checksum = "24670b639492630905459a6c7d47f063d33c2d4fcd5362f6e5827c5613976c9f"
 
 [[package]]
 name = "linktime-proc-macro"
@@ -5592,9 +5592,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -5745,7 +5745,6 @@ dependencies = [
  "dotenvy",
  "futures",
  "ort",
- "parking_lot",
  "pgvector",
  "search_types",
  "siglip2",

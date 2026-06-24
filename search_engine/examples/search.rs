@@ -4,14 +4,13 @@ use search_engine::Engine;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (engine, mut jh1, mut jh2) = Engine::new(
+    let engine = Engine::new(
         Some("models/siglip2-so400m-patch14-384/onnx/text_model.onnx"),
         Some("models/siglip2-so400m-patch14-384/tokenizer.json"),
         Some("models/dinov3-vitb16-pretrain-lvd1689m/onnx/model.onnx"),
+        None,
     )
     .await?;
-    jh1.take().unwrap().await.unwrap()?;
-    jh2.take().unwrap().await.unwrap()?;
     let _posts = engine.search_posts_by_tag("genshin impact", 5, 0).await?;
     let _images = engine.search_images_by_tag("genshin impact", 5, 0).await?;
     let _images = engine.search_clip(["长满青苔的小路"], 5, 0).await?;
