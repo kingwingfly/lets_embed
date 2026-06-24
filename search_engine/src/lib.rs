@@ -203,6 +203,52 @@ impl Engine {
         Ok(res)
     }
 
+    pub async fn random_posts<'a>(
+        &'a self,
+        limit: i64,
+    ) -> anyhow::Result<impl Stream<Item = Post> + Send + 'a> {
+        if limit < 0 {
+            bail!("limit should >= 0")
+        }
+
+        let res = sqlx::query_as!(
+            Post,
+            r#"
+            SELECT id, title
+            FROM posts
+            TABLESAMPLE SYSTEM_ROWS($1)
+            "#,
+            limit,
+        )
+        .fetch(&self.pool)
+        .filter_map(|res| ready(res.ok()));
+
+        Ok(res)
+    }
+
+    pub async fn random_images<'a>(
+        &'a self,
+        limit: i64,
+    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a> {
+        if limit < 0 {
+            bail!("limit should >= 0")
+        }
+
+        let res = sqlx::query_as!(
+            Image,
+            r#"
+            SELECT id, name, width, height
+            FROM images
+            TABLESAMPLE SYSTEM_ROWS($1)
+            "#,
+            limit,
+        )
+        .fetch(&self.pool)
+        .filter_map(|res| ready(res.ok()));
+
+        Ok(res)
+    }
+
     pub async fn search_posts_by_title<'a>(
         &'a self,
         title: impl AsRef<str>,
