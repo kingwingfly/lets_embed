@@ -1,9 +1,10 @@
 #![feature(iterator_try_collect, portable_simd)]
 
 use std::{
+    fmt,
     future::ready,
     io::{Read, Seek},
-    path::{Path, PathBuf},
+    path::Path,
     simd::f32x16,
     sync::Arc,
     time::Duration,
@@ -26,23 +27,33 @@ struct Inner {
     last_used: Instant,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LazyModel {
     name: &'static str,
-    model_path: Arc<PathBuf>,
+    model: &'static (dyn Fn() -> ort::Result<Session> + Send + Sync + 'static),
     inner: Arc<Mutex<Inner>>,
     idle_timeout: Option<Duration>,
+}
+
+impl fmt::Debug for LazyModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LazyModel")
+            .field("name", &self.name)
+            .field("inner", &self.inner)
+            .field("idle_timeout", &self.idle_timeout)
+            .finish()
+    }
 }
 
 impl LazyModel {
     pub fn new(
         name: &'static str,
-        model_path: impl AsRef<Path>,
+        model: impl Fn() -> ort::Result<Session> + Send + Sync + 'static,
         idle_timeout: Option<Duration>,
     ) -> Self {
         let me = Self {
             name,
-            model_path: Arc::new(model_path.as_ref().to_owned()),
+            model: Box::leak(Box::new(model)),
             inner: Arc::new(Mutex::new(Inner {
                 session: None,
                 last_used: Instant::now(),
@@ -57,10 +68,7 @@ impl LazyModel {
         let mut guard = self.inner.lock().await;
 
         if guard.session.is_none() {
-            let path = self.model_path.as_ref().clone();
-            let session = tokio::task::spawn_blocking(move || siglip2::model(path))
-                .await
-                .unwrap()?;
+            let session = tokio::task::spawn_blocking(self.model).await.unwrap()?;
             tracing::info!(model = self.name, "model session ready");
             guard.session = Some(Arc::new(Mutex::new(session)));
         }
@@ -111,9 +119,7 @@ pub struct Engine {
 impl Engine {
     /// Create search engine.
     /// This call will return immediately after connecting db and loading tokenizer,
-    /// and start loading siglip2 and dinov3 in back threads.
-    ///
-    /// The first JoinHandle is for clip_text and the second is for dinov3.
+    /// and load siglip2 and dinov3 in back threads lazily.
     pub async fn new(
         clip_text_model_path: Option<impl AsRef<Path>>,
         tokenizer_config_path: Option<impl AsRef<Path>>,
@@ -144,10 +150,21 @@ impl Engine {
         };
 
         let clip_text_session = clip_text_model_path.map(|clip_text_model_path| {
-            LazyModel::new("clip_text", clip_text_model_path, idle_timeout)
+            let clip_text_model_path = clip_text_model_path.as_ref().to_owned();
+            LazyModel::new(
+                "clip_text",
+                move || siglip2::model(&clip_text_model_path),
+                idle_timeout,
+            )
         });
-        let dinov3_session = dinov3_model_path
-            .map(|dinov3_model_path| LazyModel::new("dinov3", dinov3_model_path, idle_timeout));
+        let dinov3_session = dinov3_model_path.map(|dinov3_model_path| {
+            let dinov3_model_path = dinov3_model_path.as_ref().to_owned();
+            LazyModel::new(
+                "dinov3",
+                move || dinov3::model(&dinov3_model_path),
+                idle_timeout,
+            )
+        });
 
         Ok(Self {
             pool,
