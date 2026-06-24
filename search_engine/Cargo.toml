@@ -26,6 +26,8 @@ dinov3 = { path = "../dinov3" }
 
 dotenvy.workspace = true
 
+moka = { version = "0.12", features = ["future"] }
+
 [features]
 default = []
 serde = ["search_types/serde"]

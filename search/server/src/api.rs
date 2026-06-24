@@ -102,7 +102,7 @@ pub async fn search_sse(
                             .await
                             .map(|s| Box::pin(s) as Pin<Box<dyn Stream<Item = search_types::Image> + Send>>),
                      Mode::Clip =>
-                        engine.search_clip([q], limit, offset)
+                        engine.search_clip_cached([q], limit, offset)
                             .await
                             .map(|s| Box::pin(s) as _),
                      _ => unreachable!()
@@ -179,7 +179,7 @@ pub async fn search_sse(
                     Err(e) => yield Ok(send_err(format!("invalid image data: {e}"))),
                     Ok(bytes) => {
                         let cursor = std::io::Cursor::new(bytes);
-                        match engine.search_dinov3([cursor], limit, offset).await {
+                        match engine.search_dinov3_cached([cursor], limit, offset).await {
                             Err(e) => yield Ok(send_err(e.to_string())),
                             Ok(mut images) => {
                                 let mut count = 0i64;

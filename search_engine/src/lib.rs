@@ -1,17 +1,20 @@
 #![feature(iterator_try_collect, portable_simd)]
 
 use std::{
+    borrow::Borrow,
     fmt,
     future::ready,
-    io::{Read, Seek},
+    hash::{DefaultHasher, Hash, Hasher},
+    io::{Cursor, Read, Seek},
     path::Path,
     simd::f32x16,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use futures::{Stream, StreamExt as _};
+use moka::future::Cache;
 use ort::session::Session;
 use pgvector::HalfVector;
 use search_types::{Author, Image, ImageDetails, Post, Tag, Video, VideoDetails};
@@ -356,16 +359,13 @@ impl Engine {
         Ok(images)
     }
 
-    pub async fn search_clip<'a, 's>(
-        &'a self,
-        describes: impl IntoIterator<Item = impl Into<EncodeInput<'s>> + Send + 's> + Send + 'static,
-        limit: i64,
-        offset: i64,
-    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a> {
-        if limit < 0 || offset < 0 {
-            bail!("both limit and offset should >= 0")
-        }
-
+    async fn clip_embedding<'s, I>(
+        &self,
+        describes: impl IntoIterator<Item = I> + Send + 'static,
+    ) -> anyhow::Result<HalfVector>
+    where
+        I: Into<EncodeInput<'s>> + Send + 's,
+    {
         let Some(tokenizer) = self.tokenizer.clone() else {
             bail!("tokenizer not enabled")
         };
@@ -373,7 +373,7 @@ impl Engine {
             bail!("clip_text_session not enabled")
         };
         let clip_text_session = clip_text_lazy.session().await?;
-        let embedding = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut clip_text_session = clip_text_session.blocking_lock();
             let embeddings = siglip2::infer_text(&tokenizer, &mut clip_text_session, describes)?
                 .into_iter()
@@ -398,8 +398,18 @@ impl Engine {
             anyhow::Ok(embedding)
         })
         .await
-        .unwrap()?;
+        .unwrap()
+    }
 
+    async fn search_clip_inner<'a>(
+        &'a self,
+        embedding: impl Borrow<HalfVector>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
         let res = sqlx::query_as!(
             Image,
             r#"
@@ -408,7 +418,7 @@ impl Engine {
             ORDER BY i.clip_embedding <=> $1::halfvec
             LIMIT $2 OFFSET $3
             "#,
-            &embedding as _,
+            embedding.borrow() as _,
             limit,
             offset
         )
@@ -418,21 +428,58 @@ impl Engine {
         Ok(res)
     }
 
-    pub async fn search_dinov3<'a, R: Read + Seek>(
+    pub async fn search_clip<'a, 's, I>(
         &'a self,
-        images: impl IntoIterator<Item = R> + Send + 'static,
+        describes: impl IntoIterator<Item = I> + Send + 'static,
         limit: i64,
         offset: i64,
-    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a> {
-        if limit < 0 || offset < 0 {
-            bail!("both limit and offset should >= 0")
-        }
+    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a>
+    where
+        I: Into<EncodeInput<'s>> + Send + 's,
+    {
+        let embedding = self.clip_embedding(describes).await?;
+        self.search_clip_inner(embedding, limit, offset).await
+    }
 
+    pub async fn search_clip_cached<'a, 's, I>(
+        &'a self,
+        describes: impl IntoIterator<Item = I> + Send + 'static,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a>
+    where
+        I: Into<EncodeInput<'s>> + Send + 's,
+        I: AsRef<str>,
+    {
+        static CACHE: LazyLock<Cache<u64, Arc<HalfVector>>> = LazyLock::new(|| Cache::new(2 << 14));
+        let describes = describes
+            .into_iter()
+            .map(|s| s.as_ref().to_owned())
+            .collect::<Vec<_>>();
+        let mut hasher = DefaultHasher::default();
+        describes.hash(&mut hasher);
+        let hash = hasher.finish();
+        let embedding = CACHE
+            .try_get_with(hash, async move {
+                self.clip_embedding(describes).await.map(Arc::new)
+            })
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+        self.search_clip_inner(embedding, limit, offset).await
+    }
+
+    async fn dinov3_embedding<R>(
+        &self,
+        images: impl IntoIterator<Item = R> + Send + 'static,
+    ) -> anyhow::Result<HalfVector>
+    where
+        R: Read + Seek,
+    {
         let Some(dinov3_lazy) = self.dinov3_session.as_ref() else {
             bail!("dinov3_session not enblaed")
         };
         let dinov3_session = dinov3_lazy.session().await?;
-        let embedding = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let converted = images
                 .into_iter()
                 .map(|i| dinov3::convert_image(i))
@@ -460,7 +507,18 @@ impl Engine {
             anyhow::Ok(embedding)
         })
         .await
-        .unwrap()?;
+        .unwrap()
+    }
+
+    async fn search_dinov3_inner<'a>(
+        &'a self,
+        embedding: impl Borrow<HalfVector>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
 
         let res = sqlx::query_as!(
             Image,
@@ -470,14 +528,58 @@ impl Engine {
             ORDER BY i.dinov3_embedding <=> $1::halfvec
             LIMIT $2 OFFSET $3
             "#,
-            &embedding as _,
+            embedding.borrow() as _,
             limit,
             offset
         )
         .fetch(&self.pool)
         .filter_map(|res| ready(res.ok()));
-
         Ok(res)
+    }
+
+    pub async fn search_dinov3<'a, R>(
+        &'a self,
+        images: impl IntoIterator<Item = R> + Send + 'static,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a>
+    where
+        R: Read + Seek,
+    {
+        let embedding = self.dinov3_embedding(images).await?;
+        self.search_dinov3_inner(embedding, limit, offset).await
+    }
+
+    pub async fn search_dinov3_cached<'a, R>(
+        &'a self,
+        images: impl IntoIterator<Item = R> + Send + 'static,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a>
+    where
+        R: Read + Seek,
+    {
+        static CACHE: LazyLock<Cache<u64, Arc<HalfVector>>> = LazyLock::new(|| Cache::new(2 << 14));
+        let images = images
+            .into_iter()
+            .map(|mut i| {
+                let mut buf = vec![];
+                i.read_to_end(&mut buf)?;
+                anyhow::Ok(buf)
+            })
+            .try_collect::<Vec<_>>()?;
+        let mut hasher = DefaultHasher::default();
+        images.hash(&mut hasher);
+        let hash = hasher.finish();
+        let embedding = CACHE
+            .try_get_with(hash, async move {
+                self.dinov3_embedding(images.into_iter().map(Cursor::new))
+                    .await
+                    .map(Arc::new)
+            })
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+        self.search_dinov3_inner(embedding, limit, offset).await
     }
 
     pub async fn search_dinov3_by_id<'a>(
