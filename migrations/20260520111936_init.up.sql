@@ -113,4 +113,4 @@ CREATE TABLE wd_tag_translations (
     translation VARCHAR(100) NOT NULL,
     PRIMARY KEY (tag_id, translation)
 );
-CREATE INDEX idx_wd_tag_translations ON wd_tag_translations USING GIN (translation gin_trgm_ops);
+CREATE INDEX idx_wd_tag_translations_translation_trgm ON wd_tag_translations USING GIN (translation gin_trgm_ops);

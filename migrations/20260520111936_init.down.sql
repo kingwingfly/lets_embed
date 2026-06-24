@@ -1,5 +1,5 @@
 -- wd_tag translations
-DROP INDEX IF EXISTS idx_wd_tag_translations;
+DROP INDEX IF EXISTS idx_wd_tag_translations_translation_trgm;
 DROP TABLE IF EXISTS wd_tag_translations;
 
 -- wd_tags
