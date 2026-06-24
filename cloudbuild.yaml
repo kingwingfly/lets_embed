@@ -2,7 +2,7 @@ substitutions:
   _REPO: "us-central1-docker.pkg.dev/project-8aaff395-290a-492d-976/images"
 
 options:
-  machineType: "E2_HIGHCPU_32"
+  machineType: "UNSPECIFIED"
   diskSizeGb: 100
   env:
     - "DOCKER_BUILDKIT=1"
