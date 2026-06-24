@@ -428,20 +428,15 @@ impl Engine {
             bail!("both limit and offset should >= 0")
         }
 
-        let converted = tokio::task::spawn_blocking(move || {
-            images
-                .into_iter()
-                .map(|i| dinov3::convert_image(i))
-                .try_collect::<Vec<_>>()
-        })
-        .await
-        .unwrap()?;
-
         let Some(dinov3_lazy) = self.dinov3_session.as_ref() else {
             bail!("dinov3_session not enblaed")
         };
         let dinov3_session = dinov3_lazy.session().await?;
         let embedding = tokio::task::spawn_blocking(move || {
+            let converted = images
+                .into_iter()
+                .map(|i| dinov3::convert_image(i))
+                .try_collect::<Vec<_>>()?;
             let mut dinov3_session = dinov3_session.blocking_lock();
             let embeddings = dinov3::infer_vision(&mut dinov3_session, converted)?;
             drop(dinov3_session);
