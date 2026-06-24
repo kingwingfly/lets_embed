@@ -382,15 +382,19 @@ impl Engine {
             let mut embedding = embeddings
                 .into_iter()
                 .map(|v| <[f32; siglip2::EMBED_DIM]>::try_from(v).unwrap())
-                .fold([f32x16::splat(0.0); 768 / 16], |mut acc, v| {
-                    for (c, x) in acc.iter_mut().zip(v.chunks_exact(16)) {
-                        *c += f32x16::from_slice(x);
-                    }
-                    acc
-                });
+                .fold(
+                    [f32x16::splat(0.0); siglip2::EMBED_DIM / 16],
+                    |mut acc, v| {
+                        for (c, x) in acc.iter_mut().zip(v.chunks_exact(16)) {
+                            *c += f32x16::from_slice(x);
+                        }
+                        acc
+                    },
+                );
             embedding.iter_mut().for_each(|c| *c *= div);
-            let embedding =
-                HalfVector::from_f32_slice(unsafe { &*(embedding.as_ptr() as *const [f32; 768]) });
+            let embedding = HalfVector::from_f32_slice(unsafe {
+                &*(embedding.as_ptr() as *const [f32; siglip2::EMBED_DIM])
+            });
             anyhow::Ok(embedding)
         })
         .await
@@ -445,15 +449,19 @@ impl Engine {
             let mut embedding = embeddings
                 .into_iter()
                 .map(|v| <[f32; dinov3::EMBED_DIM]>::try_from(v).unwrap())
-                .fold([f32x16::splat(0.0); 768 / 16], |mut acc, v| {
-                    for (c, x) in acc.iter_mut().zip(v.chunks_exact(16)) {
-                        *c += f32x16::from_slice(x);
-                    }
-                    acc
-                });
+                .fold(
+                    [f32x16::splat(0.0); dinov3::EMBED_DIM / 16],
+                    |mut acc, v| {
+                        for (c, x) in acc.iter_mut().zip(v.chunks_exact(16)) {
+                            *c += f32x16::from_slice(x);
+                        }
+                        acc
+                    },
+                );
             embedding.iter_mut().for_each(|c| *c *= div);
-            let embedding =
-                HalfVector::from_f32_slice(unsafe { &*(embedding.as_ptr() as *const [f32; 768]) });
+            let embedding = HalfVector::from_f32_slice(unsafe {
+                &*(embedding.as_ptr() as *const [f32; dinov3::EMBED_DIM])
+            });
             anyhow::Ok(embedding)
         })
         .await
