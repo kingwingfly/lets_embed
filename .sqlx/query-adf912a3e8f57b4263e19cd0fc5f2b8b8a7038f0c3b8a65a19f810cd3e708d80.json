@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            WITH qs AS (\n                SELECT q FROM\n                unnest($1::halfvec[]) AS _(q)\n            )\n            SELECT id, name, width, height\n            FROM images i\n            CROSS JOIN qs\n            ORDER BY i.clip_embedding <=> qs.q\n            LIMIT $2 OFFSET $3\n            ",
+  "query": "\n            SELECT id, name, width, height\n            FROM images i\n            ORDER BY i.clip_embedding <=> $1::halfvec\n            LIMIT $2 OFFSET $3\n            ",
   "describe": {
     "columns": [
       {
@@ -52,15 +52,8 @@
       "Left": [
         {
           "Custom": {
-            "name": "halfvec[]",
-            "kind": {
-              "Array": {
-                "Custom": {
-                  "name": "halfvec",
-                  "kind": "Simple"
-                }
-              }
-            }
+            "name": "halfvec",
+            "kind": "Simple"
           }
         },
         "Int8",
@@ -74,5 +67,5 @@
       false
     ]
   },
-  "hash": "15d10e68d8ea7af87db4fa537f9b5871175f04c20e0c59765a864ea8609de5ea"
+  "hash": "adf912a3e8f57b4263e19cd0fc5f2b8b8a7038f0c3b8a65a19f810cd3e708d80"
 }
