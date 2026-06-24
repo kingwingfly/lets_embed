@@ -10,6 +10,7 @@ pub enum Mode {
     Clip,
     Similar,
     SearchImage,
+    Random,
 }
 
 impl Mode {
@@ -21,6 +22,7 @@ impl Mode {
             Mode::Clip => "clip",
             Mode::Similar => "similar",
             Mode::SearchImage => "search_image",
+            Mode::Random => "random",
         }
     }
     pub fn parse(s: &str) -> Self {
@@ -30,6 +32,7 @@ impl Mode {
             "clip" => Mode::Clip,
             "similar" => Mode::Similar,
             "search_image" => Mode::SearchImage,
+            "random" => Mode::Random,
             _ => Mode::Tag,
         }
     }

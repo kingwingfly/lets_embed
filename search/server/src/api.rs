@@ -46,17 +46,21 @@ pub async fn search_sse(
                 .unwrap()
         };
 
-        match (mode, q.is_empty()) {
-            (_, true) | (Mode::Author, false) | (Mode::Title, false)  => {
-                let res = match q.is_empty() {
-                     true =>
+        match (mode, q.as_str()) {
+            (_, "") | (Mode::Author, _) | (Mode::Title, _) | (Mode::Random, _)
+                if mode != Mode::Random || q != "images"
+            => {
+                let res = match q.as_str() {
+                     "" =>
                         engine.newest_posts(limit, offset)
                             .await
                             .map(|s| Box::pin(s) as Pin<Box<dyn Stream<Item = search_types::Post> + Send>>),
-                     false => match mode {
+                     _ => match mode {
                         Mode::Author => engine.search_posts_by_author(q, limit, offset).await
                             .map(|s| Box::pin(s) as _),
                         Mode::Title => engine.search_posts_by_title(q, limit, offset).await
+                            .map(|s| Box::pin(s) as _),
+                        Mode::Random => engine.random_posts(limit).await
                             .map(|s| Box::pin(s) as _),
                         _ => unreachable!()
                      }
@@ -95,14 +99,18 @@ pub async fn search_sse(
                     Err(e) => yield Ok(send_err(e.to_string())),
                 }
             }
-            (Mode::Tag | Mode::Clip, false) => {
+            (Mode::Tag | Mode::Clip, _) | (Mode::Random, "images") => {
                 let res = match mode {
                      Mode::Tag =>
                         engine.search_images_by_tag(q, limit, offset)
                             .await
                             .map(|s| Box::pin(s) as Pin<Box<dyn Stream<Item = search_types::Image> + Send>>),
-                     Mode::Clip =>
+                    Mode::Clip =>
                         engine.search_clip_cached([q], limit, offset)
+                            .await
+                            .map(|s| Box::pin(s) as _),
+                    Mode::Random =>
+                        engine.random_images(limit)
                             .await
                             .map(|s| Box::pin(s) as _),
                      _ => unreachable!()
@@ -127,7 +135,7 @@ pub async fn search_sse(
                     Err(e) => yield Ok(send_err(e.to_string())),
                 }
             }
-            (Mode::Similar, false) => {
+            (Mode::Similar, _) => {
                 let prepared = async {
                     let id = q.parse::<i64>().map_err(|e| e.to_string())?;
                     let details = engine.image_details(id).await.map_err(|e| e.to_string())?;
@@ -172,7 +180,7 @@ pub async fn search_sse(
                     }
                 }
             }
-            (Mode::SearchImage, false) => {
+            (Mode::SearchImage, _) => {
                 let decoded = URL_SAFE_NO_PAD.decode(q.as_bytes());
 
                 match decoded {

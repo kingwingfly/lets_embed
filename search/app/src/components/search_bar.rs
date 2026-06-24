@@ -54,7 +54,10 @@ pub fn SearchBar() -> impl IntoView {
 
     let (init_mode, init_q, init_limit) = qmap.with_untracked(|m| {
         (
-            Mode::parse(m.get("mode").as_deref().unwrap_or("tag")),
+            m.get("mode")
+                .as_deref()
+                .map(Mode::parse)
+                .unwrap_or(Mode::Tag),
             m.get("q").unwrap_or_default(),
             m.get("limit")
                 .and_then(|s| s.parse::<usize>().ok())
@@ -88,25 +91,38 @@ pub fn SearchBar() -> impl IntoView {
         }
     };
 
-    let on_file = move |ev: leptos::ev::Event| {
-        let input: web_sys::HtmlInputElement = event_target(&ev);
-        let Some(file) = input.files().and_then(|fs| fs.get(0)) else {
-            return;
-        };
-        file_name.set(file.name());
+    let on_file = {
         let go = go.clone();
-        spawn_local(async move {
-            if let Some(b64) = encode_file(file).await {
-                q_input.set(b64.clone());
-                go(b64);
-            }
-        });
+        move |ev: leptos::ev::Event| {
+            let input: web_sys::HtmlInputElement = event_target(&ev);
+            let Some(file) = input.files().and_then(|fs| fs.get(0)) else {
+                return;
+            };
+            file_name.set(file.name());
+            let go = go.clone();
+            spawn_local(async move {
+                if let Some(b64) = encode_file(file).await {
+                    q_input.set(b64.clone());
+                    go(b64);
+                }
+            });
+        }
     };
 
     let tab_cls = move |m: Mode| {
         format!(
             "px-3 py-1 rounded text-sm transition-colors {}",
             if mode.get() == m {
+                "bg-gray-500 text-white"
+            } else {
+                "text-gray-300 hover:text-white"
+            }
+        )
+    };
+    let random_cls = move |r: &str| {
+        format!(
+            "px-3 py-1 rounded text-sm transition-colors {}",
+            if q_input.get() == r {
                 "bg-gray-500 text-white"
             } else {
                 "text-gray-300 hover:text-white"
@@ -137,6 +153,16 @@ pub fn SearchBar() -> impl IntoView {
                             on:click=move |_| mode.set(Mode::Similar)>"DINO"</button>
                         <button type="button" class=move || tab_cls(Mode::SearchImage)
                             on:click=move |_| mode.set(Mode::SearchImage)>"Image"</button>
+                        <button type="button" class=move || tab_cls(Mode::Random)
+                            on:click={
+                                let go = go.clone();
+                                move |_| {
+                                    mode.set(Mode::Random);
+                                    if q_input.read().is_empty() { q_input.set("posts".to_string()); }
+                                    go(q_input.get_untracked());
+                                }
+                            }
+                        >"Random"</button>
                     </div>
 
                     <div class="flex w-full items-center gap-2 min-w-0">
@@ -158,6 +184,27 @@ pub fn SearchBar() -> impl IntoView {
                                         />
                                     </label>
                                 }.into_any()
+                            } else if mode.get() == Mode::Random {
+                                view! {
+                                    <div class="flex gap-1 bg-gray-800 rounded-lg p-1 shrink-0 self-center md:self-auto">
+                                        <button type="button" class=move || random_cls("posts")
+                                            on:click={
+                                                let go = go.clone();
+                                                move |_| {
+                                                    q_input.set("posts".to_string());
+                                                    go(q_input.get_untracked());
+                                                }
+                                            }>"Posts"</button>
+                                        <button type="button" class=move || random_cls("images")
+                                            on:click={
+                                                let go = go.clone();
+                                                move |_| {
+                                                    q_input.set("images".to_string());
+                                                    go(q_input.get_untracked());
+                                                }
+                                            }>"Images"</button>
+                                    </div>
+                                }.into_any()
                             } else {
                                 view! {
                                     <input
@@ -168,7 +215,7 @@ pub fn SearchBar() -> impl IntoView {
                                             Mode::Title => "One title",
                                             Mode::Clip => "Describe the image...",
                                             Mode::Similar => "Image ID",
-                                            Mode::SearchImage => "",
+                                            _ => ""
                                         }
                                         prop:value=move || q_input.get()
                                         on:input=move |ev| q_input.set(event_target_value(&ev))
@@ -186,10 +233,14 @@ pub fn SearchBar() -> impl IntoView {
                                 }
                             }
                         />
-                        <button type="submit"
-                            class="shrink-0 bg-gray-500 text-white rounded-lg py-2 px-4 hover:bg-gray-400">
-                            "Search"
-                        </button>
+                        {
+                            (mode.get() != Mode::Random).then(|| view! {
+                                <button type="submit"
+                                    class="shrink-0 bg-gray-500 text-white rounded-lg py-2 px-4 hover:bg-gray-400">
+                                    "Search"
+                                </button>
+                            })
+                        }
                     </div>
                 </form>
             </div>
