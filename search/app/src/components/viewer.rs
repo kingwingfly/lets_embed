@@ -13,8 +13,8 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
     let total = images.with_value(|v| v.len());
     let track = NodeRef::<leptos::html::Div>::new();
 
-    let tx = RwSignal::new(-100.0_f64);
     let animating = RwSignal::new(false);
+    let drag = RwSignal::new(0.0_f64); 
 
     let has_prev = move || matches!(index.get(), Some(i) if i > 0);
     let has_next = move || matches!(index.get(), Some(i) if i + 1 < total);
@@ -26,35 +26,26 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
         match dir {
             -1 if matches!(index.get_untracked(), Some(i) if i > 0) => {
                 animating.set(true);
-                tx.set(0.0);
-            }
-            1 if matches!(index.get_untracked(), Some(i) if i + 1 < total) => {
-                animating.set(true);
-                tx.set(-200.0);
-            }
-            _ => {}
-        }
-    };
-
-    let _ = use_event_listener(track, ev::transitionend, move |_| {
-        let cur = tx.get_untracked();
-        batch(move || {
-            if cur <= -199.0 {
-                index.update(|i| {
-                    if let Some(c) = i {
-                        *c += 1;
-                    }
-                });
-            } else if cur >= -1.0 {
                 index.update(|i| {
                     if let Some(c) = i {
                         *c -= 1;
                     }
                 });
             }
-            animating.set(false);
-            tx.set(-100.0);
-        });
+            1 if matches!(index.get_untracked(), Some(i) if i + 1 < total) => {
+                animating.set(true);
+                index.update(|i| {
+                    if let Some(c) = i {
+                        *c += 1;
+                    }
+                });
+            }
+            _ => {}
+        }
+    };
+
+    let _ = use_event_listener(track, ev::transitionend, move |_| {
+        animating.set(false);
     });
 
     let _ = use_event_listener(window(), ev::keydown, move |e| {
@@ -92,15 +83,14 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
             return;
         }
         if let Some(t) = ev.changed_touches().get(0) {
-            let dx = t.client_x() as f64 - start_x.get_value();
-            let mut pct = dx / width.get_value() * 100.0;
-            if pct > 0.0 && !has_prev() {
-                pct = 0.0;
+            let mut dx = t.client_x() as f64 - start_x.get_value();
+            if dx > 0.0 && !has_prev() {
+                dx = 0.0;
             }
-            if pct < 0.0 && !has_next() {
-                pct = 0.0;
+            if dx < 0.0 && !has_next() {
+                dx = 0.0;
             }
-            tx.set(-100.0 + pct);
+            drag.set(dx);
         }
     };
     let on_touch_end = move |_: TouchEvent| {
@@ -108,58 +98,59 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
             return;
         }
         dragging.set_value(false);
-        let drag = tx.get_untracked() + 100.0;
-        let target = if drag <= -SWIPE_RATIO * 100.0 && has_next() {
-            -200.0
-        } else if drag >= SWIPE_RATIO * 100.0 && has_prev() {
-            0.0
-        } else {
-            -100.0
-        };
-        batch(move || {
-            animating.set((target - tx.get_untracked()).abs() >= 0.5);
-            tx.set(target);
-        });
+        let frac = drag.get_untracked() / width.get_value();
+        animating.set(true);
+        if frac <= -SWIPE_RATIO && has_next() {
+            index.update(|i| {
+                if let Some(c) = i {
+                    *c += 1;
+                }
+            });
+        } else if frac >= SWIPE_RATIO && has_prev() {
+            index.update(|i| {
+                if let Some(c) = i {
+                    *c -= 1;
+                }
+            });
+        }
+        drag.set(0.0);
     };
 
     let track_style = move || {
+        let i = index.get().unwrap_or(0);
         format!(
-            "transform: translateX({}%); transition: {};",
-            tx.get(),
-            if animating.get() {
+            "transform: translateX(calc(-{i}00vw + {d}px)); transition: {t};",
+            i = i,
+            d = drag.get(),
+            t = if animating.get() {
                 "transform 0.3s ease"
             } else {
                 "none"
-            }
+            },
         )
     };
 
-    let view_slide = move |idx: Option<usize>| {
-        let data = idx.and_then(|i| {
-            images.with_value(|v| {
-                v.get(i).map(|im| {
-                    (
-                        format!("/images/{}.webp", encode_path(&im.name)),
-                        format!("/details/{id}?mode=similar&q={id}&limit=50", id = im.id),
-                        im.name.clone(),
-                    )
-                })
+    let slides = images.with_value(|v| {
+        v.iter()
+            .map(|im| {
+                let src = format!("/images/{}.webp", encode_path(&im.name));
+                let href = format!("/details/{id}?mode=similar&q={id}&limit=50", id = im.id);
+                let alt = im.name.clone();
+                view! {
+                    <div class="flex-none w-screen h-full grid place-items-center p-2">
+                        <a href=href on:click=|ev| ev.stop_propagation()>
+                            <img
+                                src=src
+                                alt=alt
+                                loading="lazy"
+                                class="max-h-screen max-w-screen object-contain select-none cursor-cell"
+                            />
+                        </a>
+                    </div>
+                }
             })
-        });
-        view! {
-            <div class="flex-none w-full h-full grid place-items-center p-2">
-                {data.map(|(src, href, alt)| view! {
-                    <a href=href on:click=|ev| ev.stop_propagation()>
-                        <img
-                            src=src
-                            alt=alt
-                            class="max-h-screen max-w-screen object-contain select-none cursor-cell"
-                        />
-                    </a>
-                })}
-            </div>
-        }
-    };
+            .collect_view()
+    });
 
     view! {
         <div
@@ -171,13 +162,11 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
             on:touchcancel=move |_: TouchEvent| {
                 dragging.set_value(false);
                 animating.set(true);
-                tx.set(-100.0);
+                drag.set(0.0);
             }
         >
-            <div node_ref=track class="flex h-full w-full will-change-transform" style=track_style>
-                {move || view_slide(index.get().filter(|&i| i > 0).map(|i| i - 1))}
-                {move || view_slide(index.get())}
-                {move || view_slide(index.get().map(|i| i + 1).filter(|&i| i < total))}
+            <div node_ref=track class="flex h-full will-change-transform" style=track_style>
+                {slides}
             </div>
 
             <button
