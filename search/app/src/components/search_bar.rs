@@ -111,7 +111,7 @@ pub fn SearchBar() -> impl IntoView {
 
     let tab_cls = move |m: Mode| {
         format!(
-            "px-3 py-1 rounded text-sm transition-colors {}",
+            "px-3 py-1 rounded text-sm transition-colors shrink-0 whitespace-nowrap {}",
             if mode.get() == m {
                 "bg-gray-500 text-white"
             } else {
@@ -121,8 +121,8 @@ pub fn SearchBar() -> impl IntoView {
     };
     let random_cls = move |r: &str| {
         format!(
-            "px-3 py-1 rounded text-sm transition-colors {}",
-            if q_input.get() == r {
+            "px-3 py-1 rounded text-sm transition-colors shrink-0 whitespace-nowrap {}",
+            if q_input.read().as_str() == r {
                 "bg-gray-500 text-white"
             } else {
                 "text-gray-300 hover:text-white"
@@ -132,42 +132,43 @@ pub fn SearchBar() -> impl IntoView {
 
     view! {
         <div class="flex flex-col w-full h-fit sticky top-0 z-40 bg-black">
-            <div class="flex flex-col md:flex-row w-full items-center gap-2 py-2">
-                <a href="/" class="text-white text-3xl font-bold text-center w-full md:w-1/4 max-w-64 shrink-0">
+            <div class="flex flex-wrap w-full items-center gap-2 py-2 px-4 justify-center lg:justify-start">
+                <a href="/" class="text-white text-3xl font-bold text-center w-full md:w-auto max-w-64 mx-auto md:mx-0 shrink-0">
                     "Let's Embed"
                 </a>
-                <form
-                    class="flex flex-col md:flex-row w-full items-stretch md:items-center gap-2 px-4"
-                    on:submit=submit
-                >
-                    <div class="flex gap-1 bg-gray-800 rounded-lg p-1 shrink-0 self-center
-                        overflow-x-auto scrollbar-none overscroll-contain scrollbar-gutter-auto md:self-auto"
-                    >
-                        <button type="button" class=move || tab_cls(Mode::Tag)
-                            on:click=move |_| mode.set(Mode::Tag)>"Tag"</button>
-                        <button type="button" class=move || tab_cls(Mode::Author)
-                            on:click=move |_| mode.set(Mode::Author)>"Author"</button>
-                        <button type="button" class=move || tab_cls(Mode::Title)
-                            on:click=move |_| mode.set(Mode::Title)>"Title"</button>
-                        <button type="button" class=move || tab_cls(Mode::Clip)
-                            on:click=move |_| mode.set(Mode::Clip)>"CLIP"</button>
-                        <button type="button" class=move || tab_cls(Mode::Similar)
-                            on:click=move |_| mode.set(Mode::Similar)>"DINO"</button>
-                        <button type="button" class=move || tab_cls(Mode::SearchImage)
-                            on:click=move |_| mode.set(Mode::SearchImage)>"Image"</button>
-                        <button type="button" class=move || tab_cls(Mode::Random)
-                            on:click={
-                                let go = go.clone();
-                                move |_| {
-                                    mode.set(Mode::Random);
-                                    if q_input.read().is_empty() { q_input.set("posts".to_string()); }
-                                    go(q_input.get_untracked());
+                <form class="contents" on:submit=submit>
+                    <div class="flex w-full md:w-auto min-w-0 justify-center md:justify-start">
+                        <div class="flex gap-1 bg-gray-800 rounded-lg p-1 max-w-full
+                            overflow-x-auto scrollbar-none overscroll-contain scrollbar-gutter-auto"
+                        >
+                            <button type="button" class=move || tab_cls(Mode::Tag)
+                                on:click=move |_| mode.set(Mode::Tag)>"Tag"</button>
+                            <button type="button" class=move || tab_cls(Mode::Author)
+                                on:click=move |_| mode.set(Mode::Author)>"Author"</button>
+                            <button type="button" class=move || tab_cls(Mode::Title)
+                                on:click=move |_| mode.set(Mode::Title)>"Title"</button>
+                            <button type="button" class=move || tab_cls(Mode::Clip)
+                                on:click=move |_| mode.set(Mode::Clip)>"CLIP"</button>
+                            <button type="button" class=move || tab_cls(Mode::Similar)
+                                on:click=move |_| mode.set(Mode::Similar)>"DINO"</button>
+                            <button type="button" class=move || tab_cls(Mode::SearchImage)
+                                on:click=move |_| mode.set(Mode::SearchImage)>"Image"</button>
+                            <button type="button" class=move || tab_cls(Mode::Random)
+                                on:click={
+                                    let go = go.clone();
+                                    move |_| {
+                                        mode.set(Mode::Random);
+                                        if q_input.with_untracked(|q| !["posts", "images"].contains(&q.as_str())) {
+                                            q_input.set("posts".to_string());
+                                        }
+                                        go(q_input.get_untracked());
+                                    }
                                 }
-                            }
-                        >"Random"</button>
+                            >"Random"</button>
+                        </div>
                     </div>
 
-                    <div class="flex w-full items-center gap-2 min-w-0">
+                    <div class="flex w-full lg:w-auto lg:flex-1 items-center gap-2 min-w-0">
                         {
                             move || if mode.get() == Mode::SearchImage {
                                 let label = move || {
@@ -188,23 +189,13 @@ pub fn SearchBar() -> impl IntoView {
                                 }.into_any()
                             } else if mode.get() == Mode::Random {
                                 view! {
-                                    <div class="w-full min-w-0 flex gap-1 bg-gray-800 rounded-lg p-1 shrink-0 self-center md:self-auto">
-                                        <button type="button" class=move || random_cls("posts")
-                                            on:click={
-                                                let go = go.clone();
-                                                move |_| {
-                                                    q_input.set("posts".to_string());
-                                                    go(q_input.get_untracked());
-                                                }
-                                            }>"Posts"</button>
-                                        <button type="button" class=move || random_cls("images")
-                                            on:click={
-                                                let go = go.clone();
-                                                move |_| {
-                                                    q_input.set("images".to_string());
-                                                    go(q_input.get_untracked());
-                                                }
-                                            }>"Images"</button>
+                                    <div class="flex grow justify-center min-w-0">
+                                        <div class="flex flex-wrap justify-center gap-1 bg-gray-800 rounded-lg p-1 max-w-full">
+                                            <button type="submit" class=move || random_cls("posts")
+                                                on:click=move |_| q_input.set("posts".to_string())>"Posts"</button>
+                                            <button type="submit" class=move || random_cls("images")
+                                                on:click=move |_| q_input.set("images".to_string())>"Images"</button>
+                                        </div>
                                     </div>
                                 }.into_any()
                             } else {
@@ -235,8 +226,9 @@ pub fn SearchBar() -> impl IntoView {
                                 }
                             }
                         />
+
                         {
-                            (mode.get() != Mode::Random).then(|| view! {
+                            move || (mode() != Mode::Random).then(|| view! {
                                 <button type="submit"
                                     class="shrink-0 bg-gray-500 text-white rounded-lg py-2 px-4 hover:bg-gray-400">
                                     "Search"
