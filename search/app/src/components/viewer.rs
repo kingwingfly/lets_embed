@@ -14,7 +14,7 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
     let track = NodeRef::<leptos::html::Div>::new();
 
     let animating = RwSignal::new(false);
-    let drag = RwSignal::new(0.0_f64); 
+    let drag = RwSignal::new(0.0_f64);
 
     let has_prev = move || matches!(index.get(), Some(i) if i > 0);
     let has_next = move || matches!(index.get(), Some(i) if i + 1 < total);
@@ -99,17 +99,18 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
         }
         dragging.set_value(false);
         let frac = drag.get_untracked() / width.get_value();
-        animating.set(true);
         if frac <= -SWIPE_RATIO && has_next() {
             index.update(|i| {
                 if let Some(c) = i {
                     *c += 1;
+                    animating.set(true);
                 }
             });
         } else if frac >= SWIPE_RATIO && has_prev() {
             index.update(|i| {
                 if let Some(c) = i {
                     *c -= 1;
+                    animating.set(true);
                 }
             });
         }
@@ -172,11 +173,15 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
             <button
                 class="absolute left-2 top-1/2 -translate-y-1/2 text-white bg-black/60 hover:bg-black/80 rounded-full w-12 h-12 text-3xl disabled:opacity-30 disabled:cursor-default"
                 prop:disabled=move || !has_prev()
+                on:touchstart=|ev: TouchEvent| ev.stop_propagation()
+                on:touchend=|ev: TouchEvent| ev.stop_propagation()
                 on:click=move |ev| { ev.stop_propagation(); slide(-1); }
             >"‹"</button>
             <button
                 class="absolute right-2 top-1/2 -translate-y-1/2 text-white bg-black/60 hover:bg-black/80 rounded-full w-12 h-12 text-3xl disabled:opacity-30 disabled:cursor-default"
                 prop:disabled=move || !has_next()
+                on:touchstart=|ev: TouchEvent| ev.stop_propagation()
+                on:touchend=|ev: TouchEvent| ev.stop_propagation()
                 on:click=move |ev| { ev.stop_propagation(); slide(1); }
             >"›"</button>
 
