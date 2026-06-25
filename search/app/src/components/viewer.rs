@@ -38,21 +38,23 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
 
     let _ = use_event_listener(track, ev::transitionend, move |_| {
         let cur = tx.get_untracked();
-        if cur <= -199.0 {
-            index.update(|i| {
-                if let Some(c) = i {
-                    *c += 1;
-                }
-            });
-        } else if cur >= -1.0 {
-            index.update(|i| {
-                if let Some(c) = i {
-                    *c -= 1;
-                }
-            });
-        }
-        animating.set(false);
-        tx.set(-100.0);
+        batch(move || {
+            if cur <= -199.0 {
+                index.update(|i| {
+                    if let Some(c) = i {
+                        *c += 1;
+                    }
+                });
+            } else if cur >= -1.0 {
+                index.update(|i| {
+                    if let Some(c) = i {
+                        *c -= 1;
+                    }
+                });
+            }
+            animating.set(false);
+            tx.set(-100.0);
+        });
     });
 
     let _ = use_event_listener(window(), ev::keydown, move |e| {
@@ -114,13 +116,10 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
         } else {
             -100.0
         };
-        if (target - tx.get_untracked()).abs() < 0.5 {
-            animating.set(false);
+        batch(move || {
+            animating.set((target - tx.get_untracked()).abs() >= 0.5);
             tx.set(target);
-        } else {
-            animating.set(true);
-            tx.set(target);
-        }
+        });
     };
 
     let track_style = move || {
