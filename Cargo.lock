@@ -2645,6 +2645,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "clap",
  "dotenvy",
  "futures",
  "libvips",
@@ -2652,6 +2653,8 @@ dependencies = [
  "opendal 0.57.0",
  "tokio",
  "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3921,7 +3924,7 @@ dependencies = [
  "opendal-layer-logging 0.56.0",
  "opendal-layer-retry 0.56.0",
  "opendal-layer-timeout 0.56.0",
- "opendal-service-fs",
+ "opendal-service-fs 0.56.0",
  "opendal-service-http",
  "opendal-service-s3 0.56.0",
 ]
@@ -3938,6 +3941,7 @@ dependencies = [
  "opendal-layer-logging 0.57.0",
  "opendal-layer-retry 0.57.0",
  "opendal-layer-timeout 0.57.0",
+ "opendal-service-fs 0.57.0",
  "opendal-service-s3 0.57.0",
 ]
 
@@ -4092,6 +4096,20 @@ dependencies = [
  "bytes",
  "log",
  "opendal-core 0.56.0",
+ "serde",
+ "tokio",
+ "xattr",
+]
+
+[[package]]
+name = "opendal-service-fs"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22e89a665fef0e6bd249cf5ea47fc174b7ba892159bee4b9382528b1ca873a2c"
+dependencies = [
+ "bytes",
+ "log",
+ "opendal-core 0.57.0",
  "serde",
  "tokio",
  "xattr",

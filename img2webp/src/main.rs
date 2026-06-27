@@ -1,109 +1,34 @@
-use std::{
-    future::ready,
-    sync::{
-        LazyLock,
-        atomic::{AtomicU64, Ordering},
-    },
-    thread::{self, available_parallelism},
-    time::Duration,
-};
+use std::{path::PathBuf, time::Duration};
 
-use futures::{StreamExt as _, TryStreamExt};
-use libvips::{
-    VipsApp, VipsImage,
-    ops::{ForeignKeep, ForeignWebpPreset, WebpsaveBufferOptions, webpsave_buffer_with_opts},
-};
-use mime_guess::{MimeGuess, mime::IMAGE};
+use clap::Parser;
+use img2webp::walk_convert;
 use opendal::{
     Operator,
     layers::{RetryLayer, TimeoutLayer},
-    services::S3,
+    services::{Fs, S3},
 };
-use tokio_util::sync::CancellationToken;
+use tracing_subscriber::EnvFilter;
 
-static FINISHED: AtomicU64 = AtomicU64::new(0);
-
-static CONCURRENT: LazyLock<usize> = LazyLock::new(|| {
-    available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1)
-});
+#[derive(Debug, Parser)]
+struct Cli {
+    path: Option<PathBuf>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let op = operator().await?;
+    let cli = Cli::parse();
 
-    let app = VipsApp::new("img2webp", false).expect("Cannot initialize libvips");
-    app.concurrency_set(1);
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| "img2webp:info".parse().unwrap()),
+        )
+        .init();
 
-    let entries = op.lister_with("/").recursive(true).await?;
-
-    thread::spawn(move || {
-        loop {
-            println!("Finished: {}", FINISHED.load(Ordering::Relaxed));
-            thread::sleep(Duration::from_secs(5));
-        }
-    });
-
-    let cancel = CancellationToken::new();
-
-    let finished_paths = entries
-        .take_until(cancel.cancelled())
-        .filter_map(|e| ready(e.ok()))
-        .filter(|e| {
-            let mimes = MimeGuess::from_path(e.path());
-            ready(
-                e.metadata().is_file()
-                    && !e.path().ends_with(".webp")
-                    && (mimes.is_empty() || mimes.into_iter().any(|m| m.type_() == IMAGE)),
-            )
-        })
-        .map(|e| e.into_parts().0)
-        .map(async |path| Ok::<_, opendal::Error>((op.read(&path).await?, path)))
-        .buffer_unordered(*CONCURRENT)
-        .inspect_err(|e| eprintln!("{e}"))
-        .filter_map(async |res| res.ok())
-        .map(async |(bytes, path)| {
-            tokio::task::spawn_blocking(move || {
-                let bytes = bytes.to_bytes();
-                convert(&bytes)
-            })
-            .await
-            .unwrap()
-            .map(|bytes| (path, bytes))
-        })
-        .buffer_unordered(*CONCURRENT)
-        .inspect_err(|e| {
-            eprintln!("{e} {:?}", app.error_buffer());
-            app.error_clear();
-        })
-        .filter_map(async |res| res.ok())
-        .map(async |(path, bytes)| {
-            op.write(&format!("{}.webp", path), bytes).await?;
-            #[cfg(not(debug_assertions))]
-            op.delete(&path).await?;
-            Ok::<_, opendal::Error>(path)
-        })
-        .buffer_unordered(*CONCURRENT)
-        .inspect_err(|e| eprintln!("{e}"))
-        .filter_map(async |res| res.ok());
-
-    let task = async {
-        tokio::pin!(finished_paths);
-        while finished_paths.next().await.is_some() {
-            FINISHED.fetch_add(1, Ordering::Relaxed);
-        }
+    let op = match cli.path {
+        None => operator().await?,
+        Some(path) => Operator::new(Fs::default().root(&path.to_string_lossy()))?.finish(),
     };
-
-    tokio::pin!(task);
-    tokio::select! {
-        _ = &mut task => {},
-        _ = tokio::signal::ctrl_c() => {
-            cancel.cancel();
-            task.await
-        }
-    }
-
+    walk_convert(op).await?;
     Ok(())
 }
 
@@ -155,22 +80,4 @@ pub async fn operator() -> anyhow::Result<Operator> {
     )
     .finish();
     Ok(op)
-}
-
-pub fn convert(bytes: &[u8]) -> Result<Vec<u8>, libvips::error::Error> {
-    let inp = VipsImage::new_from_buffer(bytes, "")?;
-    webpsave_buffer_with_opts(
-        &inp,
-        &WebpsaveBufferOptions {
-            q: 80,
-            preset: ForeignWebpPreset::Photo,
-            // lossless: true,
-            // near_lossless: true,
-            // exact: true,
-            alpha_q: 100,
-            smart_subsample: true,
-            keep: ForeignKeep::Icc,
-            ..Default::default()
-        },
-    )
 }
