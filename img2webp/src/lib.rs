@@ -72,9 +72,16 @@ pub async fn walk_convert(
         })
         .filter_map(async |res| res.ok())
         .map(async |(path, bytes)| {
-            let new_path = match path.rsplit_once(".") {
-                Some((pre, _)) => format!("{}.webp", pre),
-                None => format!("{}.webp", path),
+            let (new_path, key) = match path.rsplit_once(".") {
+                Some((pre, ext))
+                    if [
+                        "jpg", "jpeg", "png", "gif", "bmp", "webp", "tiff", "svg", "ico", "heic",
+                    ]
+                    .contains(&ext) =>
+                {
+                    (format!("{}.webp", pre), pre.to_string())
+                }
+                _ => (format!("{}.webp", path), path.to_owned()),
             };
 
             let imagesize::ImageSize { width, height } = imagesize::blob_size(&bytes)?;
@@ -82,7 +89,7 @@ pub async fn walk_convert(
             if delete_origin {
                 src_op.delete(&path).await?;
             }
-            anyhow::Ok((path, new_path, (width, height)))
+            anyhow::Ok((path, new_path, key, (width, height)))
         })
         .buffer_unordered(*CONCURRENT)
         .inspect_err(|e| tracing::error!("{e}"))
@@ -90,7 +97,7 @@ pub async fn walk_convert(
 
     let task = async {
         tokio::pin!(finished_paths);
-        while let Some((path, new_path, (width, height))) = finished_paths.next().await {
+        while let Some((path, new_path, key, (width, height))) = finished_paths.next().await {
             tracing::info!(path, new_path, "converted");
             let (title, author) = {
                 let p = Path::new(&new_path);
@@ -113,7 +120,7 @@ pub async fn walk_convert(
                 meta.authors.push(author);
             }
             let new_image = Image {
-                name: new_path,
+                name: key,
                 width: width as i32,
                 height: height as i32,
             };
