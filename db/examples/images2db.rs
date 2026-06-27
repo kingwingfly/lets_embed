@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
     let (tx, rx) = mpsc::unbounded_channel();
 
     let jh = thread::spawn(move || -> anyhow::Result<()> {
-        let meta = std::fs::read_to_string("meta.json")?;
+        let meta = std::fs::read_to_string("metas.json")?;
         let mut metas = Vec::with_capacity(BATCH_SIZE);
         SimpleJsonReader::new(meta.as_bytes())
             .read_array_items(|reader| {

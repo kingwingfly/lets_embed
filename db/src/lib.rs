@@ -1,7 +1,8 @@
-use serde::Deserialize;
+use borrow_key::BorrowKey;
+use serde::{Deserialize, Serialize};
 use sqlx::{Database, Postgres, prelude::*};
 
-#[derive(Debug, Deserialize, Type)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[sqlx(type_name = "translation")]
 pub struct Translation {
     pub name: String,
@@ -31,17 +32,19 @@ where
     .await
 }
 
-#[derive(Debug, Default, sqlx::Type)]
+#[derive(Debug, Default, Clone, sqlx::Type, BorrowKey, Serialize, Deserialize)]
 #[sqlx(type_name = "image")]
 pub struct Image {
+    #[key(str)]
     pub name: String,
     pub width: i32,
     pub height: i32,
 }
 
-#[derive(Debug, Default, sqlx::Type)]
+#[derive(Debug, Default, Clone, sqlx::Type, BorrowKey, Serialize, Deserialize)]
 #[sqlx(type_name = "meta")]
 pub struct Meta {
+    #[key(str)]
     pub title: String,
     pub authors: Vec<String>,
     pub tags: Vec<String>,
