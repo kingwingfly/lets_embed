@@ -1,0 +1,72 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH input AS (\n                SELECT * FROM unnest($1::meta[])\n                AS _(title, authors, tags, images)\n            ),\n            ins_posts AS (\n                INSERT INTO posts (title)\n                SELECT DISTINCT title FROM input\n                WHERE trim(title) != ''\n                ORDER BY title\n                ON CONFLICT DO NOTHING\n                RETURNING id, title\n            ),\n            posts AS (\n                SELECT * FROM ins_posts\n                UNION ALL\n                SELECT DISTINCT ON (id) id, title\n                FROM input i\n                JOIN posts p USING (title)\n            ),\n            ins_images AS (\n                INSERT INTO images (name, width, height)\n                SELECT DISTINCT ON (name) name, width, height\n                FROM input i\n                CROSS JOIN LATERAL unnest(i.images::image[]) as _(name, width, height)\n                WHERE trim(name) != ''\n                ORDER BY name\n                ON CONFLICT DO NOTHING\n                RETURNING id, name\n            ),\n            images AS (\n                SELECT * FROM ins_images\n                UNION ALL\n                SELECT DISTINCT ON (id) id, name\n                FROM input i\n                CROSS JOIN LATERAL unnest(i.images::image[]) as _(name, width, height)\n                JOIN images USING (name)\n            ),\n            post_images AS (\n                INSERT INTO post_images (post_id, image_id)\n                SELECT p.id, images.id\n                FROM input i JOIN posts p USING (title)\n                CROSS JOIN LATERAL unnest(i.images::image[]) AS _(name, width, height)\n                JOIN images USING (name)\n                ORDER BY p.id, images.id\n                ON CONFLICT DO NOTHING\n                RETURNING post_id, image_id\n            ),\n            ins_authors AS (\n                INSERT INTO authors (name)\n                SELECT DISTINCT name\n                FROM input i\n                CROSS JOIN LATERAL unnest(i.authors::VARCHAR[]) AS _(name)\n                WHERE trim(name) != ''\n                ORDER BY name\n                ON CONFLICT DO NOTHING\n                RETURNING id, name\n            ),\n            authors AS (\n                SELECT * FROM ins_authors\n                UNION ALL\n                SELECT DISTINCT ON (id) id, name\n                FROM input i\n                CROSS JOIN LATERAL unnest(i.authors::VARCHAR[]) as _(name)\n                JOIN authors USING (name)\n            ),\n            author_posts AS (\n                INSERT INTO author_posts (author_id, post_id)\n                SELECT authors.id, p.id\n                FROM input i JOIN posts p USING (title)\n                CROSS JOIN LATERAL unnest(i.authors::VARCHAR[]) AS _(name)\n                JOIN authors USING (name)\n                ORDER BY authors.id, p.id\n                ON CONFLICT DO NOTHING\n                RETURNING author_id, post_id\n            ),\n            ins_tags AS (\n                INSERT INTO tags (name)\n                SELECT name\n                FROM input i\n                CROSS JOIN LATERAL unnest(i.tags::VARCHAR[]) AS _(name)\n                WHERE trim(name) != ''\n                ORDER BY name\n                ON CONFLICT DO NOTHING\n                RETURNING id, name\n            ),\n            tags AS (\n                SELECT * FROM ins_tags\n                UNION ALL\n                SELECT DISTINCT ON (id) id, name\n                FROM input i\n                CROSS JOIN LATERAL unnest(i.tags::VARCHAR[]) as _(name)\n                JOIN tags USING (name)\n            )\n            INSERT INTO tag_posts (tag_id, post_id)\n            SELECT tags.id, p.id\n            FROM input i JOIN posts p USING (title)\n            CROSS JOIN LATERAL unnest(i.tags::VARCHAR[]) AS _(name)\n            JOIN tags USING (name)\n            ORDER BY tags.id, p.id\n            ON CONFLICT DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "meta[]",
+            "kind": {
+              "Array": {
+                "Custom": {
+                  "name": "meta",
+                  "kind": {
+                    "Composite": [
+                      [
+                        "title",
+                        "Text"
+                      ],
+                      [
+                        "authors",
+                        "TextArray"
+                      ],
+                      [
+                        "tags",
+                        "TextArray"
+                      ],
+                      [
+                        "images",
+                        {
+                          "Custom": {
+                            "name": "image[]",
+                            "kind": {
+                              "Array": {
+                                "Custom": {
+                                  "name": "image",
+                                  "kind": {
+                                    "Composite": [
+                                      [
+                                        "name",
+                                        "Text"
+                                      ],
+                                      [
+                                        "width",
+                                        "Int4"
+                                      ],
+                                      [
+                                        "height",
+                                        "Int4"
+                                      ]
+                                    ]
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "911710d7b111d7b760d1953ed7381285380b25238e65085630f9edfcf100ff22"
+}

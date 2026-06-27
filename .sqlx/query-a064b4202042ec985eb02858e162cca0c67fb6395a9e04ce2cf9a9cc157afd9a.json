@@ -1,0 +1,37 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO wd_tag_translations (tag_id, translation)\n        SELECT t.id, btrim(x)\n        FROM UNNEST($1::translation[]) AS v(name, translations)\n        JOIN wd_tags t ON t.name = v.name\n        CROSS JOIN LATERAL unnest(v.translations) AS x\n        WHERE btrim(x) <> ''\n        ON CONFLICT (tag_id, translation) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "translation[]",
+            "kind": {
+              "Array": {
+                "Custom": {
+                  "name": "translation",
+                  "kind": {
+                    "Composite": [
+                      [
+                        "name",
+                        "Text"
+                      ],
+                      [
+                        "translations",
+                        "TextArray"
+                      ]
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a064b4202042ec985eb02858e162cca0c67fb6395a9e04ce2cf9a9cc157afd9a"
+}

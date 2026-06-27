@@ -1,7 +1,7 @@
 //! import wd tag translations to db
 
-use serde::Deserialize;
-use sqlx::{PgPool, prelude::Type};
+use db::{Translation, upsert_translations};
+use sqlx::PgPool;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,27 +17,7 @@ async fn main() -> anyhow::Result<()> {
             .as_str(),
     )?;
 
-    sqlx::query!(
-        r#"
-        INSERT INTO wd_tag_translations (tag_id, translation)
-        SELECT t.id, btrim(x)
-        FROM UNNEST($1::translation[]) AS v(name, translations)
-        JOIN wd_tags t ON t.name = v.name
-        CROSS JOIN LATERAL unnest(v.translations) AS x
-        WHERE btrim(x) <> ''
-        ON CONFLICT (tag_id, translation) DO NOTHING
-        "#,
-        &translations as _
-    )
-    .execute(&pool)
-    .await?;
+    upsert_translations(&translations, &pool).await?;
 
     Ok(())
-}
-
-#[derive(Debug, Deserialize, Type)]
-#[sqlx(type_name = "translation")]
-struct Translation {
-    name: String,
-    translations: Vec<String>,
 }
