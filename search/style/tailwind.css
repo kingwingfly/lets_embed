@@ -1,10 +1,15 @@
 @import "tailwindcss";
 
 /* ===== 萌 blue-white theme ===== */
-@theme {
-    /* Rounded, cute display font for branding only (latin/logo) */
-    --font-display: "Fredoka", "Baloo 2", ui-rounded, "Hiragino Maru Gothic ProN",
-        "Segoe UI", system-ui, sans-serif;
+/* Rounded, cute display font for branding only (latin/logo).
+   Defined via the standard `@layer` at-rule (instead of Tailwind's
+   `@theme`, which the plain CSS language server flags as unknown) so the
+   `font-display` utility still resolves. */
+@layer utilities {
+    .font-display {
+        font-family: "Fredoka", "Baloo 2", ui-rounded,
+            "Hiragino Maru Gothic ProN", "Segoe UI", system-ui, sans-serif;
+    }
 }
 
 @layer base {

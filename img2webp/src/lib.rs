@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 static CONCURRENT: LazyLock<usize> = LazyLock::new(|| {
     available_parallelism()
-        .map(|count| count.get() / 2)
+        .map(|count| (count.get() / 2).max(1))
         .unwrap_or(1)
 });
 
