@@ -64,11 +64,14 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                 .map(|(i, im)| {
                     let url = format!("/images/{}.webp", encode_path(&im.name));
                     view! {
-                        <div class="relative aspect-square overflow-hidden rounded bg-gray-800">
+                        <div
+                            class="relative aspect-square overflow-hidden rounded-xl bg-white/10 ring-1 ring-white/10"
+                            style="content-visibility:auto;contain-intrinsic-size:240px 240px;"
+                        >
                             <img
                                 loading="lazy"
                                 decoding="async"
-                                class="absolute inset-0 w-full h-full object-cover cursor-zoom-in"
+                                class="absolute inset-0 w-full h-full object-cover cursor-zoom-in hover:scale-105 transition-transform duration-300"
                                 src=url
                                 on:click=move |_| viewer.set(Some(i))
                             />
@@ -84,14 +87,14 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
             class="fixed inset-0 bg-black/95 z-50 overflow-hidden cursor-zoom-out flex flex-col"
             on:click=move |ev| { ev.stop_propagation(); lightbox.set(None); }
         >
-            <div class="sticky top-0 z-10 flex items-center justify-between px-4 py-2 bg-black/80 text-white shrink-0">
-                <div class="font-semibold truncate">{title}</div>
+            <div class="sticky top-0 z-10 flex items-center justify-between px-4 py-2 bg-black/85 backdrop-blur text-white shrink-0 border-b border-sky-400/30">
+                <div class="font-semibold truncate text-sky-100">{title}</div>
                 <div class="flex items-center gap-4">
-                    <div class="text-sm text-gray-400">
+                    <div class="text-sm text-sky-200/70">
                         {move || format!("{} / {}", visible.get(), total)}
                     </div>
                     <button
-                        class="px-3 py-1 hover:bg-gray-700 rounded"
+                        class="px-3 py-1 rounded-full bg-sky-500/30 hover:bg-sky-500/60 text-sky-50 transition-colors"
                         on:click=move |_| lightbox.set(None)
                     >"Close"</button>
                 </div>
@@ -102,7 +105,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                 on:click=move |ev| ev.stop_propagation()
             >
                 <div class="flex-[2] min-w-0 overflow-y-auto overscroll-contain
-                        scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
+                        scrollbar-thin scrollbar-thumb-sky-400/40 scrollbar-track-transparent">
                     <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-3 lg:grid-cols-4 gap-2">
                         {render_images}
                     </div>
@@ -110,13 +113,13 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                     <div node_ref=sentinel class="h-12 w-full"></div>
 
                     {move || (visible.get() >= total).then(|| view! {
-                        <div class="text-gray-500 text-center pb-6">"-- End --"</div>
+                        <div class="text-sky-300/70 text-center pb-6">"\u{2014} \u{1f33f} \u{2014}"</div>
                     })}
                 </div>
 
                 {has_videos.then(|| view! {
                     <div class="flex-1 min-w-0 overflow-y-auto overscroll-contain
-                            scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
+                            scrollbar-thin scrollbar-thumb-sky-400/40 scrollbar-track-transparent">
                         <div class="grid grid-cols-1 gap-2">
                             {render_videos}
                         </div>

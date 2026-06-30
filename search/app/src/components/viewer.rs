@@ -171,26 +171,26 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
             </div>
 
             <button
-                class="absolute left-2 top-1/2 -translate-y-1/2 text-white bg-black/60 hover:bg-black/80 rounded-full w-12 h-12 text-3xl disabled:opacity-30 disabled:cursor-default"
+                class="absolute left-2 top-1/2 -translate-y-1/2 text-white bg-black/50 hover:bg-sky-500/70 transition-colors rounded-full w-12 h-12 text-3xl disabled:opacity-30 disabled:cursor-default"
                 prop:disabled=move || !has_prev()
                 on:touchstart=|ev: TouchEvent| ev.stop_propagation()
                 on:touchend=|ev: TouchEvent| ev.stop_propagation()
                 on:click=move |ev| { ev.stop_propagation(); slide(-1); }
             >"‹"</button>
             <button
-                class="absolute right-2 top-1/2 -translate-y-1/2 text-white bg-black/60 hover:bg-black/80 rounded-full w-12 h-12 text-3xl disabled:opacity-30 disabled:cursor-default"
+                class="absolute right-2 top-1/2 -translate-y-1/2 text-white bg-black/50 hover:bg-sky-500/70 transition-colors rounded-full w-12 h-12 text-3xl disabled:opacity-30 disabled:cursor-default"
                 prop:disabled=move || !has_next()
                 on:touchstart=|ev: TouchEvent| ev.stop_propagation()
                 on:touchend=|ev: TouchEvent| ev.stop_propagation()
                 on:click=move |ev| { ev.stop_propagation(); slide(1); }
             >"›"</button>
 
-            <div class="absolute bottom-3 left-1/2 -translate-x-1/2 text-sm text-gray-300 bg-black/60 px-3 py-1 rounded-full">
+            <div class="absolute bottom-3 left-1/2 -translate-x-1/2 text-sm text-sky-100 bg-black/55 px-3 py-1 rounded-full">
                 {move || index.get().map(|i| format!("{} / {}", i + 1, total)).unwrap_or_default()}
             </div>
 
             <button
-                class="absolute top-2 right-2 text-white bg-black/60 hover:bg-black/80 rounded-full w-10 h-10 text-2xl"
+                class="absolute top-2 right-2 text-white bg-black/50 hover:bg-sky-500/70 transition-colors rounded-full w-10 h-10 text-2xl"
                 on:click=move |ev| { ev.stop_propagation(); index.set(None); }
             >"×"</button>
         </div>

@@ -23,9 +23,18 @@ enum Item {
     Image(Image),
 }
 
+/// An item already placed into a column, carrying its rendered pixel box so we can
+/// hand the browser a `contain-intrinsic-size` and skip off-screen decode/layout.
+#[derive(Debug, Clone)]
+struct Placed {
+    item: Item,
+    w: u32,
+    h: u32,
+}
+
 #[derive(Debug, Clone)]
 struct Column {
-    items: Vec<Item>,
+    items: Vec<Placed>,
     width: u32,
     height: u32,
 }
@@ -67,10 +76,10 @@ pub fn Results() -> impl IntoView {
         .collect::<Vec<_>>();
         let old = columns.get_untracked();
         let max_row = old.iter().map(|c| c.items.len()).max().unwrap_or_default();
-        for item in
-            (0..max_row).flat_map(|row| old.iter().filter_map(move |c| c.items.get(row).cloned()))
+        for placed in (0..max_row)
+            .flat_map(|row| old.iter().filter_map(move |c| c.items.get(row).cloned()))
         {
-            match item {
+            match placed.item {
                 Item::Post(p) => {
                     let Some(cover) = p.images.first() else {
                         continue;
@@ -80,8 +89,9 @@ pub fn Results() -> impl IntoView {
                     };
                     let height = ((cover.height as f64 / cover.width as f64) * column.width as f64)
                         .round() as u32;
+                    let w = column.width;
                     column.height += height + COLUMN_PAD;
-                    column.items.push(Item::Post(p));
+                    column.items.push(Placed { item: Item::Post(p), w, h: height });
                 }
                 Item::Image(im) => {
                     let Some(column) = new.iter_mut().min_by_key(|c| c.height) else {
@@ -89,8 +99,9 @@ pub fn Results() -> impl IntoView {
                     };
                     let height =
                         ((im.height as f64 / im.width as f64) * column.width as f64).round() as u32;
+                    let w = column.width;
                     column.height += height + COLUMN_PAD;
-                    column.items.push(Item::Image(im));
+                    column.items.push(Placed { item: Item::Image(im), w, h: height });
                 }
             }
         }
@@ -144,16 +155,18 @@ pub fn Results() -> impl IntoView {
         }
     });
 
-    let render_item = move |it: Item| -> AnyView {
-        match it {
+    let render_item = move |placed: Placed| -> AnyView {
+        // Off-screen items skip render/decode; the reserved box keeps scroll stable.
+        let cv = format!("content-visibility:auto;contain-intrinsic-size:{}px {}px;", placed.w, placed.h);
+        match placed.item {
             Item::Post(p) => {
                 let cover = p.images.first().cloned();
                 let img_count = p.images.len();
                 let video_count = p.videos.len();
                 view! {
-                    <div class="mb-2 break-inside-avoid">
+                    <div class="mb-2 break-inside-avoid" style=cv>
                         <div
-                            class="relative cursor-pointer group rounded overflow-hidden bg-gray-900"
+                            class="relative cursor-pointer group rounded-xl overflow-hidden bg-sky-100 ring-1 ring-sky-200/70 shadow-sm shadow-sky-200/50 hover:shadow-md hover:shadow-sky-300/50 transition-shadow"
                             on:click=move |_| lightbox.set(Some(p.clone()))
                         >
                             {cover.map(|c| view! {
@@ -161,14 +174,14 @@ pub fn Results() -> impl IntoView {
                                     loading="lazy"
                                     decoding="async"
                                     style=format!("aspect-ratio: {} / {}", c.width, c.height)
-                                    class="w-full h-auto block bg-gray-900 select-none hover:opacity-80 hover:scale-[1.02] transition-all"
+                                    class="w-full h-auto block bg-sky-100 select-none group-hover:scale-[1.03] transition-transform duration-300"
                                     src=format!("/images/{}.webp", encode_path(&c.name))
                                 />
                             })}
-                            <div class="absolute top-1 right-1 bg-black/70 text-white text-xs px-2 py-0.5 rounded">
-                                {img_count}"p"{video_count}"v"
+                            <div class="absolute top-1.5 right-1.5 bg-sky-500/85 text-white text-xs font-medium px-2 py-0.5 rounded-full shadow-sm">
+                                {img_count}"p "{video_count}"v"
                             </div>
-                            <div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent text-white text-xs p-1 truncate">
+                            <div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/70 to-transparent text-white text-xs p-1.5 truncate">
                                 {p.title.clone()}
                             </div>
                         </div>
@@ -180,12 +193,13 @@ pub fn Results() -> impl IntoView {
                 let url = format!("/images/{}.webp", encode_path(&im.name));
                 let id = im.id;
                 view! {
-                    <div class="m-1">
+                    <div class="m-1" style=cv>
                         <img
                             loading="lazy"
                             decoding="async"
                             style=format!("aspect-ratio: {} / {}", im.width, im.height)
-                            class="w-full h-auto block bg-gray-900 cursor-zoom-in select-none hover:opacity-80 hover:scale-[1.02] transition-all"
+                            class="w-full h-auto block rounded-xl bg-sky-100 ring-1 ring-sky-200/70 shadow-sm shadow-sky-200/50
+                                cursor-zoom-in select-none hover:shadow-md hover:shadow-sky-300/50 hover:scale-[1.02] transition-all"
                             src=url
                             on:click=move |_| {
                                 if let Some(i) = images.with_value(|v| v.iter().position(|x| x.id == id)) {
@@ -203,7 +217,7 @@ pub fn Results() -> impl IntoView {
     let error_view = move || {
         error.get().map(|e| {
             view! {
-                <div class="w-full text-red-400 p-4 text-center">
+                <div class="w-full text-rose-500 p-4 text-center">
                     {format!("Error: {e}")}
                 </div>
             }
@@ -213,7 +227,7 @@ pub fn Results() -> impl IntoView {
     let loading_view = move || {
         loading.get().then(|| {
             view! {
-                <div class="w-full text-gray-400 p-4 text-center">"Loading..."</div>
+                <div class="w-full text-sky-500 p-4 text-center animate-pulse">"Loading\u{2026} \u{1f4ab}"</div>
             }
         })
     };
@@ -222,7 +236,7 @@ pub fn Results() -> impl IntoView {
         (!loading.get() && !has_more.get() && !columns.read().iter().all(|c| c.items.is_empty()))
             .then(|| {
                 view! {
-                    <div class="w-full text-gray-500 p-4 text-center">"-- End --"</div>
+                    <div class="w-full text-sky-400 p-4 text-center">"\u{2014} \u{1f33f} \u{2014}"</div>
                 }
             })
     };
@@ -256,13 +270,13 @@ pub fn Results() -> impl IntoView {
                                     .into_iter()
                                     .enumerate()
                             }
-                            key=|(i, it)| match it {
+                            key=|(i, placed)| match &placed.item {
                                 Item::Post(p) => format!("p_{}_{}", i, p.id),
                                 Item::Image(im) => format!("i_{}_{}", i, im.id),
                             }
-                            let((_, it))
+                            let((_, placed))
                         >
-                        { render_item(it) }
+                        { render_item(placed) }
                         </For>
                     </div>
                 </For>
@@ -343,8 +357,9 @@ fn load_page(
                 };
                 let height = ((cover.height as f64 / cover.width as f64) * column.width as f64)
                     .round() as u32;
+                let w = column.width;
                 column.height += height + COLUMN_PAD;
-                column.items.push(Item::Post(p));
+                column.items.push(Placed { item: Item::Post(p), w, h: height });
             });
         }
     }) as Box<dyn FnMut(_)>);
@@ -364,8 +379,9 @@ fn load_page(
                 };
                 let height =
                     ((im.height as f64 / im.width as f64) * column.width as f64).round() as u32;
+                let w = column.width;
                 column.height += height + COLUMN_PAD;
-                column.items.push(Item::Image(im));
+                column.items.push(Placed { item: Item::Image(im), w, h: height });
             });
         }
     }) as Box<dyn FnMut(_)>);

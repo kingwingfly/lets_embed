@@ -1,1 +1,42 @@
 @import "tailwindcss";
+
+/* ===== 萌 blue-white theme ===== */
+@theme {
+    /* Rounded, cute display font for branding only (latin/logo) */
+    --font-display: "Fredoka", "Baloo 2", ui-rounded, "Hiragino Maru Gothic ProN",
+        "Segoe UI", system-ui, sans-serif;
+}
+
+@layer base {
+    html {
+        scrollbar-color: var(--color-sky-300) transparent;
+    }
+
+    /* soft blue text selection */
+    ::selection {
+        background: color-mix(in srgb, var(--color-sky-300) 65%, white);
+        color: var(--color-sky-900);
+    }
+
+    /* cute thin scrollbars (webkit) */
+    ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+    }
+    ::-webkit-scrollbar-thumb {
+        background: color-mix(in srgb, var(--color-sky-300) 80%, white);
+        border-radius: 9999px;
+    }
+    ::-webkit-scrollbar-track {
+        background: transparent;
+    }
+}
+
+/* gentle floating animation for kawaii accents */
+@keyframes float-soft {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-3px); }
+}
+.animate-float-soft {
+    animation: float-soft 3s ease-in-out infinite;
+}

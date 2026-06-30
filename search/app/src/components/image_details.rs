@@ -289,7 +289,7 @@ pub fn ImageDetails() -> impl IntoView {
                 <div
                     node_ref=container_ref
                     class="relative w-full h-[45vh] md:h-full md:flex-1 md:min-w-0 shrink-0
-                            flex items-center justify-center bg-black/30 rounded-lg overflow-hidden"
+                            flex items-center justify-center bg-sky-100/70 ring-1 ring-sky-200 rounded-2xl overflow-hidden"
                 >
                     <img
                         node_ref=img_ref
@@ -338,8 +338,9 @@ pub fn ImageDetails() -> impl IntoView {
                     {
 
                         view! {
-                            <div class="text-white text-xl md:text-2xl font-bold text-center shrink-0
-                                        px-3 py-2 md:py-3 bg-white/10 rounded-lg line-clamp-2 cursor-pointer"
+                            <div class="text-sky-800 text-xl md:text-2xl font-bold text-center shrink-0
+                                        px-3 py-2 md:py-3 bg-white/80 ring-1 ring-sky-200 shadow-sm shadow-sky-200/50
+                                        rounded-2xl line-clamp-2 cursor-pointer hover:bg-white transition-colors"
                                 on:click=move |_| open_lightbox()
                             >
                                 { post.map(|p| p.title) }
@@ -348,8 +349,8 @@ pub fn ImageDetails() -> impl IntoView {
                     }
 
                     <div class="shrink-0 max-h-24 md:max-h-32 overflow-y-auto
-                                flex flex-wrap content-start gap-2 p-2 bg-white/5 rounded-lg
-                                scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
+                                flex flex-wrap content-start gap-2 p-2 bg-white/70 ring-1 ring-sky-100 rounded-2xl
+                                scrollbar-thin scrollbar-thumb-sky-200 scrollbar-track-transparent">
                         {
                             authors.into_iter().map(|author|
                                 render_pill(author.name, "author", "from-sky-500 to-cyan-500")
@@ -374,7 +375,7 @@ pub fn ImageDetails() -> impl IntoView {
                                                     gap-2 pr-1
                                                     max-h-[40vh] overflow-y-auto
                                                     md:max-h-none md:min-h-0
-                                                    scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
+                                                    scrollbar-thin scrollbar-thumb-sky-200 scrollbar-track-transparent">
                                                 {
                                                     images.into_iter().enumerate().map(|(i, image)| view! {
                                                         <img
@@ -408,7 +409,7 @@ pub fn ImageDetails() -> impl IntoView {
                                                     gap-2 pr-1
                                                     max-h-[40vh] overflow-y-auto
                                                     md:max-h-none md:min-h-0
-                                                    scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
+                                                    scrollbar-thin scrollbar-thumb-sky-200 scrollbar-track-transparent">
                                                 {
                                                     videos.into_iter().map(|v| {
                                                         let aspect = if v.width > 0 && v.height > 0 {
@@ -451,7 +452,7 @@ pub fn ImageDetails() -> impl IntoView {
                         details.get().map(|details| match details {
                             Ok(details) => render_details(details).into_any(),
                             Err(e) => view! {
-                                <div class="text-red-400 p-4">{ e.to_string() }</div>
+                                <div class="text-rose-500 p-4">{ e.to_string() }</div>
                             }.into_any(),
                         })
                     }
@@ -459,7 +460,7 @@ pub fn ImageDetails() -> impl IntoView {
             </Transition>
 
             <div class="w-full px-3 md:px-4 pb-4 mt-2">
-                <h2 class="text-white text-lg md:text-xl font-semibold mb-3">"Similar"</h2>
+                <h2 class="text-sky-700 text-lg md:text-xl font-semibold mb-3">"Similar \u{1f49e}"</h2>
                 <Results />
             </div>
 

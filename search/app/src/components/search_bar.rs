@@ -111,34 +111,36 @@ pub fn SearchBar() -> impl IntoView {
 
     let tab_cls = move |m: Mode| {
         format!(
-            "px-3 py-1 rounded text-sm transition-colors shrink-0 whitespace-nowrap {}",
+            "px-3 py-1 rounded-full text-sm font-medium transition-all shrink-0 whitespace-nowrap cursor-pointer {}",
             if mode.get() == m {
-                "bg-gray-500 text-white"
+                "bg-sky-400 text-white shadow-sm shadow-sky-300/60"
             } else {
-                "text-gray-300 hover:text-white"
+                "text-sky-600 hover:bg-sky-200/70"
             }
         )
     };
     let random_cls = move |r: &str| {
         format!(
-            "px-3 py-1 rounded text-sm transition-colors shrink-0 whitespace-nowrap {}",
+            "px-3 py-1 rounded-full text-sm font-medium transition-all shrink-0 whitespace-nowrap cursor-pointer {}",
             if q_input.read().as_str() == r {
-                "bg-gray-500 text-white"
+                "bg-sky-400 text-white shadow-sm shadow-sky-300/60"
             } else {
-                "text-gray-300 hover:text-white"
+                "text-sky-600 hover:bg-sky-200/70"
             }
         )
     };
 
     view! {
-        <div class="flex flex-col w-full h-fit sticky top-0 z-40 bg-black">
+        <div class="flex flex-col w-full h-fit sticky top-0 z-40 bg-white/80 backdrop-blur-md shadow-sm shadow-sky-200/50">
             <div class="flex flex-wrap w-full items-center gap-2 py-2 px-4 justify-center lg:justify-start">
-                <a href="/" class="text-white text-3xl font-bold text-center w-full md:w-auto max-w-64 mx-auto md:mx-0 shrink-0">
-                    "Let's Embed"
+                <a href="/" class="font-display text-3xl font-bold text-center w-full md:w-auto max-w-64 mx-auto md:mx-0 shrink-0
+                    bg-gradient-to-r from-sky-500 via-blue-500 to-cyan-400 bg-clip-text text-transparent
+                    drop-shadow-sm hover:scale-105 transition-transform">
+                    "Let\u{2019}s Embed \u{2728}"
                 </a>
                 <form class="contents" on:submit=submit>
                     <div class="flex w-full md:w-auto min-w-0 justify-center md:justify-start">
-                        <div class="flex gap-1 bg-gray-800 rounded-lg p-1 max-w-full
+                        <div class="flex gap-1 bg-sky-100/80 rounded-full p-1 max-w-full
                             overflow-x-auto scrollbar-none overscroll-contain scrollbar-gutter-auto"
                         >
                             <button type="button" class=move || tab_cls(Mode::Tag)
@@ -176,8 +178,8 @@ pub fn SearchBar() -> impl IntoView {
                                     if n.is_empty() { "Choose an image…".to_string() } else { n }
                                 };
                                 view! {
-                                    <label class="w-full min-w-0 truncate cursor-pointer bg-gray-200
-                                                  rounded-lg py-2 px-4 text-gray-700 hover:bg-gray-100">
+                                    <label class="w-full min-w-0 truncate cursor-pointer bg-white border border-sky-200
+                                                  rounded-full py-2 px-4 text-slate-600 hover:bg-sky-50 transition-colors">
                                         { label }
                                         <input
                                             type="file"
@@ -190,7 +192,7 @@ pub fn SearchBar() -> impl IntoView {
                             } else if mode.get() == Mode::Random {
                                 view! {
                                     <div class="flex grow justify-center min-w-0">
-                                        <div class="flex flex-wrap justify-center gap-1 bg-gray-800 rounded-lg p-1 max-w-full">
+                                        <div class="flex flex-wrap justify-center gap-1 bg-sky-100/80 rounded-full p-1 max-w-full">
                                             <button type="submit" class=move || random_cls("posts")
                                                 on:click=move |_| q_input.set("posts".to_string())>"Posts"</button>
                                             <button type="submit" class=move || random_cls("images")
@@ -201,7 +203,8 @@ pub fn SearchBar() -> impl IntoView {
                             } else {
                                 view! {
                                     <input
-                                        class="w-full min-w-0 bg-gray-200 rounded-lg py-2 px-4 outline-none"
+                                        class="w-full min-w-0 bg-white border border-sky-200 rounded-full py-2 px-4 outline-none
+                                            text-slate-700 placeholder:text-sky-400/70 focus:border-sky-400 focus:ring-2 focus:ring-sky-200 transition"
                                         placeholder=move || match mode.get() {
                                             Mode::Tag => "One tag",
                                             Mode::Author => "One author name",
@@ -218,7 +221,8 @@ pub fn SearchBar() -> impl IntoView {
                         }
 
                         <input type="number" min="1"
-                            class="w-16 sm:w-20 shrink-0 bg-gray-200 rounded-lg py-2 px-2 outline-none"
+                            class="w-16 sm:w-20 shrink-0 bg-white border border-sky-200 rounded-full py-2 px-3 outline-none
+                                text-slate-700 focus:border-sky-400 focus:ring-2 focus:ring-sky-200 transition"
                             prop:value=move || limit.get().to_string()
                             on:change=move |ev| {
                                 if let Ok(v) = event_target_value(&ev).parse::<usize>() && v >= 1 {
@@ -230,7 +234,9 @@ pub fn SearchBar() -> impl IntoView {
                         {
                             move || (mode() != Mode::Random).then(|| view! {
                                 <button type="submit"
-                                    class="shrink-0 bg-gray-500 text-white rounded-lg py-2 px-4 hover:bg-gray-400">
+                                    class="shrink-0 bg-gradient-to-r from-sky-400 to-blue-500 text-white font-medium rounded-full
+                                        py-2 px-5 shadow-sm shadow-sky-300/60 hover:from-sky-500 hover:to-blue-600
+                                        hover:scale-105 active:scale-95 transition-all cursor-pointer">
                                     "Search"
                                 </button>
                             })
@@ -238,7 +244,7 @@ pub fn SearchBar() -> impl IntoView {
                     </div>
                 </form>
             </div>
-            <hr class="w-full h-1 bg-gray-200 border-0" />
+            <div class="w-full h-px bg-gradient-to-r from-transparent via-sky-300 to-transparent" />
         </div>
         <Outlet />
         <BackToTop />

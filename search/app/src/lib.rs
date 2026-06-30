@@ -26,11 +26,17 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
                 <MetaTags />
                 <Link
                     rel="icon"
-                    href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🍌</text></svg>"
+                    href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💠</text></svg>"
+                />
+                <Link rel="preconnect" href="https://fonts.googleapis.com" />
+                <Link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" />
+                <Link
+                    rel="stylesheet"
+                    href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&display=swap"
                 />
                 <HashedStylesheet options />
             </head>
-            <body class="bg-black">
+            <body class="bg-sky-50 text-slate-700">
                 <App />
             </body>
         </html>
@@ -43,7 +49,7 @@ pub fn App() -> impl IntoView {
     view! {
         <Title formatter=|text| format!("{text} - Let's Embed")/>
         <Router>
-            <main class="bg-black w-screen max-w-screen">
+            <main class="min-h-screen w-screen max-w-screen bg-gradient-to-b from-sky-50 via-white to-sky-100">
                 <Routes fallback=|| "Page not found.".into_view()>
                     <ParentRoute path=path!("") view=SearchBar>
                         <Route path=path!("/details/:id") view=ImageDetails/>

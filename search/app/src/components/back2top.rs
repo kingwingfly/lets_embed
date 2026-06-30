@@ -25,8 +25,9 @@ pub fn BackToTop(#[prop(default = 300.0)] threshold: f64) -> impl IntoView {
             title="back to top"
             class=move || {
                 let base = "fixed right-6 bottom-6 z-50 flex h-11 w-11 items-center justify-center \
-                            rounded-full bg-blue-600 text-xl shadow-lg cursor-pointer \
-                            transition-all duration-300 ease-out hover:bg-blue-700 hover:scale-110 \
+                            rounded-full bg-gradient-to-br from-sky-400 to-blue-500 text-xl text-white \
+                            shadow-lg shadow-sky-400/40 cursor-pointer \
+                            transition-all duration-300 ease-out hover:from-sky-500 hover:to-blue-600 hover:scale-110 \
                             active:scale-95";
                 if visible() {
                     format!("{base} opacity-100 translate-y-0 pointer-events-auto")
