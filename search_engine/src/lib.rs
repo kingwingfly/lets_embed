@@ -269,7 +269,7 @@ impl Engine {
             r#"
             SELECT p.id, p.title
             FROM posts p
-            WHERE p.title % $1::TEXT
+            WHERE p.title ILIKE '%' || $1::TEXT || '%'
             ORDER BY p.id DESC
             LIMIT $2 OFFSET $3;
             "#,
