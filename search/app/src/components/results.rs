@@ -2,17 +2,16 @@ use std::iter::repeat_with;
 
 use crate::{
     components::{lightbox::Lightbox, viewer::Viewer},
-    types::{DoneEvent, ErrorEvent, Mode, PostItem},
+    types::{ImageQuery, Mode, PostItem, SearchResponse},
     util::encode_path,
 };
 
-use leptos::{prelude::*, reactive::send_wrapper_ext::SendOption};
+use leptos::{prelude::*, task::spawn_local};
 use leptos_router::hooks::use_query_map;
 use leptos_use::{
     UseElementSizeReturn, signal_debounced, use_element_size, use_intersection_observer,
 };
 use search_types::Image;
-use wasm_bindgen::{JsCast, prelude::Closure};
 
 const COLUMN_WIDTH: u32 = 360;
 const COLUMN_PAD: u32 = 2;
@@ -118,7 +117,10 @@ pub fn Results() -> impl IntoView {
 
     let viewer_open = Memo::new(move |_| viewer.get().is_some());
 
-    let active: StoredValue<SendOption<ActiveSse>> = StoredValue::new(SendOption::new_local(None));
+    let img_query = expect_context::<ImageQuery>();
+    // Monotonic id used to discard responses from superseded requests: a new
+    // search or the next page bumps it, and stale in-flight calls return early.
+    let req_id: StoredValue<u64> = StoredValue::new(0);
 
     Effect::new(move |_| {
         let _ = params.get();
@@ -132,7 +134,9 @@ pub fn Results() -> impl IntoView {
         offset.set(0);
         has_more.set(true);
         error.set(None);
-        load_page(0, params, columns, images, has_more, loading, error, active);
+        load_page(
+            0, params, img_query, columns, images, has_more, loading, error, req_id,
+        );
     });
 
     let sentinel = NodeRef::<leptos::html::Div>::new();
@@ -150,7 +154,7 @@ pub fn Results() -> impl IntoView {
             offset.update(|old| *old += limit);
             let next = offset.get_untracked();
             load_page(
-                next, params, columns, images, has_more, loading, error, active,
+                next, params, img_query, columns, images, has_more, loading, error, req_id,
             );
         }
     });
@@ -292,144 +296,295 @@ pub fn Results() -> impl IntoView {
     }
 }
 
-// ===================== wasm-only =====================
-
-#[derive(Debug)]
-struct ActiveSse {
-    es: web_sys::EventSource,
-    _closures: Vec<Closure<dyn FnMut(web_sys::MessageEvent)>>,
-    _err_closure: Closure<dyn FnMut(web_sys::Event)>,
+/// Place a post into the shortest column, mirroring the masonry layout logic.
+fn place_post(columns: RwSignal<Vec<Column>>, p: PostItem) {
+    columns.update(move |columns| {
+        let Some(cover) = p.images.first() else {
+            return;
+        };
+        let Some(column) = columns.iter_mut().min_by_key(|c| c.height) else {
+            return;
+        };
+        let height =
+            ((cover.height as f64 / cover.width as f64) * column.width as f64).round() as u32;
+        let w = column.width;
+        column.height += height + COLUMN_PAD;
+        column.items.push(Placed { item: Item::Post(p), w, h: height });
+    });
 }
 
-impl Drop for ActiveSse {
-    fn drop(&mut self) {
-        self.es.close();
-    }
+/// Place an image into the shortest column and remember it for the viewer.
+fn place_image(columns: RwSignal<Vec<Column>>, images: StoredValue<Vec<Image>>, im: Image) {
+    images.update_value(|v| v.push(im.clone()));
+    columns.update(|columns| {
+        let Some(column) = columns.iter_mut().min_by_key(|c| c.height) else {
+            return;
+        };
+        let height = ((im.height as f64 / im.width as f64) * column.width as f64).round() as u32;
+        let w = column.width;
+        column.height += height + COLUMN_PAD;
+        column.items.push(Placed { item: Item::Image(im), w, h: height });
+    });
 }
 
+/// Fetch one page of results through the REST search endpoints and merge it into
+/// the columns. Superseded requests (a new search or an earlier page) are dropped
+/// via `req_id` so their late responses can't corrupt the current view.
 #[allow(clippy::too_many_arguments)]
 fn load_page(
     offset_val: i64,
     params: Memo<(Mode, String, i64)>,
+    img_query: ImageQuery,
     columns: RwSignal<Vec<Column>>,
     images: StoredValue<Vec<Image>>,
     has_more: RwSignal<bool>,
     loading: RwSignal<bool>,
     error: RwSignal<Option<String>>,
-    active: StoredValue<SendOption<ActiveSse>>,
+    req_id: StoredValue<u64>,
 ) {
     let (mode, q, limit) = params.get_untracked();
 
-    active.set_value(SendOption::new_local(None));
-
-    let url = format!(
-        "/api/search?mode={}&q={}&limit={}&offset={}",
-        mode.as_str(),
-        urlencoding::encode(&q),
-        limit,
-        offset_val,
-    );
-
-    let es = match web_sys::EventSource::new(&url) {
-        Ok(es) => es,
-        Err(_) => {
-            error.set(Some("Failed to open EventSource".into()));
-            return;
-        }
-    };
+    // Claim the newest request id; any in-flight call becomes stale.
+    let this_id = req_id.get_value() + 1;
+    req_id.set_value(this_id);
 
     loading.set(true);
     error.set(None);
 
-    let mut closures: Vec<Closure<dyn FnMut(web_sys::MessageEvent)>> = Vec::new();
+    spawn_local(async move {
+        let result = if mode == Mode::SearchImage {
+            match img_query.0.get_untracked() {
+                // The image bytes live only in client memory, so a reloaded or
+                // shared `search_image` URL has none. Degrade to an empty result
+                // instead of sending an empty body that would fail to decode.
+                None => {
+                    if req_id.get_value() == this_id {
+                        has_more.set(false);
+                        loading.set(false);
+                    }
+                    return;
+                }
+                Some(b64) => search_by_image(b64, limit, offset_val).await,
+            }
+        } else {
+            search_query(mode.as_str().to_string(), q, limit, offset_val).await
+        };
 
-    // post
-    let cb = Closure::wrap(Box::new(move |ev: web_sys::MessageEvent| {
-        if let Some(s) = ev.data().as_string()
-            && let Ok(p) = serde_json::from_str::<PostItem>(&s)
-        {
-            columns.update(move |columns| {
-                let Some(cover) = p.images.first() else {
-                    return;
-                };
-                let Some(column) = columns.iter_mut().min_by_key(|c| c.height) else {
-                    return;
-                };
-                let height = ((cover.height as f64 / cover.width as f64) * column.width as f64)
-                    .round() as u32;
-                let w = column.width;
-                column.height += height + COLUMN_PAD;
-                column.items.push(Placed { item: Item::Post(p), w, h: height });
+        // A newer request started while we were awaiting: discard this response.
+        if req_id.get_value() != this_id {
+            return;
+        }
+
+        match result {
+            Ok(resp) => {
+                for p in resp.posts {
+                    place_post(columns, p);
+                }
+                for im in resp.images {
+                    place_image(columns, images, im);
+                }
+                has_more.set(resp.has_more);
+            }
+            Err(e) => {
+                error.set(Some(e.to_string()));
+                has_more.set(false);
+            }
+        }
+        loading.set(false);
+    });
+}
+
+#[server]
+async fn search_query(
+    mode: String,
+    q: String,
+    limit: i64,
+    offset: i64,
+) -> Result<SearchResponse, ServerFnError> {
+    use crate::state::AppState;
+
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    use axum::extract::State;
+    use futures::{Stream, StreamExt as _};
+    use leptos_axum::extract_with_state;
+    use search_engine::{Engine, search_types};
+
+    let mode = Mode::parse(&mode);
+    let limit = limit.max(1);
+    let offset = offset.max(0);
+
+    let state = expect_context::<AppState>();
+    let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
+
+    // Return-type annotations pin `ServerFnError`'s generic parameter.
+    fn to_err(e: impl std::fmt::Display) -> ServerFnError {
+        ServerFnError::Response(e.to_string())
+    }
+    fn to_args(e: impl std::fmt::Display) -> ServerFnError {
+        ServerFnError::Args(e.to_string())
+    }
+
+    // Post-oriented modes: newest (empty query), author, title, or random posts.
+    if q.is_empty()
+        || matches!(mode, Mode::Author | Mode::Title)
+        || (mode == Mode::Random && q != "images")
+    {
+        let mut posts: Pin<Box<dyn Stream<Item = search_types::Post> + Send>> = if q.is_empty() {
+            Box::pin(engine.newest_posts(limit, offset).await.map_err(to_err)?)
+        } else {
+            match mode {
+                Mode::Author => Box::pin(
+                    engine
+                        .search_posts_by_author(q, limit, offset)
+                        .await
+                        .map_err(to_err)?,
+                ),
+                Mode::Title => Box::pin(
+                    engine
+                        .search_posts_by_title(q, limit, offset)
+                        .await
+                        .map_err(to_err)?,
+                ),
+                Mode::Random => Box::pin(engine.random_posts(limit).await.map_err(to_err)?),
+                _ => unreachable!(),
+            }
+        };
+
+        let mut items = Vec::new();
+        let mut count = 0i64;
+        while let Some(post) = posts.next().await {
+            let Ok(images) = engine.list_post_images(post.id).await else {
+                continue;
+            };
+            let Ok(videos) = engine.list_post_videos(post.id).await else {
+                continue;
+            };
+            count += 1;
+            items.push(PostItem {
+                id: post.id,
+                title: post.title,
+                images,
+                videos,
             });
         }
-    }) as Box<dyn FnMut(_)>);
-    es.add_event_listener_with_callback("post", cb.as_ref().unchecked_ref())
-        .ok();
-    closures.push(cb);
+        return Ok(SearchResponse {
+            has_more: count >= limit,
+            posts: items,
+            images: vec![],
+        });
+    }
 
-    // image
-    let cb = Closure::wrap(Box::new(move |ev: web_sys::MessageEvent| {
-        if let Some(s) = ev.data().as_string()
-            && let Ok(im) = serde_json::from_str::<Image>(&s)
-        {
-            images.update_value(|v| v.push(im.clone()));
-            columns.update(|columns| {
-                let Some(column) = columns.iter_mut().min_by_key(|c| c.height) else {
-                    return;
-                };
-                let height =
-                    ((im.height as f64 / im.width as f64) * column.width as f64).round() as u32;
-                let w = column.width;
-                column.height += height + COLUMN_PAD;
-                column.items.push(Placed { item: Item::Image(im), w, h: height });
+    // Image-oriented modes.
+    let mut stream: Pin<Box<dyn Stream<Item = Image> + Send>> = match mode {
+        Mode::Tag => Box::pin(
+            engine
+                .search_images_by_tag(q, limit, offset)
+                .await
+                .map_err(to_err)?,
+        ),
+        Mode::Clip => Box::pin(
+            engine
+                .search_clip_cached([q], limit, offset)
+                .await
+                .map_err(to_err)?,
+        ),
+        Mode::Random => Box::pin(engine.random_images(limit).await.map_err(to_err)?),
+        Mode::Similar => {
+            let id = q.parse::<i64>().map_err(to_args)?;
+            let details = engine.image_details(id).await.map_err(to_err)?;
+            let post_image_ids = match details.post.as_ref().map(|p| p.id) {
+                Some(post_id) => engine.list_post_images(post_id).await.ok().map(|imgs| {
+                    imgs.into_iter()
+                        .map(|i| i.id)
+                        .collect::<std::collections::HashSet<_>>()
+                }),
+                None => None,
+            };
+            let mut stream = engine
+                .search_dinov3_by_id([id], limit, offset)
+                .await
+                .map_err(to_err)?;
+            let mut items = Vec::new();
+            let mut count = 0i64;
+            while let Some(img) = stream.next().await {
+                count += 1;
+                if post_image_ids.as_ref().is_some_and(|ids| ids.contains(&img.id)) {
+                    continue;
+                }
+                items.push(img);
+            }
+            return Ok(SearchResponse {
+                has_more: count >= limit,
+                posts: vec![],
+                images: items,
             });
         }
-    }) as Box<dyn FnMut(_)>);
-    es.add_event_listener_with_callback("image", cb.as_ref().unchecked_ref())
-        .ok();
-    closures.push(cb);
-
-    // done
-    let cb = Closure::wrap(Box::new(move |ev: web_sys::MessageEvent| {
-        let d: DoneEvent = ev
-            .data()
-            .as_string()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or(DoneEvent { has_more: false });
-        has_more.set(d.has_more);
-        loading.set(false);
-        active.set_value(SendOption::new_local(None));
-    }) as Box<dyn FnMut(_)>);
-    es.add_event_listener_with_callback("done", cb.as_ref().unchecked_ref())
-        .ok();
-    closures.push(cb);
-
-    // server-side error event
-    let cb = Closure::wrap(Box::new(move |ev: web_sys::MessageEvent| {
-        let msg = ev
-            .data()
-            .as_string()
-            .and_then(|s| serde_json::from_str::<ErrorEvent>(&s).ok())
-            .map(|e| e.message)
-            .unwrap_or_else(|| "stream error".into());
-        error.set(Some(msg));
-        loading.set(false);
-        has_more.set(false);
-        active.set_value(SendOption::new_local(None));
-    }) as Box<dyn FnMut(_)>);
-    es.add_event_listener_with_callback("error", cb.as_ref().unchecked_ref())
-        .ok();
-    closures.push(cb);
-
-    let onerror = Closure::wrap(Box::new(move |_ev: web_sys::Event| {
-        loading.set(false);
-    }) as Box<dyn FnMut(_)>);
-    es.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-
-    let new_sse = ActiveSse {
-        es,
-        _closures: closures,
-        _err_closure: onerror,
+        _ => return Ok(SearchResponse::default()),
     };
-    active.set_value(SendOption::new_local(Some(new_sse)));
+
+    let mut items = Vec::new();
+    let mut count = 0i64;
+    while let Some(img) = stream.next().await {
+        count += 1;
+        items.push(img);
+    }
+    Ok(SearchResponse {
+        has_more: count >= limit,
+        posts: vec![],
+        images: items,
+    })
+}
+
+#[server]
+async fn search_by_image(
+    image: String,
+    limit: i64,
+    offset: i64,
+) -> Result<SearchResponse, ServerFnError> {
+    use crate::state::AppState;
+
+    use std::io::Cursor;
+    use std::sync::Arc;
+
+    use axum::extract::State;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use futures::StreamExt as _;
+    use leptos_axum::extract_with_state;
+    use search_engine::Engine;
+
+    fn to_err(e: impl std::fmt::Display) -> ServerFnError {
+        ServerFnError::Response(e.to_string())
+    }
+    fn to_args(msg: String) -> ServerFnError {
+        ServerFnError::Args(msg)
+    }
+
+    let limit = limit.max(1);
+    let offset = offset.max(0);
+
+    let bytes = URL_SAFE_NO_PAD
+        .decode(image.as_bytes())
+        .map_err(|e| to_args(format!("invalid image data: {e}")))?;
+
+    let state = expect_context::<AppState>();
+    let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
+
+    let mut stream = engine
+        .search_dinov3_cached([Cursor::new(bytes)], limit, offset)
+        .await
+        .map_err(to_err)?;
+
+    let mut items = Vec::new();
+    let mut count = 0i64;
+    while let Some(img) = stream.next().await {
+        count += 1;
+        items.push(img);
+    }
+    Ok(SearchResponse {
+        has_more: count >= limit,
+        posts: vec![],
+        images: items,
+    })
 }
