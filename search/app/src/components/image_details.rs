@@ -1,6 +1,6 @@
 use crate::{
     components::{Lightbox, Results, Viewer},
-    types::PostItem,
+    types::{ImageQuery, PostItem},
     util::encode_path,
 };
 
@@ -68,6 +68,7 @@ fn crop_to_base64(img: &HtmlImageElement, region: Region) -> Option<String> {
 pub fn ImageDetails() -> impl IntoView {
     let params = use_params_map();
     let id = Memo::new(move |_| params.with(|p| p.get("id")));
+    let img_query = expect_context::<ImageQuery>();
 
     let details =
         OnceResource::new(
@@ -262,11 +263,14 @@ pub fn ImageDetails() -> impl IntoView {
                     sel_box.set(Some(lbox));
 
                     if let Some(img) = img_ref.get()
-                        && let Some(q) = crop_to_base64(&img, region)
+                        && let Some(b64) = crop_to_base64(&img, region)
                     {
+                        // Stash the cropped region in client memory and navigate
+                        // with a short nonce, keeping the image out of the URL.
+                        img_query.0.set(Some(b64));
                         let path = pathname.get_untracked();
                         nav_up(
-                            &format!("{path}?mode=search_image&q={q}"),
+                            &format!("{path}?mode=search_image&q={}", js_sys::Date::now() as u64),
                             Default::default(),
                         );
                     }

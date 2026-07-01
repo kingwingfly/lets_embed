@@ -1,5 +1,5 @@
 use crate::components::BackToTop;
-use crate::types::Mode;
+use crate::types::{ImageQuery, Mode};
 use js_sys::futures::JsFuture;
 use leptos::{prelude::*, task::spawn_local};
 use leptos_router::{
@@ -69,6 +69,7 @@ pub fn SearchBar() -> impl IntoView {
     let q_input = RwSignal::new(init_q);
     let limit = RwSignal::new(init_limit);
     let file_name = RwSignal::new(String::new());
+    let img_query = expect_context::<ImageQuery>();
 
     let go = {
         let nav = use_navigate();
@@ -102,8 +103,11 @@ pub fn SearchBar() -> impl IntoView {
             let go = go.clone();
             spawn_local(async move {
                 if let Some(b64) = encode_file(file).await {
-                    q_input.set(b64.clone());
-                    go(b64);
+                    // Keep the (potentially large) image out of the URL: stash it
+                    // in client memory and navigate with only a short nonce so the
+                    // Results component re-runs its search against the stored bytes.
+                    img_query.0.set(Some(b64));
+                    go(format!("{}", js_sys::Date::now() as u64));
                 }
             });
         }

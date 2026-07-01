@@ -46,6 +46,7 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
+    provide_context(crate::types::ImageQuery(RwSignal::new(None)));
     view! {
         <Title formatter=|text| format!("{text} - Let's Embed")/>
         <Router>

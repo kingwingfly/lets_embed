@@ -1,5 +1,14 @@
+use leptos::prelude::RwSignal;
 use search_types::{Image, Video};
 use serde::{Deserialize, Serialize};
+
+/// Client-side holder for a pending image-search payload (URL-safe base64, no pad).
+///
+/// The bytes are kept out of the URL to avoid the request-line length limit that
+/// caused 400s; only a short nonce travels in the query string. Provided as a
+/// context at the app root and read by the search entry points + `Results`.
+#[derive(Clone, Copy)]
+pub struct ImageQuery(pub RwSignal<Option<String>>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -52,12 +61,13 @@ pub struct PostItem {
     pub videos: Vec<Video>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DoneEvent {
+/// A single page of search results returned by the REST search endpoints.
+///
+/// Exactly one of `posts` / `images` is populated depending on the search mode;
+/// the other is empty. `has_more` drives infinite-scroll pagination.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SearchResponse {
+    pub posts: Vec<PostItem>,
+    pub images: Vec<Image>,
     pub has_more: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ErrorEvent {
-    pub message: String,
 }

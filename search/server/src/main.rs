@@ -1,10 +1,9 @@
 #![recursion_limit = "256"]
 
-mod api;
 mod cli;
 
 use app::*;
-use axum::{Router, routing::get};
+use axum::Router;
 use clap::Parser;
 use leptos::prelude::*;
 use leptos_axum::{LeptosRoutes, generate_route_list};
@@ -44,7 +43,9 @@ async fn main() -> anyhow::Result<()> {
 
     let routes = generate_route_list(App);
 
-    let mut app = Router::new().route("/api/search", get(api::search_sse));
+    // Search is served by Leptos server functions (auto-registered under /api),
+    // so no manual routes are needed here beyond static assets + leptos routes.
+    let mut app = Router::new();
     if let Some(prefix) = args.prefix {
         app = app
             .nest_service("/images", ServeDir::new(&prefix))
