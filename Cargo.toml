@@ -12,6 +12,7 @@ members = [
     "search_types",
     "gateway",
     "gateway_worker",
+    "user_worker",
     "img2webp",
 ]
 resolver = "3"

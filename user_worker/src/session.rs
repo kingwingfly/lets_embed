@@ -1,0 +1,121 @@
+//! FROZEN SCAFFOLD (fully implemented): HS256 session tokens + cookie helpers.
+//!
+//! Same 2-part token format (`base64url(payload).base64url(hmac)`) and same
+//! `lets-embed-jwt-secret` as gateway_worker; `sub` is a lowercase 0x address.
+//! The `is_eth_address` check on `sub` rejects legacy `gw_token` values
+//! (UUID subs) signed with the same secret.
+
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
+use hmac::{Hmac, KeyInit as _, Mac};
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use tower_cookies::{
+    Cookie, Cookies,
+    cookie::{SameSite, time::Duration as CookieDuration},
+};
+
+type HmacSha256 = Hmac<Sha256>;
+
+pub const SESSION_COOKIE: &str = "ue_session";
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionClaims {
+    /// Lowercase 0x-prefixed eth address.
+    pub sub: String,
+    pub iat: u64,
+    pub exp: u64,
+}
+
+pub fn now_secs() -> u64 {
+    worker::Date::now().as_millis() / 1000
+}
+
+pub fn jwt_sign(c: &SessionClaims, secret: &[u8]) -> String {
+    let payload = B64.encode(serde_json::to_vec(c).unwrap());
+    let mut mac = HmacSha256::new_from_slice(secret).expect("hmac key");
+    mac.update(payload.as_bytes());
+    let sig = B64.encode(mac.finalize().into_bytes());
+    format!("{payload}.{sig}")
+}
+
+pub fn jwt_verify(token: &str, secret: &[u8], now: u64) -> Option<SessionClaims> {
+    let (payload, sig) = token.split_once('.')?;
+    let sig = B64.decode(sig).ok()?;
+    let mut mac = HmacSha256::new_from_slice(secret).expect("hmac key");
+    mac.update(payload.as_bytes());
+    mac.verify_slice(&sig).ok()?;
+    let c: SessionClaims = serde_json::from_slice(&B64.decode(payload).ok()?).ok()?;
+    (c.exp >= now && is_eth_address(&c.sub)).then_some(c)
+}
+
+/// Lowercase 0x-prefixed 20-byte hex address.
+pub fn is_eth_address(s: &str) -> bool {
+    s.len() == 42
+        && s.starts_with("0x")
+        && s[2..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Verified session address from the request cookies, or None.
+pub fn session_address(cookies: &Cookies, secret: &[u8]) -> Option<String> {
+    let token = cookies.get(SESSION_COOKIE)?;
+    Some(jwt_verify(token.value(), secret, now_secs())?.sub)
+}
+
+pub fn make_session_cookie(token: String, max_age_secs: i64) -> Cookie<'static> {
+    let mut c = Cookie::new(SESSION_COOKIE, token);
+    c.set_http_only(true);
+    c.set_secure(true);
+    c.set_same_site(SameSite::Lax);
+    c.set_path("/");
+    c.set_max_age(CookieDuration::seconds(max_age_secs));
+    c
+}
+
+pub fn clear_session_cookie() -> Cookie<'static> {
+    make_session_cookie(String::new(), 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eth_address_check() {
+        assert!(is_eth_address(
+            "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+        ));
+        // uppercase rejected (must be lowercase)
+        assert!(!is_eth_address(
+            "0xD8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+        ));
+        // legacy gw_token UUID sub rejected
+        assert!(!is_eth_address("2f4d0c9e-9f5a-4a2c-8f2e-2d3b4c5d6e7f"));
+        assert!(!is_eth_address("0x123"));
+    }
+
+    #[test]
+    fn sign_verify_roundtrip() {
+        let secret = b"test-secret";
+        let claims = SessionClaims {
+            sub: "0xd8da6bf26964af9d7eed9e03e53415d37aa96045".into(),
+            iat: 1000,
+            exp: 2000,
+        };
+        let tok = jwt_sign(&claims, secret);
+        let back = jwt_verify(&tok, secret, 1500).expect("valid");
+        assert_eq!(back.sub, claims.sub);
+        // expired
+        assert!(jwt_verify(&tok, secret, 2001).is_none());
+        // wrong key
+        assert!(jwt_verify(&tok, b"other", 1500).is_none());
+        // non-address sub rejected
+        let bad = SessionClaims {
+            sub: "some-uuid".into(),
+            iat: 1000,
+            exp: 2000,
+        };
+        assert!(jwt_verify(&jwt_sign(&bad, secret), secret, 1500).is_none());
+    }
+}

@@ -1,0 +1,31 @@
+[package]
+name = "user_worker"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[lib]
+# rlib in addition to cdylib so `cargo test -p user_worker` runs host unit tests
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+worker = { version = "0.8", features = ["http", "axum", "d1"] }
+# required by the code #[durable_object] generates
+wasm-bindgen = "0.2"
+axum = { workspace = true, features = ["macros", "form", "json", "query"] }
+tower-service = "0.3"
+tower-cookies = "0.11"
+uuid = { version = "1", features = ["v4", "js"] }
+getrandom = { version = "0.2", features = ["js"] }
+serde.workspace = true
+serde_json.workspace = true
+hmac = "0.13"
+sha2 = "0.11"
+rsa = { version = "0.10.0-rc.18", features = ["sha2"] }
+base64 = "0.22"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "alloc"] }
+sha3 = "0.10"
+hex = "0.4"
