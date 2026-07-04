@@ -1,5 +1,5 @@
 use crate::{
-    components::{Lightbox, Results, Viewer},
+    components::{Lightbox, LikeButton, Results, Viewer},
     types::{ImageQuery, PostItem},
     util::encode_path,
 };
@@ -153,6 +153,7 @@ pub fn ImageDetails() -> impl IntoView {
         let image_id = image.id;
 
         let post_meta = post.as_ref().map(|p| (p.id, p.title.clone()));
+        let post_like_id = post_meta.as_ref().map(|(id, _)| *id);
         let post_store = StoredValue::new(post_meta);
 
         let open_lightbox = move || {
@@ -351,6 +352,23 @@ pub fn ImageDetails() -> impl IntoView {
                             </div>
                         }
                     }
+
+                    <div class="shrink-0 flex items-center justify-center gap-3 px-3 py-1
+                                bg-white/70 ring-1 ring-sky-100 rounded-2xl">
+                        <LikeButton kind="image" target_id=image_id />
+                        {
+                            post_like_id.map(|post_id| view! {
+                                <LikeButton kind="post" target_id=post_id />
+                            })
+                        }
+                        <a
+                            href="/user/favorites"
+                            class="text-sm md:text-base font-medium text-sky-600
+                                    hover:text-sky-800 hover:underline"
+                        >
+                            "\u{2605} Favorites"
+                        </a>
+                    </div>
 
                     <div class="shrink-0 max-h-24 md:max-h-32 overflow-y-auto
                                 flex flex-wrap content-start gap-2 p-2 bg-white/70 ring-1 ring-sky-100 rounded-2xl
