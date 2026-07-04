@@ -1,37 +1,31 @@
 use std::sync::Arc;
 
 use axum::{
-    Form, Router,
+    Router,
     body::Bytes,
     extract::State,
-    http::{HeaderMap, Method, Uri},
+    http::{HeaderMap, Method, StatusCode, Uri},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{any, get, post},
+    routing::any,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use hmac::{Hmac, KeyInit as _, Mac};
-use rsa::{BoxedUint, Pkcs1v15Sign, RsaPublicKey};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use tower_cookies::{
-    Cookie, CookieManagerLayer, Cookies,
-    cookie::{SameSite, time::Duration as CookieDuration},
-};
+use sha2::Sha256;
+use tower_cookies::{CookieManagerLayer, Cookies};
 use tower_service::Service;
 use worker::{
     Context, Env, Error, Fetch, HttpRequest, Request, RequestInit, Result, event,
-    js_sys::Uint8Array,
+    js_sys::Uint8Array, wasm_bindgen::JsValue,
 };
 
 const API_UPSTREAM: &str = "https://lets-embed-api.louisfly.icu";
 const IMAGE_UPSTREAM: &str = "https://lets-embed-image.louisfly.icu";
 const VIDEO_UPSTREAM: &str = "https://lets-embed-video.louisfly.icu";
-const TOKEN_COOKIE: &str = "gw_token";
-const APP_COOKIE: &str = "gw_app";
-const D1_BINDING: &str = "DB";
-const JWKS_BINDING: &str = "JWKS_CACHE";
-const JWKS_KEY: &str = "cf-access-jwks";
-const JWKS_TTL: u64 = 3600;
+const SESSION_COOKIE: &str = "ue_session";
+// retired cookies from the old apply/approve flow, still stripped before proxying
+const LEGACY_TOKEN_COOKIE: &str = "gw_token";
+const LEGACY_APP_COOKIE: &str = "gw_app";
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -45,8 +39,6 @@ struct AppState {
     jwt_secret: Arc<Vec<u8>>,
     client_id: Arc<String>,
     client_secret: Arc<String>,
-    team_domain: Arc<String>,
-    access_aud: Arc<String>,
 }
 
 async fn secret(env: &Env, name: &str) -> Result<String> {
@@ -60,26 +52,15 @@ async fn router(env: Env, _ctx: Context) -> Result<Router> {
     let client_id = secret(&env, "lets-embed-client-id").await?;
     let client_secret = secret(&env, "lets-embed-client-secret").await?;
     let jwt_secret = secret(&env, "lets-embed-jwt-secret").await?;
-    let team_domain = env.var("CF_ACCESS_TEAM_DOMAIN")?.to_string();
-    let access_aud = env.var("CF_ACCESS_AUD")?.to_string();
 
     let state = AppState {
         env: Arc::new(env),
         jwt_secret: Arc::new(jwt_secret.into_bytes()),
         client_id: Arc::new(client_id),
         client_secret: Arc::new(client_secret),
-        team_domain: Arc::new(team_domain),
-        access_aud: Arc::new(access_aud),
     };
 
     Ok(Router::new()
-        // Public
-        .route("/apply", get(apply_page).post(apply_submit))
-        // Protected by Access
-        .route("/admin", get(admin_page))
-        .route("/admin/approve", post(admin_approve))
-        .route("/admin/deny", post(admin_deny))
-        // Protected by service token
         .fallback(any(gateway))
         .layer(CookieManagerLayer::new())
         .with_state(state))
@@ -91,12 +72,12 @@ async fn fetch(req: HttpRequest, env: Env, ctx: Context) -> Result<Response> {
 }
 
 // ---------------------------------------------------------------------------
-// JWT (HS256)
+// Session JWT (HS256, issued by user-worker with the same secret)
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize)]
-struct Claims {
-    sub: String, // application id
+struct SessionClaims {
+    sub: String, // lowercase 0x eth address
     iat: u64,
     exp: u64,
 }
@@ -105,358 +86,60 @@ fn now_secs() -> u64 {
     worker::Date::now().as_millis() / 1000
 }
 
-fn jwt_sign(c: &Claims, secret: &[u8]) -> String {
-    let payload = B64.encode(serde_json::to_vec(c).unwrap());
-    let mut mac = HmacSha256::new_from_slice(secret).expect("hmac key");
-    mac.update(payload.as_bytes());
-    let sig = B64.encode(mac.finalize().into_bytes());
-    format!("{payload}.{sig}")
-}
-
-fn jwt_verify(token: &str, secret: &[u8], now: u64) -> Option<Claims> {
+fn jwt_verify(token: &str, secret: &[u8], now: u64) -> Option<SessionClaims> {
     let (payload, sig) = token.split_once('.')?;
     let sig = B64.decode(sig).ok()?;
     let mut mac = HmacSha256::new_from_slice(secret).expect("hmac key");
     mac.update(payload.as_bytes());
     mac.verify_slice(&sig).ok()?;
-    let c: Claims = serde_json::from_slice(&B64.decode(payload).ok()?).ok()?;
-    (c.exp >= now).then_some(c)
+    let c: SessionClaims = serde_json::from_slice(&B64.decode(payload).ok()?).ok()?;
+    // the address check rejects legacy `gw_token` values (UUID subs) signed
+    // with the same secret
+    (c.exp >= now && is_eth_address(&c.sub)).then_some(c)
+}
+
+/// Lowercase 0x-prefixed 20-byte hex address.
+fn is_eth_address(s: &str) -> bool {
+    s.len() == 42
+        && s.starts_with("0x")
+        && s[2..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 // ---------------------------------------------------------------------------
-// D1
+// UserAccount DO wire contract — duplicated verbatim from
+// `user_worker/src/types.rs` (deliberate: it is a wire contract between two
+// separately deployed workers, not shared Rust)
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct AppRow {
-    id: String,
-    reason: String,
-    status: String,
-    duration_secs: Option<i64>,
-    created_at: i64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaKind {
+    Image,
+    Video,
 }
 
-async fn db_find(env: &Env, id: &str) -> Result<Option<AppRow>> {
-    env.d1(D1_BINDING)?
-        .prepare(
-            "SELECT id, reason, status, duration_secs, created_at FROM applications WHERE id = ?",
-        )
-        .bind(&[id.into()])?
-        .first::<AppRow>(None)
-        .await
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChargeReq {
+    /// Full request path, e.g. "/images/abc.webp" — the dedupe key.
+    pub path: String,
+    pub kind: MediaKind,
 }
 
-async fn db_list_pending(env: &Env) -> Result<Vec<AppRow>> {
-    env.d1(D1_BINDING)?
-        .prepare("SELECT id, reason, status, duration_secs, created_at FROM applications WHERE status = 'pending' ORDER BY created_at DESC LIMIT 200")
-        .all()
-        .await?
-        .results::<AppRow>()
-}
-
-// ---------------------------------------------------------------------------
-// /apply
-// ---------------------------------------------------------------------------
-
-#[worker::send]
-async fn apply_page(State(st): State<AppState>, cookies: Cookies) -> Response {
-    if let Some(cookie) = cookies.get(APP_COOKIE)
-        && let Ok(Some(row)) = db_find(&st.env, cookie.value()).await
-    {
-        if row.status == "pending" {
-            return render_apply_status("pending").into_response();
-        } else if row.status == "denied"
-            || (row.status == "consumed"
-                && !cookies.get(TOKEN_COOKIE).is_some_and(|tok| {
-                    jwt_verify(tok.value(), &st.jwt_secret, now_secs()).is_some()
-                }))
-        {
-            let mut c = Cookie::new(APP_COOKIE, "");
-            c.set_path("/");
-            c.set_http_only(true);
-            c.set_secure(true);
-            c.set_same_site(SameSite::Lax);
-            c.set_max_age(CookieDuration::seconds(0)); // expires immediately
-            cookies.add(c);
-            return render_apply_status(&row.status).into_response();
-        }
-        return render_apply_status("approved").into_response();
-    }
-    render_apply_form().into_response()
-}
-
-#[derive(Deserialize)]
-struct ApplyForm {
-    reason: String,
-}
-
-#[worker::send]
-async fn apply_submit(
-    State(st): State<AppState>,
-    cookies: Cookies,
-    Form(form): Form<ApplyForm>,
-) -> Response {
-    let reason = form.reason.trim();
-    if reason.is_empty() {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            "Reason cannot be empty",
-        )
-            .into_response();
-    }
-
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = now_secs() as i64;
-
-    let res = st.env.d1(D1_BINDING).and_then(|db| {
-        db.prepare(
-            "INSERT INTO applications (id, reason, status, created_at) VALUES (?, ?, 'pending', ?)",
-        )
-        .bind(&[id.clone().into(), reason.into(), (now as f64).into()])
-    });
-
-    match res {
-        Ok(stmt) => {
-            if let Err(e) = stmt.run().await {
-                worker::console_error!("insert failed: {e:?}");
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to commit",
-                )
-                    .into_response();
-            }
-        }
-        Err(e) => {
-            worker::console_error!("bind failed: {e:?}");
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to commit",
-            )
-                .into_response();
-        }
-    }
-
-    // app id cookie
-    let mut c = Cookie::new(APP_COOKIE, id);
-    c.set_http_only(true);
-    c.set_secure(true);
-    c.set_same_site(SameSite::Lax);
-    c.set_path("/");
-    c.set_max_age(CookieDuration::days(30));
-    cookies.add(c);
-
-    Redirect::to("/apply").into_response()
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChargeResp {
+    /// false = deduped (seen within the window) or refused; nothing deducted.
+    pub charged: bool,
+    pub cost: i64,
+    /// PAYG points after the charge.
+    pub balance: i64,
+    /// Subscription quota after the charge.
+    pub quota_remaining: i64,
 }
 
 // ---------------------------------------------------------------------------
-// /admin （Access Protected）
-// ---------------------------------------------------------------------------
-
-async fn require_approver(st: &AppState, headers: &HeaderMap) -> Option<String> {
-    #[derive(Deserialize)]
-    struct Jwk {
-        kid: String,
-        n: String,
-        e: String,
-    }
-    #[derive(Deserialize)]
-    struct Jwks {
-        keys: Vec<Jwk>,
-    }
-    #[derive(Deserialize)]
-    struct JwtHeader {
-        kid: String,
-        alg: String,
-    }
-    #[derive(Deserialize)]
-    struct AccessClaims {
-        aud: serde_json::Value,
-        email: Option<String>,
-        iss: String,
-        exp: u64,
-        nbf: Option<u64>,
-    }
-
-    fn b64url(s: &str) -> Option<Vec<u8>> {
-        B64.decode(s).ok()
-    }
-
-    async fn load_jwks(env: &Env, team_domain: &str, force: bool) -> Option<Jwks> {
-        let kv = env.kv(JWKS_BINDING).ok()?;
-
-        if !force
-            && let Ok(Some(text)) = kv.get(JWKS_KEY).text().await
-            && let Ok(j) = serde_json::from_str::<Jwks>(&text)
-        {
-            return Some(j);
-        }
-
-        let url = format!("https://{team_domain}/cdn-cgi/access/certs");
-        let mut resp = Fetch::Url(url.parse().ok()?).send().await.ok()?;
-        let text = resp.text().await.ok()?;
-        let jwks: Jwks = serde_json::from_str(&text).ok()?;
-
-        if let Ok(builder) = kv.put(JWKS_KEY, &text) {
-            let _ = builder.expiration_ttl(JWKS_TTL).execute().await;
-        }
-        Some(jwks)
-    }
-
-    async fn verify_access_jwt(
-        env: &Env,
-        token: &str,
-        team_domain: &str,
-        expected_aud: &str,
-        now: u64,
-    ) -> Option<AccessClaims> {
-        let mut parts = token.split('.');
-        let (h, p, s) = (parts.next()?, parts.next()?, parts.next()?);
-        if parts.next().is_some() {
-            return None;
-        }
-
-        let header: JwtHeader = serde_json::from_slice(&b64url(h)?).ok()?;
-        if header.alg != "RS256" {
-            return None;
-        }
-
-        let (n_str, e_str) = {
-            let cached = load_jwks(env, team_domain, false).await?;
-            match cached.keys.iter().find(|k| k.kid == header.kid) {
-                Some(j) => (j.n.clone(), j.e.clone()),
-                None => {
-                    let fresh = load_jwks(env, team_domain, true).await?;
-                    let j = fresh.keys.iter().find(|k| k.kid == header.kid)?;
-                    (j.n.clone(), j.e.clone())
-                }
-            }
-        };
-        let n = BoxedUint::from_be_slice_vartime(&b64url(&n_str)?);
-        let e = BoxedUint::from_be_slice_vartime(&b64url(&e_str)?);
-        let key = RsaPublicKey::new(n, e).ok()?;
-
-        let signing_input = format!("{h}.{p}");
-        let digest = Sha256::digest(signing_input.as_bytes());
-        let sig = b64url(s)?;
-        key.verify(Pkcs1v15Sign::new::<Sha256>(), &digest, &sig)
-            .ok()?;
-
-        let claims: AccessClaims = serde_json::from_slice(&b64url(p)?).ok()?;
-
-        // exp
-        if claims.exp < now {
-            return None;
-        }
-        if matches!(claims.nbf, Some(nbf) if nbf > now) {
-            return None;
-        }
-        // iss
-        if claims.iss.trim_end_matches('/')
-            != format!("https://{team_domain}").trim_end_matches('/')
-        {
-            return None;
-        }
-        // aud
-        let aud_ok = match &claims.aud {
-            serde_json::Value::String(a) => a == expected_aud,
-            serde_json::Value::Array(arr) => arr.iter().any(|v| v.as_str() == Some(expected_aud)),
-            _ => false,
-        };
-        if !aud_ok {
-            return None;
-        }
-
-        Some(claims)
-    }
-
-    let token = headers.get("cf-access-jwt-assertion")?.to_str().ok()?;
-    let claims =
-        verify_access_jwt(&st.env, token, &st.team_domain, &st.access_aud, now_secs()).await?;
-    claims.email
-}
-
-#[worker::send]
-async fn admin_page(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    // No Access
-    let Some(email) = require_approver(&st, &headers).await else {
-        return (axum::http::StatusCode::FORBIDDEN, "Access not configured").into_response();
-    };
-
-    let rows = match db_list_pending(&st.env).await {
-        Ok(r) => r,
-        Err(e) => {
-            worker::console_error!("list failed: {e:?}");
-            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "load failed").into_response();
-        }
-    };
-    Html(render_admin(&email, &rows)).into_response()
-}
-
-#[derive(Deserialize)]
-struct ApproveForm {
-    id: String,
-    duration_secs: i64,
-}
-
-#[worker::send]
-async fn admin_approve(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<ApproveForm>,
-) -> Response {
-    let Some(email) = require_approver(&st, &headers).await else {
-        return (axum::http::StatusCode::FORBIDDEN, "Access not configured").into_response();
-    };
-    let now = now_secs() as i64;
-
-    let stmt = st.env.d1(D1_BINDING).and_then(|db| {
-        db.prepare(
-            "UPDATE applications SET status='approved', duration_secs=?, approved_by=?, approved_at=? WHERE id=? AND status='pending'",
-        )
-        .bind(&[
-            (form.duration_secs as f64).into(),
-            email.into(),
-            (now as f64).into(),
-            form.id.into(),
-        ])
-    });
-
-    match stmt {
-        Ok(s) if s.run().await.is_ok() => Redirect::to("/admin").into_response(),
-        _ => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "approve failed",
-        )
-            .into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-struct DenyForm {
-    id: String,
-}
-
-#[worker::send]
-async fn admin_deny(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<DenyForm>,
-) -> Response {
-    if require_approver(&st, &headers).await.is_none() {
-        return (axum::http::StatusCode::FORBIDDEN, "Access not configured").into_response();
-    };
-    let stmt = st.env.d1(D1_BINDING).and_then(|db| {
-        db.prepare("UPDATE applications SET status='denied' WHERE id=? AND status='pending'")
-            .bind(&[form.id.into()])
-    });
-    match stmt {
-        Ok(s) if s.run().await.is_ok() => Redirect::to("/admin").into_response(),
-        _ => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "deny failed").into_response(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// gateway：verify JWT → sign if necessary → proxy
+// gateway：/user/* → user-worker；verify session → charge media → proxy
 // ---------------------------------------------------------------------------
 
 #[worker::send]
@@ -468,61 +151,153 @@ async fn gateway(
     cookies: Cookies,
     body: Bytes,
 ) -> Response {
-    let now = now_secs();
+    let path = uri.path();
 
-    // 1) valid JWT → proxy
-    if let Some(tok) = cookies.get(TOKEN_COOKIE)
-        && jwt_verify(tok.value(), &st.jwt_secret, now).is_some()
-    {
-        return proxy(uri, method, headers, body, &st.client_id, &st.client_secret).await;
+    // /user/* reaches the user-worker before any auth: login must be reachable
+    if path == "/user" || path.starts_with("/user/") {
+        return forward_user(&st, &uri, &method, &headers, body).await;
     }
 
-    // 2) app cookie & approved → sign JWT，redirect
-    if let Some(id) = cookies.get(APP_COOKIE).map(|c| c.value().to_string())
-        && let Ok(Some(row)) = db_find(&st.env, &id).await
-        && row.status == "approved"
-    {
-        let dur = row.duration_secs.unwrap_or(3600).max(0) as u64;
-        let claims = Claims {
-            sub: row.id,
-            iat: now,
-            exp: now + dur,
-        };
-        match db_mark_issued(&st.env, &id).await {
-            Ok(1) => {}
-            _ => return Redirect::to("/apply").into_response(),
+    let claims = cookies
+        .get(SESSION_COOKIE)
+        .and_then(|tok| jwt_verify(tok.value(), &st.jwt_secret, now_secs()));
+    let Some(claims) = claims else {
+        let media = path.starts_with("/images/") || path.starts_with("/videos/");
+        if media && matches!(method, Method::GET | Method::HEAD) {
+            // an <img> tag can't follow a login redirect
+            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
+        let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        return Redirect::to(&format!("/user/login?next={}", encode_next(pq))).into_response();
+    };
 
-        let token = jwt_sign(&claims, &st.jwt_secret);
-
-        let mut c = Cookie::new(TOKEN_COOKIE, token);
-        c.set_http_only(true);
-        c.set_secure(true);
-        c.set_same_site(SameSite::Lax);
-        c.set_path("/");
-        c.set_max_age(CookieDuration::seconds(dur as i64));
-        cookies.add(c);
-
-        let dest = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-        return Redirect::to(dest).into_response();
+    // charge GET media views against the user's account DO (HEAD is free)
+    if method == Method::GET {
+        let kind = if path.starts_with("/images/") {
+            Some(MediaKind::Image)
+        } else if path.starts_with("/videos/") {
+            Some(MediaKind::Video)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            match charge_do(&st, &claims.sub, path, kind).await {
+                Ok(200) => {}
+                Ok(402) => return out_of_points(),
+                Ok(403) => return (StatusCode::FORBIDDEN, "account suspended").into_response(),
+                Ok(status) => {
+                    worker::console_error!("charge returned {status}");
+                    return (StatusCode::BAD_GATEWAY, "charge failed").into_response();
+                }
+                Err(e) => {
+                    // fail closed
+                    worker::console_error!("charge failed: {e:?}");
+                    return (StatusCode::BAD_GATEWAY, "charge failed").into_response();
+                }
+            }
+        }
     }
 
-    // 3) other → /apply
-    Redirect::to("/apply").into_response()
+    proxy(uri, method, headers, body, &st.client_id, &st.client_secret).await
 }
 
-async fn db_mark_issued(env: &Env, id: &str) -> Result<u64> {
-    let stmt = env
-        .d1("DB")?
-        .prepare(
-            "UPDATE applications \
-             SET status = 'consumed' \
-             WHERE id = ?1 AND status = 'approved'",
-        )
-        .bind(&[id.into()])?;
+/// Minimal percent-encoding for the `next` query value.
+fn encode_next(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '?' => out.push_str("%3F"),
+            '#' => out.push_str("%23"),
+            '&' => out.push_str("%26"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
 
-    let result = stmt.run().await?;
-    Ok(result.meta()?.map(|m| m.changes.unwrap_or(0)).unwrap_or(0) as u64)
+/// POST /charge to the user's UserAccount durable object; returns the DO status.
+async fn charge_do(st: &AppState, sub: &str, path: &str, kind: MediaKind) -> Result<u16> {
+    let body = serde_json::to_string(&ChargeReq {
+        path: path.to_string(),
+        kind,
+    })
+    .unwrap();
+
+    let mut init = RequestInit::new();
+    init.with_method(worker::Method::Post);
+    init.with_body(Some(JsValue::from_str(&body)));
+    init.headers.set("content-type", "application/json")?;
+    let req = Request::new_with_init("https://do/charge", &init)?;
+
+    let stub = st
+        .env
+        .durable_object("USER_ACCOUNT")?
+        .id_from_name(sub)?
+        .get_stub()?;
+    Ok(stub.fetch_with_request(req).await?.status_code())
+}
+
+fn out_of_points() -> Response {
+    let body = r#"<div class="card center">
+<div class="icon">🪙</div>
+<span class="badge warn">Out of points</span>
+<h1 style="margin-top:14px">Out of points</h1>
+<p class="sub" style="margin-bottom:0">You have run out of points.
+<a href="/user/account">Top up your account &rarr;</a></p>
+</div>"#;
+    (
+        StatusCode::PAYMENT_REQUIRED,
+        Html(page("Out of points", body)),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// /user/* → user-worker (service binding)
+// ---------------------------------------------------------------------------
+
+async fn forward_user(
+    st: &AppState,
+    uri: &Uri,
+    method: &Method,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Response {
+    let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let target = format!("https://user-worker{pq}");
+
+    let mut init = RequestInit::new();
+    init.with_method(method.to_string().into());
+
+    if !matches!(*method, Method::GET | Method::HEAD) && !body.is_empty() {
+        init.with_body(Some(Uint8Array::from(&body[..]).into()));
+    }
+
+    // forward all headers — cookie included, the user-worker needs `ue_session`
+    for (k, v) in headers {
+        let name = k.as_str();
+        if is_hop_by_hop(name) {
+            continue;
+        }
+        if let Ok(v) = v.to_str() {
+            let _ = init.headers.set(name, v);
+        }
+    }
+
+    let sent = async {
+        let req = Request::new_with_init(&target, &init)?;
+        st.env.service("USER_WORKER")?.fetch_request(req).await
+    }
+    .await;
+
+    match sent {
+        Ok(resp) => resp.map(axum::body::Body::new),
+        Err(e) => {
+            worker::console_error!("user-worker fetch failed: {e:?}");
+            (StatusCode::BAD_GATEWAY, "user service unavailable").into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -544,7 +319,7 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
-/// remove gateway cookie
+/// remove gateway cookies
 fn sanitize_cookie(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get("cookie")?.to_str().ok()?;
     let kept: Vec<&str> = raw
@@ -552,7 +327,7 @@ fn sanitize_cookie(headers: &HeaderMap) -> Option<String> {
         .map(str::trim)
         .filter(|c| {
             let name = c.split('=').next().unwrap_or("");
-            name != TOKEN_COOKIE && name != APP_COOKIE
+            name != SESSION_COOKIE && name != LEGACY_TOKEN_COOKIE && name != LEGACY_APP_COOKIE
         })
         .collect();
     (!kept.is_empty()).then(|| kept.join("; "))
@@ -607,7 +382,7 @@ async fn proxy(
         Ok(r) => r,
         Err(e) => {
             return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 format!("build request failed: {e}"),
             )
                 .into_response();
@@ -619,7 +394,7 @@ async fn proxy(
         Err(e) => {
             worker::console_error!("fetch to {target} failed: {e:?}");
             (
-                axum::http::StatusCode::BAD_GATEWAY,
+                StatusCode::BAD_GATEWAY,
                 format!("upstream fetch failed: {e}"),
             )
                 .into_response()
@@ -680,111 +455,4 @@ fn page(title: &str, body: &str) -> String {
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title>{STYLE}
 </head><body><div class="wrap">{body}</div></body></html>"#
     )
-}
-
-fn render_apply_form() -> Html<String> {
-    let body = r#"<div class="card">
-<h1>Request Access</h1>
-<p class="sub">Tell us why you need access. An approver will review your request shortly.</p>
-<form method="post" action="/apply">
-<label for="reason">Statement of Purpose</label>
-<textarea id="reason" name="reason" required placeholder="Please specify the purpose..."></textarea>
-<button class="btn full" type="submit">Submit Application</button>
-</form></div>"#;
-    Html(page("Request Access", body))
-}
-
-fn render_apply_status(status: &str) -> Html<String> {
-    let (title, icon, badge_cls, badge, msg) = match status {
-        "approved" => (
-            "Approved",
-            "✅",
-            "ok",
-            "Approved",
-            r#"Your application has been approved. <a href="/">Enter now &rarr;</a>"#,
-        ),
-        "denied" => (
-            "Rejected",
-            "⛔",
-            "err",
-            "Rejected",
-            "Sorry, this application was not approved.",
-        ),
-        "consumed" => (
-            "Consumed",
-            "⌛",
-            "err",
-            "Consumed",
-            "Sorry, your permission to this site has been outdated. Refresh to apply again.",
-        ),
-        _ => (
-            "Under Review",
-            "⏳",
-            "warn",
-            "Pending",
-            "Your application is awaiting approval. Please refresh this page later.",
-        ),
-    };
-    let body = format!(
-        r#"<div class="card center">
-<div class="icon">{icon}</div>
-<span class="badge {badge_cls}">{badge}</span>
-<h1 style="margin-top:14px">{title}</h1>
-<p class="sub" style="margin-bottom:0">{msg}</p>
-</div>"#
-    );
-    Html(page(title, &body))
-}
-
-fn render_admin(email: &str, rows: &[AppRow]) -> String {
-    let mut items = String::new();
-    if rows.is_empty() {
-        items.push_str(r#"<div class="empty">🎉 No pending applications.</div>"#);
-    }
-    for r in rows {
-        let id = html_escape(&r.id);
-        let reason = html_escape(&r.reason);
-        let ts = fmt_ts(r.created_at);
-        items.push_str(&format!(
-            r#"<div class="app">
-<div class="headrow"><span class="badge warn">Pending</span><span class="meta">{ts}</span></div>
-<div class="meta">id: {id}</div>
-<div class="reason">{reason}</div>
-<div class="actions">
-<form method="post" action="/admin/approve">
-<input type="hidden" name="id" value="{id}">
-<select name="duration_secs">
-<option value="3600">1 hour</option>
-<option value="86400">1 day</option>
-<option value="604800">7 days</option>
-<option value="2592000">30 days</option>
-</select>
-<button class="btn" type="submit">Approve</button>
-</form>
-<form method="post" action="/admin/deny">
-<input type="hidden" name="id" value="{id}">
-<button class="btn ghost" type="submit">Reject</button>
-</form>
-</div></div>"#
-        ));
-    }
-    let body = format!(
-        r#"<div class="headrow">
-<h1>Pending Applications</h1>
-<span class="you">👤 {email}</span>
-</div>{items}"#,
-        email = html_escape(email)
-    );
-    page("Approve", &body)
-}
-
-fn fmt_ts(secs: i64) -> String {
-    worker::Date::new(worker::DateInit::Millis((secs.max(0) as u64) * 1000)).to_string()
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
