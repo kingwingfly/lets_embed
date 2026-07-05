@@ -31,6 +31,7 @@ use worker::{Env, Fetch, Method, Request, RequestInit};
 
 use crate::AppState;
 use crate::config::{self, Chain, MIN_CONFIRMATIONS, MIN_TOPUP_POINTS};
+use crate::solana::{self, SolOutcome};
 use crate::rates;
 use crate::types::{ApiError, CreditReq, PaymentRow, SubscribeReq, TopupReq, TopupResp};
 use crate::{do_client, session};
@@ -233,9 +234,125 @@ pub async fn topup(
 
     match chain {
         Chain::Ethereum => topup_ethereum(&st, &addr, spec, &req.tx_hash).await,
-        // UNIT 4: verify via `crate::solana` against the linked wallet.
-        Chain::Solana => api_err(StatusCode::NOT_IMPLEMENTED, "solana top-up not implemented"),
+        Chain::Solana => topup_solana(&st, &addr, spec, &req.tx_hash).await,
     }
+}
+
+/// The token's USD price with 8 decimals, or `None` for a $1 stablecoin.
+/// Chainlink feeds live on Ethereum mainnet, so this always uses `rpc_url`
+/// (even to price SOL). On RPC failure returns a ready retry-later response.
+async fn resolve_price(st: &AppState, spec: &config::TokenSpec, tx_hash: &str) -> Result<Option<u128>, Response> {
+    match spec.feed {
+        None => Ok(None),
+        Some(feed) => {
+            match rates::chainlink_price(&st.rpc_url, feed, session::now_secs()).await {
+                Ok(p) => Ok(Some(p)),
+                Err(e) => Err(rpc_unavailable(&st.env, tx_hash, "chainlink_price", e).await),
+            }
+        }
+    }
+}
+
+/// The user's linked Solana wallet (base58), if any.
+async fn linked_solana(env: &Env, addr: &str) -> worker::Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Row {
+        solana_address: Option<String>,
+    }
+    let row = env
+        .d1(crate::D1_BINDING)?
+        .prepare("SELECT solana_address FROM users WHERE address = ?")
+        .bind(&[addr.into()])?
+        .first::<Row>(None)
+        .await?;
+    Ok(row.and_then(|r| r.solana_address))
+}
+
+/// Solana top-up (native SOL + SPL USDT/USDC). Verification lives in
+/// `crate::solana::topup_solana`; this runs the payment-row lifecycle + credit.
+async fn topup_solana(
+    st: &AppState,
+    addr: &str,
+    spec: &config::TokenSpec,
+    signature_in: &str,
+) -> Response {
+    // 1) validate the signature
+    let sig = signature_in.trim().to_string();
+    if !solana::valid_signature(&sig) {
+        return api_err(StatusCode::BAD_REQUEST, "invalid transaction signature");
+    }
+
+    // 2) the top-up must originate from a linked Solana wallet
+    let linked = match linked_solana(&st.env, addr).await {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            return api_err(
+                StatusCode::BAD_REQUEST,
+                "link a Solana wallet before topping up with SOL/SPL",
+            );
+        }
+        Err(e) => {
+            worker::console_error!("linked_solana lookup failed: {e:?}");
+            return api_err(StatusCode::INTERNAL_SERVER_ERROR, "database error, retry later");
+        }
+    };
+
+    // 3) replay lock (signature is the payments PK)
+    if let Err(e) = d1_exec(
+        &st.env,
+        "INSERT INTO payments (tx_hash, address, chain, token, created_at) VALUES (?, ?, ?, ?, ?)",
+        &[
+            sig.as_str().into(),
+            addr.into(),
+            spec.chain.as_str().into(),
+            spec.symbol.into(),
+            (session::now_secs() as f64).into(),
+        ],
+    )
+    .await
+    {
+        if format!("{e:?}").to_lowercase().contains("constraint") {
+            return api_err(StatusCode::CONFLICT, "tx already submitted");
+        }
+        worker::console_error!("payments insert failed for {sig}: {e:?}");
+        return api_err(StatusCode::INTERNAL_SERVER_ERROR, "database error, retry later");
+    }
+
+    // 4) fetch + verify on-chain
+    let amount = match solana::topup_solana(
+        &st.sol_rpc_url,
+        spec,
+        &st.sol_deposit_address,
+        &linked,
+        &sig,
+    )
+    .await
+    {
+        SolOutcome::Credited { amount } => amount,
+        SolOutcome::Reject(msg) => return reject(&st.env, &sig, msg).await,
+        SolOutcome::WrongSender => {
+            delete_pending(&st.env, &sig).await;
+            return api_err(StatusCode::FORBIDDEN, "tx sender is not your linked Solana wallet");
+        }
+        SolOutcome::TooEarly => return too_early(&st.env, &sig).await,
+        SolOutcome::RpcError(e) => {
+            worker::console_error!("solana verify failed for {sig}: {e}");
+            delete_pending(&st.env, &sig).await;
+            return api_err(StatusCode::BAD_GATEWAY, "rpc unavailable, retry later");
+        }
+    };
+
+    // 5) price + points
+    let price = match resolve_price(st, spec, &sig).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let points = rates::points_for(amount, spec.decimals, price);
+    if points < MIN_TOPUP_POINTS {
+        return reject(&st.env, &sig, "amount below minimum top-up").await;
+    }
+
+    finalize_credit(st, addr, &sig, amount, points).await
 }
 
 /// Ethereum top-up. SCAFFOLD: native ETH only; UNIT 3 adds the ERC-20 path for
@@ -351,11 +468,9 @@ async fn topup_ethereum(
     }
 
     // 6) price + points
-    let price = match rates::chainlink_price(&st.rpc_url, config::FEED_ETH_USD, session::now_secs())
-        .await
-    {
-        Ok(p) => Some(p),
-        Err(e) => return rpc_unavailable(&st.env, &tx_hash, "chainlink_price", e).await,
+    let price = match resolve_price(st, spec, &tx_hash).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
     };
     let points = rates::points_for(amount, spec.decimals, price);
     if points < MIN_TOPUP_POINTS {
