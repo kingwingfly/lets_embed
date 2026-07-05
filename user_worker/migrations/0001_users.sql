@@ -6,18 +6,20 @@
 -- display mirrors for the admin list; enforcement is DO-side.
 
 CREATE TABLE IF NOT EXISTS users (
-    address    TEXT PRIMARY KEY,               -- lowercase 0x-prefixed eth address
-    created_at INTEGER NOT NULL,
-    last_login INTEGER NOT NULL,
-    plan       TEXT,                           -- display mirror; DO is authority
-    banned     INTEGER NOT NULL DEFAULT 0      -- display mirror; DO is authority
+    address        TEXT PRIMARY KEY,           -- lowercase 0x-prefixed eth address
+    created_at     INTEGER NOT NULL,
+    last_login     INTEGER NOT NULL,
+    plan           TEXT,                        -- display mirror; DO is authority
+    banned         INTEGER NOT NULL DEFAULT 0,  -- display mirror; DO is authority
+    solana_address TEXT UNIQUE                  -- base58, nullable; linked Solana wallet for SOL/SPL top-ups
 );
 
 CREATE TABLE IF NOT EXISTS payments (
-    tx_hash    TEXT PRIMARY KEY,               -- lowercase 0x + 64 hex; global replay guard
+    tx_hash    TEXT PRIMARY KEY,               -- eth 0x-hash | solana base58 signature; global replay guard
     address    TEXT NOT NULL,
-    amount_wei TEXT NOT NULL DEFAULT '0',      -- decimal string (wei exceeds SQLite int precision safety)
-    token      TEXT NOT NULL DEFAULT 'ETH',
+    chain      TEXT NOT NULL DEFAULT 'ethereum', -- ethereum | solana
+    token      TEXT NOT NULL DEFAULT 'eth',    -- eth | sol | usdt | usdc
+    amount     TEXT NOT NULL DEFAULT '0',      -- raw base units (wei / lamports / minor units), decimal string
     points     INTEGER NOT NULL DEFAULT 0,
     status     TEXT NOT NULL DEFAULT 'pending', -- pending | credited | rejected
     created_at INTEGER NOT NULL

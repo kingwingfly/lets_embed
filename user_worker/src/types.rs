@@ -3,7 +3,7 @@
 //! The "DO internal protocol" section is duplicated verbatim in
 //! `gateway_worker` (deliberate: it is a wire contract between two separately
 //! deployed workers, not shared Rust). Do not change field names or status
-//! codes without updating both sides.
+//! codes without updating both sides — they deploy together.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,22 +16,24 @@ use serde::{Deserialize, Serialize};
 //   GET  /status                  -> 200 StatusResp
 //   POST /init        InitReq     -> 200 StatusResp
 //   POST /subscribe   SubscribeReq-> 200 StatusResp | 400 | 402 | 409
-//   POST /unsubscribe             -> 200 StatusResp
 //   POST /ban         BanReq      -> 200 StatusResp
 // ---------------------------------------------------------------------------
 
+/// What is being charged. `Search` = one similarity search (dinov3); the gateway
+/// sends a synthetic dedupe `path` for it (e.g. "search:sim:{id}").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum MediaKind {
+pub enum ChargeKind {
     Image,
     Video,
+    Search,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChargeReq {
-    /// Full request path, e.g. "/images/abc.webp" — the dedupe key.
+    /// Dedupe key — a media path ("/images/abc.webp") or a search key.
     pub path: String,
-    pub kind: MediaKind,
+    pub kind: ChargeKind,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,8 +43,13 @@ pub struct ChargeResp {
     pub cost: i64,
     /// PAYG points after the charge.
     pub balance: i64,
-    /// Subscription quota after the charge.
-    pub quota_remaining: i64,
+    /// Remaining view-units in the current window; `None` = no active plan or
+    /// unlimited (pro).
+    pub views_remaining: Option<i64>,
+    /// Remaining searches in the current window; `None` = no active plan.
+    pub searches_remaining: Option<i64>,
+    /// Epoch secs when the current usage window resets; 0 = no active window.
+    pub window_reset: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -82,9 +89,14 @@ pub struct StatusResp {
     pub address: String,
     pub balance: i64,
     pub plan: Option<String>,
-    pub quota_remaining: i64,
     /// Epoch secs; 0 = no active subscription.
     pub period_end: u64,
+    /// Remaining view-units this window; `None` = no plan / unlimited (pro).
+    pub views_remaining: Option<i64>,
+    /// Remaining searches this window; `None` = no active plan.
+    pub searches_remaining: Option<i64>,
+    /// Epoch secs when the usage window resets; 0 = no active window.
+    pub window_reset: u64,
     pub banned: bool,
     pub total_views: i64,
 }
@@ -112,6 +124,11 @@ pub struct NonceResp {
 
 #[derive(Debug, Deserialize)]
 pub struct TopupReq {
+    /// "ethereum" | "solana".
+    pub chain: String,
+    /// Token symbol, lowercase: "eth" | "sol" | "usdt" | "usdc".
+    pub token: String,
+    /// Ethereum 0x tx hash, or Solana base58 transaction signature.
     pub tx_hash: String,
 }
 
@@ -124,11 +141,36 @@ pub struct TopupResp {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PaymentRow {
     pub tx_hash: String,
-    pub amount_wei: String,
+    pub chain: String,
     pub token: String,
+    /// Raw base units (wei / lamports / token minor units), decimal string.
+    pub amount: String,
     pub points: i64,
     pub status: String,
     pub created_at: i64,
+}
+
+/// Spot USD prices for the volatile top-up assets (for the account UI).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RatesResp {
+    pub eth_usd: f64,
+    pub sol_usd: f64,
+}
+
+/// Link a Solana wallet to the (ETH) session so its top-ups can be attributed.
+#[derive(Debug, Deserialize)]
+pub struct LinkSolReq {
+    /// base58 Solana address (ed25519 public key).
+    pub solana_address: String,
+    /// base58 ed25519 signature over the link challenge.
+    pub signature: String,
+    /// The nonce embedded in the signed challenge (single-use, from /api/nonce).
+    pub nonce: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LinkSolResp {
+    pub solana_address: String,
 }
 
 #[derive(Debug, Deserialize)]

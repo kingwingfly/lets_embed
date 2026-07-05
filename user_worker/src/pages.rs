@@ -198,17 +198,20 @@ fn plans_table() -> String {
     let mut rows = String::new();
     for p in config::PLANS {
         let id = html_escape(p.id);
+        let views = p
+            .views_per_window
+            .map_or_else(|| "unlimited".to_string(), |v| v.to_string());
         rows.push_str(&format!(
-            r##"<tr><td>{id}</td><td>{price}</td><td>{quota}</td><td>{days}</td>
+            r##"<tr><td>{id}</td><td>{price}</td><td>{views}</td><td>{searches}</td><td>{days}</td>
 <td><button class="btn small subscribe-btn" type="button" data-plan="{id}">Subscribe</button></td></tr>"##,
             price = p.price_points,
-            quota = p.quota_points,
+            searches = p.searches_per_window,
             days = p.period_secs / 86_400,
         ));
     }
     format!(
         r##"<div class="tablewrap"><table>
-<thead><tr><th>Plan</th><th>Price (points)</th><th>Quota (points)</th><th>Period (days)</th><th></th></tr></thead>
+<thead><tr><th>Plan</th><th>Price (points)</th><th>Views / 5h</th><th>Searches / 5h</th><th>Period (days)</th><th></th></tr></thead>
 <tbody>{rows}</tbody></table></div>"##
     )
 }

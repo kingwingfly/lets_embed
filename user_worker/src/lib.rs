@@ -13,8 +13,11 @@ pub mod do_client;
 pub mod likes;
 pub mod pages;
 pub mod payments;
+pub mod rates;
 pub mod session;
 pub mod siwe;
+pub mod solana;
+pub mod solana_link;
 pub mod types;
 
 pub use account_do::UserAccount;
@@ -42,8 +45,12 @@ pub struct AppState {
     pub siwe_domain: Arc<String>,
     pub chain_id: u64,
     pub rpc_url: Arc<String>,
-    /// lowercase 0x-prefixed deposit address for top-ups
+    /// lowercase 0x-prefixed Ethereum deposit address for top-ups
     pub deposit_address: Arc<String>,
+    /// Solana JSON-RPC endpoint used to verify SOL / SPL top-ups
+    pub sol_rpc_url: Arc<String>,
+    /// base58 Solana deposit address for top-ups
+    pub sol_deposit_address: Arc<String>,
     pub team_domain: Arc<String>,
     pub access_aud: Arc<String>,
 }
@@ -65,6 +72,8 @@ async fn router(env: Env, _ctx: Context) -> Result<Router> {
         .map_err(|e| Error::RustError(format!("bad CHAIN_ID: {e}")))?;
     let rpc_url = env.var("RPC_URL")?.to_string();
     let deposit_address = env.var("DEPOSIT_ADDRESS")?.to_string().to_lowercase();
+    let sol_rpc_url = env.var("SOL_RPC_URL")?.to_string();
+    let sol_deposit_address = env.var("SOL_DEPOSIT_ADDRESS")?.to_string();
     let team_domain = env.var("CF_ACCESS_TEAM_DOMAIN")?.to_string();
     let access_aud = env.var("CF_ACCESS_AUD")?.to_string();
 
@@ -75,6 +84,8 @@ async fn router(env: Env, _ctx: Context) -> Result<Router> {
         chain_id,
         rpc_url: Arc::new(rpc_url),
         deposit_address: Arc::new(deposit_address),
+        sol_rpc_url: Arc::new(sol_rpc_url),
+        sol_deposit_address: Arc::new(sol_deposit_address),
         team_domain: Arc::new(team_domain),
         access_aud: Arc::new(access_aud),
     };
@@ -93,7 +104,11 @@ async fn router(env: Env, _ctx: Context) -> Result<Router> {
         .route("/user/api/topup", post(payments::topup))
         .route("/user/api/payments", get(payments::list_payments))
         .route("/user/api/subscribe", post(payments::subscribe))
-        .route("/user/api/unsubscribe", post(payments::unsubscribe))
+        .route("/user/api/rates", get(rates::rates))
+        .route(
+            "/user/api/link_solana",
+            post(solana_link::link).delete(solana_link::unlink),
+        )
         // Likes
         .route(
             "/user/api/like",

@@ -115,16 +115,17 @@ fn is_eth_address(s: &str) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum MediaKind {
+pub enum ChargeKind {
     Image,
     Video,
+    Search,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChargeReq {
-    /// Full request path, e.g. "/images/abc.webp" — the dedupe key.
+    /// Dedupe key — a media path ("/images/abc.webp") or a search key.
     pub path: String,
-    pub kind: MediaKind,
+    pub kind: ChargeKind,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -134,8 +135,12 @@ pub struct ChargeResp {
     pub cost: i64,
     /// PAYG points after the charge.
     pub balance: i64,
-    /// Subscription quota after the charge.
-    pub quota_remaining: i64,
+    /// Remaining view-units in the current window; `None` = no plan / unlimited.
+    pub views_remaining: Option<i64>,
+    /// Remaining searches in the current window; `None` = no active plan.
+    pub searches_remaining: Option<i64>,
+    /// Epoch secs when the usage window resets; 0 = no active window.
+    pub window_reset: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -174,9 +179,9 @@ async fn gateway(
     // charge GET media views against the user's account DO (HEAD is free)
     if method == Method::GET {
         let kind = if path.starts_with("/images/") {
-            Some(MediaKind::Image)
+            Some(ChargeKind::Image)
         } else if path.starts_with("/videos/") {
-            Some(MediaKind::Video)
+            Some(ChargeKind::Video)
         } else {
             None
         };
@@ -217,7 +222,7 @@ fn encode_next(s: &str) -> String {
 }
 
 /// POST /charge to the user's UserAccount durable object; returns the DO status.
-async fn charge_do(st: &AppState, sub: &str, path: &str, kind: MediaKind) -> Result<u16> {
+async fn charge_do(st: &AppState, sub: &str, path: &str, kind: ChargeKind) -> Result<u16> {
     let body = serde_json::to_string(&ChargeReq {
         path: path.to_string(),
         kind,

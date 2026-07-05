@@ -450,7 +450,8 @@ fn render_detail(s: &StatusResp) -> String {
 <dl class="status">
 <dt>Balance</dt><dd>{balance}</dd>
 <dt>Plan</dt><dd>{plan}</dd>
-<dt>Quota remaining</dt><dd>{quota}</dd>
+<dt>Views remaining</dt><dd>{views_rem}</dd>
+<dt>Searches remaining</dt><dd>{searches_rem}</dd>
 <dt>Period end</dt><dd>{period_end}</dd>
 <dt>Total views</dt><dd>{views}</dd>
 <dt>Status</dt><dd>{badge}</dd>
@@ -469,7 +470,12 @@ fn render_detail(s: &StatusResp) -> String {
 </form>
 </div></div>"#,
         balance = s.balance,
-        quota = s.quota_remaining,
+        views_rem = s
+            .views_remaining
+            .map_or_else(|| "unlimited / none".to_string(), |v| v.to_string()),
+        searches_rem = s
+            .searches_remaining
+            .map_or_else(|| "—".to_string(), |v| v.to_string()),
         views = s.total_views,
         badge = banned_badge(s.banned),
     )

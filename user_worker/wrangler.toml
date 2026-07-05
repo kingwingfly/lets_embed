@@ -12,11 +12,15 @@ invocation_logs = true
 [vars]
 # Public hostname the SIWE message must be signed for (the gateway-worker's domain).
 SIWE_DOMAIN = "lets-embed.louisfly.icu"
-# Ethereum JSON-RPC endpoint used to verify top-up transactions.
+# Ethereum JSON-RPC endpoint used to verify ETH/ERC-20 top-ups + Chainlink prices.
 RPC_URL = "https://cloudflare-eth.com"
-# Deposit address users send ETH to (MUST be lowercase). Placeholder — set before deploy.
+# Deposit address users send ETH/ERC-20 to (MUST be lowercase). Placeholder — set before deploy.
 DEPOSIT_ADDRESS = "0x0000000000000000000000000000000000000000"
 CHAIN_ID = "1"
+# Solana JSON-RPC endpoint used to verify SOL / SPL top-ups.
+SOL_RPC_URL = "https://api.mainnet-beta.solana.com"
+# Deposit address users send SOL / SPL tokens to (base58). Placeholder — set before deploy.
+SOL_DEPOSIT_ADDRESS = "REPLACE_WITH_SOLANA_DEPOSIT_ADDRESS"
 # Cloudflare Access application protecting /user/admin* (new Access app — set its AUD).
 CF_ACCESS_TEAM_DOMAIN = "kingwingfly.cloudflareaccess.com"
 CF_ACCESS_AUD = "REPLACE_WITH_NEW_ACCESS_APP_AUD"

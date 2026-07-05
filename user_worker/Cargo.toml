@@ -29,3 +29,6 @@ base64 = "0.22"
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "alloc"] }
 sha3 = "0.10"
 hex = "0.4"
+# Solana wallet-link signature verification (ed25519) + base58 addr/sig codec
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+bs58 = "0.5"
