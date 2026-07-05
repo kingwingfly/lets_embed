@@ -178,6 +178,7 @@ dependencies = [
  "tokio",
  "urlencoding",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 
