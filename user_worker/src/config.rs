@@ -6,7 +6,7 @@ pub const COST_IMAGE_VIEW: i64 = 1;
 /// Points consumed by one video view.
 pub const COST_VIDEO_VIEW: i64 = 5;
 /// Points granted to a brand-new account on first touch.
-pub const FREE_GRANT_POINTS: i64 = 200;
+pub const FREE_GRANT_POINTS: i64 = 3_000;
 /// Repeat views of the same media path within this window are free.
 pub const DEDUPE_WINDOW_SECS: u64 = 86_400;
 /// Session cookie lifetime.

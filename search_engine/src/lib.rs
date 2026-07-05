@@ -431,7 +431,7 @@ impl Engine {
                 .fold(
                     [f32x16::splat(0.0); siglip2::EMBED_DIM / 16],
                     |mut acc, v| {
-                        for (c, x) in acc.iter_mut().zip(v.chunks_exact(16)) {
+                        for (c, x) in acc.iter_mut().zip(v.as_chunks::<16>().0) {
                             *c += f32x16::from_slice(x);
                         }
                         acc
@@ -540,7 +540,7 @@ impl Engine {
                 .fold(
                     [f32x16::splat(0.0); dinov3::EMBED_DIM / 16],
                     |mut acc, v| {
-                        for (c, x) in acc.iter_mut().zip(v.chunks_exact(16)) {
+                        for (c, x) in acc.iter_mut().zip(v.as_chunks::<16>().0) {
                             *c += f32x16::from_slice(x);
                         }
                         acc

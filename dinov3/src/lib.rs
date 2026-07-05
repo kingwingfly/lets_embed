@@ -119,8 +119,7 @@ fn l2_normalize_inplace_simd(data: &mut [f32]) {
     let mut acc1 = f32x16::splat(0.0);
     let mut acc2 = f32x16::splat(0.0);
     let mut acc3 = f32x16::splat(0.0);
-    let chunks = data.chunks_exact(64); // 4 * 16
-    let remainder = chunks.remainder();
+    let (chunks, remainder) = data.as_chunks::<64>(); // 4 * 16
     for c in chunks {
         let v0 = f32x16::from_slice(&c[0..16]);
         let v1 = f32x16::from_slice(&c[16..32]);
@@ -131,7 +130,7 @@ fn l2_normalize_inplace_simd(data: &mut [f32]) {
         acc2 = v2.mul_add(v2, acc2);
         acc3 = v3.mul_add(v3, acc3);
     }
-    for c in remainder.chunks_exact(16) {
+    for c in remainder.as_chunks::<16>().0 {
         let v = f32x16::from_slice(c);
         acc0 = v.mul_add(v, acc0);
     }
@@ -139,7 +138,7 @@ fn l2_normalize_inplace_simd(data: &mut [f32]) {
     let inv = 1.0 / sum_sq.sqrt().max(1e-12);
     let inv_v = f32x16::splat(inv);
 
-    for c in data.chunks_exact_mut(16) {
+    for c in data.as_chunks_mut::<16>().0 {
         let v = f32x16::from_slice(c) * inv_v;
         c.copy_from_slice(v.as_array());
     }

@@ -258,11 +258,10 @@ pub async fn admin_page(
         return forbidden();
     };
 
-    let filter = q
-        .q
-        .as_deref()
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty());
+    let filter =
+        q.q.as_deref()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty());
     let rows = match db_list_users(&st.env, filter.as_deref()).await {
         Ok(r) => r,
         Err(e) => {

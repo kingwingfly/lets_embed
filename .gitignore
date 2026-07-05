@@ -10,3 +10,4 @@ rustc-ice*
 node_modules
 .wrangler
 gateway_worker/build
+.claude
