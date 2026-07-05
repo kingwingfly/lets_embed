@@ -2120,13 +2120,11 @@ dependencies = [
  "base64 0.22.1",
  "getrandom 0.2.17",
  "hmac 0.13.0",
- "rsa 0.10.0-rc.18",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tower-cookies",
  "tower-service",
- "uuid",
  "worker",
 ]
 
