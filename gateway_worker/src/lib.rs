@@ -77,7 +77,7 @@ async fn fetch(req: HttpRequest, env: Env, ctx: Context) -> Result<Response> {
 
 #[derive(Serialize, Deserialize)]
 struct SessionClaims {
-    sub: String, // lowercase 0x eth address
+    sub: String, // session principal: lowercase 0x eth address (SIWE) or base58 Solana pubkey (SIWS)
     iat: u64,
     exp: u64,
 }
@@ -93,9 +93,9 @@ fn jwt_verify(token: &str, secret: &[u8], now: u64) -> Option<SessionClaims> {
     mac.update(payload.as_bytes());
     mac.verify_slice(&sig).ok()?;
     let c: SessionClaims = serde_json::from_slice(&B64.decode(payload).ok()?).ok()?;
-    // the address check rejects legacy `gw_token` values (UUID subs) signed
+    // the principal check rejects legacy `gw_token` values (UUID subs) signed
     // with the same secret
-    (c.exp >= now && is_eth_address(&c.sub)).then_some(c)
+    (c.exp >= now && is_valid_principal(&c.sub)).then_some(c)
 }
 
 /// Lowercase 0x-prefixed 20-byte hex address.
@@ -105,6 +105,19 @@ fn is_eth_address(s: &str) -> bool {
         && s[2..]
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A base58-encoded 32-byte Solana ed25519 public key. Format-disjoint from
+/// `is_eth_address` (base58 excludes `0`, so `0x…` never decodes). MUST match
+/// `user_worker::session::is_sol_principal` — this is a duplicated trust boundary.
+fn is_sol_principal(s: &str) -> bool {
+    (32..=44).contains(&s.len())
+        && matches!(bs58::decode(s).into_vec(), Ok(v) if v.len() == 32)
+}
+
+/// A valid session principal: an Ethereum address (SIWE) or a Solana pubkey (SIWS).
+fn is_valid_principal(s: &str) -> bool {
+    is_eth_address(s) || is_sol_principal(s)
 }
 
 // ---------------------------------------------------------------------------

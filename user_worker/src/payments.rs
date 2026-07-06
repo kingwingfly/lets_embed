@@ -339,9 +339,11 @@ async fn topup_solana(
         return api_err(StatusCode::BAD_REQUEST, "invalid transaction signature");
     }
 
-    // 2) the top-up must originate from a linked Solana wallet
+    // 2) the top-up must originate from a linked Solana wallet — or, for a
+    //    standalone Solana (SIWS) account, from the account's own principal.
     let linked = match linked_solana(&st.env, addr).await {
         Ok(Some(l)) => l,
+        Ok(None) if session::is_sol_principal(addr) => addr.to_string(),
         Ok(None) => {
             return api_err(
                 StatusCode::BAD_REQUEST,

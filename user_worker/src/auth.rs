@@ -4,6 +4,9 @@
 //!   (`NONCE_BINDING`) under "nonce:{nonce}" with `NONCE_TTL_SECS`.
 //! - POST /user/api/verify Json(VerifyReq) -> 200 Json(VerifyResp) + session
 //!   cookie | 400/401 Json(ApiError) | 403 banned.
+//! - POST /user/api/verify_solana Json(SiwsReq) -> 200 Json(VerifyResp) + session
+//!   cookie | 400/401 | 403 banned | 409 (address linked elsewhere). SIWS login:
+//!   the principal is the base58 Solana pubkey (standalone account).
 //! - POST /user/api/logout -> clears the cookie.
 //! - GET  /user/api/me     -> 200 Json(StatusResp) | 401.
 
@@ -16,8 +19,8 @@ use axum::{
 use serde::Deserialize;
 use tower_cookies::Cookies;
 
-use crate::types::{ApiError, NonceResp, VerifyReq, VerifyResp};
-use crate::{AppState, config, do_client, session, siwe};
+use crate::types::{ApiError, NonceResp, SiwsReq, VerifyReq, VerifyResp};
+use crate::{AppState, config, do_client, session, siwe, solana_link};
 
 fn api_error(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(ApiError { error: msg.into() })).into_response()
@@ -206,6 +209,164 @@ pub async fn verify(
     .into_response()
 }
 
+/// The exact challenge a Solana wallet signs to log in (SIWS). Domain-bound and
+/// nonce-bound; MUST match the login-page JS byte for byte.
+pub fn siws_challenge(domain: &str, nonce: &str) -> String {
+    format!("Sign in to lets_embed with Solana\nDomain: {domain}\nNonce: {nonce}")
+}
+
+/// Sign-In-With-Solana: authenticate with a Solana wallet as a standalone
+/// account whose principal is the base58 pubkey. Mirrors [`verify`] (the SIWE
+/// path) but proves control with an ed25519 signature over [`siws_challenge`].
+#[worker::send]
+pub async fn verify_solana(
+    State(st): State<AppState>,
+    cookies: Cookies,
+    Json(req): Json<SiwsReq>,
+) -> Response {
+    // 1) The address must be a well-formed Solana principal.
+    if !session::is_sol_principal(&req.solana_address) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid solana address");
+    }
+
+    // 2) Single-use nonce: must exist in KV, then delete it.
+    let kv = match st.env.kv(crate::NONCE_BINDING) {
+        Ok(kv) => kv,
+        Err(e) => {
+            worker::console_error!("kv binding failed: {e:?}");
+            return internal_error();
+        }
+    };
+    let nonce_key = format!("nonce:{}", req.nonce);
+    match kv.get(&nonce_key).text().await {
+        Ok(Some(_)) => {}
+        Ok(None) => return api_error(StatusCode::UNAUTHORIZED, "unknown or expired nonce"),
+        Err(e) => {
+            worker::console_error!("nonce get failed: {e:?}");
+            return internal_error();
+        }
+    }
+    if let Err(e) = kv.delete(&nonce_key).await {
+        worker::console_error!("nonce delete failed: {e:?}");
+        return internal_error();
+    }
+
+    // 3) Verify the ed25519 signature over the SIWS challenge.
+    let msg = siws_challenge(st.siwe_domain.as_str(), &req.nonce);
+    if !solana_link::verify_ed25519_b58(&req.solana_address, &req.signature, &msg) {
+        return api_error(StatusCode::UNAUTHORIZED, "signature verification failed");
+    }
+
+    let addr = req.solana_address;
+    let now = session::now_secs();
+
+    let db = match st.env.d1(crate::D1_BINDING) {
+        Ok(db) => db,
+        Err(e) => {
+            worker::console_error!("d1 binding failed: {e:?}");
+            return internal_error();
+        }
+    };
+
+    // 4) Coexistence: a Solana address that is a LINKED wallet of some ETH account
+    // cannot also be a standalone account.
+    #[derive(Deserialize)]
+    struct AddrRow {
+        #[allow(dead_code)]
+        address: String,
+    }
+    let linked = match db
+        .prepare("SELECT address FROM users WHERE solana_address = ?")
+        .bind(&[addr.as_str().into()])
+    {
+        Ok(stmt) => match stmt.first::<AddrRow>(None).await {
+            Ok(row) => row,
+            Err(e) => {
+                worker::console_error!("linked lookup failed: {e:?}");
+                return internal_error();
+            }
+        },
+        Err(e) => {
+            worker::console_error!("linked lookup bind failed: {e:?}");
+            return internal_error();
+        }
+    };
+    if linked.is_some() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "this wallet is linked to another account — unlink it there first",
+        );
+    }
+
+    // 5) Upsert the user row, then check the ban flag (mirrors `verify`).
+    let upsert = db
+        .prepare(
+            "INSERT INTO users (address, created_at, last_login) VALUES (?, ?, ?) \
+             ON CONFLICT(address) DO UPDATE SET last_login = excluded.last_login",
+        )
+        .bind(&[
+            addr.as_str().into(),
+            (now as f64).into(),
+            (now as f64).into(),
+        ]);
+    match upsert {
+        Ok(stmt) => {
+            if let Err(e) = stmt.run().await {
+                worker::console_error!("user upsert failed: {e:?}");
+                return internal_error();
+            }
+        }
+        Err(e) => {
+            worker::console_error!("user upsert bind failed: {e:?}");
+            return internal_error();
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct BanRow {
+        banned: i64,
+    }
+    let banned = match db
+        .prepare("SELECT banned FROM users WHERE address = ?")
+        .bind(&[addr.as_str().into()])
+    {
+        Ok(stmt) => match stmt.first::<BanRow>(None).await {
+            Ok(row) => row.is_some_and(|r| r.banned != 0),
+            Err(e) => {
+                worker::console_error!("ban check failed: {e:?}");
+                return internal_error();
+            }
+        },
+        Err(e) => {
+            worker::console_error!("ban check bind failed: {e:?}");
+            return internal_error();
+        }
+    };
+    if banned {
+        return api_error(StatusCode::FORBIDDEN, "account banned");
+    }
+
+    // 6) Ensure the Durable Object account exists (free grant on first touch).
+    if let Err(e) = do_client::do_init(&st.env, &addr).await {
+        worker::console_error!("do init failed: {e:?}");
+        return internal_error();
+    }
+
+    // 7) Issue the session cookie (sub = the Solana principal).
+    let claims = session::SessionClaims {
+        sub: addr.clone(),
+        iat: now,
+        exp: now + config::SESSION_TTL_SECS,
+    };
+    let token = session::jwt_sign(&claims, &st.jwt_secret);
+    cookies.add(session::make_session_cookie(
+        token,
+        config::SESSION_TTL_SECS as i64,
+    ));
+
+    Json(VerifyResp { address: addr }).into_response()
+}
+
 #[worker::send]
 pub async fn logout(cookies: Cookies) -> Response {
     cookies.add(session::clear_session_cookie());
@@ -223,5 +384,36 @@ pub async fn me(State(st): State<AppState>, cookies: Cookies) -> Response {
             worker::console_error!("do status failed: {e:?}");
             internal_error()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn siws_challenge_is_deterministic() {
+        assert_eq!(
+            siws_challenge("app.example.com", "n1"),
+            "Sign in to lets_embed with Solana\nDomain: app.example.com\nNonce: n1"
+        );
+    }
+
+    #[test]
+    fn siws_signature_roundtrip_verifies() {
+        // A wallet signs the exact challenge; the shared verifier must accept it,
+        // and the signing key's base58 pubkey is a valid Solana principal.
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let pk_b58 = bs58::encode(sk.verifying_key().to_bytes()).into_string();
+        assert!(session::is_sol_principal(&pk_b58));
+
+        let msg = siws_challenge("app.example.com", "nonce-xyz");
+        let sig_b58 = bs58::encode(sk.sign(msg.as_bytes()).to_bytes()).into_string();
+        assert!(solana_link::verify_ed25519_b58(&pk_b58, &sig_b58, &msg));
+
+        // wrong domain in the rebuilt challenge must fail
+        let other = siws_challenge("evil.example.com", "nonce-xyz");
+        assert!(!solana_link::verify_ed25519_b58(&pk_b58, &sig_b58, &other));
     }
 }

@@ -21,3 +21,4 @@ serde_json.workspace = true
 hmac = "0.13"
 sha2 = "0.11"
 base64 = "0.22"
+bs58 = "0.5"
