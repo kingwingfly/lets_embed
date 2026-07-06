@@ -365,7 +365,7 @@ __PRICING__
 <select id="topup-token"></select>
 <div id="sol-link" hidden>
 <p class="sub" style="margin:0 0 10px" id="sol-linked-state">No Solana wallet linked yet.</p>
-<p class="sub" style="margin:0 0 10px">Solana top-ups must originate from your linked wallet.</p>
+<p class="sub" style="margin:0 0 10px">Solana top-ups must originate from your linked wallet. Works with MetaMask (Solana account), Phantom, or another Solana wallet.</p>
 <button class="btn small" type="button" id="sol-link-btn">Link Solana wallet</button>
 <div class="msg" id="sol-link-msg" hidden></div>
 </div>
@@ -542,12 +542,83 @@ async function loadLink() {
   } catch (_) {}
 }
 
-document.getElementById("sol-link-btn").addEventListener("click", async function () {
-  var provider = window.solana || (window.phantom && window.phantom.solana);
-  if (!provider || !provider.connect) {
-    setMsg("sol-link-msg", "No Solana wallet found. Install Phantom, or open this page in your wallet app's in-app browser.", "err");
-    return;
+// ---- Solana wallet discovery (Wallet Standard) ---------------------------
+// Modern Solana-capable wallets — including MetaMask (multichain accounts),
+// Phantom, Solflare and Backpack — announce themselves via the Wallet Standard
+// rather than a single injected `window.solana`. We run the standard app<->wallet
+// handshake so any of them is discoverable, then fall back to a legacy injected
+// provider (older Phantom) if no standard wallet registers.
+var solWallets = [];
+(function () {
+  function register() {
+    for (var i = 0; i < arguments.length; i++) {
+      if (solWallets.indexOf(arguments[i]) === -1) solWallets.push(arguments[i]);
+    }
+    return function () {};
   }
+  var api = { register: register, get: function () { return solWallets.slice(); }, on: function () { return function () {}; } };
+  try {
+    window.addEventListener("wallet-standard:register-wallet", function (ev) { ev.detail(api); });
+  } catch (e) {}
+  try {
+    window.dispatchEvent(new CustomEvent("wallet-standard:app-ready", { detail: api }));
+  } catch (e) {}
+})();
+
+// A registered wallet that can connect + sign a message on Solana.
+function pickSolanaWallet() {
+  for (var i = 0; i < solWallets.length; i++) {
+    var f = solWallets[i] && solWallets[i].features;
+    if (f && f["solana:signMessage"] && f["standard:connect"]) return solWallets[i];
+  }
+  return null;
+}
+
+// Prefer an account that advertises a Solana chain; else the first account.
+function pickSolanaAccount(accounts) {
+  for (var i = 0; i < accounts.length; i++) {
+    var chains = accounts[i].chains || [];
+    for (var j = 0; j < chains.length; j++) {
+      if (chains[j].indexOf("solana:") === 0) return accounts[i];
+    }
+  }
+  return accounts.length ? accounts[0] : null;
+}
+
+// Resolve a { address, sign(msgBytes) -> Uint8Array } signer, or null if no
+// Solana-capable wallet is available. Connecting may prompt the wallet.
+async function getSolanaSigner() {
+  var w = pickSolanaWallet();
+  if (w) {
+    var res = await w.features["standard:connect"].connect();
+    var accounts = (res && res.accounts && res.accounts.length ? res.accounts : w.accounts) || [];
+    var account = pickSolanaAccount(accounts);
+    if (!account) throw new Error("No Solana account in this wallet — enable one (e.g. in MetaMask) and try again.");
+    return {
+      address: account.address,
+      sign: async function (msgBytes) {
+        var out = await w.features["solana:signMessage"].signMessage({ account: account, message: msgBytes });
+        return out[0].signature;
+      },
+    };
+  }
+  var provider = window.solana || (window.phantom && window.phantom.solana);
+  if (provider && provider.connect) {
+    var conn = await provider.connect();
+    var pk = provider.publicKey || (conn && conn.publicKey);
+    if (!pk) throw new Error("wallet did not return a public key");
+    return {
+      address: pk.toString(),
+      sign: async function (msgBytes) {
+        var signed = await provider.signMessage(msgBytes, "utf8");
+        return signed && signed.signature ? signed.signature : signed;
+      },
+    };
+  }
+  return null;
+}
+
+document.getElementById("sol-link-btn").addEventListener("click", async function () {
   if (!currentMe || !currentMe.address) {
     setMsg("sol-link-msg", "Account still loading — try again in a moment.", "err");
     return;
@@ -555,17 +626,18 @@ document.getElementById("sol-link-btn").addEventListener("click", async function
   var btn = document.getElementById("sol-link-btn");
   btn.disabled = true;
   try {
-    var conn = await provider.connect();
-    var pk = provider.publicKey || (conn && conn.publicKey);
-    if (!pk) throw new Error("wallet did not return a public key");
-    var solAddr = pk.toString();
+    var signer = await getSolanaSigner();
+    if (!signer) {
+      setMsg("sol-link-msg", "No Solana-capable wallet found. Enable Solana in MetaMask (or install Phantom / another Solana wallet), then reload this page.", "err");
+      return;
+    }
+    var solAddr = signer.address;
     var nr = await fetch("/user/api/nonce");
     if (!nr.ok) throw new Error("failed to fetch nonce (" + nr.status + ")");
     var nonce = (await nr.json()).nonce;
     // MUST match solana_link::challenge_message byte for byte.
     var message = "Link Solana wallet to " + currentMe.address + "\nNonce: " + nonce;
-    var signed = await provider.signMessage(new TextEncoder().encode(message), "utf8");
-    var sigBytes = signed && signed.signature ? signed.signature : signed;
+    var sigBytes = await signer.sign(new TextEncoder().encode(message));
     var sigB58 = typeof sigBytes === "string" ? sigBytes : bs58encode(sigBytes);
     var r = await fetch("/user/api/link_solana", {
       method: "POST",
