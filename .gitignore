@@ -11,3 +11,4 @@ node_modules
 .wrangler
 gateway_worker/build
 .claude
+cloudbuild-search-cpu.yaml
