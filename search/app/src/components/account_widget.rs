@@ -139,17 +139,14 @@ pub fn AccountWidget() -> impl IntoView {
         });
     });
 
-    // Shared card idiom for the float panel.
-    // Outer wrapper handles positioning + hover reveal. Its `pt-2` is a
-    // transparent bridge so moving the pointer from the chip into the card
-    // doesn't cross a dead gap that would drop `group-hover`. When `open`
-    // (tapped), the panel is forced visible regardless of hover.
+    // Shared card idiom for the float panel. Visibility is driven solely by the
+    // `open` signal (click/tap toggle) so behaviour is identical on desktop and
+    // touch: a CSS `:hover` reveal was removed because it fought the toggle —
+    // on desktop the lingering hover kept the panel open after a close-click,
+    // and on touch the sticky emulated `:hover` made tap-to-close impossible.
     let panel_cls = move || {
         let base = "absolute right-0 top-full pt-2 w-56 max-w-[calc(100vw-2rem)] z-50 \
-            origin-top-right transition-all duration-150 \
-            group-hover:opacity-100 group-hover:scale-100 group-hover:pointer-events-auto \
-            group-focus-within:opacity-100 group-focus-within:scale-100 \
-            group-focus-within:pointer-events-auto";
+            origin-top-right transition-all duration-150";
         if open.get() {
             format!("{base} opacity-100 scale-100 pointer-events-auto")
         } else {
@@ -160,7 +157,7 @@ pub fn AccountWidget() -> impl IntoView {
         shadow-lg shadow-sky-200/50 p-4 text-sm text-slate-700";
 
     view! {
-        <div class="relative group shrink-0">
+        <div class="relative shrink-0">
             // Tap-outside backdrop: only rendered while expanded so a tap
             // anywhere (including the chip) collapses the panel on touch.
             {move || open.get().then(|| view! {
