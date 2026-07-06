@@ -153,8 +153,11 @@ if (!window.ethereum) {
   if (isMobile) {
     // Mobile browsers have no injected provider. Offer deep links that reopen
     // THIS page inside a wallet app's in-app browser (which injects one).
-    // MetaMask universal link: host+path+query, no scheme.
-    var mmUrl = "https://metamask.app.link/dapp/" +
+    // link.metamask.io is MetaMask's current deeplink host: host+path+query,
+    // no scheme. The legacy metamask.app.link (Branch) link could reopen the
+    // dapp over http:// and 404 with "this page doesn't exist" on HTTPS-only
+    // sites — see MetaMask/metamask-mobile#3816.
+    var mmUrl = "https://link.metamask.io/dapp/" +
       location.host + location.pathname + location.search;
     // Phantom universal link: full https URL, encoded; ref = origin.
     var phUrl = "https://phantom.app/ul/browse/" +
