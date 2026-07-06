@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 //   POST /credit      CreditReq   -> 200 BalanceResp
 //   GET  /status                  -> 200 StatusResp
 //   POST /init        InitReq     -> 200 StatusResp
-//   POST /subscribe   SubscribeReq-> 200 StatusResp | 400 | 402 | 409
+//   POST /subscribe   SubscribeReq-> 200 StatusResp | 400 | 402
+//   POST /unsubscribe             -> 200 StatusResp
 //   POST /ban         BanReq      -> 200 StatusResp
 // ---------------------------------------------------------------------------
 

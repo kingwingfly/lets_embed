@@ -39,6 +39,12 @@ pub struct CreditForm {
     /// May be negative to deduct.
     pub points: i64,
     pub reason: String,
+    /// Per-render idempotency token embedded in the credit form. Reused verbatim
+    /// as the DO credit key so an accidental resubmission (browser refresh /
+    /// double-click) dedupes instead of applying the credit twice. Optional for
+    /// backward compatibility with an already-open older form.
+    #[serde(default)]
+    pub token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -303,9 +309,16 @@ pub async fn credit(
         return resp;
     }
 
+    // Prefer the form's idempotency token so a refresh/replay of the same form
+    // dedupes in the DO; fall back to a fresh uuid only if it's missing.
+    let token = if form.token.trim().is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        form.token.clone()
+    };
     let req = CreditReq {
         points: form.points,
-        key: format!("admin:{}", uuid::Uuid::new_v4()),
+        key: format!("admin:{token}"),
         reason: form.reason,
     };
     if let Err(e) = do_client::do_credit(&st.env, &form.address, &req).await {
@@ -474,6 +487,7 @@ fn render_detail(s: &StatusResp) -> String {
 <div class="actions">
 <form method="post" action="/user/admin/credit">
 <input type="hidden" name="address" value="{addr}">
+<input type="hidden" name="token" value="{token}">
 <input type="number" name="points" required placeholder="points (&plusmn;)">
 <input type="text" name="reason" required placeholder="reason">
 <button class="btn" type="submit">Credit</button>
@@ -487,6 +501,7 @@ fn render_detail(s: &StatusResp) -> String {
         balance = s.balance,
         views = s.total_views,
         badge = banned_badge(s.banned),
+        token = uuid::Uuid::new_v4(),
     )
 }
 
@@ -522,7 +537,7 @@ fn render_admin(email: &str, q: &str, rows: &[UserRow], detail: Option<&StatusRe
         for r in rows {
             let addr = html_escape(&r.address);
             body.push_str(&format!(
-                r#"<tr><td class="mono"><a href="?address={addr}">{addr}</a></td>
+                r#"<tr><td class="mono"><a href="/user/admin?address={addr}">{addr}</a></td>
 <td>{created}</td><td>{login}</td><td>{plan}</td><td>{badge}</td></tr>"#,
                 created = fmt_ts(r.created_at),
                 login = fmt_ts(r.last_login),
