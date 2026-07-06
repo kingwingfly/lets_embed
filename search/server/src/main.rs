@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod cli;
+mod previews;
 
 use app::*;
 use axum::Router;
@@ -52,6 +53,10 @@ async fn main() -> anyhow::Result<()> {
             .nest_service("/videos", ServeDir::new(&prefix))
     }
     let app = app
+        .route(
+            "/api/like_previews",
+            axum::routing::get(previews::like_previews),
+        )
         .leptos_routes_with_context(
             &app_state,
             routes,
