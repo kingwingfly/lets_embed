@@ -76,6 +76,7 @@ ul.likes{list-style:none;margin:0;padding:0}
 ul.likes li{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)}
 ul.likes li .date{margin-left:auto;color:var(--muted);font-size:12px;white-space:nowrap}
 .links{margin-top:18px;display:flex;gap:16px;flex-wrap:wrap}
+[hidden]{display:none!important}
 </style>"##;
 
 fn page(title: &str, body: &str) -> String {
@@ -225,7 +226,7 @@ const ACCOUNT_BODY: &str = r##"<div class="card">
 <dl class="stats">
 <dt>Balance</dt><dd id="acct-balance">&mdash;</dd>
 <dt>Plan</dt><dd id="acct-plan">&mdash;</dd>
-<dt>Quota remaining</dt><dd id="acct-quota">&mdash;</dd>
+<dt>Usage left</dt><dd id="acct-quota">&mdash;</dd>
 <dt>Period ends</dt><dd id="acct-period-end">&mdash;</dd>
 <dt>Total views</dt><dd id="acct-views">&mdash;</dd>
 </dl>
@@ -299,7 +300,12 @@ async function loadMe() {
   setText("acct-address", me.address);
   setText("acct-balance", String(me.balance) + " points");
   setText("acct-plan", me.plan ? me.plan : "none");
-  setText("acct-quota", String(me.quota_remaining) + " points");
+  var hasPlan = !!me.plan;
+  var viewsStr = me.views_remaining != null
+    ? String(me.views_remaining)
+    : (hasPlan ? "unlimited" : "—");
+  var searchesStr = me.searches_remaining != null ? String(me.searches_remaining) : "—";
+  setText("acct-quota", "Views: " + viewsStr + "  ·  Searches: " + searchesStr);
   setText("acct-period-end", me.period_end ? fmtDate(me.period_end) : "—");
   setText("acct-views", String(me.total_views));
   document.getElementById("banned-badge").hidden = !me.banned;
