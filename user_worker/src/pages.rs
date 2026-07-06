@@ -354,11 +354,24 @@ __PRICING__
 
 <div class="card">
 <h2>Top up</h2>
-<p class="sub">Send ETH to the deposit address below, then paste the transaction hash to credit your balance.</p>
-<label>Deposit address</label>
-<p class="meta">__DEPOSIT_ADDRESS__</p>
+<p class="sub">Pick an asset, send it to the deposit address shown, then paste the transaction hash (Ethereum) or signature (Solana) to credit your balance. Stablecoins price at $1; ETH/SOL use a live price feed.</p>
 <form id="topup-form">
-<label for="tx-hash">Transaction hash</label>
+<label for="topup-chain">Chain</label>
+<select id="topup-chain">
+<option value="ethereum">Ethereum</option>
+<option value="solana">Solana</option>
+</select>
+<label for="topup-token">Asset</label>
+<select id="topup-token"></select>
+<div id="sol-link" hidden>
+<p class="sub" style="margin:0 0 10px" id="sol-linked-state">No Solana wallet linked yet.</p>
+<p class="sub" style="margin:0 0 10px">Solana top-ups must originate from your linked wallet.</p>
+<button class="btn small" type="button" id="sol-link-btn">Link Solana wallet</button>
+<div class="msg" id="sol-link-msg" hidden></div>
+</div>
+<label>Deposit address</label>
+<p class="meta" id="deposit-address">__DEPOSIT_ADDRESS__</p>
+<label for="tx-hash" id="tx-label">Transaction hash</label>
 <input type="text" id="tx-hash" placeholder="0x&hellip;" autocomplete="off" required>
 <button class="btn full" type="submit" id="topup-btn">Credit top-up</button>
 </form>
@@ -378,7 +391,7 @@ __PLANS_TABLE__
 <div class="card">
 <h2>Payment history</h2>
 <div class="tablewrap"><table>
-<thead><tr><th>Tx</th><th>Amount (wei)</th><th>Token</th><th>Points</th><th>Status</th><th>Date</th></tr></thead>
+<thead><tr><th>Tx</th><th>Chain</th><th>Asset</th><th>Amount</th><th>Points</th><th>Status</th><th>Date</th></tr></thead>
 <tbody id="payments-body"></tbody>
 </table></div>
 <div class="empty" id="payments-empty" hidden>No payments yet.</div>
@@ -446,7 +459,7 @@ async function loadPayments() {
   for (var i = 0; i < rows.length; i++) {
     var p = rows[i];
     var tr = document.createElement("tr");
-    var cells = [p.tx_hash, p.amount_wei, p.token, String(p.points), p.status, fmtDate(p.created_at)];
+    var cells = [p.tx_hash, p.chain, (p.token || "").toUpperCase(), p.amount, String(p.points), p.status, fmtDate(p.created_at)];
     for (var j = 0; j < cells.length; j++) {
       var td = document.createElement("td");
       if (j === 0) td.className = "meta";
@@ -457,8 +470,132 @@ async function loadPayments() {
   }
 }
 
+// ---- Top-up: chain / asset selection -------------------------------------
+// Deposit addresses (server-substituted) and the accepted assets per chain.
+// Asset lists MUST match the server-side token registry (config::TOKENS).
+var DEPOSIT = { ethereum: "__DEPOSIT_ADDRESS__", solana: "__SOL_DEPOSIT_ADDRESS__" };
+var ASSETS = {
+  ethereum: [["eth", "ETH"], ["usdt", "USDT"], ["usdc", "USDC"]],
+  solana: [["sol", "SOL"], ["usdt", "USDT"], ["usdc", "USDC"]],
+};
+var chainSel = document.getElementById("topup-chain");
+var tokenSel = document.getElementById("topup-token");
+var linkedSol = null;
+
+function applyChain() {
+  var chain = chainSel.value;
+  // Rebuild the asset dropdown for this chain.
+  tokenSel.textContent = "";
+  var opts = ASSETS[chain] || [];
+  for (var i = 0; i < opts.length; i++) {
+    var o = document.createElement("option");
+    o.value = opts[i][0];
+    o.textContent = opts[i][1];
+    tokenSel.appendChild(o);
+  }
+  document.getElementById("deposit-address").textContent = DEPOSIT[chain] || "";
+  document.getElementById("sol-link").hidden = chain !== "solana";
+  var eth = chain === "ethereum";
+  document.getElementById("tx-label").textContent = eth ? "Transaction hash" : "Transaction signature";
+  document.getElementById("tx-hash").placeholder = eth ? "0x…" : "base58 signature…";
+}
+chainSel.addEventListener("change", applyChain);
+applyChain();
+
+// Minimal base58 (Bitcoin alphabet) encoder for the wallet's signature bytes.
+// Canonical base-x algorithm: each leading zero byte becomes one "1", and the
+// leading-zeros loop stops one short of the end so an all-zero input still emits
+// its final digit (matches the bs58 crate the server verifies with).
+function bs58encode(bytes) {
+  var ALPH = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  if (bytes.length === 0) return "";
+  var digits = [0];
+  for (var i = 0; i < bytes.length; i++) {
+    var carry = bytes[i];
+    for (var j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) { digits.push(carry % 58); carry = (carry / 58) | 0; }
+  }
+  var str = "";
+  for (var k = 0; k < bytes.length - 1 && bytes[k] === 0; k++) str += "1";
+  for (var q = digits.length - 1; q >= 0; q--) str += ALPH[digits[q]];
+  return str;
+}
+
+function setLinked(addr) {
+  linkedSol = addr || null;
+  document.getElementById("sol-linked-state").textContent =
+    linkedSol ? ("Linked wallet: " + linkedSol) : "No Solana wallet linked yet.";
+  document.getElementById("sol-link-btn").textContent =
+    linkedSol ? "Change linked wallet" : "Link Solana wallet";
+}
+
+async function loadLink() {
+  try {
+    var r = await fetch("/user/api/link_solana");
+    if (!r.ok) return;
+    var d = await r.json();
+    setLinked(d.solana_address);
+  } catch (_) {}
+}
+
+document.getElementById("sol-link-btn").addEventListener("click", async function () {
+  var provider = window.solana || (window.phantom && window.phantom.solana);
+  if (!provider || !provider.connect) {
+    setMsg("sol-link-msg", "No Solana wallet found. Install Phantom, or open this page in your wallet app's in-app browser.", "err");
+    return;
+  }
+  if (!currentMe || !currentMe.address) {
+    setMsg("sol-link-msg", "Account still loading — try again in a moment.", "err");
+    return;
+  }
+  var btn = document.getElementById("sol-link-btn");
+  btn.disabled = true;
+  try {
+    var conn = await provider.connect();
+    var pk = provider.publicKey || (conn && conn.publicKey);
+    if (!pk) throw new Error("wallet did not return a public key");
+    var solAddr = pk.toString();
+    var nr = await fetch("/user/api/nonce");
+    if (!nr.ok) throw new Error("failed to fetch nonce (" + nr.status + ")");
+    var nonce = (await nr.json()).nonce;
+    // MUST match solana_link::challenge_message byte for byte.
+    var message = "Link Solana wallet to " + currentMe.address + "\nNonce: " + nonce;
+    var signed = await provider.signMessage(new TextEncoder().encode(message), "utf8");
+    var sigBytes = signed && signed.signature ? signed.signature : signed;
+    var sigB58 = typeof sigBytes === "string" ? sigBytes : bs58encode(sigBytes);
+    var r = await fetch("/user/api/link_solana", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ solana_address: solAddr, signature: sigB58, nonce: nonce }),
+    });
+    if (r.ok) {
+      var lr = await r.json();
+      setLinked(lr.solana_address);
+      setMsg("sol-link-msg", "Wallet linked. You can now top up with SOL/USDT/USDC.", "ok");
+    } else {
+      var err;
+      try { err = (await r.json()).error; } catch (_) {}
+      setMsg("sol-link-msg", err || "link failed (" + r.status + ")", "err");
+    }
+  } catch (e) {
+    setMsg("sol-link-msg", e && e.message ? e.message : String(e), "err");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 document.getElementById("topup-form").addEventListener("submit", async function (ev) {
   ev.preventDefault();
+  var chain = chainSel.value;
+  var token = tokenSel.value;
+  if (chain === "solana" && !linkedSol) {
+    setMsg("topup-msg", "Link your Solana wallet first (button above) so this top-up can be attributed to you.", "err");
+    return;
+  }
   var btn = document.getElementById("topup-btn");
   btn.disabled = true;
   try {
@@ -466,7 +603,7 @@ document.getElementById("topup-form").addEventListener("submit", async function 
     var r = await fetch("/user/api/topup", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ tx_hash: txHash }),
+      body: JSON.stringify({ chain: chain, token: token, tx_hash: txHash }),
     });
     if (r.ok) {
       var res = await r.json();
@@ -559,6 +696,7 @@ document.getElementById("logout-btn").addEventListener("click", async function (
 
 loadMe();
 loadPayments();
+loadLink();
 </script>"##;
 
 #[worker::send]
@@ -568,6 +706,10 @@ pub async fn account_page(State(st): State<AppState>, cookies: Cookies) -> Respo
     }
     let body = ACCOUNT_BODY
         .replace("__DEPOSIT_ADDRESS__", &html_escape(&st.deposit_address))
+        .replace(
+            "__SOL_DEPOSIT_ADDRESS__",
+            &html_escape(&st.sol_deposit_address),
+        )
         .replace("__PRICING__", &pricing_table())
         .replace("__PLANS_TABLE__", &plans_table());
     Html(page("Account — lets_embed", &body)).into_response()

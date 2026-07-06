@@ -110,7 +110,9 @@ async fn router(env: Env, _ctx: Context) -> Result<Router> {
         .route("/user/api/rates", get(rates::rates))
         .route(
             "/user/api/link_solana",
-            post(solana_link::link).delete(solana_link::unlink),
+            get(solana_link::link_status)
+                .post(solana_link::link)
+                .delete(solana_link::unlink),
         )
         // Likes
         .route(

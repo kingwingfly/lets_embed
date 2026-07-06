@@ -178,6 +178,12 @@ pub struct LinkSolResp {
     pub solana_address: String,
 }
 
+/// Current Solana wallet linked to the session, if any (GET /user/api/link_solana).
+#[derive(Debug, Serialize)]
+pub struct LinkStatusResp {
+    pub solana_address: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LikeReq {
     /// "post" | "image" | "video"
