@@ -105,6 +105,63 @@ struct RpcReceipt {
     status: Option<String>,
     #[serde(rename = "blockNumber")]
     block_number: Option<String>,
+    /// Event logs emitted by the tx (used to verify ERC-20 `Transfer`s). The
+    /// native-ETH path ignores these, so default to empty when absent.
+    #[serde(default)]
+    logs: Vec<RpcLog>,
+}
+
+/// One entry of `receipt.logs[]` (fields we care about for an ERC-20 transfer).
+#[derive(Debug, Deserialize)]
+struct RpcLog {
+    /// Emitting contract address (0x, possibly EIP-55 mixed-case).
+    address: String,
+    /// Indexed event params. `Transfer`: [keccak(sig), from, to].
+    topics: Vec<String>,
+    /// ABI-encoded non-indexed params. `Transfer`: the uint256 value.
+    data: String,
+}
+
+/// keccak256("Transfer(address,address,uint256)") — the ERC-20 `Transfer`
+/// event signature (`topics[0]`).
+const TRANSFER_TOPIC0: &str =
+    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+/// The 20-byte address packed into a 32-byte indexed topic: strip `0x`, take
+/// the low 40 hex nibbles, lowercased. Robust to nodes that omit zero padding.
+fn topic_address(topic: &str) -> String {
+    let h = topic.strip_prefix("0x").unwrap_or(topic).to_lowercase();
+    match h.len().checked_sub(40) {
+        Some(off) => h[off..].to_string(),
+        None => h,
+    }
+}
+
+/// Scan `logs` for the FIRST ERC-20 `Transfer(from=sender, to=deposit)` emitted
+/// by `token_addr`, returning the transferred amount. Pure; host-tested.
+/// `token_addr` is lowercase 0x; `deposit_no0x`/`sender_no0x` are lowercase
+/// 40-hex addresses without the `0x` prefix.
+fn match_transfer_log(
+    logs: &[RpcLog],
+    token_addr: &str,
+    deposit_no0x: &str,
+    sender_no0x: &str,
+) -> Option<u128> {
+    logs.iter().find_map(|log| {
+        if log.address.to_lowercase() != token_addr || log.topics.len() < 3 {
+            return None;
+        }
+        if log.topics[0].to_lowercase() != TRANSFER_TOPIC0 {
+            return None;
+        }
+        if topic_address(&log.topics[2]) != deposit_no0x
+            || topic_address(&log.topics[1]) != sender_no0x
+        {
+            return None;
+        }
+        // data = the uint256 value (`0x` + up to 64 hex); parse as the amount.
+        hex_to_u128(&log.data)
+    })
 }
 
 /// Verify a native-ETH transfer and return its value in wei. Only checks
@@ -363,8 +420,8 @@ async fn topup_ethereum(
     spec: &config::TokenSpec,
     tx_hash_in: &str,
 ) -> Response {
-    if spec.contract.is_some() {
-        return api_err(StatusCode::NOT_IMPLEMENTED, "ERC-20 top-up not implemented");
+    if let Some(contract) = spec.contract {
+        return topup_erc20(st, addr, spec, contract, tx_hash_in).await;
     }
 
     // 1) normalize + validate the hash
@@ -445,6 +502,7 @@ async fn topup_ethereum(
         Some(RpcReceipt {
             status: Some(_),
             block_number: Some(b),
+            ..
         }) => match hex_to_u64(&b) {
             Some(b) => b,
             None => {
@@ -468,6 +526,133 @@ async fn topup_ethereum(
     }
 
     // 6) price + points
+    let price = match resolve_price(st, spec, &tx_hash).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+    let points = rates::points_for(amount, spec.decimals, price);
+    if points < MIN_TOPUP_POINTS {
+        return reject(&st.env, &tx_hash, "amount below minimum top-up").await;
+    }
+
+    finalize_credit(st, addr, &tx_hash, amount, points).await
+}
+
+/// Ethereum ERC-20 top-up (USDT/USDC). Mirrors the native path but verifies a
+/// `Transfer(from=sender, to=deposit)` event log in the receipt instead of
+/// `tx.value`. `contract` is the token's (lowercase) address from the registry.
+async fn topup_erc20(
+    st: &AppState,
+    addr: &str,
+    spec: &config::TokenSpec,
+    contract: &str,
+    tx_hash_in: &str,
+) -> Response {
+    // 1) normalize + validate the hash
+    let tx_hash = tx_hash_in.trim().to_lowercase();
+    if !valid_tx_hash(&tx_hash) {
+        return api_err(StatusCode::BAD_REQUEST, "invalid tx hash");
+    }
+
+    // 2) replay lock: tx_hash is the payments PK.
+    if let Err(e) = d1_exec(
+        &st.env,
+        "INSERT INTO payments (tx_hash, address, chain, token, created_at) VALUES (?, ?, ?, ?, ?)",
+        &[
+            tx_hash.as_str().into(),
+            addr.into(),
+            spec.chain.as_str().into(),
+            spec.symbol.into(),
+            (session::now_secs() as f64).into(),
+        ],
+    )
+    .await
+    {
+        if format!("{e:?}").to_lowercase().contains("constraint") {
+            return api_err(StatusCode::CONFLICT, "tx already submitted");
+        }
+        worker::console_error!("payments insert failed for {tx_hash}: {e:?}");
+        return api_err(StatusCode::INTERNAL_SERVER_ERROR, "database error, retry later");
+    }
+
+    // 3) the transaction itself: existence + sender. `value` is irrelevant for
+    //    an ERC-20 transfer (the token move lives in the receipt logs).
+    let tx_json =
+        match rpc(&st.rpc_url, "eth_getTransactionByHash", serde_json::json!([tx_hash])).await {
+            Ok(v) => v,
+            Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionByHash", e).await,
+        };
+    if tx_json.is_null() {
+        delete_pending(&st.env, &tx_hash).await;
+        return api_err(StatusCode::BAD_REQUEST, "tx not found");
+    }
+    let tx: RpcTx = match serde_json::from_value(tx_json) {
+        Ok(t) => t,
+        Err(e) => {
+            let e = worker::Error::RustError(e.to_string());
+            return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionByHash decode", e).await;
+        }
+    };
+    if tx.from.to_lowercase() != addr {
+        delete_pending(&st.env, &tx_hash).await;
+        return api_err(StatusCode::FORBIDDEN, "tx sender does not match logged-in address");
+    }
+
+    // 4) receipt: mined + successful, then the Transfer-log verification.
+    let receipt_json =
+        match rpc(&st.rpc_url, "eth_getTransactionReceipt", serde_json::json!([tx_hash])).await {
+            Ok(v) => v,
+            Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionReceipt", e).await,
+        };
+    if receipt_json.is_null() {
+        return too_early(&st.env, &tx_hash).await;
+    }
+    let receipt: RpcReceipt = match serde_json::from_value(receipt_json) {
+        Ok(r) => r,
+        Err(e) => {
+            let e = worker::Error::RustError(e.to_string());
+            return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionReceipt decode", e).await;
+        }
+    };
+    let block = match receipt {
+        RpcReceipt { status: Some(s), .. } if s != "0x1" => {
+            return reject(&st.env, &tx_hash, "tx failed on-chain").await;
+        }
+        RpcReceipt {
+            status: Some(_),
+            block_number: Some(ref b),
+            ..
+        } => match hex_to_u64(b) {
+            Some(b) => b,
+            None => {
+                let e = worker::Error::RustError(format!("bad receipt blockNumber: {b}"));
+                return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionReceipt", e).await;
+            }
+        },
+        _ => return too_early(&st.env, &tx_hash).await,
+    };
+
+    // Find the token Transfer into the deposit address from this sender.
+    let deposit_no0x = st.deposit_address.strip_prefix("0x").unwrap_or(&st.deposit_address);
+    let sender_no0x = addr.strip_prefix("0x").unwrap_or(addr);
+    let amount = match match_transfer_log(&receipt.logs, contract, deposit_no0x, sender_no0x) {
+        Some(a) => a,
+        None => return reject(&st.env, &tx_hash, "no matching token transfer").await,
+    };
+
+    // 5) confirmations
+    let head = match rpc(&st.rpc_url, "eth_blockNumber", serde_json::json!([])).await {
+        Ok(v) => v.as_str().and_then(hex_to_u64),
+        Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_blockNumber", e).await,
+    };
+    let confirmed = head
+        .and_then(|h| h.checked_sub(block))
+        .is_some_and(|d| d + 1 >= MIN_CONFIRMATIONS);
+    if !confirmed {
+        return too_early(&st.env, &tx_hash).await;
+    }
+
+    // 6) price + points (stablecoins have no feed -> price None -> $1)
     let price = match resolve_price(st, spec, &tx_hash).await {
         Ok(p) => p,
         Err(resp) => return resp,
@@ -614,5 +799,120 @@ mod tests {
         assert_eq!(verify_native_tx(&mixed, DEPOSIT), Ok(10u128.pow(18)));
         // contract creation (no `to`) rejected
         assert!(verify_native_tx(&tx(None, "0x1"), DEPOSIT).is_err());
+    }
+
+    // USDC on Ethereum mainnet.
+    const USDC: &str = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
+
+    fn log(address: &str, topic0: &str, from_no0x: &str, to_no0x: &str, data: &str) -> RpcLog {
+        RpcLog {
+            address: address.into(),
+            topics: vec![
+                topic0.into(),
+                format!("0x{}{from_no0x}", "0".repeat(24)),
+                format!("0x{}{to_no0x}", "0".repeat(24)),
+            ],
+            data: data.into(),
+        }
+    }
+
+    /// A well-formed USDC `Transfer(SENDER -> DEPOSIT)` of `amount` base units.
+    fn transfer_log(amount: u128) -> RpcLog {
+        log(
+            USDC,
+            TRANSFER_TOPIC0,
+            &SENDER[2..],
+            &DEPOSIT[2..],
+            &format!("0x{amount:064x}"),
+        )
+    }
+
+    #[test]
+    fn transfer_log_match_and_amount() {
+        // 1 USDC (6 decimals).
+        let logs = vec![transfer_log(1_000_000)];
+        assert_eq!(
+            match_transfer_log(&logs, USDC, &DEPOSIT[2..], &SENDER[2..]),
+            Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn transfer_log_wrong_contract_ignored() {
+        // Same Transfer, but emitted by USDT — not the token we expect.
+        let usdt = "0xdac17f958d2ee523a2206206994597c13d831ec7";
+        let logs = vec![log(
+            usdt,
+            TRANSFER_TOPIC0,
+            &SENDER[2..],
+            &DEPOSIT[2..],
+            &format!("0x{:064x}", 1_000_000u128),
+        )];
+        assert_eq!(match_transfer_log(&logs, USDC, &DEPOSIT[2..], &SENDER[2..]), None);
+    }
+
+    #[test]
+    fn transfer_log_wrong_topic0_ignored() {
+        // Approval, not Transfer, in the USDC contract.
+        let approval = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
+        let logs = vec![log(
+            USDC,
+            approval,
+            &SENDER[2..],
+            &DEPOSIT[2..],
+            &format!("0x{:064x}", 1_000_000u128),
+        )];
+        assert_eq!(match_transfer_log(&logs, USDC, &DEPOSIT[2..], &SENDER[2..]), None);
+    }
+
+    #[test]
+    fn transfer_log_wrong_recipient_ignored() {
+        // Transfer to some other address, not our deposit address.
+        let other = "1111111111111111111111111111111111111111";
+        let logs = vec![log(
+            USDC,
+            TRANSFER_TOPIC0,
+            &SENDER[2..],
+            other,
+            &format!("0x{:064x}", 1_000_000u128),
+        )];
+        assert_eq!(match_transfer_log(&logs, USDC, &DEPOSIT[2..], &SENDER[2..]), None);
+    }
+
+    #[test]
+    fn transfer_log_wrong_sender_ignored() {
+        // Correct recipient/contract, but a different `from`.
+        let other = "2222222222222222222222222222222222222222";
+        let logs = vec![log(
+            USDC,
+            TRANSFER_TOPIC0,
+            other,
+            &DEPOSIT[2..],
+            &format!("0x{:064x}", 1_000_000u128),
+        )];
+        assert_eq!(match_transfer_log(&logs, USDC, &DEPOSIT[2..], &SENDER[2..]), None);
+    }
+
+    #[test]
+    fn transfer_log_skips_noise_and_matches_later() {
+        // A non-Transfer log precedes the real one; it must be skipped.
+        let approval = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
+        let noise = log(USDC, approval, &SENDER[2..], &DEPOSIT[2..], "0x0");
+        let logs = vec![noise, transfer_log(2_500_000)];
+        assert_eq!(
+            match_transfer_log(&logs, USDC, &DEPOSIT[2..], &SENDER[2..]),
+            Some(2_500_000)
+        );
+    }
+
+    #[test]
+    fn transfer_log_checksummed_contract_matches() {
+        // Node returns an EIP-55 mixed-case `log.address`; we still match.
+        let mut lg = transfer_log(1_000_000);
+        lg.address = "0xA0b86991c6218b36c1D19D4a2e9Eb0cE3606eB48".into();
+        assert_eq!(
+            match_transfer_log(&[lg], USDC, &DEPOSIT[2..], &SENDER[2..]),
+            Some(1_000_000)
+        );
     }
 }
