@@ -119,6 +119,10 @@ fn fmt_usage(remaining: Option<i64>, has_plan: bool) -> String {
 pub fn AccountWidget() -> impl IntoView {
     // None = SSR placeholder / still loading in the browser.
     let state: RwSignal<Option<AccountState>> = RwSignal::new(None);
+    // Whether the detail panel is expanded via click/tap. Hover still reveals
+    // the panel on desktop (pointer devices); `open` is the touch-friendly path
+    // since mobile browsers can't hover.
+    let open = RwSignal::new(false);
 
     // Effects only run in the browser, so this never fires on the server.
     Effect::new(move |_| {
@@ -138,20 +142,36 @@ pub fn AccountWidget() -> impl IntoView {
     // Shared card idiom for the float panel.
     // Outer wrapper handles positioning + hover reveal. Its `pt-2` is a
     // transparent bridge so moving the pointer from the chip into the card
-    // doesn't cross a dead gap that would drop `group-hover`.
-    let panel_cls = "absolute right-0 top-full pt-2 w-56 max-w-[calc(100vw-2rem)] z-50 \
-        origin-top-right opacity-0 scale-95 pointer-events-none \
-        group-hover:opacity-100 group-hover:scale-100 group-hover:pointer-events-auto \
-        group-focus-within:opacity-100 group-focus-within:scale-100 \
-        group-focus-within:pointer-events-auto transition-all duration-150";
+    // doesn't cross a dead gap that would drop `group-hover`. When `open`
+    // (tapped), the panel is forced visible regardless of hover.
+    let panel_cls = move || {
+        let base = "absolute right-0 top-full pt-2 w-56 max-w-[calc(100vw-2rem)] z-50 \
+            origin-top-right transition-all duration-150 \
+            group-hover:opacity-100 group-hover:scale-100 group-hover:pointer-events-auto \
+            group-focus-within:opacity-100 group-focus-within:scale-100 \
+            group-focus-within:pointer-events-auto";
+        if open.get() {
+            format!("{base} opacity-100 scale-100 pointer-events-auto")
+        } else {
+            format!("{base} opacity-0 scale-95 pointer-events-none")
+        }
+    };
     let card_cls = "bg-white/90 backdrop-blur-md rounded-2xl ring-1 ring-sky-200 \
         shadow-lg shadow-sky-200/50 p-4 text-sm text-slate-700";
 
     view! {
         <div class="relative group shrink-0">
-            <a
-                href="/user/account"
-                rel="external"
+            // Tap-outside backdrop: only rendered while expanded so a tap
+            // anywhere (including the chip) collapses the panel on touch.
+            {move || open.get().then(|| view! {
+                <div
+                    class="fixed inset-0 z-40 cursor-default"
+                    on:click=move |_| open.set(false)
+                />
+            })}
+            <button
+                type="button"
+                on:click=move |_| open.update(|o| *o = !*o)
                 class="flex items-center gap-1.5 rounded-full py-2 px-3 bg-white/80 backdrop-blur-md
                     ring-1 ring-sky-200 shadow-sm shadow-sky-200/50 text-sky-600 font-medium
                     hover:ring-sky-300 hover:scale-105 transition-all cursor-pointer whitespace-nowrap"
@@ -172,7 +192,7 @@ pub fn AccountWidget() -> impl IntoView {
                         <span class="text-sky-300 select-none">"\u{2026}"</span>
                     }.into_any(),
                 }}
-            </a>
+            </button>
 
             <div class=panel_cls>
                 <div class=card_cls>
@@ -204,6 +224,15 @@ pub fn AccountWidget() -> impl IntoView {
                                 <span class="text-sky-500">"Searches left"</span>
                                 <span class="tabular-nums text-slate-800">{searches}</span>
                             </div>
+                            <a
+                                href="/user/account"
+                                rel="external"
+                                class="block text-center mt-3 bg-gradient-to-r from-sky-400 to-blue-500
+                                    text-white font-medium rounded-full py-1.5 px-4 shadow-sm shadow-sky-300/60
+                                    hover:from-sky-500 hover:to-blue-600 transition-all"
+                            >
+                                "Account details"
+                            </a>
                         }.into_any()
                     }
                     Some(AccountState::SignedOut) => view! {
