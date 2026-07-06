@@ -8,18 +8,22 @@ Worker. Replaces the old apply/approve flow in `gateway_worker`.
   cookie `ue_session` (signed with the same `lets-embed-jwt-secret` as the
   gateway; `sub` = lowercase address). Nonces are single-use, stored in the
   `NONCES` KV namespace with a 300s TTL.
-- **Metering**: every image/video view costs points, deduped per user per file
-  per 24h. Enforced by `gateway_worker` calling the per-user `UserAccount`
-  Durable Object (bound cross-script).
-- **Billing**: pay-as-you-go points balance + optional subscription plans
-  (periodic quota, renewed from the balance; overage falls back to PAYG).
+- **Metering**: every image view (1 pt), video view (5 pts) and similarity
+  search (100 pts) costs points, deduped per user per resource per 24h.
+  Enforced by `gateway_worker` calling the per-user `UserAccount` Durable
+  Object (bound cross-script).
+- **Billing (v2)**: pay-as-you-go points balance + optional subscription plans
+  (per-window view/search allowances, bought/renewed **from** the balance, **no
+  auto-renew** — they lapse to PAYG at period end). Overage falls back to PAYG.
   New users get a free grant.
-- **Top-up**: crypto only — send ETH to the deposit address, submit the tx
-  hash, the worker verifies it via JSON-RPC and credits points.
+- **Top-up**: crypto only, **multi-chain**. Ethereum (native ETH + ERC-20
+  USDT/USDC) and Solana (native SOL + SPL USDT/USDC). Submit the tx
+  hash/signature; the worker verifies it on-chain and credits points.
 - **Likes**: post/image/video favorites stored in D1, surfaced as like buttons
   on the Leptos details page and a `/user/favorites` page.
-- **Storage**: balance/quota/dedupe live only in the Durable Object; D1 holds
-  `users`, `payments`, `likes` (see `migrations/0001_users.sql`).
+- **Storage**: balance/plan/window/dedupe live only in the Durable Object; D1
+  holds `users` (incl. linked `solana_address`), `payments` (chain-aware) and
+  `likes` (see `migrations/0001_users.sql`).
 
 ## Routes
 
@@ -28,38 +32,73 @@ Worker. Replaces the old apply/approve flow in `gateway_worker`.
 | `/user/login` | GET | wallet login page (`?next=` redirect target) |
 | `/user/account` | GET | balance, plan, top-up (submit tx hash), payment history |
 | `/user/favorites` | GET | liked posts/images/videos |
-| `/user/api/nonce` | GET | issue a SIWE nonce (KV, 300s, single-use) |
+| `/user/api/nonce` | GET | issue a SIWE / link nonce (KV, 300s, single-use) |
 | `/user/api/verify` | POST | verify SIWE message + signature, set `ue_session` |
 | `/user/api/logout` | POST | clear the session cookie |
-| `/user/api/me` | GET | current address + balance/plan/quota status |
-| `/user/api/topup` | POST | submit an ETH tx hash for verification + credit |
+| `/user/api/me` | GET | current address + balance / plan / window status |
+| `/user/api/topup` | POST | submit a `{chain, token, tx_hash}` top-up for verification + credit |
 | `/user/api/payments` | GET | payment history |
-| `/user/api/subscribe` | POST | buy/renew a plan from the balance |
-| `/user/api/unsubscribe` | POST | stop auto-renewal |
+| `/user/api/subscribe` | POST | buy/renew a plan from the balance (no auto-renew) |
+| `/user/api/rates` | GET | spot USD prices for ETH/SOL (Chainlink feeds) |
+| `/user/api/link_solana` | POST | link a Solana wallet by signing a challenge |
 | `/user/api/like` | GET/POST/DELETE | check / add / remove a like |
 | `/user/api/likes` | GET | list likes (keyset paginated) |
 | `/user/admin` | GET | admin page (Cloudflare Access protected) |
 | `/user/admin/credit` | POST | admin credit/deduct points |
 | `/user/admin/ban` | POST | admin ban/unban |
 
-## Points & billing model
+## Points & billing model (v2)
 
-All numbers are placeholders in `src/config.rs` — tune before launch.
+Points are the single internal currency. **$1 = 10,000 points.** Numbers live
+in `src/config.rs`.
 
-- Image view: **1 pt**; video view: **5 pts** (`COST_IMAGE_VIEW`,
-  `COST_VIDEO_VIEW`). Repeat views of the same path within 24h
-  (`DEDUPE_WINDOW_SECS`) are free — dedupe happens inside the DO.
-- New accounts get **200 pts** free on first touch (`FREE_GRANT_POINTS`).
-- Plans (`PLANS`), purchased and auto-renewed **from the PAYG balance**:
-  `basic` = 1,000 pts → 5,000 quota / 30d; `pro` = 3,000 pts → 20,000 quota /
-  30d. Views draw quota first, then the balance. If renewal can't be paid
-  (DO alarm), the account lapses back to PAYG.
-- Top-up: send ETH to `DEPOSIT_ADDRESS`, submit the tx hash on
-  `/user/account`. The worker checks via `RPC_URL`: correct to-address,
-  value ≥ 0.001 ETH (`MIN_TOPUP_WEI`), receipt status success, ≥ 6
-  confirmations (`MIN_CONFIRMATIONS`). Points = wei × `POINTS_PER_ETH` / 1e18
-  (100,000 pts/ETH). `payments.tx_hash` is a primary key — each tx credits
-  exactly once.
+### Pricing (pay-as-you-go)
+
+- Image view: **1 pt**; video view: **5 pts**; similarity search: **100 pts**.
+- Repeat use of the same resource within 24h (`DEDUPE_WINDOW_SECS`) is free —
+  dedupe happens inside the DO (per media path, per search query).
+- New accounts get a **3,000 pt** free grant on first touch
+  (`FREE_GRANT_POINTS`).
+
+### Plans
+
+Plans are bought/renewed **from the points balance** (there is **no
+auto-renew**): at period end an account simply lapses back to PAYG, and the
+user clicks Subscribe/Renew to start a new period. A plan grants per-window
+allowances that refresh every rolling **5h** window; overage past the window
+allowance falls back to the PAYG balance. An account can be PAYG-only,
+plan-only, or plan+PAYG.
+
+| Plan | Price | Points | Period | Per 5h window |
+| --- | --- | --- | --- | --- |
+| `basic` | $2 | 20,000 pts | 30d | 2,000 view-units + 10 similarity searches |
+| `pro` | $5 | 50,000 pts | 30d | **unlimited** views + 50 similarity searches |
+
+## Payment rails
+
+Top-ups are crypto only. Submit `{chain, token, tx_hash}` on `/user/account`;
+each transaction credits exactly once (`payments` is keyed on the tx hash).
+
+- **Ethereum** — native **ETH** plus ERC-20 **USDT** / **USDC**. Token
+  transfers are verified from the `Transfer` event in the receipt logs.
+  Requires **≥ 6 confirmations** (`MIN_CONFIRMATIONS`); deposits must go to
+  `DEPOSIT_ADDRESS`.
+- **Solana** — native **SOL** plus SPL **USDT** / **USDC**. Verified at the
+  **`finalized`** commitment; deposits must go to `SOL_DEPOSIT_ADDRESS` and
+  originate from the user's linked Solana address (see below).
+- **USD pricing**: stablecoins (USDT/USDC) are treated as **$1**. Volatile
+  assets (ETH, SOL) are priced in USD from **Chainlink on-chain price feeds**
+  (an `eth_call` to `latestRoundData` over `RPC_URL`). Credited points =
+  USD value × 10,000.
+
+### Solana wallet linking
+
+A Solana transaction carries no on-chain link to the SIWE (Ethereum) session,
+so a user links a Solana wallet **once**: they sign a challenge with the wallet
+(`ed25519` `signMessage`, e.g. Phantom) and POST it to
+`/user/api/link_solana`. The verified address is stored on
+`users.solana_address` (UNIQUE). SOL/SPL top-ups are only accepted when the
+transaction's sender matches this linked address.
 
 ## Setup & deployment
 
@@ -70,20 +109,28 @@ All numbers are placeholders in `src/config.rs` — tune before launch.
    ```
 
 2. Fill in `[vars]` in `wrangler.toml`:
-   - `DEPOSIT_ADDRESS` — the ETH address that receives top-ups (**lowercase**).
+   - `DEPOSIT_ADDRESS` — the ETH address that receives top-ups (**lowercase**
+     `0x`).
+   - `RPC_URL` / `CHAIN_ID` — Ethereum JSON-RPC endpoint and chain
+     (defaults: `https://cloudflare-eth.com`, mainnet `1`). Also used for the
+     Chainlink `latestRoundData` price-feed `eth_call`s.
+   - `SOL_RPC_URL` — Solana JSON-RPC endpoint (default
+     `https://api.mainnet-beta.solana.com`).
+   - `SOL_DEPOSIT_ADDRESS` — the Solana address (base58) that receives SOL/SPL
+     top-ups. **Set it** — Solana top-ups are rejected until it is configured.
    - `SIWE_DOMAIN` — the public hostname users sign in on (the
      gateway-worker's domain).
-   - `RPC_URL` / `CHAIN_ID` — JSON-RPC endpoint and chain
-     (defaults: `https://cloudflare-eth.com`, mainnet `1`).
 
 3. Create a **new** Cloudflare Access application covering
    `/user/admin*` on the public hostname, and put its AUD into
    `CF_ACCESS_AUD` (`CF_ACCESS_TEAM_DOMAIN` is your team domain).
 
-4. Apply the D1 migration (shared `lets-embed` database):
+4. Apply the D1 migration (shared `lets-embed` database). It now adds
+   `users.solana_address` (UNIQUE) and a chain-aware `payments` table with
+   `chain`, `token` and `amount` columns:
 
    ```sh
-   wrangler d1 execute lets-embed --remote --file migrations/0001_users.sql
+   wrangler d1 execute lets-embed --remote --file user_worker/migrations/0001_users.sql
    ```
 
 5. Deploy **user-worker first**:

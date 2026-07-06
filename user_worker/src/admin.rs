@@ -437,11 +437,25 @@ fn banned_badge(banned: bool) -> &'static str {
 
 fn render_detail(s: &StatusResp) -> String {
     let addr = html_escape(&s.address);
-    let plan = html_escape(s.plan.as_deref().unwrap_or("—"));
+    let plan = html_escape(s.plan.as_deref().unwrap_or("none"));
     let period_end = if s.period_end == 0 {
         "—".to_string()
     } else {
         fmt_ts(s.period_end as i64)
+    };
+    // No plan → "—"; active plan with no cap (pro) → "Unlimited"; else the count.
+    let views_rem = match s.views_remaining {
+        Some(v) => v.to_string(),
+        None if s.plan.is_none() => "—".to_string(),
+        None => "Unlimited".to_string(),
+    };
+    let searches_rem = s
+        .searches_remaining
+        .map_or_else(|| "—".to_string(), |v| v.to_string());
+    let window_reset = if s.window_reset == 0 {
+        "—".to_string()
+    } else {
+        fmt_ts(s.window_reset as i64)
     };
     let (ban_value, ban_label) = if s.banned { (0, "Unban") } else { (1, "Ban") };
     format!(
@@ -450,9 +464,10 @@ fn render_detail(s: &StatusResp) -> String {
 <dl class="status">
 <dt>Balance</dt><dd>{balance}</dd>
 <dt>Plan</dt><dd>{plan}</dd>
+<dt>Period end</dt><dd>{period_end}</dd>
 <dt>Views remaining</dt><dd>{views_rem}</dd>
 <dt>Searches remaining</dt><dd>{searches_rem}</dd>
-<dt>Period end</dt><dd>{period_end}</dd>
+<dt>Window reset</dt><dd>{window_reset}</dd>
 <dt>Total views</dt><dd>{views}</dd>
 <dt>Status</dt><dd>{badge}</dd>
 </dl>
@@ -470,12 +485,6 @@ fn render_detail(s: &StatusResp) -> String {
 </form>
 </div></div>"#,
         balance = s.balance,
-        views_rem = s
-            .views_remaining
-            .map_or_else(|| "unlimited / none".to_string(), |v| v.to_string()),
-        searches_rem = s
-            .searches_remaining
-            .map_or_else(|| "—".to_string(), |v| v.to_string()),
         views = s.total_views,
         badge = banned_badge(s.banned),
     )

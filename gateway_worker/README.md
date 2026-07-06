@@ -46,3 +46,13 @@ rejected (and stripped before proxying).
 - Deploy **after** `user_worker` — both bindings above reference the deployed
   `user-worker` script, so deploying the gateway first fails. Full runbook and
   cutover steps: `user_worker/README.md`.
+
+## Metering
+
+Besides charging media views (`GET /images/*`, `GET /videos/*`) against the
+user's `UserAccount` Durable Object, the gateway now also meters **similarity
+searches**: `POST /api/search_similar` and `POST /api/search_by_image` are
+charged as `ChargeKind::Search`, deduped per query per 24h in the DO (so
+paginated re-searches with the same query are free). On insufficient points
+these endpoints return a `402` JSON error (`{"error":"out of points"}`) to the
+fetch caller — not the HTML payment page used for media navigations.
