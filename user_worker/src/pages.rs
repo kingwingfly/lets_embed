@@ -78,6 +78,12 @@ ul.likes li .date{margin-left:auto;color:var(--muted);font-size:12px;white-space
 .links{margin-top:18px;display:flex;gap:16px;flex-wrap:wrap}
 ul.likes li .thumb{width:60px;height:60px;flex:0 0 auto;object-fit:cover;
 border-radius:var(--radius);border:1px solid var(--border);background:rgba(127,127,127,.07)}
+a.btn,a.btn:hover{color:#fff;text-decoration:none}
+a.btn.ghost-alt{background:transparent;color:var(--accent);border:1px solid var(--border)}
+a.btn.ghost-alt:hover{background:rgba(79,70,229,.08);border-color:var(--accent)}
+#mobile-wallets .full{margin-top:12px}
+.hint{color:var(--muted);font-size:14px;margin:20px 0 0}
+[hidden]{display:none!important}
 </style>"##;
 
 fn page(title: &str, body: &str) -> String {
@@ -114,6 +120,11 @@ const LOGIN_BODY: &str = r##"<div class="card center">
 <h1>Sign in with Ethereum</h1>
 <p class="sub">Authenticate with your wallet to access your account.</p>
 <button class="btn full" id="siwe-btn" type="button">Sign in with Ethereum</button>
+<div id="mobile-wallets" hidden>
+<p class="hint">Open this page in your wallet app's browser to sign in.</p>
+<a class="btn full" id="mm-link" rel="noopener" href="#">Open in MetaMask</a>
+<a class="btn full ghost-alt" id="ph-link" rel="noopener" href="#">Open in Phantom</a>
+</div>
 <div class="msg" id="login-msg" hidden></div>
 <div class="links" style="justify-content:center"><a href="/">&larr; Back to site</a></div>
 </div>
@@ -138,8 +149,24 @@ function nextUrl() {
 }
 
 if (!window.ethereum) {
-  btn.disabled = true;
-  showMsg("No Ethereum wallet detected. Please install a wallet extension (e.g. MetaMask) and reload this page.");
+  var isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  if (isMobile) {
+    // Mobile browsers have no injected provider. Offer deep links that reopen
+    // THIS page inside a wallet app's in-app browser (which injects one).
+    // MetaMask universal link: host+path+query, no scheme.
+    var mmUrl = "https://metamask.app.link/dapp/" +
+      location.host + location.pathname + location.search;
+    // Phantom universal link: full https URL, encoded; ref = origin.
+    var phUrl = "https://phantom.app/ul/browse/" +
+      encodeURIComponent(location.href) + "?ref=" + encodeURIComponent(location.origin);
+    document.getElementById("mm-link").href = mmUrl;
+    document.getElementById("ph-link").href = phUrl;
+    btn.hidden = true;
+    document.getElementById("mobile-wallets").hidden = false;
+  } else {
+    btn.disabled = true;
+    showMsg("No Ethereum wallet detected. Please install a wallet extension (e.g. MetaMask) and reload this page.");
+  }
 } else {
   btn.addEventListener("click", async function () {
     btn.disabled = true;
@@ -227,7 +254,7 @@ const ACCOUNT_BODY: &str = r##"<div class="card">
 <dl class="stats">
 <dt>Balance</dt><dd id="acct-balance">&mdash;</dd>
 <dt>Plan</dt><dd id="acct-plan">&mdash;</dd>
-<dt>Quota remaining</dt><dd id="acct-quota">&mdash;</dd>
+<dt>Usage left</dt><dd id="acct-quota">&mdash;</dd>
 <dt>Period ends</dt><dd id="acct-period-end">&mdash;</dd>
 <dt>Total views</dt><dd id="acct-views">&mdash;</dd>
 </dl>
@@ -301,7 +328,12 @@ async function loadMe() {
   setText("acct-address", me.address);
   setText("acct-balance", String(me.balance) + " points");
   setText("acct-plan", me.plan ? me.plan : "none");
-  setText("acct-quota", String(me.quota_remaining) + " points");
+  var hasPlan = !!me.plan;
+  var viewsStr = me.views_remaining != null
+    ? String(me.views_remaining)
+    : (hasPlan ? "unlimited" : "—");
+  var searchesStr = me.searches_remaining != null ? String(me.searches_remaining) : "—";
+  setText("acct-quota", "Views: " + viewsStr + "  ·  Searches: " + searchesStr);
   setText("acct-period-end", me.period_end ? fmtDate(me.period_end) : "—");
   setText("acct-views", String(me.total_views));
   document.getElementById("banned-badge").hidden = !me.banned;
