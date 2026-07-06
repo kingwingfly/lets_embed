@@ -20,7 +20,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
 use tower_cookies::Cookies;
 
-use crate::types::{ApiError, LinkSolReq, LinkSolResp};
+use crate::types::{ApiError, LinkSolReq, LinkSolResp, LinkStatusResp};
 use crate::{AppState, session};
 
 /// The exact message the wallet signs. MUST match the account-page JS byte for
@@ -166,6 +166,45 @@ pub async fn link(
         solana_address: req.solana_address,
     })
     .into_response()
+}
+
+/// Report the Solana wallet currently linked to the session (or `null`), so the
+/// account page can show the linked state and gate SOL/SPL top-ups.
+#[worker::send]
+pub async fn link_status(State(st): State<AppState>, cookies: Cookies) -> Response {
+    let Some(addr) = session::session_address(&cookies, &st.jwt_secret) else {
+        return api_err(StatusCode::UNAUTHORIZED, "login required");
+    };
+
+    #[derive(Deserialize)]
+    struct Row {
+        solana_address: Option<String>,
+    }
+    let db = match st.env.d1(crate::D1_BINDING) {
+        Ok(db) => db,
+        Err(e) => {
+            worker::console_error!("d1 binding failed: {e:?}");
+            return internal_error();
+        }
+    };
+    let row = db
+        .prepare("SELECT solana_address FROM users WHERE address = ?")
+        .bind(&[addr.as_str().into()]);
+    let solana_address = match row {
+        Ok(stmt) => match stmt.first::<Row>(None).await {
+            Ok(r) => r.and_then(|r| r.solana_address),
+            Err(e) => {
+                worker::console_error!("solana_address status lookup failed: {e:?}");
+                return internal_error();
+            }
+        },
+        Err(e) => {
+            worker::console_error!("solana_address status bind failed: {e:?}");
+            return internal_error();
+        }
+    };
+
+    Json(LinkStatusResp { solana_address }).into_response()
 }
 
 #[worker::send]
