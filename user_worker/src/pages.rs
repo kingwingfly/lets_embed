@@ -124,6 +124,7 @@ const LOGIN_BODY: &str = r##"<div class="card center">
 <h1>Sign in with Ethereum</h1>
 <p class="sub">Authenticate with your wallet to access your account.</p>
 <button class="btn full" id="siwe-btn" type="button">Sign in with Ethereum</button>
+<button class="btn full ghost-alt" id="siws-btn" type="button" style="margin-top:12px">Sign in with Solana</button>
 <div id="mobile-wallets" hidden>
 <h2>Sign in on mobile</h2>
 <p class="hint">Open your wallet app (MetaMask / Phantom / etc.), use its built-in browser, and go to:</p>
@@ -142,6 +143,7 @@ const LOGIN_BODY: &str = r##"<div class="card center">
 <script>
 "use strict";
 var CHAIN_ID = __CHAIN_ID__;
+var SIWE_DOMAIN = "__SIWE_DOMAIN__";
 var btn = document.getElementById("siwe-btn");
 var msgEl = document.getElementById("login-msg");
 
@@ -260,11 +262,121 @@ Issued At: ${new Date().toISOString()}`;
     }
   });
 }
+
+// ---- Sign in with Solana (SIWS) -------------------------------------------
+// Independent of the Ethereum provider: discovers a Solana wallet via the Wallet
+// Standard (MetaMask multichain, Phantom, Solflare, Backpack), signs the SIWS
+// challenge, and posts to /user/api/verify_solana for a standalone account.
+function bs58encode(bytes) {
+  var ALPH = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  if (bytes.length === 0) return "";
+  var digits = [0];
+  for (var i = 0; i < bytes.length; i++) {
+    var carry = bytes[i];
+    for (var j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) { digits.push(carry % 58); carry = (carry / 58) | 0; }
+  }
+  var out = "";
+  for (var k = 0; k < bytes.length - 1 && bytes[k] === 0; k++) out += "1";
+  for (var q = digits.length - 1; q >= 0; q--) out += ALPH[digits[q]];
+  return out;
+}
+var solWallets = [];
+(function () {
+  function register() {
+    for (var i = 0; i < arguments.length; i++) {
+      if (solWallets.indexOf(arguments[i]) === -1) solWallets.push(arguments[i]);
+    }
+    return function () {};
+  }
+  var api = { register: register, get: function () { return solWallets.slice(); }, on: function () { return function () {}; } };
+  try { window.addEventListener("wallet-standard:register-wallet", function (ev) { ev.detail(api); }); } catch (e) {}
+  try { window.dispatchEvent(new CustomEvent("wallet-standard:app-ready", { detail: api })); } catch (e) {}
+})();
+function pickSolanaWallet() {
+  for (var i = 0; i < solWallets.length; i++) {
+    var f = solWallets[i] && solWallets[i].features;
+    if (f && f["solana:signMessage"] && f["standard:connect"]) return solWallets[i];
+  }
+  return null;
+}
+function pickSolanaAccount(accounts) {
+  for (var i = 0; i < accounts.length; i++) {
+    var chains = accounts[i].chains || [];
+    for (var j = 0; j < chains.length; j++) if (chains[j].indexOf("solana:") === 0) return accounts[i];
+  }
+  return accounts.length ? accounts[0] : null;
+}
+async function getSolanaSigner() {
+  var w = pickSolanaWallet();
+  if (w) {
+    var res = await w.features["standard:connect"].connect();
+    var accounts = (res && res.accounts && res.accounts.length ? res.accounts : w.accounts) || [];
+    var account = pickSolanaAccount(accounts);
+    if (!account) throw new Error("No Solana account in this wallet — enable one (e.g. in MetaMask) and try again.");
+    return {
+      address: account.address,
+      sign: async function (m) { return (await w.features["solana:signMessage"].signMessage({ account: account, message: m }))[0].signature; },
+    };
+  }
+  var provider = window.solana || (window.phantom && window.phantom.solana);
+  if (provider && provider.connect) {
+    var conn = await provider.connect();
+    var pk = provider.publicKey || (conn && conn.publicKey);
+    if (!pk) throw new Error("wallet did not return a public key");
+    return {
+      address: pk.toString(),
+      sign: async function (m) { var s = await provider.signMessage(m, "utf8"); return s && s.signature ? s.signature : s; },
+    };
+  }
+  return null;
+}
+document.getElementById("siws-btn").addEventListener("click", async function () {
+  var sbtn = document.getElementById("siws-btn");
+  sbtn.disabled = true;
+  try {
+    var signer = await getSolanaSigner();
+    if (!signer) {
+      showMsg("No Solana-capable wallet found. Enable Solana in MetaMask (or install Phantom / another Solana wallet), then reload.", "err");
+      return;
+    }
+    var nr = await fetch("/user/api/nonce");
+    if (!nr.ok) throw new Error("failed to fetch nonce (" + nr.status + ")");
+    var nonce = (await nr.json()).nonce;
+    // MUST match auth::siws_challenge byte for byte.
+    var message = "Sign in to lets_embed with Solana\nDomain: " + SIWE_DOMAIN + "\nNonce: " + nonce;
+    var sigBytes = await signer.sign(new TextEncoder().encode(message));
+    var sigB58 = typeof sigBytes === "string" ? sigBytes : bs58encode(sigBytes);
+    var vr = await fetch("/user/api/verify_solana", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ solana_address: signer.address, signature: sigB58, nonce: nonce }),
+    });
+    if (vr.ok) {
+      showMsg("Signed in. Redirecting…", "ok");
+      location = nextUrl();
+      return;
+    }
+    var err;
+    try { err = (await vr.json()).error; } catch (_) {}
+    showMsg(err || "Solana sign-in failed (" + vr.status + ")", "err");
+  } catch (e) {
+    showMsg(e && e.message ? e.message : String(e), "err");
+  } finally {
+    sbtn.disabled = false;
+  }
+});
 </script>"##;
 
 #[worker::send]
 pub async fn login_page(State(st): State<AppState>) -> Response {
-    let body = LOGIN_BODY.replace("__CHAIN_ID__", &st.chain_id.to_string());
+    let body = LOGIN_BODY
+        .replace("__CHAIN_ID__", &st.chain_id.to_string())
+        .replace("__SIWE_DOMAIN__", &st.siwe_domain);
     Html(page("Sign in — lets_embed", &body)).into_response()
 }
 

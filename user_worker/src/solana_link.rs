@@ -37,10 +37,15 @@ fn internal_error() -> Response {
     api_err(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
 }
 
-/// Pure ed25519 verification of the link challenge. `solana_address_b58` is the
+/// Pure ed25519 verification of a signed message. `solana_address_b58` is the
 /// base58 32-byte ed25519 public key; `signature_b58` is the base58 64-byte
-/// signature. Any decode / length / verify failure yields `false`.
-fn verify_link_sig(solana_address_b58: &str, signature_b58: &str, message: &str) -> bool {
+/// signature. Any decode / length / verify failure yields `false`. Shared by the
+/// wallet-link challenge and SIWS login (`auth::verify_solana`).
+pub(crate) fn verify_ed25519_b58(
+    solana_address_b58: &str,
+    signature_b58: &str,
+    message: &str,
+) -> bool {
     let Ok(pk_bytes) = bs58::decode(solana_address_b58).into_vec() else {
         return false;
     };
@@ -97,7 +102,7 @@ pub async fn link(
     let msg = challenge_message(&addr, &req.nonce);
 
     // 4) Verify the ed25519 signature.
-    if !verify_link_sig(&req.solana_address, &req.signature, &msg) {
+    if !verify_ed25519_b58(&req.solana_address, &req.signature, &msg) {
         return api_err(StatusCode::BAD_REQUEST, "signature verification failed");
     }
 
@@ -114,6 +119,31 @@ pub async fn link(
     #[derive(Deserialize)]
     struct OwnerRow {
         address: String,
+    }
+
+    // Coexistence rule: a Solana address is EITHER a standalone SIWS account OR a
+    // linked wallet, never both. If it's already a standalone account, refuse.
+    let standalone = match db
+        .prepare("SELECT address FROM users WHERE address = ?")
+        .bind(&[req.solana_address.as_str().into()])
+    {
+        Ok(stmt) => match stmt.first::<OwnerRow>(None).await {
+            Ok(row) => row.is_some(),
+            Err(e) => {
+                worker::console_error!("standalone lookup failed: {e:?}");
+                return internal_error();
+            }
+        },
+        Err(e) => {
+            worker::console_error!("standalone lookup bind failed: {e:?}");
+            return internal_error();
+        }
+    };
+    if standalone {
+        return api_err(
+            StatusCode::CONFLICT,
+            "this wallet already has its own account — log in with it directly instead of linking",
+        );
     }
     let existing = match db
         .prepare("SELECT address FROM users WHERE solana_address = ?")
@@ -270,14 +300,14 @@ mod tests {
     #[test]
     fn verify_accepts_valid_signature() {
         let (pk, sig, msg) = fixture();
-        assert!(verify_link_sig(&pk, &sig, &msg));
+        assert!(verify_ed25519_b58(&pk, &sig, &msg));
     }
 
     #[test]
     fn verify_rejects_tampered_message() {
         let (pk, sig, msg) = fixture();
         let tampered = format!("{msg} ");
-        assert!(!verify_link_sig(&pk, &sig, &tampered));
+        assert!(!verify_ed25519_b58(&pk, &sig, &tampered));
     }
 
     #[test]
@@ -286,18 +316,18 @@ mod tests {
         let mut sig_bytes = bs58::decode(&sig).into_vec().unwrap();
         sig_bytes[0] ^= 0x01;
         let bad_sig = bs58::encode(&sig_bytes).into_string();
-        assert!(!verify_link_sig(&pk, &bad_sig, &msg));
+        assert!(!verify_ed25519_b58(&pk, &bad_sig, &msg));
     }
 
     #[test]
     fn verify_rejects_garbage_base58() {
         let (pk, sig, msg) = fixture();
         // Non-base58 alphabet (contains '0', 'O', 'I', 'l') / wrong lengths.
-        assert!(!verify_link_sig("0OIl", &sig, &msg));
-        assert!(!verify_link_sig(&pk, "0OIl", &msg));
+        assert!(!verify_ed25519_b58("0OIl", &sig, &msg));
+        assert!(!verify_ed25519_b58(&pk, "0OIl", &msg));
         // Valid base58 but wrong length (not 32 / 64 bytes).
         let short = bs58::encode([0u8; 4]).into_string();
-        assert!(!verify_link_sig(&short, &sig, &msg));
-        assert!(!verify_link_sig(&pk, &short, &msg));
+        assert!(!verify_ed25519_b58(&short, &sig, &msg));
+        assert!(!verify_ed25519_b58(&pk, &short, &msg));
     }
 }

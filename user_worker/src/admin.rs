@@ -21,7 +21,7 @@ use worker::{Env, Fetch, Method, Result};
 
 use crate::{
     AppState, do_client,
-    session::{is_eth_address, now_secs},
+    session::{is_valid_principal, now_secs},
     types::{BanReq, CreditReq, StatusResp},
 };
 
@@ -237,7 +237,7 @@ async fn db_user_exists(env: &Env, address: &str) -> Result<bool> {
 /// Validate a form address: must look like a lowercase eth address (400) and
 /// exist in `users` (404). Returns an error response on failure.
 async fn validate_form_address(env: &Env, address: &str) -> std::result::Result<(), Response> {
-    if !is_eth_address(address) {
+    if !is_valid_principal(address) {
         return Err((StatusCode::BAD_REQUEST, "invalid address").into_response());
     }
     match db_user_exists(env, address).await {
@@ -276,7 +276,7 @@ pub async fn admin_page(
         }
     };
 
-    let detail = match q.address.as_deref().filter(|a| is_eth_address(a)) {
+    let detail = match q.address.as_deref().filter(|a| is_valid_principal(a)) {
         Some(addr) => match do_client::do_status(&st.env, addr).await {
             Ok(s) => Some(s),
             Err(e) => {

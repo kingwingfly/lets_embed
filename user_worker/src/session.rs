@@ -1,8 +1,9 @@
 //! FROZEN SCAFFOLD (fully implemented): HS256 session tokens + cookie helpers.
 //!
 //! Same 2-part token format (`base64url(payload).base64url(hmac)`) and same
-//! `lets-embed-jwt-secret` as gateway_worker; `sub` is a lowercase 0x address.
-//! The `is_eth_address` check on `sub` rejects legacy `gw_token` values
+//! `lets-embed-jwt-secret` as gateway_worker; `sub` is a session **principal** —
+//! either a lowercase 0x eth address (SIWE) or a base58 Solana pubkey (SIWS).
+//! The `is_valid_principal` check on `sub` rejects legacy `gw_token` values
 //! (UUID subs) signed with the same secret.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
@@ -20,7 +21,8 @@ pub const SESSION_COOKIE: &str = "ue_session";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionClaims {
-    /// Lowercase 0x-prefixed eth address.
+    /// Session principal: a lowercase 0x eth address (SIWE) or a base58 Solana
+    /// pubkey (SIWS).
     pub sub: String,
     pub iat: u64,
     pub exp: u64,
@@ -45,7 +47,7 @@ pub fn jwt_verify(token: &str, secret: &[u8], now: u64) -> Option<SessionClaims>
     mac.update(payload.as_bytes());
     mac.verify_slice(&sig).ok()?;
     let c: SessionClaims = serde_json::from_slice(&B64.decode(payload).ok()?).ok()?;
-    (c.exp >= now && is_eth_address(&c.sub)).then_some(c)
+    (c.exp >= now && is_valid_principal(&c.sub)).then_some(c)
 }
 
 /// Lowercase 0x-prefixed 20-byte hex address.
@@ -55,6 +57,21 @@ pub fn is_eth_address(s: &str) -> bool {
         && s[2..]
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A base58-encoded 32-byte Solana ed25519 public key. Format-disjoint from
+/// [`is_eth_address`] — eth is `0x`+hex, and the base58 alphabet excludes `0`,
+/// so `0x…` can never decode as base58 — letting eth and Solana principals share
+/// one namespace (session `sub`, `users.address`, DO id) without collision.
+pub fn is_sol_principal(s: &str) -> bool {
+    // base58 of 32 bytes is 32–44 chars; bound the work before decoding.
+    (32..=44).contains(&s.len())
+        && matches!(bs58::decode(s).into_vec(), Ok(v) if v.len() == 32)
+}
+
+/// A valid session principal: an Ethereum address (SIWE) or a Solana pubkey (SIWS).
+pub fn is_valid_principal(s: &str) -> bool {
+    is_eth_address(s) || is_sol_principal(s)
 }
 
 /// Verified session address from the request cookies, or None.
@@ -93,6 +110,23 @@ mod tests {
         // legacy gw_token UUID sub rejected
         assert!(!is_eth_address("2f4d0c9e-9f5a-4a2c-8f2e-2d3b4c5d6e7f"));
         assert!(!is_eth_address("0x123"));
+    }
+
+    #[test]
+    fn sol_and_valid_principal() {
+        // a real 32-byte base58 ed25519 pubkey
+        let sol = "7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2";
+        assert!(is_sol_principal(sol));
+        assert!(is_valid_principal(sol));
+        // eth is not a sol principal (base58 excludes '0', so "0x…" can't decode)
+        let eth = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045";
+        assert!(!is_sol_principal(eth));
+        assert!(is_valid_principal(eth));
+        // legacy UUID sub is neither
+        assert!(!is_sol_principal("2f4d0c9e-9f5a-4a2c-8f2e-2d3b4c5d6e7f"));
+        assert!(!is_valid_principal("2f4d0c9e-9f5a-4a2c-8f2e-2d3b4c5d6e7f"));
+        // base58 but wrong length (not 32 bytes) rejected
+        assert!(!is_sol_principal(&bs58::encode([0u8; 16]).into_string()));
     }
 
     #[test]

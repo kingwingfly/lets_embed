@@ -116,6 +116,17 @@ pub struct VerifyReq {
     pub signature: String,
 }
 
+/// Sign-In-With-Solana login: the wallet signs the server's nonce challenge.
+#[derive(Debug, Deserialize)]
+pub struct SiwsReq {
+    /// base58 Solana address (ed25519 public key) — becomes the account principal.
+    pub solana_address: String,
+    /// base58 ed25519 signature over the SIWS challenge.
+    pub signature: String,
+    /// The nonce embedded in the signed challenge (single-use, from /api/nonce).
+    pub nonce: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct VerifyResp {
     /// EIP-55 checksummed for display.

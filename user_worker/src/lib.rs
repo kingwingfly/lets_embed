@@ -100,6 +100,7 @@ async fn router(env: Env, _ctx: Context) -> Result<Router> {
         // Auth (SIWE)
         .route("/user/api/nonce", get(auth::nonce))
         .route("/user/api/verify", post(auth::verify))
+        .route("/user/api/verify_solana", post(auth::verify_solana))
         .route("/user/api/logout", post(auth::logout))
         .route("/user/api/me", get(auth::me))
         // Payments / subscription
