@@ -151,6 +151,7 @@ pub fn AccountWidget() -> impl IntoView {
         <div class="relative group shrink-0">
             <a
                 href="/user/account"
+                rel="external"
                 class="flex items-center gap-1.5 rounded-full py-2 px-3 bg-white/80 backdrop-blur-md
                     ring-1 ring-sky-200 shadow-sm shadow-sky-200/50 text-sky-600 font-medium
                     hover:ring-sky-300 hover:scale-105 transition-all cursor-pointer whitespace-nowrap"
@@ -210,6 +211,7 @@ pub fn AccountWidget() -> impl IntoView {
                             <span class="text-slate-600">"You\u{2019}re not signed in."</span>
                             <a
                                 href="/user/login"
+                                rel="external"
                                 class="text-center bg-gradient-to-r from-sky-400 to-blue-500 text-white
                                     font-medium rounded-full py-1.5 px-4 shadow-sm shadow-sky-300/60
                                     hover:from-sky-500 hover:to-blue-600 transition-all"

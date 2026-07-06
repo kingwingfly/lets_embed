@@ -144,38 +144,45 @@ pub fn LikeButton(kind: &'static str, target_id: i64) -> impl IntoView {
     };
 
     let base = "text-xl md:text-2xl leading-none select-none transition-transform";
+    // Distinct glyph + accent per kind so the image and post favorite toggles are
+    // visually distinguishable side by side: image = heart (rose), post = star (amber).
+    let (filled, outline, liked_color, notliked_color) = match kind {
+        "post" => ("\u{2605}", "\u{2606}", "text-amber-500", "hover:text-amber-400"),
+        _ => ("\u{2665}", "\u{2661}", "text-rose-500", "hover:text-rose-400"),
+    };
     view! {
         {move || match state.get() {
             Some(LikeState::Liked) => view! {
                 <button
-                    class=format!("{base} text-rose-500 hover:scale-110 cursor-pointer")
+                    class=format!("{base} {liked_color} hover:scale-110 cursor-pointer")
                     title=format!("unfavorite this {kind}")
                     on:click=move |_| toggle()
                 >
-                    "\u{2665}"
+                    {filled}
                 </button>
             }.into_any(),
             Some(LikeState::NotLiked) => view! {
                 <button
-                    class=format!("{base} text-sky-400 hover:text-rose-400 hover:scale-110 cursor-pointer")
+                    class=format!("{base} text-sky-400 {notliked_color} hover:scale-110 cursor-pointer")
                     title=format!("favorite this {kind}")
                     on:click=move |_| toggle()
                 >
-                    "\u{2661}"
+                    {outline}
                 </button>
             }.into_any(),
             Some(LikeState::SignedOut) => view! {
                 <a
                     href="/user/login"
+                    rel="external"
                     class=format!("{base} text-sky-300 hover:text-sky-500 hover:scale-110")
-                    title="sign in to favorite"
+                    title=format!("sign in to favorite this {kind}")
                 >
-                    "\u{2661}"
+                    {outline}
                 </a>
             }.into_any(),
             None => view! {
-                <span class=format!("{base} text-sky-200") title="favorite">
-                    "\u{2661}"
+                <span class=format!("{base} text-sky-200") title=format!("favorite this {kind}")>
+                    {outline}
                 </span>
             }.into_any(),
         }}

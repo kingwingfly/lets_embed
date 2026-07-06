@@ -363,6 +363,7 @@ pub fn ImageDetails() -> impl IntoView {
                         }
                         <a
                             href="/user/favorites"
+                            rel="external"
                             class="text-sm md:text-base font-medium text-sky-600
                                     hover:text-sky-800 hover:underline"
                         >
