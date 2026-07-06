@@ -8,8 +8,9 @@ Worker. Replaces the old apply/approve flow in `gateway_worker`.
   cookie `ue_session` (signed with the same `lets-embed-jwt-secret` as the
   gateway; `sub` = lowercase address). Nonces are single-use, stored in the
   `NONCES` KV namespace with a 300s TTL.
-- **Metering**: every image view (1 pt), video view (5 pts) and similarity
-  search (100 pts) costs points, deduped per user per resource per 24h.
+- **Metering**: every image view (1 pt), video view (5 pts), upload-image
+  search (100 pts) and by-id search (10 pts) costs points, deduped per user per
+  resource per 24h.
   Enforced by `gateway_worker` calling the per-user `UserAccount` Durable
   Object (bound cross-script).
 - **Billing (v2)**: pay-as-you-go points balance + optional subscription plans
@@ -54,7 +55,13 @@ in `src/config.rs`.
 
 ### Pricing (pay-as-you-go)
 
-- Image view: **1 pt**; video view: **5 pts**; similarity search: **100 pts**.
+- Image view: **1 pt**; video view: **5 pts**.
+- Similarity search comes in two tiers by cost-to-serve:
+  - **upload-image search: 100 pts** — runs dinov3 ONNX inference (expensive).
+    For subscribers it draws from the per-window search allowance.
+  - **by-id search: 10 pts** — reuses a stored embedding (a pgvector query, no
+    inference — cheap), so it is a view-class charge: for subscribers it draws
+    from the (abundant) view allowance, not the scarce search allowance.
 - Repeat use of the same resource within 24h (`DEDUPE_WINDOW_SECS`) is free —
   dedupe happens inside the DO (per media path, per search query).
 - New accounts get a **3,000 pt** free grant on first touch

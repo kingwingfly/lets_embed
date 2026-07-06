@@ -19,14 +19,18 @@ use serde::{Deserialize, Serialize};
 //   POST /ban         BanReq      -> 200 StatusResp
 // ---------------------------------------------------------------------------
 
-/// What is being charged. `Search` = one similarity search (dinov3); the gateway
-/// sends a synthetic dedupe `path` for it (e.g. "search:sim:{id}").
+/// What is being charged. The gateway sends a synthetic dedupe `path` for the
+/// search kinds (e.g. "search:img:{hash}" / "search:sim:{id}").
+/// - `Search`: upload-image similarity search — runs dinov3 inference (expensive).
+/// - `EmbedSearch`: by-id similarity search — reuses a stored embedding via a
+///   pgvector query (cheap); charged as a view-class action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChargeKind {
     Image,
     Video,
     Search,
+    EmbedSearch,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
