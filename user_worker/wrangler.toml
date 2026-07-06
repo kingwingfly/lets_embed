@@ -15,15 +15,15 @@ SIWE_DOMAIN = "lets-embed.louisfly.icu"
 # Ethereum JSON-RPC endpoint used to verify ETH/ERC-20 top-ups + Chainlink prices.
 RPC_URL = "https://cloudflare-eth.com"
 # Deposit address users send ETH/ERC-20 to (MUST be lowercase). Placeholder — set before deploy.
-DEPOSIT_ADDRESS = "0x0000000000000000000000000000000000000000"
+DEPOSIT_ADDRESS = "0xe441B924145Ee4eE855D7Bd81BE58C8F4d9a7056"
 CHAIN_ID = "1"
 # Solana JSON-RPC endpoint used to verify SOL / SPL top-ups.
 SOL_RPC_URL = "https://api.mainnet-beta.solana.com"
 # Deposit address users send SOL / SPL tokens to (base58). Placeholder — set before deploy.
-SOL_DEPOSIT_ADDRESS = "REPLACE_WITH_SOLANA_DEPOSIT_ADDRESS"
+SOL_DEPOSIT_ADDRESS = "GjgLaySkPhke5xrgu67uxxmcVoaBwNyjp3LTsZyu79Tx"
 # Cloudflare Access application protecting /user/admin* (new Access app — set its AUD).
 CF_ACCESS_TEAM_DOMAIN = "kingwingfly.cloudflareaccess.com"
-CF_ACCESS_AUD = "REPLACE_WITH_NEW_ACCESS_APP_AUD"
+CF_ACCESS_AUD = "5700459f509f888154922a3f93bbf18d7dbd6b4be7fa472716693eb2fefb6ba5"
 
 [[secrets_store_secrets]]
 binding = "lets-embed-jwt-secret"
@@ -34,7 +34,7 @@ secret_name = "lets-embed-jwt-secret"
 #   wrangler kv namespace create NONCES
 [[kv_namespaces]]
 binding = "NONCES"
-id = "REPLACE_WITH_NONCES_NAMESPACE_ID"
+id = "1d3aa70037834252a25d895d60637774"
 
 # Reuses the gateway's JWKS cache namespace (CF Access RS256 verification for /user/admin).
 [[kv_namespaces]]
