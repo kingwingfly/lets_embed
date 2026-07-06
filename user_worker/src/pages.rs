@@ -81,6 +81,7 @@ a.btn.ghost-alt{background:transparent;color:var(--accent);border:1px solid var(
 a.btn.ghost-alt:hover{background:rgba(79,70,229,.08);border-color:var(--accent)}
 #mobile-wallets .full{margin-top:12px}
 .hint{color:var(--muted);font-size:14px;margin:20px 0 0}
+[hidden]{display:none!important}
 </style>"##;
 
 fn page(title: &str, body: &str) -> String {
@@ -251,7 +252,7 @@ const ACCOUNT_BODY: &str = r##"<div class="card">
 <dl class="stats">
 <dt>Balance</dt><dd id="acct-balance">&mdash;</dd>
 <dt>Plan</dt><dd id="acct-plan">&mdash;</dd>
-<dt>Quota remaining</dt><dd id="acct-quota">&mdash;</dd>
+<dt>Usage left</dt><dd id="acct-quota">&mdash;</dd>
 <dt>Period ends</dt><dd id="acct-period-end">&mdash;</dd>
 <dt>Total views</dt><dd id="acct-views">&mdash;</dd>
 </dl>
@@ -325,7 +326,12 @@ async function loadMe() {
   setText("acct-address", me.address);
   setText("acct-balance", String(me.balance) + " points");
   setText("acct-plan", me.plan ? me.plan : "none");
-  setText("acct-quota", String(me.quota_remaining) + " points");
+  var hasPlan = !!me.plan;
+  var viewsStr = me.views_remaining != null
+    ? String(me.views_remaining)
+    : (hasPlan ? "unlimited" : "—");
+  var searchesStr = me.searches_remaining != null ? String(me.searches_remaining) : "—";
+  setText("acct-quota", "Views: " + viewsStr + "  ·  Searches: " + searchesStr);
   setText("acct-period-end", me.period_end ? fmtDate(me.period_end) : "—");
   setText("acct-views", String(me.total_views));
   document.getElementById("banned-badge").hidden = !me.banned;
