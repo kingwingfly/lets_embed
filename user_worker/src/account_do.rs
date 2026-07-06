@@ -31,6 +31,7 @@ fn view_cost(kind: ChargeKind) -> i64 {
         ChargeKind::Image => config::COST_IMAGE_VIEW,
         ChargeKind::Video => config::COST_VIDEO_VIEW,
         ChargeKind::Search => config::COST_SIM_SEARCH,
+        ChargeKind::EmbedSearch => config::COST_EMBED_SEARCH,
     }
 }
 
@@ -78,14 +79,19 @@ fn decide_charge(
 ) -> ChargeSource {
     if active && let Some(plan) = plan {
         match kind {
-            ChargeKind::Image | ChargeKind::Video => match plan.views_per_window {
-                None => return ChargeSource::FreeUnlimited,
-                Some(limit) => {
-                    if win_views + cost <= limit {
-                        return ChargeSource::Window;
+            // View-class kinds (incl. the cheap by-id embed search) draw from the
+            // media view budget; pro's unlimited views cover them for free.
+            ChargeKind::Image | ChargeKind::Video | ChargeKind::EmbedSearch => {
+                match plan.views_per_window {
+                    None => return ChargeSource::FreeUnlimited,
+                    Some(limit) => {
+                        if win_views + cost <= limit {
+                            return ChargeSource::Window;
+                        }
                     }
                 }
-            },
+            }
+            // The expensive upload-image search draws from the scarce search quota.
             ChargeKind::Search => {
                 if win_search < plan.searches_per_window {
                     return ChargeSource::Window;
@@ -349,7 +355,9 @@ impl UserAccount {
             ChargeSource::Window => {
                 match req.kind {
                     ChargeKind::Search => win_search += 1,
-                    ChargeKind::Image | ChargeKind::Video => win_views += cost,
+                    ChargeKind::Image | ChargeKind::Video | ChargeKind::EmbedSearch => {
+                        win_views += cost
+                    }
                 }
                 window_dirty = true;
             }
@@ -504,6 +512,7 @@ mod tests {
         assert_eq!(view_cost(ChargeKind::Image), config::COST_IMAGE_VIEW);
         assert_eq!(view_cost(ChargeKind::Video), config::COST_VIDEO_VIEW);
         assert_eq!(view_cost(ChargeKind::Search), config::COST_SIM_SEARCH);
+        assert_eq!(view_cost(ChargeKind::EmbedSearch), config::COST_EMBED_SEARCH);
     }
 
     fn basic() -> &'static config::Plan {
@@ -591,8 +600,37 @@ mod tests {
     }
 
     #[test]
+    fn embed_search_is_view_class_not_search_quota() {
+        let c = view_cost(ChargeKind::EmbedSearch);
+        assert_eq!(c, config::COST_EMBED_SEARCH);
+        // cheaper than the inference search
+        assert!(c < view_cost(ChargeKind::Search));
+        // pro's unlimited views cover it for free (does not touch search quota)
+        assert_eq!(
+            decide_charge(Some(pro()), true, ChargeKind::EmbedSearch, 0, pro().searches_per_window, 0, c),
+            ChargeSource::FreeUnlimited
+        );
+        // basic draws it from the VIEW window (win_views), regardless of search usage
+        let vlimit = basic().views_per_window.unwrap();
+        assert_eq!(
+            decide_charge(Some(basic()), true, ChargeKind::EmbedSearch, vlimit - c, basic().searches_per_window, 0, c),
+            ChargeSource::Window
+        );
+        // view window exhausted → PAYG, even though search slots remain
+        assert_eq!(
+            decide_charge(Some(basic()), true, ChargeKind::EmbedSearch, vlimit, 0, c, c),
+            ChargeSource::Balance
+        );
+    }
+
+    #[test]
     fn no_plan_is_payg_for_all_kinds() {
-        for kind in [ChargeKind::Image, ChargeKind::Video, ChargeKind::Search] {
+        for kind in [
+            ChargeKind::Image,
+            ChargeKind::Video,
+            ChargeKind::Search,
+            ChargeKind::EmbedSearch,
+        ] {
             let c = view_cost(kind);
             assert_eq!(
                 decide_charge(None, false, kind, 0, 0, c, c),

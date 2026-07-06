@@ -118,7 +118,10 @@ fn is_eth_address(s: &str) -> bool {
 pub enum ChargeKind {
     Image,
     Video,
+    /// Upload-image similarity search (runs dinov3 inference — expensive).
     Search,
+    /// By-id similarity search (reuses a stored embedding — cheap, view-class).
+    EmbedSearch,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -210,18 +213,21 @@ async fn gateway(
     // through unchanged. Dedupe (same key within 24h) lives in the DO, so
     // paginated re-searches with the same `q` are automatically free.
     if method == Method::POST
-        && let Some(charge_key) = match path {
-            "/api/search_similar" => form_field(&body, "q").map(|q| format!("search:sim:{q}")),
-            "/api/search_by_image" => {
-                form_field(&body, "image").map(|img| format!("search:img:{}", &sha256_hex(&img)[..32]))
+        && let Some((charge_key, kind)) = match path {
+            // By-id search reuses a stored embedding (cheap) -> view-class EmbedSearch.
+            "/api/search_similar" => {
+                form_field(&body, "q").map(|q| (format!("search:sim:{q}"), ChargeKind::EmbedSearch))
             }
+            // Upload-image search runs dinov3 inference (expensive) -> Search.
+            "/api/search_by_image" => form_field(&body, "image")
+                .map(|img| (format!("search:img:{}", &sha256_hex(&img)[..32]), ChargeKind::Search)),
             _ => None,
         }
     {
         // If the field is absent/unparseable we PROXY WITHOUT CHARGING (and warn):
         // a body-shape change must never break search. `None` charge_key means we
         // did match an intercepted path but couldn't read the field.
-        match charge_do(&st, &claims.sub, &charge_key, ChargeKind::Search).await {
+        match charge_do(&st, &claims.sub, &charge_key, kind).await {
             Ok(200) => {}
             Ok(402) => {
                 return (

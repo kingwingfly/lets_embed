@@ -16,8 +16,14 @@ pub const POINTS_PER_USD: i64 = 10_000;
 pub const COST_IMAGE_VIEW: i64 = 1;
 /// Points consumed by one video view (bandwidth-weighted).
 pub const COST_VIDEO_VIEW: i64 = 5;
-/// Points consumed by one similarity search (PAYG; $0.01).
+/// Points consumed by one upload-image similarity search (PAYG; $0.01). This
+/// runs dinov3 ONNX inference on the uploaded bytes — the expensive path.
 pub const COST_SIM_SEARCH: i64 = 100;
+/// Points consumed by one by-id similarity search (PAYG; $0.001). This reuses a
+/// stored dinov3 embedding (a pgvector query, no inference) — the cheap path, so
+/// it is a view-class charge drawn from the abundant view budget rather than the
+/// scarce inference-search quota.
+pub const COST_EMBED_SEARCH: i64 = 10;
 /// Points granted to a brand-new account on first touch ($0.30).
 pub const FREE_GRANT_POINTS: i64 = 3_000;
 /// Minimum top-up accepted, in points ($0.10); smaller credits are rejected.
