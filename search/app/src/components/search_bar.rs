@@ -136,7 +136,7 @@ pub fn SearchBar() -> impl IntoView {
 
     view! {
         <div class="relative flex flex-col w-full h-fit sticky top-0 z-40 bg-white/80 backdrop-blur-md shadow-sm shadow-sky-200/50">
-            <div class="flex flex-wrap w-full items-center gap-2 py-2 px-4 pr-24 lg:pr-28 justify-center lg:justify-start">
+            <div class="flex flex-wrap w-full items-center gap-2 py-2 px-4 justify-center lg:justify-start">
                 <a href="/" class="font-display text-3xl font-bold text-left md:text-center w-full md:w-auto max-w-64 md:mx-0 shrink-0
                     bg-gradient-to-r from-sky-500 via-blue-500 to-cyan-400 bg-clip-text text-transparent
                     drop-shadow-sm hover:scale-105 transition-transform">
@@ -248,7 +248,10 @@ pub fn SearchBar() -> impl IntoView {
                     </div>
                 </form>
             </div>
-            <div class="absolute top-2 right-4 z-50">
+            // Floats just below the whole bar at the top-right corner (like the
+            // back-to-top button), tracking the sticky bar's variable height via
+            // `top-full`, so it never crowds the Search button.
+            <div class="absolute top-full right-4 mt-2 z-50">
                 <AccountWidget />
             </div>
             <div class="w-full h-px bg-gradient-to-r from-transparent via-sky-300 to-transparent" />
