@@ -14,9 +14,7 @@
 use std::collections::HashMap;
 
 use serde::de::DeserializeOwned;
-use worker::{
-    Date, DurableObject, Env, Method, Request, Response, Result, State, durable_object,
-};
+use worker::{Date, DurableObject, Env, Method, Request, Response, Result, State, durable_object};
 
 use crate::config;
 use crate::types::{
@@ -109,10 +107,9 @@ fn views_remaining(plan: Option<&config::Plan>, active: bool, win_views: i64) ->
     if !active {
         return None;
     }
-    match plan?.views_per_window {
-        None => None,
-        Some(limit) => Some((limit - win_views).max(0)),
-    }
+    plan?
+        .views_per_window
+        .map(|limit| (limit - win_views).max(0))
 }
 
 /// Remaining searches this window; `None` = no active plan.
@@ -328,7 +325,9 @@ impl UserAccount {
             window_dirty = true;
         }
 
-        let source = decide_charge(plan_cfg, active, req.kind, win_views, win_search, balance, cost);
+        let source = decide_charge(
+            plan_cfg, active, req.kind, win_views, win_search, balance, cost,
+        );
         if source == ChargeSource::Refuse {
             let views_remaining = views_remaining(plan_cfg, active, win_views);
             let searches_remaining = searches_remaining(plan_cfg, active, win_search);
@@ -369,7 +368,10 @@ impl UserAccount {
         storage.put("total_views", total_views).await?;
         if window_dirty {
             storage
-                .put("win_start", win_start.expect("rolled/active window has a start"))
+                .put(
+                    "win_start",
+                    win_start.expect("rolled/active window has a start"),
+                )
                 .await?;
             storage.put("win_views", win_views).await?;
             storage.put("win_search", win_search).await?;
@@ -396,12 +398,24 @@ impl UserAccount {
         let marker = format!("credit:{}", req.key);
         let balance: i64 = self.get_or("balance", 0).await?;
         if storage.get::<bool>(&marker).await?.is_some() {
-            return json(&BalanceResp { balance, applied: false }, 200);
+            return json(
+                &BalanceResp {
+                    balance,
+                    applied: false,
+                },
+                200,
+            );
         }
         let balance = (balance + req.points).max(0);
         storage.put("balance", balance).await?;
         storage.put(&marker, true).await?;
-        json(&BalanceResp { balance, applied: true }, 200)
+        json(
+            &BalanceResp {
+                balance,
+                applied: true,
+            },
+            200,
+        )
     }
 
     async fn subscribe(&self, req: SubscribeReq) -> Result<Response> {
@@ -472,9 +486,17 @@ mod tests {
     fn dedupe_misses_unknown_path_and_expired_entry() {
         let yesterday = map(&[("/images/old.webp", NOW - config::DEDUPE_WINDOW_SECS)]);
         let empty = HashMap::new();
-        assert!(!is_recent_view("/images/new.webp", NOW, [&empty, &yesterday]));
+        assert!(!is_recent_view(
+            "/images/new.webp",
+            NOW,
+            [&empty, &yesterday]
+        ));
         // first_seen exactly at the cutoff is no longer free
-        assert!(!is_recent_view("/images/old.webp", NOW, [&empty, &yesterday]));
+        assert!(!is_recent_view(
+            "/images/old.webp",
+            NOW,
+            [&empty, &yesterday]
+        ));
     }
 
     #[test]
@@ -601,7 +623,10 @@ mod tests {
         );
         // basic clamps at zero, never negative
         let vlimit = basic().views_per_window.unwrap();
-        assert_eq!(views_remaining(Some(basic()), true, 100), Some(vlimit - 100));
+        assert_eq!(
+            views_remaining(Some(basic()), true, 100),
+            Some(vlimit - 100)
+        );
         assert_eq!(views_remaining(Some(basic()), true, vlimit + 50), Some(0));
         assert_eq!(
             searches_remaining(Some(basic()), true, basic().searches_per_window + 5),

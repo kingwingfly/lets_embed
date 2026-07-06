@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 //! user_worker — SIWE user system for lets_embed.
 //!
 //! FROZEN SCAFFOLD: this file (plus `config.rs`, `types.rs`, `session.rs`,
