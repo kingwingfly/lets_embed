@@ -43,6 +43,94 @@ fn is_recent_view(path: &str, now: u64, maps: [&HashMap<String, u64>; 2]) -> boo
         .any(|m| m.get(path).is_some_and(|&first_seen| first_seen > cutoff))
 }
 
+/// Whether a new usage window should be opened: none yet, or the current one has
+/// elapsed (`now` reached `win_start + WINDOW_SECS`).
+fn should_roll(win_start: Option<u64>, now: u64) -> bool {
+    match win_start {
+        None => true,
+        Some(start) => now >= start + config::WINDOW_SECS,
+    }
+}
+
+/// Where a (non-deduped) charge draws from once the plan + window are consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChargeSource {
+    /// Pro plan media view — unlimited; deduct nothing, just record the view.
+    FreeUnlimited,
+    /// Draw from the subscription window quota (no balance change).
+    Window,
+    /// Pay-as-you-go: deduct `cost` from the points balance.
+    Balance,
+    /// No quota and the balance is too low — refuse (402).
+    Refuse,
+}
+
+/// Decide how one charge is satisfied given plan, window usage and balance.
+/// Pure (plain values + caller-provided window counters) so it is host-testable.
+/// `win_views` / `win_search` are the counters for the *current* (already rolled)
+/// window.
+fn decide_charge(
+    plan: Option<&config::Plan>,
+    active: bool,
+    kind: ChargeKind,
+    win_views: i64,
+    win_search: i64,
+    balance: i64,
+    cost: i64,
+) -> ChargeSource {
+    if active && let Some(plan) = plan {
+        match kind {
+            ChargeKind::Image | ChargeKind::Video => match plan.views_per_window {
+                None => return ChargeSource::FreeUnlimited,
+                Some(limit) => {
+                    if win_views + cost <= limit {
+                        return ChargeSource::Window;
+                    }
+                }
+            },
+            ChargeKind::Search => {
+                if win_search < plan.searches_per_window {
+                    return ChargeSource::Window;
+                }
+            }
+        }
+    }
+    // No plan, or the window quota is exhausted: fall back to PAYG.
+    if balance >= cost {
+        ChargeSource::Balance
+    } else {
+        ChargeSource::Refuse
+    }
+}
+
+/// Remaining media view-units this window; `None` = no active plan or unlimited
+/// (pro). `win_views` is the current window's consumed count.
+fn views_remaining(plan: Option<&config::Plan>, active: bool, win_views: i64) -> Option<i64> {
+    if !active {
+        return None;
+    }
+    match plan?.views_per_window {
+        None => None,
+        Some(limit) => Some((limit - win_views).max(0)),
+    }
+}
+
+/// Remaining searches this window; `None` = no active plan.
+fn searches_remaining(plan: Option<&config::Plan>, active: bool, win_search: i64) -> Option<i64> {
+    if !active {
+        return None;
+    }
+    Some((plan?.searches_per_window - win_search).max(0))
+}
+
+/// Epoch secs when the current window resets; 0 = no active/open window.
+fn window_reset(active: bool, win_start: Option<u64>, now: u64) -> u64 {
+    match win_start {
+        Some(start) if active && now < start + config::WINDOW_SECS => start + config::WINDOW_SECS,
+        _ => 0,
+    }
+}
+
 fn now_secs() -> u64 {
     Date::now().as_millis() / 1000
 }
@@ -94,8 +182,12 @@ impl DurableObject for UserAccount {
                 .await?;
             return Response::ok("");
         }
-        // period elapsed: no auto-renew — lapse to PAYG
+        // period elapsed: no auto-renew — lapse to PAYG and close the window so a
+        // lapsed account reports `None` for views/searches.
         storage.delete("plan").await?;
+        storage.delete("win_start").await?;
+        storage.delete("win_views").await?;
+        storage.delete("win_search").await?;
         Response::ok("")
     }
 }
@@ -121,19 +213,48 @@ impl UserAccount {
         Ok(self.state.storage().get::<String>("plan").await?.is_some() && period_end > now)
     }
 
+    /// Report the current window's remaining view/search quota and reset time
+    /// from stored state, WITHOUT rolling/persisting. An elapsed (or never
+    /// opened) window reports a fresh window: full quota, `window_reset == 0`.
+    async fn window_fields(
+        &self,
+        active: bool,
+        plan: Option<&config::Plan>,
+        now: u64,
+    ) -> Result<(Option<i64>, Option<i64>, u64)> {
+        let win_start: Option<u64> = self.state.storage().get("win_start").await?;
+        let open = active && !should_roll(win_start, now);
+        let (win_views, win_search) = if open {
+            (
+                self.get_or("win_views", 0).await?,
+                self.get_or("win_search", 0).await?,
+            )
+        } else {
+            (0, 0)
+        };
+        Ok((
+            views_remaining(plan, active, win_views),
+            searches_remaining(plan, active, win_search),
+            window_reset(active, win_start, now),
+        ))
+    }
+
     async fn status_resp(&self) -> Result<StatusResp> {
         let now = now_secs();
         let period_end: u64 = self.get_or("period_end", 0).await?;
         let active = self.plan_active(now).await?;
+        let plan_id: Option<String> = self.state.storage().get("plan").await?;
+        let plan_cfg = plan_id.as_deref().and_then(config::plan);
+        let (views_remaining, searches_remaining, window_reset) =
+            self.window_fields(active, plan_cfg, now).await?;
         Ok(StatusResp {
             address: self.get_or("address", String::new()).await?,
             balance: self.get_or("balance", 0).await?,
-            plan: self.state.storage().get("plan").await?,
+            plan: plan_id,
             period_end: if active { period_end } else { 0 },
-            // SCAFFOLD: window accounting is UNIT 1's job.
-            views_remaining: None,
-            searches_remaining: None,
-            window_reset: 0,
+            views_remaining,
+            searches_remaining,
+            window_reset,
             banned: self.get_or("banned", false).await?,
             total_views: self.get_or("total_views", 0).await?,
         })
@@ -162,26 +283,81 @@ impl UserAccount {
         let cost = view_cost(req.kind);
         let mut balance: i64 = self.get_or("balance", 0).await?;
 
-        let new_day = today.is_none();
-        let mut today_map = today.unwrap_or_default();
-        let resp = |charged: bool, balance: i64| ChargeResp {
-            charged,
-            cost,
-            balance,
-            views_remaining: None,
-            searches_remaining: None,
-            window_reset: 0,
+        let active = self.plan_active(now).await?;
+        let plan_cfg = if active {
+            storage
+                .get::<String>("plan")
+                .await?
+                .as_deref()
+                .and_then(config::plan)
+        } else {
+            None
         };
 
+        let new_day = today.is_none();
+        let mut today_map = today.unwrap_or_default();
+
+        // Deduped repeats within the window cost nothing and touch no state; they
+        // still report the current window figures.
         if is_recent_view(&req.path, now, [&today_map, &yesterday]) {
-            return json(&resp(false, balance), 200);
+            let (views_remaining, searches_remaining, window_reset) =
+                self.window_fields(active, plan_cfg, now).await?;
+            return json(
+                &ChargeResp {
+                    charged: false,
+                    cost,
+                    balance,
+                    views_remaining,
+                    searches_remaining,
+                    window_reset,
+                },
+                200,
+            );
         }
 
-        // SCAFFOLD: PAYG only. UNIT 1 consults the active plan's window first.
-        if balance < cost {
-            return json(&resp(false, balance), 402);
+        // Roll the usage window if the plan is active and the current one elapsed
+        // (or was never opened).
+        let mut win_start: Option<u64> = storage.get("win_start").await?;
+        let mut win_views: i64 = self.get_or("win_views", 0).await?;
+        let mut win_search: i64 = self.get_or("win_search", 0).await?;
+        let mut window_dirty = false;
+        if active && should_roll(win_start, now) {
+            win_start = Some(now);
+            win_views = 0;
+            win_search = 0;
+            window_dirty = true;
         }
-        balance -= cost;
+
+        let source = decide_charge(plan_cfg, active, req.kind, win_views, win_search, balance, cost);
+        if source == ChargeSource::Refuse {
+            let views_remaining = views_remaining(plan_cfg, active, win_views);
+            let searches_remaining = searches_remaining(plan_cfg, active, win_search);
+            let window_reset = window_reset(active, win_start, now);
+            return json(
+                &ChargeResp {
+                    charged: false,
+                    cost,
+                    balance,
+                    views_remaining,
+                    searches_remaining,
+                    window_reset,
+                },
+                402,
+            );
+        }
+        match source {
+            ChargeSource::FreeUnlimited => {} // pro media view: deduct nothing
+            ChargeSource::Window => {
+                match req.kind {
+                    ChargeKind::Search => win_search += 1,
+                    ChargeKind::Image | ChargeKind::Video => win_views += cost,
+                }
+                window_dirty = true;
+            }
+            ChargeSource::Balance => balance -= cost,
+            ChargeSource::Refuse => unreachable!("handled above"),
+        }
+
         if new_day {
             // drop the map that fell out of the dedupe horizon (bounded storage)
             storage.delete(&format!("seen:{}", day - 2)).await?;
@@ -191,7 +367,28 @@ impl UserAccount {
         storage.put(&today_key, &today_map).await?;
         storage.put("balance", balance).await?;
         storage.put("total_views", total_views).await?;
-        json(&resp(true, balance), 200)
+        if window_dirty {
+            storage
+                .put("win_start", win_start.expect("rolled/active window has a start"))
+                .await?;
+            storage.put("win_views", win_views).await?;
+            storage.put("win_search", win_search).await?;
+        }
+
+        let views_remaining = views_remaining(plan_cfg, active, win_views);
+        let searches_remaining = searches_remaining(plan_cfg, active, win_search);
+        let window_reset = window_reset(active, win_start, now);
+        json(
+            &ChargeResp {
+                charged: true,
+                cost,
+                balance,
+                views_remaining,
+                searches_remaining,
+                window_reset,
+            },
+            200,
+        )
     }
 
     async fn credit(&self, req: CreditReq) -> Result<Response> {
@@ -232,6 +429,10 @@ impl UserAccount {
         storage.put("balance", balance - plan.price_points).await?;
         storage.put("plan", plan.id).await?;
         storage.put("period_end", new_end).await?;
+        // Reset the usage window on any successful subscribe (new or renew).
+        storage.put("win_start", now).await?;
+        storage.put("win_views", 0i64).await?;
+        storage.put("win_search", 0i64).await?;
         storage
             .set_alarm((new_end.saturating_sub(now) * 1000) as i64)
             .await?;
@@ -281,5 +482,142 @@ mod tests {
         assert_eq!(view_cost(ChargeKind::Image), config::COST_IMAGE_VIEW);
         assert_eq!(view_cost(ChargeKind::Video), config::COST_VIDEO_VIEW);
         assert_eq!(view_cost(ChargeKind::Search), config::COST_SIM_SEARCH);
+    }
+
+    fn basic() -> &'static config::Plan {
+        config::plan("basic").expect("basic plan")
+    }
+    fn pro() -> &'static config::Plan {
+        config::plan("pro").expect("pro plan")
+    }
+
+    #[test]
+    fn should_roll_unset_or_elapsed() {
+        assert!(should_roll(None, NOW));
+        assert!(should_roll(Some(NOW), NOW + config::WINDOW_SECS));
+        assert!(should_roll(Some(NOW), NOW + config::WINDOW_SECS + 1));
+        assert!(!should_roll(Some(NOW), NOW));
+        assert!(!should_roll(Some(NOW), NOW + config::WINDOW_SECS - 1));
+    }
+
+    #[test]
+    fn pro_media_views_are_free_unlimited() {
+        let c = view_cost(ChargeKind::Image);
+        assert_eq!(
+            decide_charge(Some(pro()), true, ChargeKind::Image, 0, 0, 0, c),
+            ChargeSource::FreeUnlimited
+        );
+        // still free with a huge accumulated count and zero balance
+        assert_eq!(
+            decide_charge(Some(pro()), true, ChargeKind::Video, 1_000_000, 0, 0, c),
+            ChargeSource::FreeUnlimited
+        );
+    }
+
+    #[test]
+    fn basic_media_within_window_consumes_quota() {
+        let c = view_cost(ChargeKind::Image);
+        assert_eq!(
+            decide_charge(Some(basic()), true, ChargeKind::Image, 0, 0, 0, c),
+            ChargeSource::Window
+        );
+        // exactly at the limit boundary (limit - cost) still fits
+        let limit = basic().views_per_window.unwrap();
+        assert_eq!(
+            decide_charge(Some(basic()), true, ChargeKind::Image, limit - c, 0, 0, c),
+            ChargeSource::Window
+        );
+    }
+
+    #[test]
+    fn basic_media_exhausted_falls_back_to_balance_then_refuses() {
+        let c = view_cost(ChargeKind::Video);
+        let limit = basic().views_per_window.unwrap();
+        // window full: fall back to PAYG when the balance covers it
+        assert_eq!(
+            decide_charge(Some(basic()), true, ChargeKind::Video, limit, 0, 100, c),
+            ChargeSource::Balance
+        );
+        // window full AND broke: refuse
+        assert_eq!(
+            decide_charge(Some(basic()), true, ChargeKind::Video, limit, 0, c - 1, c),
+            ChargeSource::Refuse
+        );
+    }
+
+    #[test]
+    fn search_uses_window_then_payg() {
+        let c = view_cost(ChargeKind::Search);
+        let limit = basic().searches_per_window;
+        assert_eq!(
+            decide_charge(Some(basic()), true, ChargeKind::Search, 0, 0, 0, c),
+            ChargeSource::Window
+        );
+        assert_eq!(
+            decide_charge(Some(basic()), true, ChargeKind::Search, 0, limit - 1, 0, c),
+            ChargeSource::Window
+        );
+        // window searches exhausted: PAYG if funded, else refuse
+        assert_eq!(
+            decide_charge(Some(basic()), true, ChargeKind::Search, 0, limit, c, c),
+            ChargeSource::Balance
+        );
+        assert_eq!(
+            decide_charge(Some(basic()), true, ChargeKind::Search, 0, limit, c - 1, c),
+            ChargeSource::Refuse
+        );
+    }
+
+    #[test]
+    fn no_plan_is_payg_for_all_kinds() {
+        for kind in [ChargeKind::Image, ChargeKind::Video, ChargeKind::Search] {
+            let c = view_cost(kind);
+            assert_eq!(
+                decide_charge(None, false, kind, 0, 0, c, c),
+                ChargeSource::Balance
+            );
+            assert_eq!(
+                decide_charge(None, false, kind, 0, 0, c - 1, c),
+                ChargeSource::Refuse
+            );
+        }
+        // an inactive plan behaves like no plan
+        assert_eq!(
+            decide_charge(Some(basic()), false, ChargeKind::Image, 0, 0, 1, 1),
+            ChargeSource::Balance
+        );
+    }
+
+    #[test]
+    fn remaining_reflects_plan_and_usage() {
+        // no active plan → None
+        assert_eq!(views_remaining(None, false, 0), None);
+        assert_eq!(searches_remaining(None, false, 0), None);
+        // pro views unlimited → None; searches still counted
+        assert_eq!(views_remaining(Some(pro()), true, 5), None);
+        assert_eq!(
+            searches_remaining(Some(pro()), true, 3),
+            Some(pro().searches_per_window - 3)
+        );
+        // basic clamps at zero, never negative
+        let vlimit = basic().views_per_window.unwrap();
+        assert_eq!(views_remaining(Some(basic()), true, 100), Some(vlimit - 100));
+        assert_eq!(views_remaining(Some(basic()), true, vlimit + 50), Some(0));
+        assert_eq!(
+            searches_remaining(Some(basic()), true, basic().searches_per_window + 5),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn window_reset_zero_unless_active_and_open() {
+        assert_eq!(window_reset(false, Some(NOW), NOW), 0);
+        assert_eq!(window_reset(true, None, NOW), 0);
+        assert_eq!(
+            window_reset(true, Some(NOW), NOW),
+            NOW + config::WINDOW_SECS
+        );
+        // elapsed window is no longer open
+        assert_eq!(window_reset(true, Some(NOW), NOW + config::WINDOW_SECS), 0);
     }
 }
