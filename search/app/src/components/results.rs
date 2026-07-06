@@ -366,6 +366,8 @@ fn load_page(
                 }
                 Some(b64) => search_by_image(b64, limit, offset_val).await,
             }
+        } else if mode == Mode::Similar {
+            search_similar(q, limit, offset_val).await
         } else {
             search_query(mode.as_str().to_string(), q, limit, offset_val).await
         };
@@ -421,9 +423,6 @@ async fn search_query(
     // Return-type annotations pin `ServerFnError`'s generic parameter.
     fn to_err(e: impl std::fmt::Display) -> ServerFnError {
         ServerFnError::Response(e.to_string())
-    }
-    fn to_args(e: impl std::fmt::Display) -> ServerFnError {
-        ServerFnError::Args(e.to_string())
     }
 
     // Post-oriented modes: newest (empty query), author, title, or random posts.
@@ -491,36 +490,7 @@ async fn search_query(
                 .map_err(to_err)?,
         ),
         Mode::Random => Box::pin(engine.random_images(limit).await.map_err(to_err)?),
-        Mode::Similar => {
-            let id = q.parse::<i64>().map_err(to_args)?;
-            let details = engine.image_details(id).await.map_err(to_err)?;
-            let post_image_ids = match details.post.as_ref().map(|p| p.id) {
-                Some(post_id) => engine.list_post_images(post_id).await.ok().map(|imgs| {
-                    imgs.into_iter()
-                        .map(|i| i.id)
-                        .collect::<std::collections::HashSet<_>>()
-                }),
-                None => None,
-            };
-            let mut stream = engine
-                .search_dinov3_by_id([id], limit, offset)
-                .await
-                .map_err(to_err)?;
-            let mut items = Vec::new();
-            let mut count = 0i64;
-            while let Some(img) = stream.next().await {
-                count += 1;
-                if post_image_ids.as_ref().is_some_and(|ids| ids.contains(&img.id)) {
-                    continue;
-                }
-                items.push(img);
-            }
-            return Ok(SearchResponse {
-                has_more: count >= limit,
-                posts: vec![],
-                images: items,
-            });
-        }
+        Mode::Similar => return Err(ServerFnError::Args("similar search moved".into())),
         _ => return Ok(SearchResponse::default()),
     };
 
@@ -537,7 +507,7 @@ async fn search_query(
     })
 }
 
-#[server]
+#[server(endpoint = "search_by_image")]
 async fn search_by_image(
     image: String,
     limit: i64,
@@ -587,4 +557,72 @@ async fn search_by_image(
         posts: vec![],
         images: items,
     })
+}
+
+/// Similarity search by image id. Pinned to the exact path `/api/search_similar`
+/// so the gateway (Unit 6) can meter it by an EXACT server-fn POST path.
+#[server(endpoint = "search_similar")]
+async fn search_similar(
+    q: String,
+    limit: i64,
+    offset: i64,
+) -> Result<SearchResponse, ServerFnError> {
+    use crate::state::AppState;
+
+    use std::sync::Arc;
+
+    use axum::extract::State;
+    use futures::StreamExt as _;
+    use leptos_axum::extract_with_state;
+    use search_engine::Engine;
+
+    fn to_err(e: impl std::fmt::Display) -> ServerFnError {
+        ServerFnError::Response(e.to_string())
+    }
+    fn to_args(e: impl std::fmt::Display) -> ServerFnError {
+        ServerFnError::Args(e.to_string())
+    }
+
+    let limit = limit.max(1);
+    let offset = offset.max(0);
+
+    let state = expect_context::<AppState>();
+    let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
+
+    let id = q.parse::<i64>().map_err(to_args)?;
+    let details = engine.image_details(id).await.map_err(to_err)?;
+    let post_image_ids = match details.post.as_ref().map(|p| p.id) {
+        Some(post_id) => engine.list_post_images(post_id).await.ok().map(|imgs| {
+            imgs.into_iter()
+                .map(|i| i.id)
+                .collect::<std::collections::HashSet<_>>()
+        }),
+        None => None,
+    };
+    let mut stream = engine
+        .search_dinov3_by_id([id], limit, offset)
+        .await
+        .map_err(to_err)?;
+    let mut items = Vec::new();
+    let mut count = 0i64;
+    while let Some(img) = stream.next().await {
+        count += 1;
+        if post_image_ids.as_ref().is_some_and(|ids| ids.contains(&img.id)) {
+            continue;
+        }
+        items.push(img);
+    }
+    Ok(SearchResponse {
+        has_more: count >= limit,
+        posts: vec![],
+        images: items,
+    })
+}
+
+#[cfg(feature = "ssr")]
+#[test]
+fn pinned_paths() {
+    use leptos::server_fn::ServerFn;
+    assert_eq!(SearchSimilar::PATH, "/api/search_similar");
+    assert_eq!(SearchByImage::PATH, "/api/search_by_image");
 }
