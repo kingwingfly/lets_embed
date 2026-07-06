@@ -40,9 +40,10 @@ h1{font-size:22px;margin:0 0 4px;letter-spacing:-.01em}
 h2{font-size:16px;margin:0 0 10px;letter-spacing:-.01em}
 .sub{color:var(--muted);font-size:14px;margin:0 0 22px}
 label{display:block;font-size:13px;font-weight:600;color:var(--muted);margin-bottom:8px}
-input[type=text]{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:10px;
+input[type=text],select{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:10px;
 background:transparent;color:var(--fg);font:inherit;transition:border-color .15s,box-shadow .15s}
-input[type=text]:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.2)}
+input[type=text]:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.2)}
+select{background:var(--card);margin-bottom:14px}
 .btn{display:inline-flex;align-items:center;gap:6px;border:0;border-radius:10px;padding:10px 18px;font:inherit;
 font-weight:600;cursor:pointer;color:#fff;background:var(--accent);transition:background .15s,transform .05s}
 .btn:hover{background:var(--accent-h)}.btn:active{transform:translateY(1px)}
