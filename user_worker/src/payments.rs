@@ -747,6 +747,16 @@ pub async fn subscribe(
     plan_passthrough(&st, &addr, "/subscribe", Some(&req), Some(&req.plan)).await
 }
 
+#[worker::send]
+pub async fn unsubscribe(State(st): State<AppState>, cookies: Cookies) -> Response {
+    let Some(addr) = session::session_address(&cookies, &st.jwt_secret) else {
+        return api_err(StatusCode::UNAUTHORIZED, "login required");
+    };
+    // No body / no plan: the DO refunds the prorated remainder and lapses to
+    // PAYG; the passthrough mirrors `users.plan = NULL` in D1 on success.
+    plan_passthrough(&st, &addr, "/unsubscribe", None, None).await
+}
+
 // ---------------------------------------------------------------------------
 // Host unit tests
 // ---------------------------------------------------------------------------

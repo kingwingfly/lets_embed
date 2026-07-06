@@ -126,6 +126,18 @@ fn searches_remaining(plan: Option<&config::Plan>, active: bool, win_search: i64
     Some((plan?.searches_per_window - win_search).max(0))
 }
 
+/// Points refunded for the unused remainder of a subscription period. The
+/// refund is the plan price prorated by the fraction of the period still
+/// unspent (floored): `price * remaining / period`. `remaining_secs` is clamped
+/// to the period length so it can never over-refund. Pure (host-testable).
+fn prorated_refund(price_points: i64, period_secs: u64, remaining_secs: u64) -> i64 {
+    if period_secs == 0 {
+        return 0;
+    }
+    let remaining = remaining_secs.min(period_secs);
+    ((price_points as i128 * remaining as i128) / period_secs as i128) as i64
+}
+
 /// Epoch secs when the current window resets; 0 = no active/open window.
 fn window_reset(active: bool, win_start: Option<u64>, now: u64) -> u64 {
     match win_start {
@@ -166,6 +178,7 @@ impl DurableObject for UserAccount {
             (Method::Post, "/credit") => self.credit(req.json().await?).await,
             (Method::Get, "/status") => json(&self.status_resp().await?, 200),
             (Method::Post, "/subscribe") => self.subscribe(req.json().await?).await,
+            (Method::Post, "/unsubscribe") => self.unsubscribe().await,
             (Method::Post, "/ban") => self.ban(req.json().await?).await,
             _ => Response::error("not found", 404),
         }
@@ -426,8 +439,14 @@ impl UserAccount {
         )
     }
 
+    /// Subscribe to / renew / switch plans. Any currently active plan is
+    /// prorated: its unused remainder is refunded, and the target plan is then
+    /// bought for a fresh full period. So the active period is always *at most*
+    /// one plan period (30d) — clicking Subscribe repeatedly no longer stacks
+    /// days — and switching (upgrade/downgrade/renew) only charges the
+    /// difference net of the refund. A pure renew (same plan) costs ~0 net.
     async fn subscribe(&self, req: SubscribeReq) -> Result<Response> {
-        let Some(plan) = config::plan(&req.plan) else {
+        let Some(target) = config::plan(&req.plan) else {
             return Response::error("unknown plan", 400);
         };
         let storage = self.state.storage();
@@ -435,29 +454,68 @@ impl UserAccount {
         let current: Option<String> = storage.get("plan").await?;
         let period_end: u64 = self.get_or("period_end", 0).await?;
         let active = current.is_some() && period_end > now;
-        // Renew (same plan, active) extends; a different active plan is a 409.
-        if active && current.as_deref() != Some(plan.id) {
-            return Response::error("another plan is active", 409);
-        }
+
+        // Refund the unused remainder of the currently active plan (if any).
+        let refund = if active {
+            current
+                .as_deref()
+                .and_then(config::plan)
+                .map(|cur| prorated_refund(cur.price_points, cur.period_secs, period_end - now))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
         let balance: i64 = self.get_or("balance", 0).await?;
-        if balance < plan.price_points {
+        // Net cost of the switch: full target price offset by the refund. May be
+        // negative when downgrading (the user is credited the difference).
+        let net_cost = target.price_points - refund;
+        if net_cost > 0 && balance < net_cost {
             return Response::error("insufficient balance", 402);
         }
-        let new_end = if active {
-            period_end + plan.period_secs
-        } else {
-            now + plan.period_secs
-        };
-        storage.put("balance", balance - plan.price_points).await?;
-        storage.put("plan", plan.id).await?;
+        let new_balance = (balance - net_cost).max(0);
+        // Always a fresh full period from now — never stacks past one period.
+        let new_end = now + target.period_secs;
+
+        storage.put("balance", new_balance).await?;
+        storage.put("plan", target.id).await?;
         storage.put("period_end", new_end).await?;
-        // Reset the usage window on any successful subscribe (new or renew).
+        // Reset the usage window on any successful subscribe (new / renew / switch).
         storage.put("win_start", now).await?;
         storage.put("win_views", 0i64).await?;
         storage.put("win_search", 0i64).await?;
         storage
             .set_alarm((new_end.saturating_sub(now) * 1000) as i64)
             .await?;
+        json(&self.status_resp().await?, 200)
+    }
+
+    /// Cancel the active plan, refunding the unused (prorated) remainder to the
+    /// PAYG balance and lapsing to pay-as-you-go immediately. Idempotent: with
+    /// no active plan it just clears any stale state and returns 200.
+    async fn unsubscribe(&self) -> Result<Response> {
+        let storage = self.state.storage();
+        let now = now_secs();
+        let current: Option<String> = storage.get("plan").await?;
+        let period_end: u64 = self.get_or("period_end", 0).await?;
+        let active = current.is_some() && period_end > now;
+
+        if active {
+            let refund = current
+                .as_deref()
+                .and_then(config::plan)
+                .map(|cur| prorated_refund(cur.price_points, cur.period_secs, period_end - now))
+                .unwrap_or(0);
+            let balance: i64 = self.get_or("balance", 0).await?;
+            storage.put("balance", balance + refund).await?;
+        }
+        // Lapse to PAYG and close the window (mirrors the alarm's lapse path).
+        storage.delete("plan").await?;
+        storage.delete("period_end").await?;
+        storage.delete("win_start").await?;
+        storage.delete("win_views").await?;
+        storage.delete("win_search").await?;
+        let _ = storage.delete_alarm().await;
         json(&self.status_resp().await?, 200)
     }
 
@@ -520,6 +578,26 @@ mod tests {
     }
     fn pro() -> &'static config::Plan {
         config::plan("pro").expect("pro plan")
+    }
+
+    #[test]
+    fn prorated_refund_matches_examples() {
+        let day = 86_400u64;
+        let basic_price = basic().price_points; // 20_000 over 30d
+        let pro_price = pro().price_points; // 50_000 over 30d
+        let period = basic().period_secs; // 30d (same for both)
+
+        // Used 15 of 30 days of basic → 10_000 unused refund (the "off" on an upgrade).
+        assert_eq!(prorated_refund(basic_price, period, 15 * day), 10_000);
+        // Used 15 of 30 days of pro → 25_000 back on unsubscribe.
+        assert_eq!(prorated_refund(pro_price, period, 15 * day), 25_000);
+        // Boundaries: brand-new period refunds ~full; fully-spent refunds 0.
+        assert_eq!(prorated_refund(pro_price, period, period), pro_price);
+        assert_eq!(prorated_refund(pro_price, period, 0), 0);
+        // Over-long remaining is clamped to the period (never over-refunds).
+        assert_eq!(prorated_refund(pro_price, period, period + 999 * day), pro_price);
+        // Degenerate period never divides by zero.
+        assert_eq!(prorated_refund(pro_price, 0, day), 0);
     }
 
     #[test]

@@ -106,6 +106,7 @@ async fn router(env: Env, _ctx: Context) -> Result<Router> {
         .route("/user/api/topup", post(payments::topup))
         .route("/user/api/payments", get(payments::list_payments))
         .route("/user/api/subscribe", post(payments::subscribe))
+        .route("/user/api/unsubscribe", post(payments::unsubscribe))
         .route("/user/api/rates", get(rates::rates))
         .route(
             "/user/api/link_solana",

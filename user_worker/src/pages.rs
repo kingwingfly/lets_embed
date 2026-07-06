@@ -282,7 +282,7 @@ fn plans_table() -> String {
             .map_or_else(|| "unlimited".to_string(), |v| v.to_string());
         rows.push_str(&format!(
             r##"<tr><td>{id}</td><td>{price}</td><td>{views}</td><td>{searches}</td><td>{days}</td>
-<td><button class="btn small subscribe-btn" type="button" data-plan="{id}">Subscribe</button></td></tr>"##,
+<td><button class="btn small subscribe-btn" type="button" data-plan="{id}" data-price="{price}">Subscribe</button></td></tr>"##,
             price = p.price_points,
             searches = p.searches_per_window,
             days = p.period_secs / 86_400,
@@ -367,7 +367,7 @@ __PRICING__
 
 <div class="card">
 <h2>Subscription</h2>
-<p class="sub">Plans are paid from your point balance and renew automatically each period.</p>
+<p class="sub">Plans are paid from your point balance and last up to 30 days &mdash; they do <strong>not</strong> auto-renew. Switching plans or unsubscribing refunds the unused days of your current plan, prorated to the day.</p>
 __PLANS_TABLE__
 <div class="actions" style="margin-top:14px">
 <button class="btn ghost small" type="button" id="unsub-btn">Unsubscribe</button>
@@ -405,6 +405,10 @@ function setText(id, text) {
   document.getElementById(id).textContent = text;
 }
 
+// Last-loaded account status, so the subscribe confirmation can explain the
+// proration when the user already has an active plan.
+var currentMe = null;
+
 async function loadMe() {
   var r = await fetch("/user/api/me");
   if (r.status === 401) {
@@ -416,6 +420,7 @@ async function loadMe() {
     return;
   }
   var me = await r.json();
+  currentMe = me;
   setText("acct-address", me.address);
   setText("acct-balance", String(me.balance) + " points");
   setText("acct-plan", me.plan ? me.plan : "none");
@@ -486,6 +491,22 @@ var subBtns = document.querySelectorAll(".subscribe-btn");
 for (var i = 0; i < subBtns.length; i++) {
   subBtns[i].addEventListener("click", async function (ev) {
     var plan = ev.currentTarget.getAttribute("data-plan");
+    var price = ev.currentTarget.getAttribute("data-price");
+    // Warn that this spends points before committing.
+    var msg;
+    if (currentMe && currentMe.plan && currentMe.plan === plan) {
+      msg = "Renew " + plan + "? This resets your plan to a fresh 30 days. "
+        + "The unused days of your current period are refunded first, so you pay "
+        + "only for the days already used (up to " + price + " points).";
+    } else if (currentMe && currentMe.plan) {
+      msg = "Switch from " + currentMe.plan + " to " + plan + " for up to " + price
+        + " points? The unused days of your current " + currentMe.plan
+        + " plan are refunded first, reducing what you pay.";
+    } else {
+      msg = "Subscribe to " + plan + " for " + price
+        + " points, charged from your balance? The plan lasts 30 days and does not auto-renew.";
+    }
+    if (!confirm(msg)) return;
     try {
       var r = await fetch("/user/api/subscribe", {
         method: "POST",
@@ -507,10 +528,19 @@ for (var i = 0; i < subBtns.length; i++) {
 }
 
 document.getElementById("unsub-btn").addEventListener("click", async function () {
+  if (currentMe && !currentMe.plan) {
+    setMsg("sub-msg", "You have no active plan.", "err");
+    return;
+  }
+  if (!confirm("Unsubscribe now? The unused days of your current plan are refunded to your balance (prorated), and you lapse to pay-as-you-go.")) {
+    return;
+  }
   try {
     var r = await fetch("/user/api/unsubscribe", { method: "POST" });
     if (r.ok) {
-      setMsg("sub-msg", "Unsubscribed.", "ok");
+      var st = null;
+      try { st = await r.json(); } catch (_) {}
+      setMsg("sub-msg", st ? ("Unsubscribed. Balance is now " + st.balance + " points.") : "Unsubscribed.", "ok");
       loadMe();
     } else {
       var err;
