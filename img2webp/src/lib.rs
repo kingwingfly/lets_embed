@@ -42,6 +42,7 @@ pub async fn walk_convert(
 
     let finished_paths = entries
         .take_until(cancel.cancelled())
+        .inspect_err(|e| tracing::error!("{e}"))
         .filter_map(|e| ready(e.ok()))
         .filter(|e| {
             let mimes = MimeGuess::from_path(e.path());
