@@ -4,7 +4,7 @@
 //! `/user/api/*` endpoints:
 //! - GET /user/login: SIWE wallet sign-in (EIP-4361 message, strict shape).
 //! - GET /user/account: balance / plan / top-up / payments / logout.
-//! - GET /user/favorites: paged list of likes (text links only, no media).
+//! - GET /user/favorites: paged list of likes with preview thumbnails.
 //!
 //! Everything dynamic coming from Rust is passed through [`html_escape`];
 //! JSON fetched client-side is rendered with `textContent` (never innerHTML).
@@ -76,6 +76,8 @@ ul.likes{list-style:none;margin:0;padding:0}
 ul.likes li{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)}
 ul.likes li .date{margin-left:auto;color:var(--muted);font-size:12px;white-space:nowrap}
 .links{margin-top:18px;display:flex;gap:16px;flex-wrap:wrap}
+ul.likes li .thumb{width:60px;height:60px;flex:0 0 auto;object-fit:cover;
+border-radius:var(--radius);border:1px solid var(--border);background:rgba(127,127,127,.07)}
 </style>"##;
 
 fn page(title: &str, body: &str) -> String {
@@ -421,10 +423,11 @@ pub async fn account_page(State(st): State<AppState>, cookies: Cookies) -> Respo
 // GET /user/favorites
 // ---------------------------------------------------------------------------
 
-// No thumbnails on purpose: media requests consume points.
+// Thumbnails are resolved via the search server's /api/like_previews endpoint;
+// loading them (and post covers) may consume points.
 const FAVORITES_BODY: &str = r##"<div class="card">
 <div class="headrow"><h1>Favorites</h1></div>
-<p class="sub">Your liked posts, images and videos. Text links only &mdash; media loads cost points.</p>
+<p class="sub">Your liked posts, images and videos. Previews may cost points.</p>
 <ul class="likes" id="likes-list"></ul>
 <div class="empty" id="likes-empty" hidden>No favorites yet.</div>
 <div class="msg err" id="likes-msg" hidden></div>
@@ -448,19 +451,62 @@ function badgeFor(kind) {
   return span;
 }
 
-function renderItem(it) {
+function labelFor(kind, id) {
+  return (kind === "post" ? "post #" : kind === "image" ? "image #" : "video #") + id;
+}
+
+// Fetch cover/image thumbnails for the post & image likes just loaded.
+// Returns a map keyed by "<kind>:<target_id>". Best-effort: on any failure
+// the map is empty and items fall back to plain text labels.
+async function fetchPreviews(items) {
+  var map = {};
+  var pairs = [];
+  for (var i = 0; i < items.length; i++) {
+    var k = items[i].kind;
+    if (k === "post" || k === "image") pairs.push(k + ":" + items[i].target_id);
+  }
+  if (pairs.length === 0) return map;
+  try {
+    var r = await fetch("/api/like_previews?items=" + encodeURIComponent(pairs.join(",")));
+    if (!r.ok) return map;
+    var arr = await r.json();
+    for (var j = 0; j < arr.length; j++) map[arr[j].kind + ":" + arr[j].target_id] = arr[j];
+  } catch (_) {}
+  return map;
+}
+
+function renderItem(it, preview) {
   var li = document.createElement("li");
   li.appendChild(badgeFor(it.kind));
-  if (it.kind === "post" || it.kind === "image") {
+
+  if (preview) {
+    var img = document.createElement("img");
+    img.className = "thumb";
+    img.loading = "lazy";
+    img.alt = labelFor(it.kind, it.target_id);
+    img.src = "/images/" + encodeURIComponent(preview.name) + ".webp";
+    li.appendChild(img);
+  }
+
+  if (it.kind === "image") {
+    // image likes always link to their own /details page.
     var a = document.createElement("a");
-    a.href = "/details/" + encodeURIComponent(it.target_id);
-    a.textContent = (it.kind === "post" ? "post #" : "image #") + it.target_id;
+    a.href = "/details/" + encodeURIComponent(preview ? preview.image_id : it.target_id);
+    a.textContent = labelFor("image", it.target_id);
     li.appendChild(a);
+  } else if (it.kind === "post" && preview) {
+    // post likes link to their cover image's /details page.
+    var pa = document.createElement("a");
+    pa.href = "/details/" + encodeURIComponent(preview.image_id);
+    pa.textContent = labelFor("post", it.target_id);
+    li.appendChild(pa);
   } else {
+    // video, or a post/image whose preview could not be resolved.
     var span = document.createElement("span");
-    span.textContent = "video #" + it.target_id;
+    span.textContent = labelFor(it.kind, it.target_id);
     li.appendChild(span);
   }
+
   var date = document.createElement("span");
   date.className = "date";
   date.textContent = new Date(it.created_at * 1000).toLocaleString();
@@ -487,7 +533,11 @@ async function loadPage() {
       return;
     }
     var data = await r.json();
-    for (var i = 0; i < data.items.length; i++) renderItem(data.items[i]);
+    var previews = await fetchPreviews(data.items);
+    for (var i = 0; i < data.items.length; i++) {
+      var it = data.items[i];
+      renderItem(it, previews[it.kind + ":" + it.target_id]);
+    }
     loadedAny = loadedAny || data.items.length > 0;
     document.getElementById("likes-empty").hidden = loadedAny;
     cursor = data.next_cursor;
