@@ -4,14 +4,14 @@ use axum::{
     Router,
     body::Bytes,
     extract::State,
-    http::{HeaderMap, Method, StatusCode, Uri},
+    http::{HeaderMap, Method, StatusCode, Uri, header::CONTENT_TYPE},
     response::{Html, IntoResponse, Redirect, Response},
     routing::any,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use hmac::{Hmac, KeyInit as _, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tower_cookies::{CookieManagerLayer, Cookies};
 use tower_service::Service;
 use worker::{
@@ -203,6 +203,53 @@ async fn gateway(
         }
     }
 
+    // Meter the two similarity-search server-fn endpoints (POST). These are
+    // XHR/fetch calls from the Leptos app (not browser navigations), so on 402
+    // we return a JSON error the app can surface — never the HTML out_of_points
+    // page. Only these exact paths + POST are intercepted; all else falls
+    // through unchanged. Dedupe (same key within 24h) lives in the DO, so
+    // paginated re-searches with the same `q` are automatically free.
+    if method == Method::POST
+        && let Some(charge_key) = match path {
+            "/api/search_similar" => form_field(&body, "q").map(|q| format!("search:sim:{q}")),
+            "/api/search_by_image" => {
+                form_field(&body, "image").map(|img| format!("search:img:{}", &sha256_hex(&img)[..32]))
+            }
+            _ => None,
+        }
+    {
+        // If the field is absent/unparseable we PROXY WITHOUT CHARGING (and warn):
+        // a body-shape change must never break search. `None` charge_key means we
+        // did match an intercepted path but couldn't read the field.
+        match charge_do(&st, &claims.sub, &charge_key, ChargeKind::Search).await {
+            Ok(200) => {}
+            Ok(402) => {
+                return (
+                    StatusCode::PAYMENT_REQUIRED,
+                    [(CONTENT_TYPE, "application/json")],
+                    r#"{"error":"out of points"}"#,
+                )
+                    .into_response();
+            }
+            Ok(403) => return (StatusCode::FORBIDDEN, "account suspended").into_response(),
+            Ok(status) => {
+                worker::console_error!("search charge returned {status}");
+                return (StatusCode::BAD_GATEWAY, "charge failed").into_response();
+            }
+            Err(e) => {
+                // fail closed, mirroring the media path
+                worker::console_error!("search charge failed: {e:?}");
+                return (StatusCode::BAD_GATEWAY, "charge failed").into_response();
+            }
+        }
+    } else if method == Method::POST
+        && matches!(path, "/api/search_similar" | "/api/search_by_image")
+    {
+        // matched an intercepted path but the expected form field was missing:
+        // proxy uncharged rather than break search on an unexpected body shape.
+        worker::console_warn!("search charge skipped: missing form field on {path}");
+    }
+
     proxy(uri, method, headers, body, &st.client_id, &st.client_secret).await
 }
 
@@ -256,6 +303,56 @@ fn out_of_points() -> Response {
         Html(page("Out of points", body)),
     )
         .into_response()
+}
+
+/// Lowercase hex SHA-256 of `s` (reuses the sha2 dep already pulled in for HS256).
+fn sha256_hex(s: &str) -> String {
+    Sha256::digest(s.as_bytes())
+        .iter()
+        .fold(String::with_capacity(64), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
+}
+
+/// Read one `application/x-www-form-urlencoded` field value from a raw body,
+/// without adding a dependency. Splits on `&`, then `=`, matches `key`, and
+/// percent-decodes the value (`+` → space, `%XX` → byte). Returns `None` if the
+/// field is absent (caller then proxies without charging).
+fn form_field(body: &Bytes, key: &str) -> Option<String> {
+    let s = String::from_utf8_lossy(body);
+    s.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then(|| percent_decode(v))
+    })
+}
+
+/// Minimal `application/x-www-form-urlencoded` value decoder.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len()
+                && let Some(hi) = (bytes[i + 1] as char).to_digit(16)
+                && let Some(lo) = (bytes[i + 2] as char).to_digit(16) =>
+            {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ---------------------------------------------------------------------------
