@@ -1,4 +1,4 @@
-use crate::components::BackToTop;
+use crate::components::{AccountWidget, BackToTop};
 use crate::types::{ImageQuery, Mode};
 use js_sys::futures::JsFuture;
 use leptos::{prelude::*, task::spawn_local};
@@ -247,6 +247,7 @@ pub fn SearchBar() -> impl IntoView {
                         }
                     </div>
                 </form>
+                <AccountWidget />
             </div>
             <div class="w-full h-px bg-gradient-to-r from-transparent via-sky-300 to-transparent" />
         </div>
