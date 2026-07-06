@@ -83,7 +83,11 @@ a.btn.ghost-alt{background:transparent;color:var(--accent);border:1px solid var(
 a.btn.ghost-alt:hover{background:rgba(79,70,229,.08);border-color:var(--accent)}
 #mobile-wallets .full{margin-top:12px}
 .hint{color:var(--muted);font-size:14px;margin:20px 0 0}
+#mobile-host{margin:14px 0 4px;font-size:15px;font-weight:700;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
+#mobile-deeplinks{margin-top:22px;padding-top:18px;border-top:1px solid var(--border)}
+#mobile-deeplinks .hint{margin-top:0}
 [hidden]{display:none!important}
+ul.likes li .badge{min-width:56px;justify-content:center}
 </style>"##;
 
 fn page(title: &str, body: &str) -> String {
@@ -121,9 +125,16 @@ const LOGIN_BODY: &str = r##"<div class="card center">
 <p class="sub">Authenticate with your wallet to access your account.</p>
 <button class="btn full" id="siwe-btn" type="button">Sign in with Ethereum</button>
 <div id="mobile-wallets" hidden>
-<p class="hint">Open this page in your wallet app's browser to sign in.</p>
-<a class="btn full" id="mm-link" rel="noopener" href="#">Open in MetaMask</a>
+<h2>Sign in on mobile</h2>
+<p class="hint">Open your wallet app (MetaMask / Phantom / etc.), use its built-in browser, and go to:</p>
+<p id="mobile-host"></p>
+<button class="btn full" id="copy-link" type="button">Copy link</button>
+<p class="hint">Your wallet's in-app browser injects the wallet into the page, so sign-in works there.</p>
+<div id="mobile-deeplinks">
+<p class="hint">Or try opening directly (may not work on all devices):</p>
+<a class="btn full ghost-alt" id="mm-link" rel="noopener" href="#">Open in MetaMask</a>
 <a class="btn full ghost-alt" id="ph-link" rel="noopener" href="#">Open in Phantom</a>
+</div>
 </div>
 <div class="msg" id="login-msg" hidden></div>
 <div class="links" style="justify-content:center"><a href="/">&larr; Back to site</a></div>
@@ -151,12 +162,47 @@ function nextUrl() {
 if (!window.ethereum) {
   var isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
   if (isMobile) {
-    // Mobile browsers have no injected provider. Offer deep links that reopen
-    // THIS page inside a wallet app's in-app browser (which injects one).
-    // link.metamask.io is MetaMask's current deeplink host: host+path+query,
-    // no scheme. The legacy metamask.app.link (Branch) link could reopen the
-    // dapp over http:// and 404 with "this page doesn't exist" on HTTPS-only
-    // sites — see MetaMask/metamask-mobile#3816.
+    // Mobile browsers have no injected provider. The reliable path is manual:
+    // the user opens their wallet app's built-in browser and navigates here,
+    // so we show the host prominently and offer a one-tap "copy link".
+    document.getElementById("mobile-host").textContent = location.host;
+    // Full URL to this exact page, built from location with a fixed origin.
+    var siteUrl = location.origin + location.pathname + location.search;
+    var copyBtn = document.getElementById("copy-link");
+    copyBtn.addEventListener("click", function () {
+      function copied() {
+        showMsg("Link copied. Open your wallet app's browser and paste it.", "ok");
+      }
+      function manual() {
+        // Neither clipboard path worked — show the link so it can be copied by hand.
+        showMsg("Couldn't copy automatically. Copy this link manually:\n" + siteUrl);
+      }
+      function legacyCopy() {
+        try {
+          var inp = document.createElement("input");
+          inp.setAttribute("readonly", "");
+          inp.value = siteUrl;
+          inp.style.position = "absolute";
+          inp.style.left = "-9999px";
+          document.body.appendChild(inp);
+          inp.select();
+          inp.setSelectionRange(0, siteUrl.length);
+          var ok = document.execCommand && document.execCommand("copy");
+          document.body.removeChild(inp);
+          if (ok) { copied(); return; }
+        } catch (e) {}
+        manual();
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(siteUrl).then(copied, legacyCopy);
+      } else {
+        legacyCopy();
+      }
+    });
+    // Best-effort deep links that reopen THIS page inside a wallet app's in-app
+    // browser (which injects a provider). Documented-unreliable, so secondary.
+    // link.metamask.io is MetaMask's current deeplink host: host+path+query, no
+    // scheme (the legacy metamask.app.link Branch link 404s on HTTPS-only sites).
     var mmUrl = "https://link.metamask.io/dapp/" +
       location.host + location.pathname + location.search;
     // Phantom universal link: full https URL, encoded; ref = origin.
@@ -249,8 +295,44 @@ fn plans_table() -> String {
     )
 }
 
-/// `__DEPOSIT_ADDRESS__` (HTML-escaped) and `__PLANS_TABLE__` are substituted
-/// server-side.
+/// Server-rendered pay-as-you-go pricing summary, derived entirely from the
+/// `config::*` cost constants so it stays in sync with billing.
+fn pricing_table() -> String {
+    // USD equivalent of a point cost, e.g. 100 points -> "$0.0100".
+    let usd = |points: i64| -> String {
+        format!("${:.4}", points as f64 / config::POINTS_PER_USD as f64)
+    };
+    let dedupe_hours = config::DEDUPE_WINDOW_SECS / 3_600;
+    format!(
+        r##"<dl class="stats">
+<dt>Rate</dt><dd>$1 = {rate} points</dd>
+<dt>Free signup grant</dt><dd>{grant} points ({grant_usd})</dd>
+</dl>
+<div class="tablewrap"><table>
+<thead><tr><th>Action</th><th>Cost (points)</th><th>&asymp; USD</th></tr></thead>
+<tbody>
+<tr><td>Image view</td><td>{img}</td><td>{img_usd}</td></tr>
+<tr><td>Video view</td><td>{vid}</td><td>{vid_usd}</td></tr>
+<tr><td>Similarity search (upload image)</td><td>{sim}</td><td>{sim_usd}</td></tr>
+<tr><td>Similarity search (by id)</td><td>{emb}</td><td>{emb_usd}</td></tr>
+</tbody></table></div>
+<p class="sub meta">Repeat views of the same item within {dedupe_hours} hours are free.</p>"##,
+        rate = config::POINTS_PER_USD,
+        grant = config::FREE_GRANT_POINTS,
+        grant_usd = usd(config::FREE_GRANT_POINTS),
+        img = config::COST_IMAGE_VIEW,
+        img_usd = usd(config::COST_IMAGE_VIEW),
+        vid = config::COST_VIDEO_VIEW,
+        vid_usd = usd(config::COST_VIDEO_VIEW),
+        sim = config::COST_SIM_SEARCH,
+        sim_usd = usd(config::COST_SIM_SEARCH),
+        emb = config::COST_EMBED_SEARCH,
+        emb_usd = usd(config::COST_EMBED_SEARCH),
+    )
+}
+
+/// `__DEPOSIT_ADDRESS__` (HTML-escaped), `__PRICING__` and `__PLANS_TABLE__` are
+/// substituted server-side.
 const ACCOUNT_BODY: &str = r##"<div class="card">
 <div class="headrow"><h1>Your account</h1><span class="badge err" id="banned-badge" hidden>Banned</span></div>
 <p class="sub meta" id="acct-address">loading&hellip;</p>
@@ -262,6 +344,12 @@ const ACCOUNT_BODY: &str = r##"<div class="card">
 <dt>Total views</dt><dd id="acct-views">&mdash;</dd>
 </dl>
 <div class="links"><a href="/user/favorites">My favorites</a><a href="/">&larr; Back to site</a></div>
+</div>
+
+<div class="card">
+<h2>Pricing</h2>
+<p class="sub">Pay-as-you-go: your point balance is charged per action. New accounts start with a free grant.</p>
+__PRICING__
 </div>
 
 <div class="card">
@@ -450,6 +538,7 @@ pub async fn account_page(State(st): State<AppState>, cookies: Cookies) -> Respo
     }
     let body = ACCOUNT_BODY
         .replace("__DEPOSIT_ADDRESS__", &html_escape(&st.deposit_address))
+        .replace("__PRICING__", &pricing_table())
         .replace("__PLANS_TABLE__", &plans_table());
     Html(page("Account — lets_embed", &body)).into_response()
 }
@@ -546,7 +635,52 @@ function renderItem(it, preview) {
   date.className = "date";
   date.textContent = new Date(it.created_at * 1000).toLocaleString();
   li.appendChild(date);
+
+  var del = document.createElement("button");
+  del.type = "button";
+  del.className = "btn small ghost";
+  del.textContent = "Remove";
+  del.addEventListener("click", function () { removeLike(it, li, del); });
+  li.appendChild(del);
+
   list.appendChild(li);
+}
+
+// DELETE the like, then drop its <li>. On 401 bounce to login; on any other
+// failure re-enable the button and surface the message in #likes-msg.
+async function removeLike(it, li, btn) {
+  btn.disabled = true;
+  try {
+    var r = await fetch("/user/api/like", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: it.kind, target_id: it.target_id }),
+    });
+    if (r.status === 401) {
+      location = "/user/login?next=/user/favorites";
+      return;
+    }
+    if (!r.ok) {
+      var err;
+      try { err = (await r.json()).error; } catch (_) {}
+      var msgEl = document.getElementById("likes-msg");
+      msgEl.hidden = false;
+      msgEl.textContent = err || "failed to remove favorite (" + r.status + ")";
+      btn.disabled = false;
+      return;
+    }
+    list.removeChild(li);
+    if (list.children.length === 0) {
+      loadedAny = false;
+      document.getElementById("likes-empty").hidden = false;
+      moreBtn.hidden = true;
+    }
+  } catch (e) {
+    var m = document.getElementById("likes-msg");
+    m.hidden = false;
+    m.textContent = e && e.message ? e.message : String(e);
+    btn.disabled = false;
+  }
 }
 
 async function loadPage() {
