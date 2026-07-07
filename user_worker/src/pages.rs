@@ -425,6 +425,7 @@ fn pricing_table() -> String {
 <tbody>
 <tr><td>Image view</td><td>{img}</td><td>{img_usd}</td></tr>
 <tr><td>Video view</td><td>{vid}</td><td>{vid_usd}</td></tr>
+<tr><td>Description search (by text)</td><td>{sim}</td><td>{sim_usd}</td></tr>
 <tr><td>Similarity search (upload image)</td><td>{sim}</td><td>{sim_usd}</td></tr>
 <tr><td>Similarity search (by id)</td><td>{emb}</td><td>{emb_usd}</td></tr>
 </tbody></table></div>
