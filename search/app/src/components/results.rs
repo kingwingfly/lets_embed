@@ -75,8 +75,8 @@ pub fn Results() -> impl IntoView {
         .collect::<Vec<_>>();
         let old = columns.get_untracked();
         let max_row = old.iter().map(|c| c.items.len()).max().unwrap_or_default();
-        for placed in (0..max_row)
-            .flat_map(|row| old.iter().filter_map(move |c| c.items.get(row).cloned()))
+        for placed in
+            (0..max_row).flat_map(|row| old.iter().filter_map(move |c| c.items.get(row).cloned()))
         {
             match placed.item {
                 Item::Post(p) => {
@@ -90,7 +90,11 @@ pub fn Results() -> impl IntoView {
                         .round() as u32;
                     let w = column.width;
                     column.height += height + COLUMN_PAD;
-                    column.items.push(Placed { item: Item::Post(p), w, h: height });
+                    column.items.push(Placed {
+                        item: Item::Post(p),
+                        w,
+                        h: height,
+                    });
                 }
                 Item::Image(im) => {
                     let Some(column) = new.iter_mut().min_by_key(|c| c.height) else {
@@ -100,7 +104,11 @@ pub fn Results() -> impl IntoView {
                         ((im.height as f64 / im.width as f64) * column.width as f64).round() as u32;
                     let w = column.width;
                     column.height += height + COLUMN_PAD;
-                    column.items.push(Placed { item: Item::Image(im), w, h: height });
+                    column.items.push(Placed {
+                        item: Item::Image(im),
+                        w,
+                        h: height,
+                    });
                 }
             }
         }
@@ -161,7 +169,10 @@ pub fn Results() -> impl IntoView {
 
     let render_item = move |placed: Placed| -> AnyView {
         // Off-screen items skip render/decode; the reserved box keeps scroll stable.
-        let cv = format!("content-visibility:auto;contain-intrinsic-size:{}px {}px;", placed.w, placed.h);
+        let cv = format!(
+            "content-visibility:auto;contain-intrinsic-size:{}px {}px;",
+            placed.w, placed.h
+        );
         match placed.item {
             Item::Post(p) => {
                 let cover = p.images.first().cloned();
@@ -309,7 +320,11 @@ fn place_post(columns: RwSignal<Vec<Column>>, p: PostItem) {
             ((cover.height as f64 / cover.width as f64) * column.width as f64).round() as u32;
         let w = column.width;
         column.height += height + COLUMN_PAD;
-        column.items.push(Placed { item: Item::Post(p), w, h: height });
+        column.items.push(Placed {
+            item: Item::Post(p),
+            w,
+            h: height,
+        });
     });
 }
 
@@ -323,7 +338,11 @@ fn place_image(columns: RwSignal<Vec<Column>>, images: StoredValue<Vec<Image>>, 
         let height = ((im.height as f64 / im.width as f64) * column.width as f64).round() as u32;
         let w = column.width;
         column.height += height + COLUMN_PAD;
-        column.items.push(Placed { item: Item::Image(im), w, h: height });
+        column.items.push(Placed {
+            item: Item::Image(im),
+            w,
+            h: height,
+        });
     });
 }
 
@@ -368,6 +387,8 @@ fn load_page(
             }
         } else if mode == Mode::Similar {
             search_similar(q, limit, offset_val).await
+        } else if mode == Mode::Clip {
+            search_by_desc(q, limit, offset_val).await
         } else {
             search_query(mode.as_str().to_string(), q, limit, offset_val).await
         };
@@ -483,12 +504,6 @@ async fn search_query(
                 .await
                 .map_err(to_err)?,
         ),
-        Mode::Clip => Box::pin(
-            engine
-                .search_clip_cached([q], limit, offset)
-                .await
-                .map_err(to_err)?,
-        ),
         Mode::Random => Box::pin(engine.random_images(limit).await.map_err(to_err)?),
         Mode::Similar => return Err(ServerFnError::Args("similar search moved".into())),
         _ => return Ok(SearchResponse::default()),
@@ -559,8 +574,6 @@ async fn search_by_image(
     })
 }
 
-/// Similarity search by image id. Pinned to the exact path `/api/search_similar`
-/// so the gateway (Unit 6) can meter it by an EXACT server-fn POST path.
 #[server(endpoint = "search_similar")]
 async fn search_similar(
     q: String,
@@ -607,9 +620,54 @@ async fn search_similar(
     let mut count = 0i64;
     while let Some(img) = stream.next().await {
         count += 1;
-        if post_image_ids.as_ref().is_some_and(|ids| ids.contains(&img.id)) {
+        if post_image_ids
+            .as_ref()
+            .is_some_and(|ids| ids.contains(&img.id))
+        {
             continue;
         }
+        items.push(img);
+    }
+    Ok(SearchResponse {
+        has_more: count >= limit,
+        posts: vec![],
+        images: items,
+    })
+}
+
+#[server(endpoint = "search_by_desc")]
+async fn search_by_desc(
+    q: String,
+    limit: i64,
+    offset: i64,
+) -> Result<SearchResponse, ServerFnError> {
+    use crate::state::AppState;
+
+    use std::sync::Arc;
+
+    use axum::extract::State;
+    use futures::StreamExt as _;
+    use leptos_axum::extract_with_state;
+    use search_engine::Engine;
+
+    fn to_err(e: impl std::fmt::Display) -> ServerFnError {
+        ServerFnError::Response(e.to_string())
+    }
+
+    let limit = limit.max(1);
+    let offset = offset.max(0);
+
+    let state = expect_context::<AppState>();
+    let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
+
+    let mut stream = engine
+        .search_clip_cached([q], limit, offset)
+        .await
+        .map_err(to_err)?;
+    let mut items = Vec::new();
+    let mut count = 0i64;
+    while let Some(img) = stream.next().await {
+        count += 1;
         items.push(img);
     }
     Ok(SearchResponse {
@@ -625,4 +683,5 @@ fn pinned_paths() {
     use leptos::server_fn::ServerFn;
     assert_eq!(SearchSimilar::PATH, "/api/search_similar");
     assert_eq!(SearchByImage::PATH, "/api/search_by_image");
+    assert_eq!(SearchByDesc::PATH, "/api/search_by_desc");
 }

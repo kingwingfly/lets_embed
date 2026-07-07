@@ -111,8 +111,7 @@ fn is_eth_address(s: &str) -> bool {
 /// `is_eth_address` (base58 excludes `0`, so `0x…` never decodes). MUST match
 /// `user_worker::session::is_sol_principal` — this is a duplicated trust boundary.
 fn is_sol_principal(s: &str) -> bool {
-    (32..=44).contains(&s.len())
-        && matches!(bs58::decode(s).into_vec(), Ok(v) if v.len() == 32)
+    (32..=44).contains(&s.len()) && matches!(bs58::decode(s).into_vec(), Ok(v) if v.len() == 32)
 }
 
 /// A valid session principal: an Ethereum address (SIWE) or a Solana pubkey (SIWS).
@@ -131,7 +130,8 @@ fn is_valid_principal(s: &str) -> bool {
 pub enum ChargeKind {
     Image,
     Video,
-    /// Upload-image similarity search (runs dinov3 inference — expensive).
+    /// Upload-image similarity search (runs dinov3 inference — expensive),
+    /// or description search (runs siglip2 text inference — expensive).
     Search,
     /// By-id similarity search (reuses a stored embedding — cheap, view-class).
     EmbedSearch,
@@ -226,16 +226,22 @@ async fn gateway(
     // through unchanged. Dedupe (same key within 24h) lives in the DO, so
     // paginated re-searches with the same `q` are automatically free.
     if method == Method::POST
-        && let Some((charge_key, kind)) = match path {
-            // By-id search reuses a stored embedding (cheap) -> view-class EmbedSearch.
-            "/api/search_similar" => {
-                form_field(&body, "q").map(|q| (format!("search:sim:{q}"), ChargeKind::EmbedSearch))
+        && let Some((charge_key, kind)) =
+            match path {
+                // By-id search reuses a stored embedding (cheap) -> view-class EmbedSearch.
+                "/api/search_similar" => form_field(&body, "q")
+                    .map(|q| (format!("search:sim:{q}"), ChargeKind::EmbedSearch)),
+                // Upload-image search runs dinov3 inference (expensive) -> Search.
+                "/api/search_by_image" => form_field(&body, "image").map(|img| {
+                    (
+                        format!("search:img:{}", &sha256_hex(&img)[..32]),
+                        ChargeKind::Search,
+                    )
+                }),
+                "/api/search_by_desc" => form_field(&body, "q")
+                    .map(|q| (format!("search:desc:{}", q), ChargeKind::Search)),
+                _ => None,
             }
-            // Upload-image search runs dinov3 inference (expensive) -> Search.
-            "/api/search_by_image" => form_field(&body, "image")
-                .map(|img| (format!("search:img:{}", &sha256_hex(&img)[..32]), ChargeKind::Search)),
-            _ => None,
-        }
     {
         // If the field is absent/unparseable we PROXY WITHOUT CHARGING (and warn):
         // a body-shape change must never break search. `None` charge_key means we

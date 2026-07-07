@@ -51,7 +51,7 @@ rejected (and stripped before proxying).
 
 Besides charging media views (`GET /images/*`, `GET /videos/*`) against the
 user's `UserAccount` Durable Object, the gateway now also meters **similarity
-searches**: `POST /api/search_similar` and `POST /api/search_by_image` are
+searches** and **description searches**: `POST /api/search_similar` is charged as `ChargeKind::EmbedSearch`, `POST /api/search_by_image` and `POST /api/search_by_desc` are
 charged as `ChargeKind::Search`, deduped per query per 24h in the DO (so
 paginated re-searches with the same query are free). On insufficient points
 these endpoints return a `402` JSON error (`{"error":"out of points"}`) to the
