@@ -24,6 +24,29 @@ use tokenizers::{EncodeInput, Tokenizer};
 pub use search_types;
 use tokio::{sync::Mutex, time::Instant};
 
+/// splitmix64 finalizer — a fast, well-distributed integer hash.
+fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Counter-based RNG: map sequence indices `[offset, offset+limit)` to ids in
+/// `[min, max]`. Being counter-based (each index hashed independently) means any
+/// offset costs O(1) to reach and the whole stream is reproducible from `seed`
+/// alone. Ids are sampled with replacement, so we de-duplicate within the page
+/// (order preserved) to avoid showing the same row twice; the caller drops ids
+/// that don't resolve to a row. Requires `min <= max`.
+fn random_ids(seed: i64, min: i64, max: i64, limit: i64, offset: i64) -> Vec<i64> {
+    let span = (max - min + 1) as u64;
+    let seed = seed as u64;
+    let mut seen = std::collections::HashSet::new();
+    (offset..offset.saturating_add(limit))
+        .map(|i| min + (mix64(seed ^ mix64(i as u64)) % span) as i64)
+        .filter(|id| seen.insert(*id))
+        .collect()
+}
+
 #[derive(Debug)]
 struct Inner {
     session: Option<Arc<Mutex<Session>>>,
@@ -203,22 +226,38 @@ impl Engine {
         Ok(res)
     }
 
+    /// Deterministic random posts for a given `seed`. Page `[offset, offset+limit)`
+    /// indexes a counter-based RNG (see [`random_ids`]), so any offset is reached in
+    /// O(1) — the random state lives entirely in `seed` and can be carried in a URL.
+    /// Ids that no longer exist are silently dropped, so a page may hold < `limit`
+    /// rows; if the row set changes the sample is allowed to change with it.
     pub async fn random_posts<'a>(
         &'a self,
+        seed: i64,
         limit: i64,
+        offset: i64,
     ) -> anyhow::Result<impl Stream<Item = Post> + Send + 'a> {
-        if limit < 0 {
-            bail!("limit should >= 0")
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
         }
+
+        let bounds = sqlx::query!(r#"SELECT MIN(id) AS min_id, MAX(id) AS max_id FROM posts"#)
+            .fetch_one(&self.pool)
+            .await?;
+        let ids = match (bounds.min_id, bounds.max_id) {
+            (Some(min), Some(max)) => random_ids(seed, min, max, limit, offset),
+            _ => vec![],
+        };
 
         let res = sqlx::query_as!(
             Post,
             r#"
-            SELECT id, title
-            FROM posts
-            TABLESAMPLE SYSTEM_ROWS($1)
+            SELECT p.id, p.title
+            FROM UNNEST($1::BIGINT[]) WITH ORDINALITY AS c(id, ord)
+            JOIN posts p ON p.id = c.id
+            ORDER BY c.ord
             "#,
-            limit,
+            &ids,
         )
         .fetch(&self.pool)
         .filter_map(|res| ready(res.ok()));
@@ -226,22 +265,34 @@ impl Engine {
         Ok(res)
     }
 
+    /// Deterministic random images for a given `seed`; see [`Engine::random_posts`].
     pub async fn random_images<'a>(
         &'a self,
+        seed: i64,
         limit: i64,
+        offset: i64,
     ) -> anyhow::Result<impl Stream<Item = Image> + Send + 'a> {
-        if limit < 0 {
-            bail!("limit should >= 0")
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
         }
+
+        let bounds = sqlx::query!(r#"SELECT MIN(id) AS min_id, MAX(id) AS max_id FROM images"#)
+            .fetch_one(&self.pool)
+            .await?;
+        let ids = match (bounds.min_id, bounds.max_id) {
+            (Some(min), Some(max)) => random_ids(seed, min, max, limit, offset),
+            _ => vec![],
+        };
 
         let res = sqlx::query_as!(
             Image,
             r#"
-            SELECT id, name, width, height
-            FROM images
-            TABLESAMPLE SYSTEM_ROWS($1)
+            SELECT i.id, i.name, i.width, i.height
+            FROM UNNEST($1::BIGINT[]) WITH ORDINALITY AS c(id, ord)
+            JOIN images i ON i.id = c.id
+            ORDER BY c.ord
             "#,
-            limit,
+            &ids,
         )
         .fetch(&self.pool)
         .filter_map(|res| ready(res.ok()));

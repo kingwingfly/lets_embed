@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT MIN(id) AS min_id, MAX(id) AS max_id FROM images",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "min_id",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "max_id",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "35f32f7140066e58ed5ce7dae35795c5b32a9cc31c57c8fc5aa27f4a77f170f0"
+}

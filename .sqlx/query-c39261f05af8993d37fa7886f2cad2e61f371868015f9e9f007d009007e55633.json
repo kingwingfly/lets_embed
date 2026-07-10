@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT MIN(id) AS min_id, MAX(id) AS max_id FROM posts",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "min_id",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "max_id",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "c39261f05af8993d37fa7886f2cad2e61f371868015f9e9f007d009007e55633"
+}

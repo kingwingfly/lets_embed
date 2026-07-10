@@ -51,6 +51,9 @@ pub fn Results() -> impl IntoView {
                     .and_then(|s| s.parse::<i64>().ok())
                     .unwrap_or(50)
                     .max(1),
+                // Random state: the seed lives in the URL so pagination + reload
+                // reproduce the same shuffle. Absent (non-random) modes ignore it.
+                m.get("seed").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
             )
         })
     });
@@ -158,7 +161,7 @@ pub fn Results() -> impl IntoView {
         let more = has_more.get();
 
         if intersecting && !is_loading && more {
-            let (_, _, limit) = params.get_untracked();
+            let (_, _, limit, _) = params.get_untracked();
             offset.update(|old| *old += limit);
             let next = offset.get_untracked();
             load_page(
@@ -352,7 +355,7 @@ fn place_image(columns: RwSignal<Vec<Column>>, images: StoredValue<Vec<Image>>, 
 #[allow(clippy::too_many_arguments)]
 fn load_page(
     offset_val: i64,
-    params: Memo<(Mode, String, i64)>,
+    params: Memo<(Mode, String, i64, i64)>,
     img_query: ImageQuery,
     columns: RwSignal<Vec<Column>>,
     images: StoredValue<Vec<Image>>,
@@ -361,7 +364,7 @@ fn load_page(
     error: RwSignal<Option<String>>,
     req_id: StoredValue<u64>,
 ) {
-    let (mode, q, limit) = params.get_untracked();
+    let (mode, q, limit, seed) = params.get_untracked();
 
     // Claim the newest request id; any in-flight call becomes stale.
     let this_id = req_id.get_value() + 1;
@@ -390,7 +393,7 @@ fn load_page(
         } else if mode == Mode::Clip {
             search_by_desc(q, limit, offset_val).await
         } else {
-            search_query(mode.as_str().to_string(), q, limit, offset_val).await
+            search_query(mode.as_str().to_string(), q, seed, limit, offset_val).await
         };
 
         // A newer request started while we were awaiting: discard this response.
@@ -421,6 +424,7 @@ fn load_page(
 async fn search_query(
     mode: String,
     q: String,
+    seed: i64,
     limit: i64,
     offset: i64,
 ) -> Result<SearchResponse, ServerFnError> {
@@ -467,7 +471,9 @@ async fn search_query(
                         .await
                         .map_err(to_err)?,
                 ),
-                Mode::Random => Box::pin(engine.random_posts(limit).await.map_err(to_err)?),
+                Mode::Random => {
+                    Box::pin(engine.random_posts(seed, limit, offset).await.map_err(to_err)?)
+                }
                 _ => unreachable!(),
             }
         };
@@ -489,8 +495,15 @@ async fn search_query(
                 videos,
             });
         }
+        // Random pages skip ids with no row, so `count < limit` is normal; keep
+        // paging (endless reshuffle) until a whole window resolves to nothing.
+        let has_more = if mode == Mode::Random {
+            count > 0
+        } else {
+            count >= limit
+        };
         return Ok(SearchResponse {
-            has_more: count >= limit,
+            has_more,
             posts: items,
             images: vec![],
         });
@@ -504,7 +517,9 @@ async fn search_query(
                 .await
                 .map_err(to_err)?,
         ),
-        Mode::Random => Box::pin(engine.random_images(limit).await.map_err(to_err)?),
+        Mode::Random => {
+            Box::pin(engine.random_images(seed, limit, offset).await.map_err(to_err)?)
+        }
         Mode::Similar => return Err(ServerFnError::Args("similar search moved".into())),
         _ => return Ok(SearchResponse::default()),
     };
@@ -515,8 +530,13 @@ async fn search_query(
         count += 1;
         items.push(img);
     }
+    let has_more = if mode == Mode::Random {
+        count > 0
+    } else {
+        count >= limit
+    };
     Ok(SearchResponse {
-        has_more: count >= limit,
+        has_more,
         posts: vec![],
         images: items,
     })

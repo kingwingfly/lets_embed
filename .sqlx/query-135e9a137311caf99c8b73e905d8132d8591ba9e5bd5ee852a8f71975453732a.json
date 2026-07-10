@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, name, width, height\n            FROM images\n            TABLESAMPLE SYSTEM_ROWS($1)\n            ",
+  "query": "\n            SELECT i.id, i.name, i.width, i.height\n            FROM UNNEST($1::BIGINT[]) WITH ORDINALITY AS c(id, ord)\n            JOIN images i ON i.id = c.id\n            ORDER BY c.ord\n            ",
   "describe": {
     "columns": [
       {
@@ -50,7 +50,7 @@
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Int8Array"
       ]
     },
     "nullable": [
@@ -60,5 +60,5 @@
       false
     ]
   },
-  "hash": "982032048f5d0d82a5c572378de158181e9d34a042f8abe0c263517ff5ec74bd"
+  "hash": "135e9a137311caf99c8b73e905d8132d8591ba9e5bd5ee852a8f71975453732a"
 }

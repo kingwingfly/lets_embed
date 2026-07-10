@@ -74,12 +74,19 @@ pub fn SearchBar() -> impl IntoView {
     let go = {
         let nav = use_navigate();
         move |q: String| {
-            let url = format!(
+            let mode = mode.get_untracked();
+            let mut url = format!(
                 "/?mode={}&q={}&limit={}",
-                mode.get_untracked().as_str(),
+                mode.as_str(),
                 urlencoding::encode(&q),
                 limit.get_untracked().max(1),
             );
+            // Each random roll gets a fresh seed carried in the URL, so paging and
+            // reloads reproduce the same shuffle until the user re-rolls.
+            if mode == Mode::Random {
+                let seed = (js_sys::Math::random() * i64::MAX as f64) as i64;
+                url.push_str(&format!("&seed={seed}"));
+            }
             nav(&url, NavigateOptions::default());
         }
     };

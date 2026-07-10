@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, title\n            FROM posts\n            TABLESAMPLE SYSTEM_ROWS($1)\n            ",
+  "query": "\n            SELECT p.id, p.title\n            FROM UNNEST($1::BIGINT[]) WITH ORDINALITY AS c(id, ord)\n            JOIN posts p ON p.id = c.id\n            ORDER BY c.ord\n            ",
   "describe": {
     "columns": [
       {
@@ -28,7 +28,7 @@
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Int8Array"
       ]
     },
     "nullable": [
@@ -36,5 +36,5 @@
       false
     ]
   },
-  "hash": "67b689d88f32702c9aeebcae9b9225f542375089a612e84edb29c19d258c480f"
+  "hash": "f86f2c5056f5b0f2b6612cf4b6fc112eba6fee97e8862e0c88b4af50975a365f"
 }
