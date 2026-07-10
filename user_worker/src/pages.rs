@@ -335,8 +335,21 @@ async function getSolanaSigner() {
   }
   return null;
 }
-document.getElementById("siws-btn").addEventListener("click", async function () {
-  var sbtn = document.getElementById("siws-btn");
+var sbtn = document.getElementById("siws-btn");
+function hasSolanaWallet() {
+  return !!(pickSolanaWallet() || window.solana || (window.phantom && window.phantom.solana));
+}
+if (!hasSolanaWallet()) {
+  // Mirror the Ethereum button: with no Solana wallet present, don't leave an
+  // active button that can only fail. On mobile the deep-link block is the real
+  // path (hide it, like siwe-btn); on desktop gray it out like the Ethereum button.
+  if (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) {
+    sbtn.hidden = true;
+  } else {
+    sbtn.disabled = true;
+  }
+}
+sbtn.addEventListener("click", async function () {
   sbtn.disabled = true;
   try {
     var signer = await getSolanaSigner();
