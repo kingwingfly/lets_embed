@@ -426,7 +426,7 @@ fn pricing_table() -> String {
 <tr><td>Image view</td><td>{img}</td><td>{img_usd}</td></tr>
 <tr><td>Video view</td><td>{vid}</td><td>{vid_usd}</td></tr>
 <tr><td>Description search (by text)</td><td>{sim}</td><td>{sim_usd}</td></tr>
-<tr><td>Similarity search (upload image)</td><td>{sim}</td><td>{sim_usd}</td></tr>
+<tr><td>Similarity search (upload image)</td><td>{desc}</td><td>{desc_usd}</td></tr>
 <tr><td>Similarity search (by id)</td><td>{emb}</td><td>{emb_usd}</td></tr>
 </tbody></table></div>
 <p class="sub meta">Repeat views of the same item within {dedupe_hours} hours are free.</p>"##,
@@ -437,8 +437,10 @@ fn pricing_table() -> String {
         img_usd = usd(config::COST_IMAGE_VIEW),
         vid = config::COST_VIDEO_VIEW,
         vid_usd = usd(config::COST_VIDEO_VIEW),
-        sim = config::COST_SIM_SEARCH,
-        sim_usd = usd(config::COST_SIM_SEARCH),
+        sim = config::COST_SEARCH,
+        sim_usd = usd(config::COST_SEARCH),
+        desc = config::COST_SEARCH,
+        desc_usd = usd(config::COST_SEARCH),
         emb = config::COST_EMBED_SEARCH,
         emb_usd = usd(config::COST_EMBED_SEARCH),
     )

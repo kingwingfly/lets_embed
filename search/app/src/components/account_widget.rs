@@ -73,7 +73,10 @@ async fn call_me_api() -> Result<AccountState, String> {
         .unwrap_or_default();
     let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
 
-    let balance = json.get("balance").map(fmt_num).unwrap_or_else(|| "0".into());
+    let balance = json
+        .get("balance")
+        .map(fmt_num)
+        .unwrap_or_else(|| "0".into());
     let plan = json
         .get("plan")
         .and_then(|v| v.as_str())

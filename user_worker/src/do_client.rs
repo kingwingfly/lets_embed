@@ -24,8 +24,7 @@ pub async fn call_do<B: Serialize>(
     let mut init = RequestInit::new();
     init.with_method(method);
     if let Some(b) = body {
-        let json =
-            serde_json::to_string(b).map_err(|e| worker::Error::RustError(e.to_string()))?;
+        let json = serde_json::to_string(b).map_err(|e| worker::Error::RustError(e.to_string()))?;
         init.headers.set("content-type", "application/json")?;
         init.with_body(Some(json.into()));
     }

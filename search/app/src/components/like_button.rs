@@ -133,7 +133,9 @@ pub fn LikeButton(kind: &'static str, target_id: i64) -> impl IntoView {
                 Ok(ApiResult::Liked(false)) => LikeState::NotLiked,
                 Ok(ApiResult::Unauthorized) => LikeState::SignedOut,
                 Err(e) => {
-                    leptos::logging::error!("like toggle ({method} {kind} {target_id}) failed: {e}");
+                    leptos::logging::error!(
+                        "like toggle ({method} {kind} {target_id}) failed: {e}"
+                    );
                     prev // revert the optimistic toggle
                 }
             };
@@ -147,8 +149,18 @@ pub fn LikeButton(kind: &'static str, target_id: i64) -> impl IntoView {
     // Distinct glyph + accent per kind so the image and post favorite toggles are
     // visually distinguishable side by side: image = heart (rose), post = star (amber).
     let (filled, outline, liked_color, notliked_color) = match kind {
-        "post" => ("\u{2605}", "\u{2606}", "text-amber-500", "hover:text-amber-400"),
-        _ => ("\u{2665}", "\u{2661}", "text-rose-500", "hover:text-rose-400"),
+        "post" => (
+            "\u{2605}",
+            "\u{2606}",
+            "text-amber-500",
+            "hover:text-amber-400",
+        ),
+        _ => (
+            "\u{2665}",
+            "\u{2661}",
+            "text-rose-500",
+            "hover:text-rose-400",
+        ),
     };
     view! {
         {move || match state.get() {

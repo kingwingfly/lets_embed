@@ -30,7 +30,7 @@ fn view_cost(kind: ChargeKind) -> i64 {
     match kind {
         ChargeKind::Image => config::COST_IMAGE_VIEW,
         ChargeKind::Video => config::COST_VIDEO_VIEW,
-        ChargeKind::Search => config::COST_SIM_SEARCH,
+        ChargeKind::Search => config::COST_SEARCH,
         ChargeKind::EmbedSearch => config::COST_EMBED_SEARCH,
     }
 }
@@ -569,8 +569,11 @@ mod tests {
     fn view_costs_match_config() {
         assert_eq!(view_cost(ChargeKind::Image), config::COST_IMAGE_VIEW);
         assert_eq!(view_cost(ChargeKind::Video), config::COST_VIDEO_VIEW);
-        assert_eq!(view_cost(ChargeKind::Search), config::COST_SIM_SEARCH);
-        assert_eq!(view_cost(ChargeKind::EmbedSearch), config::COST_EMBED_SEARCH);
+        assert_eq!(view_cost(ChargeKind::Search), config::COST_SEARCH);
+        assert_eq!(
+            view_cost(ChargeKind::EmbedSearch),
+            config::COST_EMBED_SEARCH
+        );
     }
 
     fn basic() -> &'static config::Plan {
@@ -595,7 +598,10 @@ mod tests {
         assert_eq!(prorated_refund(pro_price, period, period), pro_price);
         assert_eq!(prorated_refund(pro_price, period, 0), 0);
         // Over-long remaining is clamped to the period (never over-refunds).
-        assert_eq!(prorated_refund(pro_price, period, period + 999 * day), pro_price);
+        assert_eq!(
+            prorated_refund(pro_price, period, period + 999 * day),
+            pro_price
+        );
         // Degenerate period never divides by zero.
         assert_eq!(prorated_refund(pro_price, 0, day), 0);
     }
@@ -685,18 +691,42 @@ mod tests {
         assert!(c < view_cost(ChargeKind::Search));
         // pro's unlimited views cover it for free (does not touch search quota)
         assert_eq!(
-            decide_charge(Some(pro()), true, ChargeKind::EmbedSearch, 0, pro().searches_per_window, 0, c),
+            decide_charge(
+                Some(pro()),
+                true,
+                ChargeKind::EmbedSearch,
+                0,
+                pro().searches_per_window,
+                0,
+                c
+            ),
             ChargeSource::FreeUnlimited
         );
         // basic draws it from the VIEW window (win_views), regardless of search usage
         let vlimit = basic().views_per_window.unwrap();
         assert_eq!(
-            decide_charge(Some(basic()), true, ChargeKind::EmbedSearch, vlimit - c, basic().searches_per_window, 0, c),
+            decide_charge(
+                Some(basic()),
+                true,
+                ChargeKind::EmbedSearch,
+                vlimit - c,
+                basic().searches_per_window,
+                0,
+                c
+            ),
             ChargeSource::Window
         );
         // view window exhausted → PAYG, even though search slots remain
         assert_eq!(
-            decide_charge(Some(basic()), true, ChargeKind::EmbedSearch, vlimit, 0, c, c),
+            decide_charge(
+                Some(basic()),
+                true,
+                ChargeKind::EmbedSearch,
+                vlimit,
+                0,
+                c,
+                c
+            ),
             ChargeSource::Balance
         );
     }

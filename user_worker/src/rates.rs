@@ -10,7 +10,12 @@
 //! SCAFFOLD STATE: `points_for` is fully implemented (pure). `chainlink_price`
 //! and the `rates` handler are stubs — UNIT 2 implements the eth_call decode.
 
-use axum::{Json, extract::State, http::StatusCode, response::{IntoResponse, Response}};
+use axum::{
+    Json,
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use worker::{Fetch, Method, Request, RequestInit};
 
 use crate::AppState;
@@ -90,7 +95,9 @@ fn word_to_u128(word: &str) -> Result<u128, &'static str> {
 /// (word 1, int256 USD price with 8 decimals) as `u128`, rejecting a negative,
 /// zero, or stale price.
 fn decode_latest_round_data(result_hex: &str, now: u64) -> Result<u128, &'static str> {
-    let hex = result_hex.strip_prefix("0x").ok_or("result not 0x-prefixed")?;
+    let hex = result_hex
+        .strip_prefix("0x")
+        .ok_or("result not 0x-prefixed")?;
     if hex.len() != 320 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("result is not 0x + 320 hex chars");
     }
@@ -109,8 +116,7 @@ fn decode_latest_round_data(result_hex: &str, now: u64) -> Result<u128, &'static
         return Err("chainlink answer is zero");
     }
 
-    let updated_at =
-        u64::try_from(word_to_u128(word(3))?).map_err(|_| "updatedAt exceeds u64")?;
+    let updated_at = u64::try_from(word_to_u128(word(3))?).map_err(|_| "updatedAt exceeds u64")?;
     if now.saturating_sub(updated_at) > config::CHAINLINK_MAX_STALE_SECS {
         return Err("chainlink price is stale");
     }
@@ -169,10 +175,16 @@ mod tests {
     fn volatile_priced_by_feed() {
         // 1 ETH (18 decimals) at $3000.00000000 -> 3000 * POINTS_PER_USD
         let price = 3000 * 100_000_000; // 8-decimal
-        assert_eq!(points_for(10u128.pow(18), 18, Some(price)), 3000 * POINTS_PER_USD);
+        assert_eq!(
+            points_for(10u128.pow(18), 18, Some(price)),
+            3000 * POINTS_PER_USD
+        );
         // 1 SOL (9 decimals) at $150
         let sol = 150 * 100_000_000;
-        assert_eq!(points_for(10u128.pow(9), 9, Some(sol)), 150 * POINTS_PER_USD);
+        assert_eq!(
+            points_for(10u128.pow(9), 9, Some(sol)),
+            150 * POINTS_PER_USD
+        );
     }
 
     #[test]
@@ -189,11 +201,11 @@ mod tests {
     fn round_data(answer: u128, updated_at: u64) -> String {
         format!(
             "0x{:064x}{:064x}{:064x}{:064x}{:064x}",
-            1u128,             // roundId
-            answer,            // answer
-            2u128,             // startedAt
+            1u128,              // roundId
+            answer,             // answer
+            2u128,              // startedAt
             updated_at as u128, // updatedAt
-            1u128,             // answeredInRound
+            1u128,              // answeredInRound
         )
     }
 

@@ -167,11 +167,7 @@ pub async fn liked(
         st.env
             .d1(crate::D1_BINDING)?
             .prepare("SELECT 1 AS x FROM likes WHERE address = ? AND kind = ? AND target_id = ?")
-            .bind(&[
-                address.into(),
-                q.kind.into(),
-                (q.target_id as f64).into(),
-            ])?
+            .bind(&[address.into(), q.kind.into(), (q.target_id as f64).into()])?
             .first::<i64>(Some("x"))
             .await
     }
@@ -249,8 +245,7 @@ mod tests {
     #[test]
     fn empty_query_params_are_none() {
         // query-string values arrive as strings; empty means absent
-        let q: LikesQuery =
-            serde_json::from_str(r#"{"kind":"","limit":"","cursor":""}"#).unwrap();
+        let q: LikesQuery = serde_json::from_str(r#"{"kind":"","limit":"","cursor":""}"#).unwrap();
         assert!(q.kind.is_none() && q.limit.is_none() && q.cursor.is_none());
         let q: LikesQuery =
             serde_json::from_str(r#"{"kind":"image","limit":"10","cursor":"99"}"#).unwrap();

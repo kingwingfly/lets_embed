@@ -31,8 +31,8 @@ use worker::{Env, Fetch, Method, Request, RequestInit};
 
 use crate::AppState;
 use crate::config::{self, Chain, MIN_CONFIRMATIONS, MIN_TOPUP_POINTS};
-use crate::solana::{self, SolOutcome};
 use crate::rates;
+use crate::solana::{self, SolOutcome};
 use crate::types::{ApiError, CreditReq, PaymentRow, SubscribeReq, TopupReq, TopupResp};
 use crate::{do_client, session};
 
@@ -61,7 +61,9 @@ async fn rpc(
     let mut resp = Fetch::Request(req).send().await?;
     let code = resp.status_code();
     if !(200..300).contains(&code) {
-        return Err(worker::Error::RustError(format!("rpc {method}: http {code}")));
+        return Err(worker::Error::RustError(format!(
+            "rpc {method}: http {code}"
+        )));
     }
     let v: serde_json::Value = resp.json().await?;
     if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
@@ -124,8 +126,7 @@ struct RpcLog {
 
 /// keccak256("Transfer(address,address,uint256)") — the ERC-20 `Transfer`
 /// event signature (`topics[0]`).
-const TRANSFER_TOPIC0: &str =
-    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const TRANSFER_TOPIC0: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
 /// The 20-byte address packed into a 32-byte indexed topic: strip `0x`, take
 /// the low 40 hex nibbles, lowercased. Robust to nodes that omit zero padding.
@@ -168,7 +169,11 @@ fn match_transfer_log(
 /// tx-intrinsic properties (recipient) — failures here are permanent for any
 /// submitter. The minimum is enforced later, in points.
 fn verify_native_tx(tx: &RpcTx, deposit_address: &str) -> Result<u128, &'static str> {
-    let to = tx.to.as_deref().ok_or("tx has no recipient")?.to_lowercase();
+    let to = tx
+        .to
+        .as_deref()
+        .ok_or("tx has no recipient")?
+        .to_lowercase();
     if to != deposit_address {
         return Err("tx recipient is not the deposit address");
     }
@@ -184,7 +189,11 @@ fn api_err(code: StatusCode, msg: &str) -> Response {
 }
 
 async fn d1_exec(env: &Env, sql: &str, binds: &[JsValue]) -> worker::Result<()> {
-    env.d1(crate::D1_BINDING)?.prepare(sql).bind(binds)?.run().await?;
+    env.d1(crate::D1_BINDING)?
+        .prepare(sql)
+        .bind(binds)?
+        .run()
+        .await?;
     Ok(())
 }
 
@@ -226,7 +235,10 @@ async fn rpc_unavailable(env: &Env, tx_hash: &str, method: &str, e: worker::Erro
 /// to retry once the chain has caught up.
 async fn too_early(env: &Env, tx_hash: &str) -> Response {
     delete_pending(env, tx_hash).await;
-    api_err(StatusCode::TOO_EARLY, "not enough confirmations yet, retry later")
+    api_err(
+        StatusCode::TOO_EARLY,
+        "not enough confirmations yet, retry later",
+    )
 }
 
 /// Forward a subscription change to the user's DO, relay its status + JSON
@@ -242,7 +254,10 @@ async fn plan_passthrough(
         Ok(r) => r,
         Err(e) => {
             worker::console_error!("do {path} failed: {e:?}");
-            return api_err(StatusCode::INTERNAL_SERVER_ERROR, "subscription update failed");
+            return api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "subscription update failed",
+            );
         }
     };
     let code = resp.status_code();
@@ -298,15 +313,17 @@ pub async fn topup(
 /// The token's USD price with 8 decimals, or `None` for a $1 stablecoin.
 /// Chainlink feeds live on Ethereum mainnet, so this always uses `rpc_url`
 /// (even to price SOL). On RPC failure returns a ready retry-later response.
-async fn resolve_price(st: &AppState, spec: &config::TokenSpec, tx_hash: &str) -> Result<Option<u128>, Response> {
+async fn resolve_price(
+    st: &AppState,
+    spec: &config::TokenSpec,
+    tx_hash: &str,
+) -> Result<Option<u128>, Response> {
     match spec.feed {
         None => Ok(None),
-        Some(feed) => {
-            match rates::chainlink_price(&st.rpc_url, feed, session::now_secs()).await {
-                Ok(p) => Ok(Some(p)),
-                Err(e) => Err(rpc_unavailable(&st.env, tx_hash, "chainlink_price", e).await),
-            }
-        }
+        Some(feed) => match rates::chainlink_price(&st.rpc_url, feed, session::now_secs()).await {
+            Ok(p) => Ok(Some(p)),
+            Err(e) => Err(rpc_unavailable(&st.env, tx_hash, "chainlink_price", e).await),
+        },
     }
 }
 
@@ -352,7 +369,10 @@ async fn topup_solana(
         }
         Err(e) => {
             worker::console_error!("linked_solana lookup failed: {e:?}");
-            return api_err(StatusCode::INTERNAL_SERVER_ERROR, "database error, retry later");
+            return api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "database error, retry later",
+            );
         }
     };
 
@@ -374,7 +394,10 @@ async fn topup_solana(
             return api_err(StatusCode::CONFLICT, "tx already submitted");
         }
         worker::console_error!("payments insert failed for {sig}: {e:?}");
-        return api_err(StatusCode::INTERNAL_SERVER_ERROR, "database error, retry later");
+        return api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "database error, retry later",
+        );
     }
 
     // 4) fetch + verify on-chain
@@ -391,7 +414,10 @@ async fn topup_solana(
         SolOutcome::Reject(msg) => return reject(&st.env, &sig, msg).await,
         SolOutcome::WrongSender => {
             delete_pending(&st.env, &sig).await;
-            return api_err(StatusCode::FORBIDDEN, "tx sender is not your linked Solana wallet");
+            return api_err(
+                StatusCode::FORBIDDEN,
+                "tx sender is not your linked Solana wallet",
+            );
         }
         SolOutcome::TooEarly => return too_early(&st.env, &sig).await,
         SolOutcome::RpcError(e) => {
@@ -450,15 +476,23 @@ async fn topup_ethereum(
             return api_err(StatusCode::CONFLICT, "tx already submitted");
         }
         worker::console_error!("payments insert failed for {tx_hash}: {e:?}");
-        return api_err(StatusCode::INTERNAL_SERVER_ERROR, "database error, retry later");
+        return api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "database error, retry later",
+        );
     }
 
     // 3) the transaction itself: sender + recipient + value
-    let tx_json =
-        match rpc(&st.rpc_url, "eth_getTransactionByHash", serde_json::json!([tx_hash])).await {
-            Ok(v) => v,
-            Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionByHash", e).await,
-        };
+    let tx_json = match rpc(
+        &st.rpc_url,
+        "eth_getTransactionByHash",
+        serde_json::json!([tx_hash]),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionByHash", e).await,
+    };
     if tx_json.is_null() {
         delete_pending(&st.env, &tx_hash).await;
         return api_err(StatusCode::BAD_REQUEST, "tx not found");
@@ -476,15 +510,23 @@ async fn topup_ethereum(
     };
     if tx.from.to_lowercase() != addr {
         delete_pending(&st.env, &tx_hash).await;
-        return api_err(StatusCode::FORBIDDEN, "tx sender does not match logged-in address");
+        return api_err(
+            StatusCode::FORBIDDEN,
+            "tx sender does not match logged-in address",
+        );
     }
 
     // 4) receipt: mined + successful
-    let receipt_json =
-        match rpc(&st.rpc_url, "eth_getTransactionReceipt", serde_json::json!([tx_hash])).await {
-            Ok(v) => v,
-            Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionReceipt", e).await,
-        };
+    let receipt_json = match rpc(
+        &st.rpc_url,
+        "eth_getTransactionReceipt",
+        serde_json::json!([tx_hash]),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionReceipt", e).await,
+    };
     let receipt: Option<RpcReceipt> = if receipt_json.is_null() {
         None
     } else {
@@ -498,7 +540,9 @@ async fn topup_ethereum(
         }
     };
     let block = match receipt {
-        Some(RpcReceipt { status: Some(s), .. }) if s != "0x1" => {
+        Some(RpcReceipt {
+            status: Some(s), ..
+        }) if s != "0x1" => {
             return reject(&st.env, &tx_hash, "tx failed on-chain").await;
         }
         Some(RpcReceipt {
@@ -574,16 +618,24 @@ async fn topup_erc20(
             return api_err(StatusCode::CONFLICT, "tx already submitted");
         }
         worker::console_error!("payments insert failed for {tx_hash}: {e:?}");
-        return api_err(StatusCode::INTERNAL_SERVER_ERROR, "database error, retry later");
+        return api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "database error, retry later",
+        );
     }
 
     // 3) the transaction itself: existence + sender. `value` is irrelevant for
     //    an ERC-20 transfer (the token move lives in the receipt logs).
-    let tx_json =
-        match rpc(&st.rpc_url, "eth_getTransactionByHash", serde_json::json!([tx_hash])).await {
-            Ok(v) => v,
-            Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionByHash", e).await,
-        };
+    let tx_json = match rpc(
+        &st.rpc_url,
+        "eth_getTransactionByHash",
+        serde_json::json!([tx_hash]),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionByHash", e).await,
+    };
     if tx_json.is_null() {
         delete_pending(&st.env, &tx_hash).await;
         return api_err(StatusCode::BAD_REQUEST, "tx not found");
@@ -597,15 +649,23 @@ async fn topup_erc20(
     };
     if tx.from.to_lowercase() != addr {
         delete_pending(&st.env, &tx_hash).await;
-        return api_err(StatusCode::FORBIDDEN, "tx sender does not match logged-in address");
+        return api_err(
+            StatusCode::FORBIDDEN,
+            "tx sender does not match logged-in address",
+        );
     }
 
     // 4) receipt: mined + successful, then the Transfer-log verification.
-    let receipt_json =
-        match rpc(&st.rpc_url, "eth_getTransactionReceipt", serde_json::json!([tx_hash])).await {
-            Ok(v) => v,
-            Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionReceipt", e).await,
-        };
+    let receipt_json = match rpc(
+        &st.rpc_url,
+        "eth_getTransactionReceipt",
+        serde_json::json!([tx_hash]),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionReceipt", e).await,
+    };
     if receipt_json.is_null() {
         return too_early(&st.env, &tx_hash).await;
     }
@@ -617,7 +677,9 @@ async fn topup_erc20(
         }
     };
     let block = match receipt {
-        RpcReceipt { status: Some(s), .. } if s != "0x1" => {
+        RpcReceipt {
+            status: Some(s), ..
+        } if s != "0x1" => {
             return reject(&st.env, &tx_hash, "tx failed on-chain").await;
         }
         RpcReceipt {
@@ -635,7 +697,10 @@ async fn topup_erc20(
     };
 
     // Find the token Transfer into the deposit address from this sender.
-    let deposit_no0x = st.deposit_address.strip_prefix("0x").unwrap_or(&st.deposit_address);
+    let deposit_no0x = st
+        .deposit_address
+        .strip_prefix("0x")
+        .unwrap_or(&st.deposit_address);
     let sender_no0x = addr.strip_prefix("0x").unwrap_or(addr);
     let amount = match match_transfer_log(&receipt.logs, contract, deposit_no0x, sender_no0x) {
         Some(a) => a,
@@ -686,7 +751,10 @@ async fn finalize_credit(
         Err(e) => {
             worker::console_error!("do_credit failed for {tx_hash}: {e:?}");
             delete_pending(&st.env, tx_hash).await;
-            return api_err(StatusCode::INTERNAL_SERVER_ERROR, "credit failed, retry later");
+            return api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credit failed, retry later",
+            );
         }
     };
 
@@ -781,7 +849,10 @@ mod tests {
     #[test]
     fn hex_quantity_parsing() {
         assert_eq!(hex_to_u128("0x0"), Some(0));
-        assert_eq!(hex_to_u128("0xde0b6b3a7640000"), Some(1_000_000_000_000_000_000));
+        assert_eq!(
+            hex_to_u128("0xde0b6b3a7640000"),
+            Some(1_000_000_000_000_000_000)
+        );
         assert_eq!(hex_to_u128("de0b6b3a7640000"), None); // missing 0x
         assert_eq!(hex_to_u128("0x"), None); // empty digits
         assert_eq!(hex_to_u128("0xzz"), None); // garbage
@@ -807,7 +878,10 @@ mod tests {
         // wrong recipient rejected
         assert!(verify_native_tx(&good, "0x0000000000000000000000000000000000000001").is_err());
         // checksummed `to` still matches (verification lowercases)
-        let mixed = tx(Some("0x9965507D1a55bcc2695C58ba16FB37d819B0A4dc"), "0xde0b6b3a7640000");
+        let mixed = tx(
+            Some("0x9965507D1a55bcc2695C58ba16FB37d819B0A4dc"),
+            "0xde0b6b3a7640000",
+        );
         assert_eq!(verify_native_tx(&mixed, DEPOSIT), Ok(10u128.pow(18)));
         // contract creation (no `to`) rejected
         assert!(verify_native_tx(&tx(None, "0x1"), DEPOSIT).is_err());
@@ -860,7 +934,10 @@ mod tests {
             &DEPOSIT[2..],
             &format!("0x{:064x}", 1_000_000u128),
         )];
-        assert_eq!(match_transfer_log(&logs, USDC, &DEPOSIT[2..], &SENDER[2..]), None);
+        assert_eq!(
+            match_transfer_log(&logs, USDC, &DEPOSIT[2..], &SENDER[2..]),
+            None
+        );
     }
 
     #[test]
@@ -874,7 +951,10 @@ mod tests {
             &DEPOSIT[2..],
             &format!("0x{:064x}", 1_000_000u128),
         )];
-        assert_eq!(match_transfer_log(&logs, USDC, &DEPOSIT[2..], &SENDER[2..]), None);
+        assert_eq!(
+            match_transfer_log(&logs, USDC, &DEPOSIT[2..], &SENDER[2..]),
+            None
+        );
     }
 
     #[test]
@@ -888,7 +968,10 @@ mod tests {
             other,
             &format!("0x{:064x}", 1_000_000u128),
         )];
-        assert_eq!(match_transfer_log(&logs, USDC, &DEPOSIT[2..], &SENDER[2..]), None);
+        assert_eq!(
+            match_transfer_log(&logs, USDC, &DEPOSIT[2..], &SENDER[2..]),
+            None
+        );
     }
 
     #[test]
@@ -902,7 +985,10 @@ mod tests {
             &DEPOSIT[2..],
             &format!("0x{:064x}", 1_000_000u128),
         )];
-        assert_eq!(match_transfer_log(&logs, USDC, &DEPOSIT[2..], &SENDER[2..]), None);
+        assert_eq!(
+            match_transfer_log(&logs, USDC, &DEPOSIT[2..], &SENDER[2..]),
+            None
+        );
     }
 
     #[test]

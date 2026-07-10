@@ -65,8 +65,7 @@ pub fn is_eth_address(s: &str) -> bool {
 /// one namespace (session `sub`, `users.address`, DO id) without collision.
 pub fn is_sol_principal(s: &str) -> bool {
     // base58 of 32 bytes is 32–44 chars; bound the work before decoding.
-    (32..=44).contains(&s.len())
-        && matches!(bs58::decode(s).into_vec(), Ok(v) if v.len() == 32)
+    (32..=44).contains(&s.len()) && matches!(bs58::decode(s).into_vec(), Ok(v) if v.len() == 32)
 }
 
 /// A valid session principal: an Ethereum address (SIWE) or a Solana pubkey (SIWS).
@@ -100,9 +99,7 @@ mod tests {
 
     #[test]
     fn eth_address_check() {
-        assert!(is_eth_address(
-            "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
-        ));
+        assert!(is_eth_address("0xd8da6bf26964af9d7eed9e03e53415d37aa96045"));
         // uppercase rejected (must be lowercase)
         assert!(!is_eth_address(
             "0xD8dA6BF26964aF9D7eEd9e03E53415D37aA96045"

@@ -97,11 +97,15 @@ async fn get_transaction(url: &str, signature: &str) -> worker::Result<Value> {
     let mut resp = Fetch::Request(req).send().await?;
     let code = resp.status_code();
     if !(200..300).contains(&code) {
-        return Err(worker::Error::RustError(format!("getTransaction: http {code}")));
+        return Err(worker::Error::RustError(format!(
+            "getTransaction: http {code}"
+        )));
     }
     let v: Value = resp.json().await?;
     if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
-        return Err(worker::Error::RustError(format!("getTransaction error: {e}")));
+        return Err(worker::Error::RustError(format!(
+            "getTransaction error: {e}"
+        )));
     }
     Ok(v.get("result").cloned().unwrap_or(Value::Null))
 }
@@ -177,7 +181,9 @@ fn verify_solana(
             if credited <= 0 {
                 return SolOutcome::Reject("no SOL received");
             }
-            SolOutcome::Credited { amount: credited as u128 }
+            SolOutcome::Credited {
+                amount: credited as u128,
+            }
         }
         // ----------------------------------------------------------------- SPL
         Some(mint) => {
@@ -210,7 +216,9 @@ fn verify_solana(
             if post_amount <= pre_amount {
                 return SolOutcome::Reject("no token received");
             }
-            SolOutcome::Credited { amount: post_amount - pre_amount }
+            SolOutcome::Credited {
+                amount: post_amount - pre_amount,
+            }
         }
     }
 }
@@ -271,7 +279,9 @@ mod tests {
         });
         assert_eq!(
             verify_solana(&result, sol_spec(), DEPOSIT, LINKED),
-            SolOutcome::Credited { amount: 1_000_000_000 }
+            SolOutcome::Credited {
+                amount: 1_000_000_000
+            }
         );
     }
 
@@ -456,7 +466,9 @@ mod tests {
         });
         assert_eq!(
             verify_solana(&result, sol_spec(), DEPOSIT, LINKED),
-            SolOutcome::Credited { amount: 1_000_000_000 }
+            SolOutcome::Credited {
+                amount: 1_000_000_000
+            }
         );
     }
 }

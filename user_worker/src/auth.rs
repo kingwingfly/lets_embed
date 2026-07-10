@@ -124,10 +124,7 @@ pub async fn verify(
         Err(e) => return api_error(StatusCode::UNAUTHORIZED, e.to_string()),
     };
     if addr != msg.address.to_lowercase() {
-        return api_error(
-            StatusCode::UNAUTHORIZED,
-            "signature does not match address",
-        );
+        return api_error(StatusCode::UNAUTHORIZED, "signature does not match address");
     }
 
     // 6) D1: upsert the user row, then check the ban flag.

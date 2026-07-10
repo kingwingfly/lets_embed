@@ -49,7 +49,11 @@ struct Lines<'a> {
 
 impl<'a> Lines<'a> {
     fn next(&mut self, what: &'static str) -> Result<&'a str, SiweError> {
-        let l = self.lines.get(self.i).copied().ok_or(SiweError::Parse(what))?;
+        let l = self
+            .lines
+            .get(self.i)
+            .copied()
+            .ok_or(SiweError::Parse(what))?;
         self.i += 1;
         Ok(l)
     }
@@ -95,7 +99,9 @@ pub fn parse_siwe(msg: &str) -> Result<SiweMessage, SiweError> {
     // the fields (or a second blank line) follow directly.
     let mut statement_lines = Vec::new();
     loop {
-        let l = lines.peek().ok_or(SiweError::Parse("unterminated statement"))?;
+        let l = lines
+            .peek()
+            .ok_or(SiweError::Parse("unterminated statement"))?;
         if statement_lines.is_empty() && l.starts_with("URI: ") {
             break; // single-blank-line form: this is already the first field
         }
@@ -117,7 +123,10 @@ pub fn parse_siwe(msg: &str) -> Result<SiweMessage, SiweError> {
     let issued_at = lines.field("expected Issued At", "Issued At: ")?;
 
     let mut expiration_time = None;
-    if let Some(v) = lines.peek().and_then(|l| l.strip_prefix("Expiration Time: ")) {
+    if let Some(v) = lines
+        .peek()
+        .and_then(|l| l.strip_prefix("Expiration Time: "))
+    {
         expiration_time = Some(v.to_owned());
         lines.i += 1;
     }
@@ -161,9 +170,7 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
 /// Recover the lowercase 0x signer address from an EIP-191 personal_sign
 /// signature (65-byte r||s||v hex, v in {0,1,27,28}) over `message`.
 pub fn recover_address(message: &str, signature_hex: &str) -> Result<String, SiweError> {
-    let hex_str = signature_hex
-        .strip_prefix("0x")
-        .unwrap_or(signature_hex);
+    let hex_str = signature_hex.strip_prefix("0x").unwrap_or(signature_hex);
     let sig_bytes = hex::decode(hex_str).map_err(|_| SiweError::BadHex)?;
     if sig_bytes.len() != 65 {
         return Err(SiweError::BadSignature);
@@ -174,8 +181,7 @@ pub fn recover_address(message: &str, signature_hex: &str) -> Result<String, Siw
         _ => return Err(SiweError::BadSignature),
     };
 
-    let mut sig =
-        Signature::from_slice(&sig_bytes[..64]).map_err(|_| SiweError::BadSignature)?;
+    let mut sig = Signature::from_slice(&sig_bytes[..64]).map_err(|_| SiweError::BadSignature)?;
     if let Some(normalized) = sig.normalize_s() {
         sig = normalized;
         v ^= 1;
@@ -209,7 +215,11 @@ pub fn to_checksum(addr_lower: &str) -> String {
     out.push_str("0x");
     // `.take(64)` bounds the hash index for over-long (invalid) inputs.
     for (i, c) in hex_part.chars().enumerate().take(64) {
-        let nibble = if i % 2 == 0 { hash[i / 2] >> 4 } else { hash[i / 2] & 0xf };
+        let nibble = if i % 2 == 0 {
+            hash[i / 2] >> 4
+        } else {
+            hash[i / 2] & 0xf
+        };
         if c.is_ascii_alphabetic() && nibble >= 8 {
             out.push(c.to_ascii_uppercase());
         } else {
@@ -248,8 +258,7 @@ pub fn parse_rfc3339_epoch(s: &str) -> Option<u64> {
     {
         return None;
     }
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59
-    {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 {
         return None;
     }
 
