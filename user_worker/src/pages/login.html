@@ -1,0 +1,265 @@
+<div class="card center">
+<div class="icon">&#128274;</div>
+<h1>Sign in with Ethereum</h1>
+<p class="sub">Authenticate with your wallet to access your account.</p>
+<button class="btn full" id="siwe-btn" type="button">Sign in with Ethereum</button>
+<button class="btn full ghost-alt" id="siws-btn" type="button" style="margin-top:12px">Sign in with Solana</button>
+<div id="mobile-wallets" hidden>
+<h2>Sign in on mobile</h2>
+<p class="hint">Open your wallet app (MetaMask / Phantom / etc.), use its built-in browser, and go to:</p>
+<p id="mobile-host"></p>
+<button class="btn full" id="copy-link" type="button">Copy link</button>
+<p class="hint">Your wallet's in-app browser injects the wallet into the page, so sign-in works there.</p>
+<div id="mobile-deeplinks">
+<p class="hint">Or try opening directly (may not work on all devices):</p>
+<a class="btn full ghost-alt" id="mm-link" rel="noopener" href="#">Open in MetaMask</a>
+<a class="btn full ghost-alt" id="ph-link" rel="noopener" href="#">Open in Phantom</a>
+</div>
+</div>
+<div class="msg" id="login-msg" hidden></div>
+<div class="links" style="justify-content:center"><a href="/">&larr; Back to site</a></div>
+</div>
+<script>
+"use strict";
+var CHAIN_ID = __CHAIN_ID__;
+var SIWE_DOMAIN = "__SIWE_DOMAIN__";
+var btn = document.getElementById("siwe-btn");
+var msgEl = document.getElementById("login-msg");
+
+function showMsg(text, cls) {
+  msgEl.hidden = false;
+  msgEl.className = "msg" + (cls ? " " + cls : "");
+  msgEl.textContent = text;
+}
+
+function nextUrl() {
+  var next = new URLSearchParams(location.search).get("next") || "/";
+  // Browsers treat "\" as "/" when resolving URLs, so also reject backslashes
+  // to keep "/\evil.com" from becoming a protocol-relative redirect.
+  if (!next.startsWith("/") || next.startsWith("//") || next.includes("\\")) next = "/";
+  return next;
+}
+
+if (!window.ethereum) {
+  var isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  if (isMobile) {
+    // Mobile browsers have no injected provider. The reliable path is manual:
+    // the user opens their wallet app's built-in browser and navigates here,
+    // so we show the host prominently and offer a one-tap "copy link".
+    document.getElementById("mobile-host").textContent = location.host;
+    // Full URL to this exact page, built from location with a fixed origin.
+    var siteUrl = location.origin + location.pathname + location.search;
+    var copyBtn = document.getElementById("copy-link");
+    copyBtn.addEventListener("click", function () {
+      function copied() {
+        showMsg("Link copied. Open your wallet app's browser and paste it.", "ok");
+      }
+      function manual() {
+        // Neither clipboard path worked — show the link so it can be copied by hand.
+        showMsg("Couldn't copy automatically. Copy this link manually:\n" + siteUrl);
+      }
+      function legacyCopy() {
+        try {
+          var inp = document.createElement("input");
+          inp.setAttribute("readonly", "");
+          inp.value = siteUrl;
+          inp.style.position = "absolute";
+          inp.style.left = "-9999px";
+          document.body.appendChild(inp);
+          inp.select();
+          inp.setSelectionRange(0, siteUrl.length);
+          var ok = document.execCommand && document.execCommand("copy");
+          document.body.removeChild(inp);
+          if (ok) { copied(); return; }
+        } catch (e) {}
+        manual();
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(siteUrl).then(copied, legacyCopy);
+      } else {
+        legacyCopy();
+      }
+    });
+    // Best-effort deep links that reopen THIS page inside a wallet app's in-app
+    // browser (which injects a provider). Documented-unreliable, so secondary.
+    // link.metamask.io is MetaMask's current deeplink host: host+path+query, no
+    // scheme (the legacy metamask.app.link Branch link 404s on HTTPS-only sites).
+    var mmUrl = "https://link.metamask.io/dapp/" +
+      location.host + location.pathname + location.search;
+    // Phantom universal link: full https URL, encoded; ref = origin.
+    var phUrl = "https://phantom.app/ul/browse/" +
+      encodeURIComponent(location.href) + "?ref=" + encodeURIComponent(location.origin);
+    document.getElementById("mm-link").href = mmUrl;
+    document.getElementById("ph-link").href = phUrl;
+    btn.hidden = true;
+    document.getElementById("mobile-wallets").hidden = false;
+  } else {
+    btn.disabled = true;
+    showMsg("No Ethereum wallet detected. Please install a wallet extension (e.g. MetaMask) and reload this page.");
+  }
+} else {
+  btn.addEventListener("click", async function () {
+    btn.disabled = true;
+    try {
+      var accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+      var addr = accounts[0];
+      if (!addr) throw new Error("no account returned by the wallet");
+      var nr = await fetch("/user/api/nonce");
+      if (!nr.ok) throw new Error("failed to fetch nonce (" + nr.status + ")");
+      var nonce = (await nr.json()).nonce;
+      var message = `${location.host} wants you to sign in with your Ethereum account:
+${addr}
+
+Sign in to lets_embed
+
+URI: ${location.origin}/user/login
+Version: 1
+Chain ID: ${CHAIN_ID}
+Nonce: ${nonce}
+Issued At: ${new Date().toISOString()}`;
+      var signature = await window.ethereum.request({
+        method: "personal_sign",
+        params: [message, addr],
+      });
+      var vr = await fetch("/user/api/verify", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ message: message, signature: signature }),
+      });
+      if (vr.ok) {
+        showMsg("Signed in. Redirecting…", "ok");
+        location = nextUrl();
+        return;
+      }
+      var err;
+      try { err = (await vr.json()).error; } catch (_) {}
+      showMsg(err || "sign-in failed (" + vr.status + ")", "err");
+    } catch (e) {
+      showMsg(e && e.message ? e.message : String(e), "err");
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+// ---- Sign in with Solana (SIWS) -------------------------------------------
+// Independent of the Ethereum provider: discovers a Solana wallet via the Wallet
+// Standard (MetaMask multichain, Phantom, Solflare, Backpack), signs the SIWS
+// challenge, and posts to /user/api/verify_solana for a standalone account.
+function bs58encode(bytes) {
+  var ALPH = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  if (bytes.length === 0) return "";
+  var digits = [0];
+  for (var i = 0; i < bytes.length; i++) {
+    var carry = bytes[i];
+    for (var j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) { digits.push(carry % 58); carry = (carry / 58) | 0; }
+  }
+  var out = "";
+  for (var k = 0; k < bytes.length - 1 && bytes[k] === 0; k++) out += "1";
+  for (var q = digits.length - 1; q >= 0; q--) out += ALPH[digits[q]];
+  return out;
+}
+var solWallets = [];
+(function () {
+  function register() {
+    for (var i = 0; i < arguments.length; i++) {
+      if (solWallets.indexOf(arguments[i]) === -1) solWallets.push(arguments[i]);
+    }
+    return function () {};
+  }
+  var api = { register: register, get: function () { return solWallets.slice(); }, on: function () { return function () {}; } };
+  try { window.addEventListener("wallet-standard:register-wallet", function (ev) { ev.detail(api); }); } catch (e) {}
+  try { window.dispatchEvent(new CustomEvent("wallet-standard:app-ready", { detail: api })); } catch (e) {}
+})();
+function pickSolanaWallet() {
+  for (var i = 0; i < solWallets.length; i++) {
+    var f = solWallets[i] && solWallets[i].features;
+    if (f && f["solana:signMessage"] && f["standard:connect"]) return solWallets[i];
+  }
+  return null;
+}
+function pickSolanaAccount(accounts) {
+  for (var i = 0; i < accounts.length; i++) {
+    var chains = accounts[i].chains || [];
+    for (var j = 0; j < chains.length; j++) if (chains[j].indexOf("solana:") === 0) return accounts[i];
+  }
+  return accounts.length ? accounts[0] : null;
+}
+async function getSolanaSigner() {
+  var w = pickSolanaWallet();
+  if (w) {
+    var res = await w.features["standard:connect"].connect();
+    var accounts = (res && res.accounts && res.accounts.length ? res.accounts : w.accounts) || [];
+    var account = pickSolanaAccount(accounts);
+    if (!account) throw new Error("No Solana account in this wallet — enable one (e.g. in MetaMask) and try again.");
+    return {
+      address: account.address,
+      sign: async function (m) { return (await w.features["solana:signMessage"].signMessage({ account: account, message: m }))[0].signature; },
+    };
+  }
+  var provider = window.solana || (window.phantom && window.phantom.solana);
+  if (provider && provider.connect) {
+    var conn = await provider.connect();
+    var pk = provider.publicKey || (conn && conn.publicKey);
+    if (!pk) throw new Error("wallet did not return a public key");
+    return {
+      address: pk.toString(),
+      sign: async function (m) { var s = await provider.signMessage(m, "utf8"); return s && s.signature ? s.signature : s; },
+    };
+  }
+  return null;
+}
+var sbtn = document.getElementById("siws-btn");
+function hasSolanaWallet() {
+  return !!(pickSolanaWallet() || window.solana || (window.phantom && window.phantom.solana));
+}
+if (!hasSolanaWallet()) {
+  // Mirror the Ethereum button: with no Solana wallet present, don't leave an
+  // active button that can only fail. On mobile the deep-link block is the real
+  // path (hide it, like siwe-btn); on desktop gray it out like the Ethereum button.
+  if (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) {
+    sbtn.hidden = true;
+  } else {
+    sbtn.disabled = true;
+  }
+}
+sbtn.addEventListener("click", async function () {
+  sbtn.disabled = true;
+  try {
+    var signer = await getSolanaSigner();
+    if (!signer) {
+      showMsg("No Solana-capable wallet found. Enable Solana in MetaMask (or install Phantom / another Solana wallet), then reload.", "err");
+      return;
+    }
+    var nr = await fetch("/user/api/nonce");
+    if (!nr.ok) throw new Error("failed to fetch nonce (" + nr.status + ")");
+    var nonce = (await nr.json()).nonce;
+    // MUST match auth::siws_challenge byte for byte.
+    var message = "Sign in to lets_embed with Solana\nDomain: " + SIWE_DOMAIN + "\nNonce: " + nonce;
+    var sigBytes = await signer.sign(new TextEncoder().encode(message));
+    var sigB58 = typeof sigBytes === "string" ? sigBytes : bs58encode(sigBytes);
+    var vr = await fetch("/user/api/verify_solana", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ solana_address: signer.address, signature: sigB58, nonce: nonce }),
+    });
+    if (vr.ok) {
+      showMsg("Signed in. Redirecting…", "ok");
+      location = nextUrl();
+      return;
+    }
+    var err;
+    try { err = (await vr.json()).error; } catch (_) {}
+    showMsg(err || "Solana sign-in failed (" + vr.status + ")", "err");
+  } catch (e) {
+    showMsg(e && e.message ? e.message : String(e), "err");
+  } finally {
+    sbtn.disabled = false;
+  }
+});
+</script>

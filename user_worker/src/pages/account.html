@@ -1,0 +1,437 @@
+<div class="card">
+<div class="headrow"><h1>Your account</h1><span class="badge err" id="banned-badge" hidden>Banned</span></div>
+<p class="sub meta" id="acct-address">loading&hellip;</p>
+<dl class="stats">
+<dt>Balance</dt><dd id="acct-balance">&mdash;</dd>
+<dt>Plan</dt><dd id="acct-plan">&mdash;</dd>
+<dt>Usage left</dt><dd id="acct-quota">&mdash;</dd>
+<dt>Period ends</dt><dd id="acct-period-end">&mdash;</dd>
+<dt>Total views</dt><dd id="acct-views">&mdash;</dd>
+</dl>
+<div class="links"><a href="/user/favorites">My favorites</a><a href="/">&larr; Back to site</a></div>
+</div>
+
+<div class="card">
+<h2>Pricing</h2>
+<p class="sub">Pay-as-you-go: your point balance is charged per action. New accounts start with a free grant.</p>
+__PRICING__
+</div>
+
+<div class="card">
+<h2>Top up</h2>
+<p class="sub">Pick an asset, send it to the deposit address shown, then paste the transaction hash (Ethereum) or signature (Solana) to credit your balance. Stablecoins price at $1; ETH/SOL use a live price feed.</p>
+<form id="topup-form">
+<label for="topup-chain">Chain</label>
+<select id="topup-chain">
+<option value="ethereum">Ethereum</option>
+<option value="solana">Solana</option>
+</select>
+<label for="topup-token">Asset</label>
+<select id="topup-token"></select>
+<div id="sol-link" hidden>
+<p class="sub" style="margin:0 0 10px" id="sol-linked-state">No Solana wallet linked yet.</p>
+<p class="sub" style="margin:0 0 10px">Solana top-ups must originate from your linked wallet. Works with MetaMask (Solana account), Phantom, or another Solana wallet.</p>
+<button class="btn small" type="button" id="sol-link-btn">Link Solana wallet</button>
+<div class="msg" id="sol-link-msg" hidden></div>
+</div>
+<label>Deposit address</label>
+<p class="meta" id="deposit-address">__DEPOSIT_ADDRESS__</p>
+<label for="tx-hash" id="tx-label">Transaction hash</label>
+<input type="text" id="tx-hash" placeholder="0x&hellip;" autocomplete="off" required>
+<button class="btn full" type="submit" id="topup-btn">Credit top-up</button>
+</form>
+<div class="msg" id="topup-msg" hidden></div>
+</div>
+
+<div class="card">
+<h2>Subscription</h2>
+<p class="sub">Plans are paid from your point balance and last up to 30 days &mdash; they do <strong>not</strong> auto-renew. Switching plans or unsubscribing refunds the unused days of your current plan, prorated to the day.</p>
+__PLANS_TABLE__
+<div class="actions" style="margin-top:14px">
+<button class="btn ghost small" type="button" id="unsub-btn">Unsubscribe</button>
+</div>
+<div class="msg" id="sub-msg" hidden></div>
+</div>
+
+<div class="card">
+<h2>Payment history</h2>
+<div class="tablewrap"><table>
+<thead><tr><th>Tx</th><th>Chain</th><th>Asset</th><th>Amount</th><th>Points</th><th>Status</th><th>Date</th></tr></thead>
+<tbody id="payments-body"></tbody>
+</table></div>
+<div class="empty" id="payments-empty" hidden>No payments yet.</div>
+</div>
+
+<div class="card">
+<div class="actions">
+<button class="btn ghost" type="button" id="logout-btn">Log out</button>
+</div>
+</div>
+
+<script>
+"use strict";
+function fmtDate(epochSecs) {
+  return new Date(epochSecs * 1000).toLocaleString();
+}
+function setMsg(id, text, cls) {
+  var el = document.getElementById(id);
+  el.hidden = false;
+  el.className = "msg" + (cls ? " " + cls : "");
+  el.textContent = text;
+}
+function setText(id, text) {
+  document.getElementById(id).textContent = text;
+}
+
+// Last-loaded account status, so the subscribe confirmation can explain the
+// proration when the user already has an active plan.
+var currentMe = null;
+
+async function loadMe() {
+  var r = await fetch("/user/api/me");
+  if (r.status === 401) {
+    location = "/user/login?next=/user/account";
+    return;
+  }
+  if (!r.ok) {
+    setText("acct-address", "failed to load account (" + r.status + ")");
+    return;
+  }
+  var me = await r.json();
+  currentMe = me;
+  setText("acct-address", me.address);
+  setText("acct-balance", String(me.balance) + " points");
+  setText("acct-plan", me.plan ? me.plan : "none");
+  var hasPlan = !!me.plan;
+  var viewsStr = me.views_remaining != null
+    ? String(me.views_remaining)
+    : (hasPlan ? "unlimited" : "—");
+  var searchesStr = me.searches_remaining != null ? String(me.searches_remaining) : "—";
+  setText("acct-quota", "Views: " + viewsStr + "  ·  Searches: " + searchesStr);
+  setText("acct-period-end", me.period_end ? fmtDate(me.period_end) : "—");
+  setText("acct-views", String(me.total_views));
+  document.getElementById("banned-badge").hidden = !me.banned;
+}
+
+async function loadPayments() {
+  var body = document.getElementById("payments-body");
+  var empty = document.getElementById("payments-empty");
+  var r = await fetch("/user/api/payments");
+  if (!r.ok) return;
+  var rows = await r.json();
+  body.textContent = "";
+  empty.hidden = rows.length !== 0;
+  for (var i = 0; i < rows.length; i++) {
+    var p = rows[i];
+    var tr = document.createElement("tr");
+    var cells = [p.tx_hash, p.chain, (p.token || "").toUpperCase(), p.amount, String(p.points), p.status, fmtDate(p.created_at)];
+    for (var j = 0; j < cells.length; j++) {
+      var td = document.createElement("td");
+      if (j === 0) td.className = "meta";
+      td.textContent = cells[j];
+      tr.appendChild(td);
+    }
+    body.appendChild(tr);
+  }
+}
+
+// ---- Top-up: chain / asset selection -------------------------------------
+// Deposit addresses (server-substituted) and the accepted assets per chain.
+// Asset lists MUST match the server-side token registry (config::TOKENS).
+var DEPOSIT = { ethereum: "__DEPOSIT_ADDRESS__", solana: "__SOL_DEPOSIT_ADDRESS__" };
+var ASSETS = {
+  ethereum: [["eth", "ETH"], ["usdt", "USDT"], ["usdc", "USDC"]],
+  solana: [["sol", "SOL"], ["usdt", "USDT"], ["usdc", "USDC"]],
+};
+var chainSel = document.getElementById("topup-chain");
+var tokenSel = document.getElementById("topup-token");
+var linkedSol = null;
+
+function applyChain() {
+  var chain = chainSel.value;
+  // Rebuild the asset dropdown for this chain.
+  tokenSel.textContent = "";
+  var opts = ASSETS[chain] || [];
+  for (var i = 0; i < opts.length; i++) {
+    var o = document.createElement("option");
+    o.value = opts[i][0];
+    o.textContent = opts[i][1];
+    tokenSel.appendChild(o);
+  }
+  document.getElementById("deposit-address").textContent = DEPOSIT[chain] || "";
+  document.getElementById("sol-link").hidden = chain !== "solana";
+  var eth = chain === "ethereum";
+  document.getElementById("tx-label").textContent = eth ? "Transaction hash" : "Transaction signature";
+  document.getElementById("tx-hash").placeholder = eth ? "0x…" : "base58 signature…";
+}
+chainSel.addEventListener("change", applyChain);
+applyChain();
+
+// Minimal base58 (Bitcoin alphabet) encoder for the wallet's signature bytes.
+// Canonical base-x algorithm: each leading zero byte becomes one "1", and the
+// leading-zeros loop stops one short of the end so an all-zero input still emits
+// its final digit (matches the bs58 crate the server verifies with).
+function bs58encode(bytes) {
+  var ALPH = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  if (bytes.length === 0) return "";
+  var digits = [0];
+  for (var i = 0; i < bytes.length; i++) {
+    var carry = bytes[i];
+    for (var j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) { digits.push(carry % 58); carry = (carry / 58) | 0; }
+  }
+  var str = "";
+  for (var k = 0; k < bytes.length - 1 && bytes[k] === 0; k++) str += "1";
+  for (var q = digits.length - 1; q >= 0; q--) str += ALPH[digits[q]];
+  return str;
+}
+
+function setLinked(addr) {
+  linkedSol = addr || null;
+  document.getElementById("sol-linked-state").textContent =
+    linkedSol ? ("Linked wallet: " + linkedSol) : "No Solana wallet linked yet.";
+  document.getElementById("sol-link-btn").textContent =
+    linkedSol ? "Change linked wallet" : "Link Solana wallet";
+}
+
+async function loadLink() {
+  try {
+    var r = await fetch("/user/api/link_solana");
+    if (!r.ok) return;
+    var d = await r.json();
+    setLinked(d.solana_address);
+  } catch (_) {}
+}
+
+// ---- Solana wallet discovery (Wallet Standard) ---------------------------
+// Modern Solana-capable wallets — including MetaMask (multichain accounts),
+// Phantom, Solflare and Backpack — announce themselves via the Wallet Standard
+// rather than a single injected `window.solana`. We run the standard app<->wallet
+// handshake so any of them is discoverable, then fall back to a legacy injected
+// provider (older Phantom) if no standard wallet registers.
+var solWallets = [];
+(function () {
+  function register() {
+    for (var i = 0; i < arguments.length; i++) {
+      if (solWallets.indexOf(arguments[i]) === -1) solWallets.push(arguments[i]);
+    }
+    return function () {};
+  }
+  var api = { register: register, get: function () { return solWallets.slice(); }, on: function () { return function () {}; } };
+  try {
+    window.addEventListener("wallet-standard:register-wallet", function (ev) { ev.detail(api); });
+  } catch (e) {}
+  try {
+    window.dispatchEvent(new CustomEvent("wallet-standard:app-ready", { detail: api }));
+  } catch (e) {}
+})();
+
+// A registered wallet that can connect + sign a message on Solana.
+function pickSolanaWallet() {
+  for (var i = 0; i < solWallets.length; i++) {
+    var f = solWallets[i] && solWallets[i].features;
+    if (f && f["solana:signMessage"] && f["standard:connect"]) return solWallets[i];
+  }
+  return null;
+}
+
+// Prefer an account that advertises a Solana chain; else the first account.
+function pickSolanaAccount(accounts) {
+  for (var i = 0; i < accounts.length; i++) {
+    var chains = accounts[i].chains || [];
+    for (var j = 0; j < chains.length; j++) {
+      if (chains[j].indexOf("solana:") === 0) return accounts[i];
+    }
+  }
+  return accounts.length ? accounts[0] : null;
+}
+
+// Resolve a { address, sign(msgBytes) -> Uint8Array } signer, or null if no
+// Solana-capable wallet is available. Connecting may prompt the wallet.
+async function getSolanaSigner() {
+  var w = pickSolanaWallet();
+  if (w) {
+    var res = await w.features["standard:connect"].connect();
+    var accounts = (res && res.accounts && res.accounts.length ? res.accounts : w.accounts) || [];
+    var account = pickSolanaAccount(accounts);
+    if (!account) throw new Error("No Solana account in this wallet — enable one (e.g. in MetaMask) and try again.");
+    return {
+      address: account.address,
+      sign: async function (msgBytes) {
+        var out = await w.features["solana:signMessage"].signMessage({ account: account, message: msgBytes });
+        return out[0].signature;
+      },
+    };
+  }
+  var provider = window.solana || (window.phantom && window.phantom.solana);
+  if (provider && provider.connect) {
+    var conn = await provider.connect();
+    var pk = provider.publicKey || (conn && conn.publicKey);
+    if (!pk) throw new Error("wallet did not return a public key");
+    return {
+      address: pk.toString(),
+      sign: async function (msgBytes) {
+        var signed = await provider.signMessage(msgBytes, "utf8");
+        return signed && signed.signature ? signed.signature : signed;
+      },
+    };
+  }
+  return null;
+}
+
+document.getElementById("sol-link-btn").addEventListener("click", async function () {
+  if (!currentMe || !currentMe.address) {
+    setMsg("sol-link-msg", "Account still loading — try again in a moment.", "err");
+    return;
+  }
+  var btn = document.getElementById("sol-link-btn");
+  btn.disabled = true;
+  try {
+    var signer = await getSolanaSigner();
+    if (!signer) {
+      setMsg("sol-link-msg", "No Solana-capable wallet found. Enable Solana in MetaMask (or install Phantom / another Solana wallet), then reload this page.", "err");
+      return;
+    }
+    var solAddr = signer.address;
+    var nr = await fetch("/user/api/nonce");
+    if (!nr.ok) throw new Error("failed to fetch nonce (" + nr.status + ")");
+    var nonce = (await nr.json()).nonce;
+    // MUST match solana_link::challenge_message byte for byte.
+    var message = "Link Solana wallet to " + currentMe.address + "\nNonce: " + nonce;
+    var sigBytes = await signer.sign(new TextEncoder().encode(message));
+    var sigB58 = typeof sigBytes === "string" ? sigBytes : bs58encode(sigBytes);
+    var r = await fetch("/user/api/link_solana", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ solana_address: solAddr, signature: sigB58, nonce: nonce }),
+    });
+    if (r.ok) {
+      var lr = await r.json();
+      setLinked(lr.solana_address);
+      setMsg("sol-link-msg", "Wallet linked. You can now top up with SOL/USDT/USDC.", "ok");
+    } else {
+      var err;
+      try { err = (await r.json()).error; } catch (_) {}
+      setMsg("sol-link-msg", err || "link failed (" + r.status + ")", "err");
+    }
+  } catch (e) {
+    setMsg("sol-link-msg", e && e.message ? e.message : String(e), "err");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.getElementById("topup-form").addEventListener("submit", async function (ev) {
+  ev.preventDefault();
+  var chain = chainSel.value;
+  var token = tokenSel.value;
+  if (chain === "solana" && !linkedSol) {
+    setMsg("topup-msg", "Link your Solana wallet first (button above) so this top-up can be attributed to you.", "err");
+    return;
+  }
+  var btn = document.getElementById("topup-btn");
+  btn.disabled = true;
+  try {
+    var txHash = document.getElementById("tx-hash").value.trim();
+    var r = await fetch("/user/api/topup", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chain: chain, token: token, tx_hash: txHash }),
+    });
+    if (r.ok) {
+      var res = await r.json();
+      setMsg("topup-msg", "Credited " + res.credited_points + " points. New balance: " + res.balance + ".", "ok");
+      loadMe();
+      loadPayments();
+    } else if (r.status === 425) {
+      setMsg("topup-msg", "Not enough confirmations yet — retry in a few minutes.", "err");
+    } else {
+      var err;
+      try { err = (await r.json()).error; } catch (_) {}
+      setMsg("topup-msg", err || "top-up failed (" + r.status + ")", "err");
+    }
+  } catch (e) {
+    setMsg("topup-msg", e && e.message ? e.message : String(e), "err");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+var subBtns = document.querySelectorAll(".subscribe-btn");
+for (var i = 0; i < subBtns.length; i++) {
+  subBtns[i].addEventListener("click", async function (ev) {
+    var plan = ev.currentTarget.getAttribute("data-plan");
+    var price = ev.currentTarget.getAttribute("data-price");
+    // Warn that this spends points before committing.
+    var msg;
+    if (currentMe && currentMe.plan && currentMe.plan === plan) {
+      msg = "Renew " + plan + "? This resets your plan to a fresh 30 days. "
+        + "The unused days of your current period are refunded first, so you pay "
+        + "only for the days already used (up to " + price + " points).";
+    } else if (currentMe && currentMe.plan) {
+      msg = "Switch from " + currentMe.plan + " to " + plan + " for up to " + price
+        + " points? The unused days of your current " + currentMe.plan
+        + " plan are refunded first, reducing what you pay.";
+    } else {
+      msg = "Subscribe to " + plan + " for " + price
+        + " points, charged from your balance? The plan lasts 30 days and does not auto-renew.";
+    }
+    if (!confirm(msg)) return;
+    try {
+      var r = await fetch("/user/api/subscribe", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ plan: plan }),
+      });
+      if (r.ok) {
+        setMsg("sub-msg", "Subscribed to " + plan + ".", "ok");
+        loadMe();
+      } else {
+        var err;
+        try { err = (await r.json()).error; } catch (_) {}
+        setMsg("sub-msg", err || "subscribe failed (" + r.status + ")", "err");
+      }
+    } catch (e) {
+      setMsg("sub-msg", e && e.message ? e.message : String(e), "err");
+    }
+  });
+}
+
+document.getElementById("unsub-btn").addEventListener("click", async function () {
+  if (currentMe && !currentMe.plan) {
+    setMsg("sub-msg", "You have no active plan.", "err");
+    return;
+  }
+  if (!confirm("Unsubscribe now? The unused days of your current plan are refunded to your balance (prorated), and you lapse to pay-as-you-go.")) {
+    return;
+  }
+  try {
+    var r = await fetch("/user/api/unsubscribe", { method: "POST" });
+    if (r.ok) {
+      var st = null;
+      try { st = await r.json(); } catch (_) {}
+      setMsg("sub-msg", st ? ("Unsubscribed. Balance is now " + st.balance + " points.") : "Unsubscribed.", "ok");
+      loadMe();
+    } else {
+      var err;
+      try { err = (await r.json()).error; } catch (_) {}
+      setMsg("sub-msg", err || "unsubscribe failed (" + r.status + ")", "err");
+    }
+  } catch (e) {
+    setMsg("sub-msg", e && e.message ? e.message : String(e), "err");
+  }
+});
+
+document.getElementById("logout-btn").addEventListener("click", async function () {
+  try { await fetch("/user/api/logout", { method: "POST" }); } catch (_) {}
+  location = "/user/login";
+});
+
+loadMe();
+loadPayments();
+loadLink();
+</script>
