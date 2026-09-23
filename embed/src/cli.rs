@@ -20,6 +20,7 @@ use opendal::{
 };
 use opentelemetry::{global, metrics::Counter};
 use ort::session::Session;
+use parking_lot::Mutex;
 use pgvector::HalfVector;
 use sqlx::postgres::PgPool;
 use tokio::{
@@ -145,11 +146,7 @@ impl EmbedCli {
                     tracing::info!(dal = "http", endpoint, "building OpenDAL");
                     let http = Http::default().endpoint(endpoint);
                     Operator::new(http)?
-                        .layer(
-                            TimeoutLayer::new()
-                                .with_timeout(io_timeout * 2)
-                                .with_io_timeout(io_timeout),
-                        )
+                        .layer(TimeoutLayer::new().with_io_timeout(io_timeout))
                         .finish()
                 }
                 _ => bail!("Unsupported storage"),
@@ -164,19 +161,15 @@ impl EmbedCli {
                         .access_key_id(&config.key_id)
                         .secret_access_key(&config.secret),
                 )?
+                // timeout inside retry (the order OpenDAL documents): a stalled chunk read times
+                // out and is retried, rather than failing the image on the first stall
+                .layer(TimeoutLayer::new().with_io_timeout(io_timeout))
                 .layer(
                     RetryLayer::new()
                         .with_max_times(3)
                         .with_min_delay(Duration::from_millis(200))
                         .with_max_delay(Duration::from_secs(10))
                         .with_jitter(),
-                )
-                // fail a stalled read fast (the image goes back to `pending`) instead of
-                // holding its slot for minutes
-                .layer(
-                    TimeoutLayer::new()
-                        .with_timeout(io_timeout * 2)
-                        .with_io_timeout(io_timeout),
                 )
                 .finish()
             }
@@ -348,7 +341,7 @@ async fn convert_image(
         .map(|(id, name)| {
             let op = op.clone();
             let pace = pace.clone();
-            tokio::spawn(
+            let download = tokio::spawn(
                 async move {
                     let start = Instant::now();
                     let buf = op
@@ -357,16 +350,24 @@ async fn convert_image(
                         .inspect_err(|e| tracing::warn!(id, err = %e, "read image"))
                         .ok();
                     pace.served(Stage::Download, 1, start.elapsed());
-                    (id, buf)
+                    buf
                 }
                 .in_current_span(),
-            )
+            );
+            // a panic fails only this image, which goes back to `pending` like a failed read
+            async move {
+                let buf = download
+                    .await
+                    .inspect_err(|e| tracing::error!(id, err = %e, "download task"))
+                    .ok()
+                    .flatten();
+                (id, buf)
+            }
         })
         .buffer_unordered(usize::MAX)
-        .map(|res| {
+        .map(|(id, buf)| {
             let pace = pace.clone();
             async move {
-                let (id, buf) = res?;
                 tokio::task::spawn_blocking(move || {
                     let start = Instant::now();
                     let image = (
@@ -396,13 +397,17 @@ async fn convert_image(
                     image
                 })
                 .await
+                .unwrap_or_else(|e| {
+                    tracing::error!(id, err = %e, "decode task");
+                    (id, None)
+                })
             }
         })
         .buffer_unordered(decode_concurrency);
     let mut images = std::pin::pin!(images);
 
     while let Some(image) = images.next().await {
-        tx.send(image?).await?;
+        tx.send(image).await?;
     }
     Ok(())
 }
@@ -519,24 +524,30 @@ async fn record(
     /// writes in flight at once
     const CONCURRENCY: usize = 4;
 
-    // each write costs 4 sequential DB round trips, which dominate on a remote database: merge
+    // each write costs 5 sequential DB round trips, which dominate on a remote database: merge
     // whatever batches queued up meanwhile into one write, and overlap writes, so `infer`
     // doesn't block on handing over results. Writes touch disjoint images, and new tag names
     // are inserted in sorted order, so concurrent writes can't deadlock each other.
     // (A plain loop over spawned writes rather than stream combinators: holding those across
     // `.await` with `&'static Tag` inside trips rust-lang/rust#100013.)
+    let reap = |write: Result<anyhow::Result<()>, JoinError>| match write {
+        Ok(write) => write,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    };
     let mut writes = JoinSet::new();
     loop {
-        let batch = rx.recv().await;
-        // keep at most `CONCURRENCY` writes in flight; once the channel closes, finish them all
-        while writes.len() >= CONCURRENCY || (batch.is_none() && !writes.is_empty()) {
-            match writes.join_next().await {
-                Some(Ok(write)) => write?,
-                Some(Err(e)) => std::panic::resume_unwind(e.into_panic()),
-                None => break,
+        let mut res = tokio::select! {
+            // reap finished writes even while no batch arrives, so a failed write reaches the
+            // supervisor instead of holding its permits while this waits on `rx`
+            Some(write) = writes.join_next(), if !writes.is_empty() => {
+                reap(write)?;
+                continue;
             }
-        }
-        let Some(mut res) = batch else { break };
+            batch = rx.recv(), if writes.len() < CONCURRENCY => match batch {
+                Some(batch) => batch,
+                None => break,
+            },
+        };
         for _ in 1..COALESCE {
             match rx.try_recv() {
                 Ok(more) => res.extend(more),
@@ -574,29 +585,28 @@ async fn record(
                     }
                 }
 
+                // tags first, then associations in a separate statement: a concurrent writer
+                // (another write here, or another node) may insert the same new tag, in which
+                // case `DO NOTHING` returns no row and a join in the same statement couldn't see
+                // the winner's row in its snapshot; the next statement's snapshot does
                 sqlx::query!(
                     r#"
-            WITH input AS (
-                SELECT * FROM unnest($1::BIGINT[], $2::TEXT[], $3::REAL[]) AS _(id, name, score)
-            ),
-            ins_wd_tags AS (
-                INSERT INTO wd_tags (name)
-                SELECT DISTINCT ON (name) name FROM input i
-                WHERE trim(i.name) != ''
-                ORDER BY i.name
-                ON CONFLICT DO NOTHING
-                RETURNING id, name
-            ),
-            wd_tags AS (
-                SELECT * FROM ins_wd_tags
-                UNION ALL
-                SELECT DISTINCT ON (wt.id) wt.id, name
-                FROM input i
-                JOIN wd_tags wt USING (name)
-            )
+            INSERT INTO wd_tags (name)
+            SELECT DISTINCT name FROM unnest($1::TEXT[]) AS _(name)
+            WHERE trim(name) != ''
+            ORDER BY name
+            ON CONFLICT DO NOTHING
+        "#,
+                    &tag_names as _
+                )
+                .execute(&pool)
+                .await?;
+
+                sqlx::query!(
+                    r#"
             INSERT INTO wd_tag_images (wd_tag_id, image_id, score)
             SELECT wt.id, i.id, i.score
-            FROM input i
+            FROM unnest($1::BIGINT[], $2::TEXT[], $3::REAL[]) AS i(id, name, score)
             JOIN wd_tags wt USING (name)
             ON CONFLICT (wd_tag_id, image_id) DO UPDATE
             SET score = EXCLUDED.score
@@ -667,6 +677,9 @@ async fn record(
             .in_current_span(),
         );
     }
+    while let Some(write) = writes.join_next().await {
+        reap(write)?;
+    }
     Ok(())
 }
 
@@ -682,14 +695,11 @@ enum Stage {
 
 /// Counters sampled by `pace_in_flight`
 struct Pace {
-    /// reference point for `infer_idle_since`
-    epoch: Instant,
     /// images `record` marked completed, i.e. useful pipeline throughput
     completed: AtomicU64,
-    /// finished periods (µs) of `infer` waiting for input, i.e. the device starving
-    infer_idle_micros: AtomicU64,
-    /// µs since `epoch` + 1 at which `infer` started waiting, 0 while it's busy
-    infer_idle_since: AtomicU64,
+    /// time `infer` spent waiting for input (i.e. the device starving), and when its current
+    /// wait began; one lock so a reading never counts a wait twice or goes backwards
+    infer_idle: Mutex<(Duration, Option<Instant>)>,
     /// per `Stage`: summed per-image service time (µs) and images served
     stages: [(AtomicU64, AtomicU64); 5],
     /// permits still to retire for a shrink the pacer couldn't apply to idle permits
@@ -699,10 +709,8 @@ struct Pace {
 impl Pace {
     fn new() -> Self {
         Self {
-            epoch: Instant::now(),
             completed: AtomicU64::default(),
-            infer_idle_micros: AtomicU64::default(),
-            infer_idle_since: AtomicU64::default(),
+            infer_idle: Mutex::new((Duration::ZERO, None)),
             stages: Default::default(),
             retiring: AtomicUsize::default(),
         }
@@ -724,25 +732,21 @@ impl Pace {
         served.fetch_add(images as u64, Relaxed);
     }
 
-    fn micros(&self) -> u64 {
-        self.epoch.elapsed().as_micros() as u64 + 1
-    }
-
     fn infer_idle_start(&self) {
-        self.infer_idle_since.store(self.micros(), Relaxed);
+        self.infer_idle.lock().1 = Some(Instant::now());
     }
 
     fn infer_idle_end(&self) {
-        let since = self.infer_idle_since.swap(0, Relaxed);
-        self.infer_idle_micros
-            .fetch_add(self.micros() - since, Relaxed);
+        let (total, since) = &mut *self.infer_idle.lock();
+        if let Some(since) = since.take() {
+            *total += since.elapsed();
+        }
     }
 
     /// Total time `infer` has spent waiting for input, including a wait still in progress
     fn infer_idle(&self) -> Duration {
-        let since = self.infer_idle_since.load(Relaxed);
-        let ongoing = if since == 0 { 0 } else { self.micros() - since };
-        Duration::from_micros(self.infer_idle_micros.load(Relaxed) + ongoing)
+        let (total, since) = *self.infer_idle.lock();
+        total + since.map_or(Duration::ZERO, |since| since.elapsed())
     }
 }
 
@@ -804,7 +808,7 @@ async fn pace_in_flight(
         completed = now_completed;
 
         let now_idle = pace.infer_idle();
-        let starving = (now_idle - idle).as_secs_f64() / elapsed > STARVING;
+        let starving = now_idle.saturating_sub(idle).as_secs_f64() / elapsed > STARVING;
         idle = now_idle;
 
         // images claimed and not yet recorded: every permit in circulation that isn't free
@@ -827,8 +831,10 @@ async fn pace_in_flight(
         } else if residence > drain_bound {
             // draining would take too long (or nothing completes): keep what finishes in time
             (throughput * drain_bound) as usize
-        } else if starving && saturated {
-            // the device waits while admission uses the whole limit
+        } else if starving && saturated && throughput > 0.0 {
+            // the device waits while admission uses the whole limit; growth also needs images
+            // to be completing, or a storage outage (or startup) would grow it while every
+            // claimed image fails and burns one of its attempts
             (limit as f64 * GROWTH).ceil() as usize
         } else {
             limit
