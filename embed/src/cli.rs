@@ -512,7 +512,7 @@ async fn record(
     pool: PgPool,
     in_flight: Arc<Semaphore>,
     pace: Arc<Pace>,
-    rx: mpsc::Receiver<Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>, Vec<f32>)>)>>,
+    mut rx: mpsc::Receiver<Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>, Vec<f32>)>)>>,
 ) -> anyhow::Result<()> {
     /// batches merged into one write, see below
     const COALESCE: usize = 16;
@@ -523,14 +523,30 @@ async fn record(
     // whatever batches queued up meanwhile into one write, and overlap writes, so `infer`
     // doesn't block on handing over results. Writes touch disjoint images, and new tag names
     // are inserted in sorted order, so concurrent writes can't deadlock each other.
-    let writes = ReceiverStream::new(rx)
-        .ready_chunks(COALESCE)
-        .map(move |batches| {
-            // owned handles: borrowing `record`'s locals here trips rust-lang/rust#100013 when
-            // this future is spawned
-            let (pool, in_flight, pace) = (pool.clone(), in_flight.clone(), pace.clone());
+    // (A plain loop over spawned writes rather than stream combinators: holding those across
+    // `.await` with `&'static Tag` inside trips rust-lang/rust#100013.)
+    let mut writes = JoinSet::new();
+    loop {
+        let batch = rx.recv().await;
+        // keep at most `CONCURRENCY` writes in flight; once the channel closes, finish them all
+        while writes.len() >= CONCURRENCY || (batch.is_none() && !writes.is_empty()) {
+            match writes.join_next().await {
+                Some(Ok(write)) => write?,
+                Some(Err(e)) => std::panic::resume_unwind(e.into_panic()),
+                None => break,
+            }
+        }
+        let Some(mut res) = batch else { break };
+        for _ in 1..COALESCE {
+            match rx.try_recv() {
+                Ok(more) => res.extend(more),
+                Err(_) => break,
+            }
+        }
+
+        let (pool, in_flight, pace) = (pool.clone(), in_flight.clone(), pace.clone());
+        writes.spawn(
             async move {
-                let res = batches.concat();
                 let start = Instant::now();
                 let recorded = res.len();
                 let mut wd_ids = vec![];
@@ -648,12 +664,8 @@ async fn record(
                 pace.release(&in_flight, recorded);
                 anyhow::Ok(())
             }
-        })
-        .buffer_unordered(CONCURRENCY);
-    let mut writes = std::pin::pin!(writes);
-
-    while let Some(write) = writes.next().await {
-        write?;
+            .in_current_span(),
+        );
     }
     Ok(())
 }
