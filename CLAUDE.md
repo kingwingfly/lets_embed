@@ -65,6 +65,8 @@ pieces. Three independent ONNX models drive everything: **wd_tagger** (image →
 channels:
 1. `fetch_batch` — pulls a batch of un-embedded image rows from Postgres using
    `SELECT ... FOR UPDATE SKIP LOCKED`, so many worker nodes can run concurrently without coordination.
+   Claiming stamps `claimed_at`. A row left in `processing` for longer than `--reclaim-after-secs`
+   (default 30 min) counts as stranded by a crashed or failed worker, and any node can claim it again.
 2. `convert_image` — streams image bytes from an **OpenDAL** `Operator` (storage is chosen by the
    `-s/--storage` URL scheme: `fs:`, `http(s)://`, or S3/R2 from env vars when omitted).
 3. `infer` (blocking) — runs all three ONNX models, producing tags + `HalfVector` embeddings.
