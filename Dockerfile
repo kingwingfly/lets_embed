@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-ARG ORT_VERSION=1.26.0
+ARG ORT_VERSION=1.28.2
 ARG VIPS_VERSION=8.18.2
 
 ############################################################

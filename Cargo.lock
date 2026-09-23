@@ -2112,6 +2112,7 @@ dependencies = [
 name = "gateway"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arc-swap",
  "async-trait",
  "aws-lc-rs",
@@ -2120,6 +2121,7 @@ dependencies = [
  "pingora",
  "reqwest",
  "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

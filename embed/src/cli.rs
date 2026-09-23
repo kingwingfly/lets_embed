@@ -7,7 +7,7 @@ use anyhow::bail;
 use clap::Parser;
 use futures::{StreamExt, stream};
 use opendal::{
-    Buffer, Builder, Operator,
+    Operator,
     layers::{RetryLayer, TimeoutLayer},
     services::{Fs, Http, S3},
 };
@@ -75,12 +75,13 @@ pub struct EmbedCli {
     #[arg(long, alias = "bs", default_value_t = 4)]
     batch_size: usize,
 
-    /// rows claimed per `SELECT ... FOR UPDATE SKIP LOCKED`, independent of `batch_size`
-    #[arg(long, default_value_t = 256)]
+    /// rows claimed per `SELECT ... FOR UPDATE SKIP LOCKED`, independent of `batch_size`;
+    /// every claimed row is drained on SIGINT, so keep it small on slow (e.g. CPU) nodes
+    #[arg(long, default_value_t = 32)]
     fetch_size: i64,
 
     /// max in-flight image downloads from storage
-    #[arg(long, alias = "dc", default_value_t = 64)]
+    #[arg(long, alias = "dc", default_value_t = 32)]
     download_concurrency: usize,
 
     /// decoded batches buffered ahead of inference
@@ -137,21 +138,35 @@ impl EmbedCli {
                     let endpoint = url.as_str();
                     tracing::info!(dal = "http", endpoint, "building OpenDAL");
                     let http = Http::default().endpoint(endpoint);
-                    remote_operator(http, io_timeout)?
+                    Operator::new(http)?.finish()
                 }
                 _ => bail!("Unsupported storage"),
             },
             None => {
                 let config = Config::new()?;
-                remote_operator(
+                Operator::new(
                     S3::default()
                         .endpoint(&config.endpoint)
                         .bucket(&config.bucket)
                         .region(&config.region)
                         .access_key_id(&config.key_id)
                         .secret_access_key(&config.secret),
-                    io_timeout,
                 )?
+                .layer(
+                    RetryLayer::new()
+                        .with_max_times(3)
+                        .with_min_delay(Duration::from_millis(200))
+                        .with_max_delay(Duration::from_secs(10))
+                        .with_jitter(),
+                )
+                // fail a stalled read fast (the image goes back to `pending`) instead of
+                // holding its slot for minutes
+                .layer(
+                    TimeoutLayer::new()
+                        .with_timeout(io_timeout * 2)
+                        .with_io_timeout(io_timeout),
+                )
+                .finish()
             }
         };
 
@@ -251,25 +266,6 @@ async fn fetch_batch(
     Ok(())
 }
 
-/// Build a remote storage operator with retry and timeout, so one stalled read fails fast
-/// (and its image goes back to `pending`) instead of holding up the pipeline for minutes.
-fn remote_operator(builder: impl Builder, io_timeout: Duration) -> opendal::Result<Operator> {
-    Ok(Operator::new(builder)?
-        .layer(
-            RetryLayer::new()
-                .with_max_times(3)
-                .with_min_delay(Duration::from_millis(200))
-                .with_max_delay(Duration::from_secs(10))
-                .with_jitter(),
-        )
-        .layer(
-            TimeoutLayer::new()
-                .with_timeout(io_timeout * 2)
-                .with_io_timeout(io_timeout),
-        )
-        .finish())
-}
-
 /// Download and decode images one by one with high concurrency, then re-batch for the GPU.
 ///
 /// Downloads are decoupled from GPU batches: up to `download_concurrency` reads are in flight
@@ -301,7 +297,32 @@ async fn convert_image(
         .buffer_unordered(download_concurrency)
         .map(|res| async move {
             let (id, buf) = res?;
-            tokio::task::spawn_blocking(move || (id, buf.and_then(|buf| decode(id, buf)))).await
+            tokio::task::spawn_blocking(move || {
+                (
+                    id,
+                    buf.and_then(|buf| {
+                        let buf = buf.to_bytes();
+                        Some((
+                            wd_tagger::convert_image(Cursor::new(buf.clone()))
+                                .inspect_err(
+                                    |e| tracing::warn!(id, err = %e, "wd_tagger convert image"),
+                                )
+                                .ok()?,
+                            siglip2::convert_image(Cursor::new(buf.clone()))
+                                .inspect_err(
+                                    |e| tracing::warn!(id, err = %e, "siglip2 convert image"),
+                                )
+                                .ok()?,
+                            dinov3::convert_image(Cursor::new(buf))
+                                .inspect_err(
+                                    |e| tracing::warn!(id, err = %e, "dinov3 convert image"),
+                                )
+                                .ok()?,
+                        ))
+                    }),
+                )
+            })
+            .await
         })
         .buffer_unordered(decode_concurrency)
         .ready_chunks(batch_size);
@@ -312,21 +333,6 @@ async fn convert_image(
         tx.send(images).await?;
     }
     Ok(())
-}
-
-fn decode(id: i64, buf: Buffer) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-    let buf = buf.to_bytes();
-    Some((
-        wd_tagger::convert_image(Cursor::new(buf.clone()))
-            .inspect_err(|e| tracing::warn!(id, err = %e, "wd_tagger convert image"))
-            .ok()?,
-        siglip2::convert_image(Cursor::new(buf.clone()))
-            .inspect_err(|e| tracing::warn!(id, err = %e, "siglip2 convert image"))
-            .ok()?,
-        dinov3::convert_image(Cursor::new(buf))
-            .inspect_err(|e| tracing::warn!(id, err = %e, "dinov3 convert image"))
-            .ok()?,
-    ))
 }
 
 #[tracing::instrument(skip_all, err)]
