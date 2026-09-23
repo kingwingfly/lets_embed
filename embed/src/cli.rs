@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed},
     },
     thread::available_parallelism,
     time::{Duration, Instant},
@@ -204,15 +204,8 @@ impl EmbedCli {
             cancel,
         ));
         // room for every in-progress decode plus two batches, so decoding never waits on the device
-        let (tx, rx_) = mpsc::channel(decode_concurrency.div_ceil(batch_size) + 2);
-        jhs.spawn(convert_image(
-            op,
-            rx,
-            tx,
-            pace.clone(),
-            batch_size,
-            decode_concurrency,
-        ));
+        let (tx, rx_) = mpsc::channel(decode_concurrency + 2 * batch_size);
+        jhs.spawn(convert_image(op, rx, tx, pace.clone(), decode_concurrency));
         let (tx, rx__) = mpsc::channel(2);
         let infer_pace = pace.clone();
         jhs.spawn_blocking(move || {
@@ -224,14 +217,21 @@ impl EmbedCli {
                 self.character_threshold,
                 clip_vision_session,
                 dinov3_session,
+                batch_size,
                 rx_,
                 tx,
                 infer_pace,
             )
         });
-        jhs.spawn(record(pool, in_flight, pace, rx__));
+        jhs.spawn(record(pool, in_flight.clone(), pace, rx__));
 
-        let _ = jhs.join_all().await;
+        // a failed stage never returns its permits, so wake `fetch_batch` from its permit wait;
+        // the other stages stop on their closed channels
+        while let Some(res) = jhs.join_next().await {
+            if !matches!(res, Ok(Ok(()))) {
+                in_flight.close();
+            }
+        }
         pacer.abort();
 
         Ok(())
@@ -250,11 +250,15 @@ async fn fetch_batch(
 ) -> anyhow::Result<()> {
     loop {
         // claim at least one batch worth of rows, plus whatever else the in-flight limit allows;
-        // permits are forgotten here and given back by `record`
+        // permits are forgotten here and given back through `Pace::release`
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
-            permits = in_flight.acquire_many(batch_size as u32) => permits?.forget(),
+            permits = in_flight.acquire_many(batch_size as u32) => match permits {
+                Ok(permits) => permits.forget(),
+                // closed: a downstream stage failed
+                Err(_) => break,
+            },
         }
         let mut claim = batch_size;
         while let Ok(permit) = in_flight.try_acquire() {
@@ -283,7 +287,7 @@ async fn fetch_batch(
         .into_iter()
         .map(|r| (r.id, r.name))
         .collect::<Vec<_>>();
-        in_flight.add_permits(claim - records.len());
+        pace.release(&in_flight, claim - records.len());
         // every claimed image waited for this query
         pace.service_micros.fetch_add(
             start.elapsed().as_micros() as u64 * records.len() as u64,
@@ -304,7 +308,7 @@ async fn fetch_batch(
     Ok(())
 }
 
-/// Download and decode images one by one, then re-batch for the device.
+/// Download and decode images one by one; `infer` batches them.
 ///
 /// Every claimed image is downloaded at once (their number is already capped by the in-flight
 /// limit), a slow image never holds back the others, and each read runs in its own task so the
@@ -314,12 +318,11 @@ async fn fetch_batch(
 async fn convert_image(
     op: Operator,
     rx: mpsc::Receiver<Vec<(i64, String)>>,
-    tx: mpsc::Sender<Vec<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>)>>,
+    tx: mpsc::Sender<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>)>,
     pace: Arc<Pace>,
-    batch_size: usize,
     decode_concurrency: usize,
 ) -> anyhow::Result<()> {
-    let batches = stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|r| (r, rx)) })
+    let images = stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|r| (r, rx)) })
         .flat_map(stream::iter)
         .map(|(id, name)| {
             let op = op.clone();
@@ -373,13 +376,11 @@ async fn convert_image(
                 .await
             }
         })
-        .buffer_unordered(decode_concurrency)
-        .ready_chunks(batch_size);
-    let mut batches = std::pin::pin!(batches);
+        .buffer_unordered(decode_concurrency);
+    let mut images = std::pin::pin!(images);
 
-    while let Some(images) = batches.next().await {
-        let images = images.into_iter().collect::<Result<Vec<_>, _>>()?;
-        tx.send(images).await?;
+    while let Some(image) = images.next().await {
+        tx.send(image?).await?;
     }
     Ok(())
 }
@@ -394,11 +395,20 @@ fn infer(
     character_threshold: f32,
     mut clip_vision_session: Session,
     mut dinov3_session: Session,
-    mut rx: mpsc::Receiver<Vec<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>)>>,
+    batch_size: usize,
+    mut rx: mpsc::Receiver<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>)>,
     tx: mpsc::Sender<Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>, Vec<f32>)>)>>,
     pace: Arc<Pace>,
 ) -> anyhow::Result<()> {
-    while let Some(images) = rx.blocking_recv() {
+    while let Some(image) = rx.blocking_recv() {
+        // take whatever else is decoded, up to a batch: a backlogged device runs full batches,
+        // an idle one starts on what it has instead of waiting for slow downloads
+        let mut images = vec![image];
+        while images.len() < batch_size
+            && let Ok(image) = rx.try_recv()
+        {
+            images.push(image);
+        }
         let start = Instant::now();
         let batch_len = images.len() as u64;
         let (some_ids, wd_images, clip_images, dino_images, none_ids) = images.into_iter().fold(
@@ -590,7 +600,7 @@ async fn record(
             Relaxed,
         );
         pace.recorded.fetch_add(recorded as u64, Relaxed);
-        in_flight.add_permits(recorded);
+        pace.release(&in_flight, recorded);
     }
     Ok(())
 }
@@ -602,6 +612,19 @@ struct Pace {
     recorded: AtomicU64,
     /// summed per-image service time (µs) of every stage: fetch, download, decode, infer, record
     service_micros: AtomicU64,
+    /// permits still to retire for a shrink the pacer couldn't apply to idle permits
+    retiring: AtomicUsize,
+}
+
+impl Pace {
+    /// Return `n` permits, first retiring any the pacer asked to drop
+    fn release(&self, in_flight: &Semaphore, n: usize) {
+        let retired = self
+            .retiring
+            .fetch_update(Relaxed, Relaxed, |r| Some(r - r.min(n)))
+            .map_or(0, |r| r.min(n));
+        in_flight.add_permits(n - retired);
+    }
 }
 
 /// Size the in-flight limit by Little's law: an image holds its permit from claim to record, so
@@ -620,6 +643,7 @@ async fn pace_in_flight(
     const SMOOTHING: f64 = 0.5;
 
     let floor = 2 * batch_size;
+    // permits in circulation once pending retirements (`Pace::retiring`) are done
     let mut limit = floor;
     // images/s and seconds per image, exponentially smoothed
     let (mut throughput, mut latency) = (0f64, 0f64);
@@ -648,13 +672,22 @@ async fn pace_in_flight(
 
         let ceiling = ((throughput * max_drain.as_secs_f64()) as usize).max(floor);
         let target = ((throughput * latency * HEADROOM) as usize + floor).min(ceiling);
-        // only idle permits can be forgotten; the rest are taken back on later ticks
         if target > limit {
-            in_flight.add_permits(target - limit);
-            limit = target;
+            // cancel pending retirements before adding permits
+            let grow = target - limit;
+            let cancelled = pace
+                .retiring
+                .fetch_update(Relaxed, Relaxed, |r| Some(r - r.min(grow)))
+                .map_or(0, |r| r.min(grow));
+            in_flight.add_permits(grow - cancelled);
         } else if target < limit {
-            limit -= in_flight.forget_permits(limit - target);
+            // idle permits go now; held ones are retired by `Pace::release` as they come back,
+            // since a waiting `fetch_batch` would otherwise take them before they turn idle
+            let shrink = limit - target;
+            let forgotten = in_flight.forget_permits(shrink);
+            pace.retiring.fetch_add(shrink - forgotten, Relaxed);
         }
+        limit = target;
         tracing::debug!(throughput, latency, limit, "in-flight limit");
     }
 }
