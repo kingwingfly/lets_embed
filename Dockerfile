@@ -18,13 +18,13 @@ RUN curl -fL https://github.com/microsoft/onnxruntime/releases/download/v${ORT_V
 
 FROM dl-base AS ort-cuda12
 ARG ORT_VERSION
-RUN curl -fL https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-gpu-${ORT_VERSION}.tgz | tar xz && \
-    mv onnxruntime-linux-x64-gpu-${ORT_VERSION} onnxruntime
+RUN curl -fL https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-gpu_cuda12-${ORT_VERSION}.tgz | tar xz && \
+    mv onnxruntime-linux-x64-gpu_cuda12-${ORT_VERSION} onnxruntime
 
 FROM dl-base AS ort-cuda13
 ARG ORT_VERSION
 RUN curl -fL https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-gpu_cuda13-${ORT_VERSION}.tgz | tar xz && \
-    mv onnxruntime-linux-x64-gpu-${ORT_VERSION} onnxruntime
+    mv onnxruntime-linux-x64-gpu_cuda13-${ORT_VERSION} onnxruntime
 
 ############################################################
 # builders

@@ -27,7 +27,9 @@ use tokio::{
     task::{JoinError, JoinSet},
     time::MissedTickBehavior,
 };
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 use wd_tagger::Tag;
 
 #[derive(Debug, Parser)]
@@ -92,7 +94,7 @@ pub struct EmbedCli {
     max_drain_secs: u64,
 
     /// per-IO timeout (seconds) for remote storage reads
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     io_timeout_secs: u64,
 
     /// whether to quit if `SELECT ... FOR UPDATE SKIP LOCKED` got no record
@@ -141,7 +143,13 @@ impl EmbedCli {
                     let endpoint = url.as_str();
                     tracing::info!(dal = "http", endpoint, "building OpenDAL");
                     let http = Http::default().endpoint(endpoint);
-                    Operator::new(http)?.finish()
+                    Operator::new(http)?
+                        .layer(
+                            TimeoutLayer::new()
+                                .with_timeout(io_timeout * 2)
+                                .with_io_timeout(io_timeout),
+                        )
+                        .finish()
                 }
                 _ => bail!("Unsupported storage"),
             },
@@ -337,22 +345,25 @@ async fn convert_image(
     pace: Arc<Pace>,
     decode_concurrency: usize,
 ) -> anyhow::Result<()> {
-    let images = stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|r| (r, rx)) })
+    let images = ReceiverStream::new(rx)
         .flat_map(stream::iter)
         .map(|(id, name)| {
             let op = op.clone();
             let pace = pace.clone();
-            tokio::spawn(async move {
-                let start = Instant::now();
-                let buf = op
-                    .read(&format!("{}.webp", name))
-                    .await
-                    .inspect_err(|e| tracing::warn!(id, err = %e, "read image"))
-                    .ok();
-                pace.service_micros
-                    .fetch_add(start.elapsed().as_micros() as u64, Relaxed);
-                (id, buf)
-            })
+            tokio::spawn(
+                async move {
+                    let start = Instant::now();
+                    let buf = op
+                        .read(&format!("{}.webp", name))
+                        .await
+                        .inspect_err(|e| tracing::warn!(id, err = %e, "read image"))
+                        .ok();
+                    pace.service_micros
+                        .fetch_add(start.elapsed().as_micros() as u64, Relaxed);
+                    (id, buf)
+                }
+                .in_current_span(),
+            )
         })
         .buffer_unordered(usize::MAX)
         .map(|res| {
@@ -441,47 +452,52 @@ fn infer(
                 (sids, wd_images, clip_images, dino_images, nids)
             },
         );
-        let res = match wd_tagger::infer_tag(
-            &mut wd_tagger_session,
-            wd_images,
-            tags,
-            top_k,
-            general_threshold,
-            character_threshold,
-        )
-        .and_then(|tags| {
-            Ok((
+        // nothing decoded: skip the device instead of running three zero-size batches
+        let res = if some_ids.is_empty() {
+            none_ids.into_iter().zip(repeat(None)).collect::<Vec<_>>()
+        } else {
+            match wd_tagger::infer_tag(
+                &mut wd_tagger_session,
+                wd_images,
                 tags,
-                siglip2::infer_vision(&mut clip_vision_session, clip_images)?,
-            ))
-        })
-        .and_then(|(tags, clip_embeddings)| {
-            Ok((
-                tags,
-                clip_embeddings,
-                dinov3::infer_vision(&mut dinov3_session, dino_images)?,
-            ))
-        }) {
-            Ok((wd_res, clip_res, dino_res)) => some_ids
-                .into_iter()
-                .chain(none_ids)
-                .zip(
-                    wd_res
-                        .into_iter()
-                        .zip(clip_res)
-                        .zip(dino_res)
-                        .map(|((a, b), c)| (a, b, c))
-                        .map(Some)
-                        .chain(repeat(None)),
-                )
-                .collect::<Vec<_>>(),
-            Err(e) => {
-                tracing::error!("{e}");
-                some_ids
+                top_k,
+                general_threshold,
+                character_threshold,
+            )
+            .and_then(|tags| {
+                Ok((
+                    tags,
+                    siglip2::infer_vision(&mut clip_vision_session, clip_images)?,
+                ))
+            })
+            .and_then(|(tags, clip_embeddings)| {
+                Ok((
+                    tags,
+                    clip_embeddings,
+                    dinov3::infer_vision(&mut dinov3_session, dino_images)?,
+                ))
+            }) {
+                Ok((wd_res, clip_res, dino_res)) => some_ids
                     .into_iter()
                     .chain(none_ids)
-                    .zip(repeat(None))
-                    .collect::<Vec<_>>()
+                    .zip(
+                        wd_res
+                            .into_iter()
+                            .zip(clip_res)
+                            .zip(dino_res)
+                            .map(|((a, b), c)| (a, b, c))
+                            .map(Some)
+                            .chain(repeat(None)),
+                    )
+                    .collect::<Vec<_>>(),
+                Err(e) => {
+                    tracing::error!("{e}");
+                    some_ids
+                        .into_iter()
+                        .chain(none_ids)
+                        .zip(repeat(None))
+                        .collect::<Vec<_>>()
+                }
             }
         };
         // every image of the batch waits for the whole batch
@@ -614,7 +630,10 @@ async fn record(
             start.elapsed().as_micros() as u64 * recorded as u64,
             Relaxed,
         );
-        pace.recorded.fetch_add(recorded as u64, Relaxed);
+        // only successes count as throughput: fast failures (e.g. a storage outage) must not
+        // grow the in-flight limit and burn retry attempts across the table
+        pace.completed
+            .fetch_add(completed_ids.len() as u64, Relaxed);
         pace.release(&in_flight, recorded);
     }
     Ok(())
@@ -623,8 +642,8 @@ async fn record(
 /// Counters sampled by `pace_in_flight`
 #[derive(Default)]
 struct Pace {
-    /// images written back by `record`, i.e. pipeline throughput
-    recorded: AtomicU64,
+    /// images `record` marked completed, i.e. useful pipeline throughput
+    completed: AtomicU64,
     /// summed per-image service time (µs) of every stage: fetch, download, decode, infer, record
     service_micros: AtomicU64,
     /// permits still to retire for a shrink the pacer couldn't apply to idle permits
@@ -632,7 +651,7 @@ struct Pace {
 }
 
 impl Pace {
-    /// Return `n` permits, first retiring any the pacer asked to drop
+    /// Put `n` permits (back) into circulation, first retiring any the pacer asked to drop
     fn release(&self, in_flight: &Semaphore, n: usize) {
         let retired = self
             .retiring
@@ -662,7 +681,7 @@ async fn pace_in_flight(
     let mut limit = floor;
     // images/s and seconds per image, exponentially smoothed
     let (mut throughput, mut latency) = (0f64, 0f64);
-    let (mut recorded, mut service_micros) = (0, 0);
+    let (mut completed, mut service_micros) = (0, 0);
     let mut last = Instant::now();
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
     // after a stall, don't fire a burst of catch-up ticks with near-zero `elapsed`
@@ -674,29 +693,24 @@ async fn pace_in_flight(
         let elapsed = last.elapsed().as_secs_f64();
         last = Instant::now();
 
-        let now_recorded = pace.recorded.load(Relaxed);
-        let sample = (now_recorded - recorded) as f64 / elapsed;
+        let now_completed = pace.completed.load(Relaxed);
+        let sample = (now_completed - completed) as f64 / elapsed;
         throughput += SMOOTHING * (sample - throughput);
-        // until images get recorded, keep accumulating their service time into the next sample
-        if now_recorded > recorded {
+        // until images complete, keep accumulating their service time into the next sample
+        if now_completed > completed {
             let now_service_micros = pace.service_micros.load(Relaxed);
             let sample = (now_service_micros - service_micros) as f64
                 / 1e6
-                / (now_recorded - recorded) as f64;
+                / (now_completed - completed) as f64;
             latency += SMOOTHING * (sample - latency);
-            (recorded, service_micros) = (now_recorded, now_service_micros);
+            (completed, service_micros) = (now_completed, now_service_micros);
         }
 
         let ceiling = ((throughput * max_drain.as_secs_f64()) as usize).max(floor);
         let target = ((throughput * latency * HEADROOM) as usize + floor).min(ceiling);
         if target > limit {
-            // cancel pending retirements before adding permits
-            let grow = target - limit;
-            let cancelled = pace
-                .retiring
-                .try_update(Relaxed, Relaxed, |r| Some(r - r.min(grow)))
-                .map_or(0, |r| r.min(grow));
-            in_flight.add_permits(grow - cancelled);
+            // cancels pending retirements before adding permits
+            pace.release(&in_flight, target - limit);
         } else if target < limit {
             // idle permits go now; held ones are retired by `Pace::release` as they come back,
             // since a waiting `fetch_batch` would otherwise take them before they turn idle

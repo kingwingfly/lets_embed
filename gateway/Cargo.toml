@@ -17,7 +17,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 reqwest = { version = "0.13", optional = true, features = ["json", "blocking"] }
-serde.workspace = true
+serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 arc-swap = { version = "1.9", optional = true }
 aws-lc-rs = { version = "1.17", optional = true }
@@ -27,6 +27,7 @@ base64 = { version = "0.22", optional = true }
 default = []
 validate-jwt = [
     "dep:anyhow",
+    "dep:serde",
     "dep:serde_json",
     "dep:reqwest",
     "dep:arc-swap",
