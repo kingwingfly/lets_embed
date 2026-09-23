@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO wd_tag_images (wd_tag_id, image_id, score)\n            SELECT wt.id, i.id, i.score\n            FROM unnest($1::BIGINT[], $2::TEXT[], $3::REAL[]) AS i(id, name, score)\n            JOIN wd_tags wt USING (name)\n            ON CONFLICT (wd_tag_id, image_id) DO UPDATE\n            SET score = EXCLUDED.score\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8Array",
+        "TextArray",
+        "Float4Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "136ad4e38b83c0167e623736ab0dbcf69185042db73e0a5e0c939ffb97ad6847"
+}

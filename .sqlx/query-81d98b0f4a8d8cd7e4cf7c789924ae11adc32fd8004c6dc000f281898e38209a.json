@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO wd_tags (name)\n            SELECT DISTINCT name FROM unnest($1::TEXT[]) AS _(name)\n            WHERE trim(name) != ''\n            ORDER BY name\n            ON CONFLICT DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "81d98b0f4a8d8cd7e4cf7c789924ae11adc32fd8004c6dc000f281898e38209a"
+}
