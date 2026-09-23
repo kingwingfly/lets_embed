@@ -98,6 +98,12 @@ pub struct EmbedCli {
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     io_timeout_secs: u64,
 
+    /// seconds after which an image still `processing` counts as stranded (its worker crashed or
+    /// failed mid-flight) and any worker may claim it again; keep well above the worst-case time
+    /// an image spends claimed (retried downloads plus drain)
+    #[arg(long, alias = "reclaim", default_value_t = 1800, value_parser = clap::value_parser!(u64).range(1..))]
+    reclaim_after_secs: u64,
+
     /// whether to quit if `SELECT ... FOR UPDATE SKIP LOCKED` got no record
     #[arg(long, alias = "nq")]
     no_quit_while_empty: bool,
@@ -199,6 +205,7 @@ impl EmbedCli {
             in_flight.clone(),
             pace.clone(),
             tx,
+            Duration::from_secs(self.reclaim_after_secs),
             self.no_quit_while_empty,
             cancel,
         ));
@@ -254,9 +261,11 @@ async fn fetch_batch(
     in_flight: Arc<Semaphore>,
     pace: Arc<Pace>,
     tx: mpsc::Sender<Vec<(i64, String)>>,
+    reclaim_after: Duration,
     no_quit_while_empty: bool,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
+    let reclaim_after = reclaim_after.as_secs_f64();
     loop {
         tokio::select! {
             biased;
@@ -277,16 +286,22 @@ async fn fetch_batch(
             r#"
             WITH next_jobs AS (
                 SELECT id, name FROM images
-                WHERE status = 'pending'::process_status AND attempt <= 5
+                WHERE attempt <= 5 AND (
+                    status = 'pending'::process_status
+                    -- stranded by a worker that crashed or failed mid-flight
+                    OR (status = 'processing'::process_status
+                        AND claimed_at < NOW() - make_interval(secs => $2))
+                )
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE images SET
-            status = 'processing'::process_status, attempt = attempt + 1
+            status = 'processing'::process_status, attempt = attempt + 1, claimed_at = NOW()
             FROM next_jobs WHERE images.id = next_jobs.id
             RETURNING images.id, images.name
         "#,
-            claim as i64
+            claim as i64,
+            reclaim_after
         )
         .fetch_all(&pool)
         .await?
