@@ -24,7 +24,8 @@ use pgvector::HalfVector;
 use sqlx::postgres::PgPool;
 use tokio::{
     sync::{Semaphore, mpsc},
-    task::JoinSet,
+    task::{JoinError, JoinSet},
+    time::MissedTickBehavior,
 };
 use tokio_util::sync::CancellationToken;
 use wd_tagger::Tag;
@@ -198,7 +199,6 @@ impl EmbedCli {
             pool.clone(),
             in_flight.clone(),
             pace.clone(),
-            batch_size,
             tx,
             self.no_quit_while_empty,
             cancel,
@@ -226,15 +226,30 @@ impl EmbedCli {
         jhs.spawn(record(pool, in_flight.clone(), pace, rx__));
 
         // a failed stage never returns its permits, so wake `fetch_batch` from its permit wait;
-        // the other stages stop on their closed channels
+        // the other stages stop on their closed channels. Keep the first failure (a panic over
+        // an error, since the errors are usually closed channels downstream of it) to report
+        // once the pipeline has drained.
+        let mut failure: Option<Result<anyhow::Error, JoinError>> = None;
         while let Some(res) = jhs.join_next().await {
-            if !matches!(res, Ok(Ok(()))) {
-                in_flight.close();
+            let err = match res {
+                Ok(Ok(())) => continue,
+                Ok(Err(e)) => Ok(e),
+                Err(e) => Err(e),
+            };
+            in_flight.close();
+            // first failure wins, except a later panic replaces a returned error
+            if failure.as_ref().is_none_or(|f| f.is_ok() && err.is_err()) {
+                failure = Some(err);
             }
         }
         pacer.abort();
 
-        Ok(())
+        match failure {
+            None => Ok(()),
+            Some(Ok(e)) => Err(e),
+            Some(Err(e)) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Some(Err(e)) => Err(e.into()),
+        }
     }
 }
 
@@ -243,24 +258,24 @@ async fn fetch_batch(
     pool: PgPool,
     in_flight: Arc<Semaphore>,
     pace: Arc<Pace>,
-    batch_size: usize,
     tx: mpsc::Sender<Vec<(i64, String)>>,
     no_quit_while_empty: bool,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     loop {
-        // claim at least one batch worth of rows, plus whatever else the in-flight limit allows;
-        // permits are forgotten here and given back through `Pace::release`
+        // claim a row as soon as one slot frees up, plus whatever else the in-flight limit
+        // allows; batching is left to `infer`, so a stalled download never holds back admission.
+        // Permits are forgotten here and given back through `Pace::release`
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
-            permits = in_flight.acquire_many(batch_size as u32) => match permits {
-                Ok(permits) => permits.forget(),
+            permit = in_flight.acquire() => match permit {
+                Ok(permit) => permit.forget(),
                 // closed: a downstream stage failed
                 Err(_) => break,
             },
         }
-        let mut claim = batch_size;
+        let mut claim = 1;
         while let Ok(permit) = in_flight.try_acquire() {
             permit.forget();
             claim += 1;
@@ -650,6 +665,8 @@ async fn pace_in_flight(
     let (mut recorded, mut service_micros) = (0, 0);
     let mut last = Instant::now();
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    // after a stall, don't fire a burst of catch-up ticks with near-zero `elapsed`
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticker.tick().await;
 
     loop {
