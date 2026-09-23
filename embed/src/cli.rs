@@ -11,9 +11,8 @@ use anyhow::bail;
 use clap::Parser;
 use futures::{StreamExt, stream};
 use opendal::{
-    Operator, OperatorBuilder,
+    Operator,
     layers::{RetryLayer, TimeoutLayer},
-    raw::Access,
     services::{Fs, Http, S3},
 };
 use opentelemetry::{global, metrics::Counter};
