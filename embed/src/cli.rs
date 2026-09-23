@@ -7,14 +7,13 @@ use anyhow::bail;
 use clap::Parser;
 use futures::{StreamExt, stream};
 use opendal::{
-    Operator,
+    Buffer, Builder, Operator,
     layers::{RetryLayer, TimeoutLayer},
     services::{Fs, Http, S3},
 };
 use opentelemetry::{global, metrics::Counter};
 use ort::session::Session;
 use pgvector::HalfVector;
-use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
 use sqlx::postgres::PgPool;
 use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -72,8 +71,25 @@ pub struct EmbedCli {
     )]
     dinov3_model: PathBuf,
 
+    /// images per inference batch fed to the GPU
     #[arg(long, alias = "bs", default_value_t = 4)]
-    batch_size: i64,
+    batch_size: usize,
+
+    /// rows claimed per `SELECT ... FOR UPDATE SKIP LOCKED`, independent of `batch_size`
+    #[arg(long, default_value_t = 256)]
+    fetch_size: i64,
+
+    /// max in-flight image downloads from storage
+    #[arg(long, alias = "dc", default_value_t = 64)]
+    download_concurrency: usize,
+
+    /// decoded batches buffered ahead of inference
+    #[arg(long, alias = "pb", default_value_t = 4)]
+    prefetch_batches: usize,
+
+    /// per-IO timeout (seconds) for remote storage reads
+    #[arg(long, default_value_t = 30)]
+    io_timeout_secs: u64,
 
     /// whether to quit if `SELECT ... FOR UPDATE SKIP LOCKED` got no record
     #[arg(long, alias = "nq")]
@@ -107,6 +123,7 @@ impl Config {
 impl EmbedCli {
     pub async fn run(self, cancel: CancellationToken) -> anyhow::Result<()> {
         let pool = PgPool::connect(&dotenvy::var("DATABASE_URL")?).await?;
+        let io_timeout = Duration::from_secs(self.io_timeout_secs);
 
         let op = match self.storage {
             Some(url) => match url.scheme() {
@@ -120,33 +137,21 @@ impl EmbedCli {
                     let endpoint = url.as_str();
                     tracing::info!(dal = "http", endpoint, "building OpenDAL");
                     let http = Http::default().endpoint(endpoint);
-                    Operator::new(http)?.finish()
+                    remote_operator(http, io_timeout)?
                 }
                 _ => bail!("Unsupported storage"),
             },
             None => {
                 let config = Config::new()?;
-                Operator::new(
+                remote_operator(
                     S3::default()
                         .endpoint(&config.endpoint)
                         .bucket(&config.bucket)
                         .region(&config.region)
                         .access_key_id(&config.key_id)
                         .secret_access_key(&config.secret),
+                    io_timeout,
                 )?
-                .layer(
-                    RetryLayer::new()
-                        .with_max_times(3)
-                        .with_min_delay(Duration::from_millis(200))
-                        .with_max_delay(Duration::from_secs(10))
-                        .with_jitter(),
-                )
-                .layer(
-                    TimeoutLayer::new()
-                        .with_timeout(Duration::from_secs(600))
-                        .with_io_timeout(Duration::from_secs(300)),
-                )
-                .finish()
             }
         };
 
@@ -159,16 +164,24 @@ impl EmbedCli {
 
         let mut jhs = JoinSet::new();
 
-        let (tx, rx) = mpsc::channel(2);
+        // a single page queued ahead is enough: each page already holds `fetch_size` rows,
+        // and claiming more would leave extra rows in `processing` on crash
+        let (tx, rx) = mpsc::channel(1);
         jhs.spawn(fetch_batch(
             pool.clone(),
-            self.batch_size,
+            self.fetch_size,
             tx,
             self.no_quit_while_empty,
             cancel,
         ));
-        let (tx, rx_) = mpsc::channel(2);
-        jhs.spawn(convert_image(op, rx, tx));
+        let (tx, rx_) = mpsc::channel(self.prefetch_batches.max(1));
+        jhs.spawn(convert_image(
+            op,
+            rx,
+            tx,
+            self.batch_size.max(1),
+            self.download_concurrency.max(1),
+        ));
         let (tx, rx__) = mpsc::channel(2);
         jhs.spawn_blocking(move || {
             infer(
@@ -194,7 +207,7 @@ impl EmbedCli {
 #[tracing::instrument(skip_all, err)]
 async fn fetch_batch(
     pool: PgPool,
-    batch_size: i64,
+    fetch_size: i64,
     tx: mpsc::Sender<Vec<(i64, String)>>,
     no_quit_while_empty: bool,
     cancel: CancellationToken,
@@ -216,7 +229,7 @@ async fn fetch_batch(
             FROM next_jobs WHERE images.id = next_jobs.id
             RETURNING images.id, images.name
         "#,
-            batch_size
+            fetch_size
         )
         .fetch_all(&pool)
         .await?
@@ -238,66 +251,84 @@ async fn fetch_batch(
     Ok(())
 }
 
+/// Build a remote storage operator with retry and timeout, so one stalled read fails fast
+/// (and its image goes back to `pending`) instead of holding up the pipeline for minutes.
+fn remote_operator(builder: impl Builder, io_timeout: Duration) -> opendal::Result<Operator> {
+    Ok(Operator::new(builder)?
+        .layer(
+            RetryLayer::new()
+                .with_max_times(3)
+                .with_min_delay(Duration::from_millis(200))
+                .with_max_delay(Duration::from_secs(10))
+                .with_jitter(),
+        )
+        .layer(
+            TimeoutLayer::new()
+                .with_timeout(io_timeout * 2)
+                .with_io_timeout(io_timeout),
+        )
+        .finish())
+}
+
+/// Download and decode images one by one with high concurrency, then re-batch for the GPU.
+///
+/// Downloads are decoupled from GPU batches: up to `download_concurrency` reads are in flight
+/// across batch boundaries, a slow image never holds back the others, and each read runs in its
+/// own task so the network keeps pulling while this stage waits on the downstream channel.
 #[tracing::instrument(skip_all, err)]
 #[allow(clippy::type_complexity)]
 async fn convert_image(
     op: Operator,
-    mut rx: mpsc::Receiver<Vec<(i64, String)>>,
+    rx: mpsc::Receiver<Vec<(i64, String)>>,
     tx: mpsc::Sender<Vec<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>)>>,
+    batch_size: usize,
+    download_concurrency: usize,
 ) -> anyhow::Result<()> {
-    while let Some(records) = rx.recv().await {
-        let buffers = stream::iter(records)
-            .map(|(id, name)| {
-                let op = op.clone();
-                async move {
-                    (
-                        id,
-                        op.read(&format!("{}.webp", name))
-                            .await
-                            .inspect_err(|e| tracing::warn!(id, err = %e, "read image"))
-                            .map(|buf| buf.to_bytes())
-                            .ok(),
-                    )
-                }
+    let decode_concurrency = available_parallelism().map(|num| num.get()).unwrap_or(1);
+    let mut batches = stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|r| (r, rx)) })
+        .flat_map(stream::iter)
+        .map(|(id, name)| {
+            let op = op.clone();
+            tokio::spawn(async move {
+                let buf = op
+                    .read(&format!("{}.webp", name))
+                    .await
+                    .inspect_err(|e| tracing::warn!(id, err = %e, "read image"))
+                    .ok();
+                (id, buf)
             })
-            .buffer_unordered(available_parallelism().map(|num| num.get()).unwrap_or(1))
-            .collect::<Vec<_>>()
-            .await;
-        let images = tokio::task::spawn_blocking(move || {
-            buffers
-                .into_par_iter()
-                .map(|(id, opt_buf)| {
-                    {
-                        (
-                            id,
-                            opt_buf.and_then(|buf| {
-                                Some((
-                                    wd_tagger::convert_image(Cursor::new(buf.clone()))
-                                        .inspect_err(
-                                            |e| tracing::warn!(id, err = %e, "wd_tagger convert image"),
-                                        )
-                                        .ok()?,
-                                    siglip2::convert_image(Cursor::new(buf.clone()))
-                                        .inspect_err(
-                                            |e| tracing::warn!(id, err = %e, "siglip2 convert image"),
-                                        )
-                                        .ok()?,
-                                    dinov3::convert_image(Cursor::new(buf))
-                                        .inspect_err(
-                                            |e| tracing::warn!(id, err = %e, "dinov3 convert image"),
-                                        )
-                                        .ok()?,
-                                ))
-                            }),
-                        )
-                    }
-                })
-                .collect::<Vec<_>>()
         })
-        .await?;
+        .buffer_unordered(download_concurrency)
+        .map(|res| async move {
+            let (id, buf) = res?;
+            Ok::<_, tokio::task::JoinError>(
+                tokio::task::spawn_blocking(move || (id, buf.and_then(|buf| decode(id, buf))))
+                    .await?,
+            )
+        })
+        .buffer_unordered(decode_concurrency)
+        .ready_chunks(batch_size);
+
+    while let Some(images) = batches.next().await {
+        let images = images.into_iter().collect::<Result<Vec<_>, _>>()?;
         tx.send(images).await?;
     }
     Ok(())
+}
+
+fn decode(id: i64, buf: Buffer) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let buf = buf.to_bytes();
+    Some((
+        wd_tagger::convert_image(Cursor::new(buf.clone()))
+            .inspect_err(|e| tracing::warn!(id, err = %e, "wd_tagger convert image"))
+            .ok()?,
+        siglip2::convert_image(Cursor::new(buf.clone()))
+            .inspect_err(|e| tracing::warn!(id, err = %e, "siglip2 convert image"))
+            .ok()?,
+        dinov3::convert_image(Cursor::new(buf))
+            .inspect_err(|e| tracing::warn!(id, err = %e, "dinov3 convert image"))
+            .ok()?,
+    ))
 }
 
 #[tracing::instrument(skip_all, err)]

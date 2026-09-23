@@ -1799,7 +1799,6 @@ dependencies = [
  "ort",
  "parking_lot",
  "pgvector",
- "rayon",
  "siglip2",
  "sqlx",
  "sysinfo",
