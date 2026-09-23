@@ -301,10 +301,7 @@ async fn convert_image(
         .buffer_unordered(download_concurrency)
         .map(|res| async move {
             let (id, buf) = res?;
-            Ok::<_, tokio::task::JoinError>(
-                tokio::task::spawn_blocking(move || (id, buf.and_then(|buf| decode(id, buf))))
-                    .await?,
-            )
+            tokio::task::spawn_blocking(move || (id, buf.and_then(|buf| decode(id, buf)))).await
         })
         .buffer_unordered(decode_concurrency)
         .ready_chunks(batch_size);

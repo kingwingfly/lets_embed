@@ -12,13 +12,11 @@ pingora = { version = "0.8.0", features = ["proxy"] }
 async-trait = "0.1"
 http = "1.4"
 
-anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 reqwest = { version = "0.13", optional = true, features = ["json", "blocking"] }
 serde.workspace = true
-serde_json.workspace = true
 arc-swap = { version = "1.9", optional = true }
 aws-lc-rs = { version = "1.17", optional = true }
 base64 = { version = "0.22", optional = true }
