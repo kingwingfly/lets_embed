@@ -285,7 +285,7 @@ async fn convert_image(
     download_concurrency: usize,
 ) -> anyhow::Result<()> {
     let decode_concurrency = available_parallelism().map(|num| num.get()).unwrap_or(1);
-    let mut batches = stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|r| (r, rx)) })
+    let batches = stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|r| (r, rx)) })
         .flat_map(stream::iter)
         .map(|(id, name)| {
             let op = op.clone();
@@ -308,6 +308,7 @@ async fn convert_image(
         })
         .buffer_unordered(decode_concurrency)
         .ready_chunks(batch_size);
+    let mut batches = std::pin::pin!(batches);
 
     while let Some(images) = batches.next().await {
         let images = images.into_iter().collect::<Result<Vec<_>, _>>()?;
