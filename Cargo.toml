@@ -31,7 +31,7 @@ futures = "0.3"
 tokio-util = "0.7"
 tokio-stream = { version = "0.1", features = ["io-util"] }
 tokio-retry = "0.3"
-ort = { version = "2.0.0-rc.12", features = ["load-dynamic"] }
+ort = { version = "2.0.0-rc.13", features = ["load-dynamic"] }
 # observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -50,7 +50,6 @@ pgvector = { version = "0.4", features = ["sqlx", "halfvec"] }
 tokenizers = "0.23"
 image = "0.25"
 fast_image_resize = { version = "6.0", features = ["image"] }
-rayon = "1.12"
 parking_lot = "0.12"
 clap = { version = "4.6", features = ["derive"] }
 dotenvy = "0.15"

@@ -14,6 +14,7 @@ dinov3 = { path = "../dinov3" }
 
 tokio = { workspace = true, features = ["signal"] }
 tokio-util.workspace = true
+tokio-stream.workspace = true
 futures.workspace = true
 anyhow.workspace = true
 
@@ -36,4 +37,3 @@ url.workspace = true
 sysinfo = "0.39"
 nvml-wrapper = "0.12"
 parking_lot.workspace = true
-rayon.workspace = true
