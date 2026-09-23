@@ -1,6 +1,13 @@
 use std::{
-    io::Cursor, iter::repeat, path::PathBuf, sync::LazyLock, thread::available_parallelism,
-    time::Duration,
+    io::Cursor,
+    iter::repeat,
+    path::PathBuf,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
+    thread::available_parallelism,
+    time::{Duration, Instant},
 };
 
 use anyhow::bail;
@@ -15,7 +22,10 @@ use opentelemetry::{global, metrics::Counter};
 use ort::session::Session;
 use pgvector::HalfVector;
 use sqlx::postgres::PgPool;
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task::JoinSet,
+};
 use tokio_util::sync::CancellationToken;
 use wd_tagger::Tag;
 
@@ -71,22 +81,14 @@ pub struct EmbedCli {
     )]
     dinov3_model: PathBuf,
 
-    /// images per inference batch fed to the GPU
+    /// images per inference batch fed to the device
     #[arg(long, alias = "bs", default_value_t = 4)]
     batch_size: usize,
 
-    /// rows claimed per `SELECT ... FOR UPDATE SKIP LOCKED`, independent of `batch_size`;
-    /// every claimed row is drained on SIGINT, so keep it small on slow (e.g. CPU) nodes
-    #[arg(long, default_value_t = 32)]
-    fetch_size: i64,
-
-    /// max in-flight image downloads from storage
-    #[arg(long, alias = "dc", default_value_t = 32)]
-    download_concurrency: usize,
-
-    /// decoded batches buffered ahead of inference
-    #[arg(long, alias = "pb", default_value_t = 4)]
-    prefetch_batches: usize,
+    /// upper bound (seconds) on draining claimed images after SIGINT; the number of images in
+    /// flight adapts to throughput and storage latency, but never exceeds throughput × this
+    #[arg(long, alias = "drain", default_value_t = 10)]
+    max_drain_secs: u64,
 
     /// per-IO timeout (seconds) for remote storage reads
     #[arg(long, default_value_t = 30)]
@@ -177,27 +179,42 @@ impl EmbedCli {
         let clip_vision_session = siglip2::model(self.clip_vision_model)?;
         let dinov3_session = dinov3::model(self.dinov3_model)?;
 
+        let batch_size = self.batch_size.max(1);
+        let decode_concurrency = available_parallelism().map(|num| num.get()).unwrap_or(1);
+        // images claimed but not yet recorded; sized by `pace_in_flight`
+        let in_flight = Arc::new(Semaphore::new(2 * batch_size));
+        let pace = Arc::new(Pace::default());
+        let pacer = tokio::spawn(pace_in_flight(
+            in_flight.clone(),
+            pace.clone(),
+            batch_size,
+            Duration::from_secs(self.max_drain_secs),
+        ));
+
         let mut jhs = JoinSet::new();
 
-        // a single page queued ahead is enough: each page already holds `fetch_size` rows,
-        // and claiming more would leave extra rows in `processing` on crash
         let (tx, rx) = mpsc::channel(1);
         jhs.spawn(fetch_batch(
             pool.clone(),
-            self.fetch_size,
+            in_flight.clone(),
+            pace.clone(),
+            batch_size,
             tx,
             self.no_quit_while_empty,
             cancel,
         ));
-        let (tx, rx_) = mpsc::channel(self.prefetch_batches.max(1));
+        // room for every in-progress decode plus two batches, so decoding never waits on the device
+        let (tx, rx_) = mpsc::channel(decode_concurrency.div_ceil(batch_size) + 2);
         jhs.spawn(convert_image(
             op,
             rx,
             tx,
-            self.batch_size.max(1),
-            self.download_concurrency.max(1),
+            pace.clone(),
+            batch_size,
+            decode_concurrency,
         ));
         let (tx, rx__) = mpsc::channel(2);
+        let infer_pace = pace.clone();
         jhs.spawn_blocking(move || {
             infer(
                 wd_tagger_session,
@@ -209,11 +226,13 @@ impl EmbedCli {
                 dinov3_session,
                 rx_,
                 tx,
+                infer_pace,
             )
         });
-        jhs.spawn(record(pool, rx__));
+        jhs.spawn(record(pool, in_flight, pace, rx__));
 
         let _ = jhs.join_all().await;
+        pacer.abort();
 
         Ok(())
     }
@@ -222,15 +241,28 @@ impl EmbedCli {
 #[tracing::instrument(skip_all, err)]
 async fn fetch_batch(
     pool: PgPool,
-    fetch_size: i64,
+    in_flight: Arc<Semaphore>,
+    pace: Arc<Pace>,
+    batch_size: usize,
     tx: mpsc::Sender<Vec<(i64, String)>>,
     no_quit_while_empty: bool,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     loop {
-        if cancel.is_cancelled() {
-            break;
+        // claim at least one batch worth of rows, plus whatever else the in-flight limit allows;
+        // permits are forgotten here and given back by `record`
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            permits = in_flight.acquire_many(batch_size as u32) => permits?.forget(),
         }
+        let mut claim = batch_size;
+        while let Ok(permit) = in_flight.try_acquire() {
+            permit.forget();
+            claim += 1;
+        }
+
+        let start = Instant::now();
         let records = sqlx::query!(
             r#"
             WITH next_jobs AS (
@@ -244,13 +276,19 @@ async fn fetch_batch(
             FROM next_jobs WHERE images.id = next_jobs.id
             RETURNING images.id, images.name
         "#,
-            fetch_size
+            claim as i64
         )
         .fetch_all(&pool)
         .await?
         .into_iter()
         .map(|r| (r.id, r.name))
         .collect::<Vec<_>>();
+        in_flight.add_permits(claim - records.len());
+        // every claimed image waited for this query
+        pace.service_micros.fetch_add(
+            start.elapsed().as_micros() as u64 * records.len() as u64,
+            Relaxed,
+        );
 
         if records.is_empty() {
             match no_quit_while_empty {
@@ -266,63 +304,74 @@ async fn fetch_batch(
     Ok(())
 }
 
-/// Download and decode images one by one with high concurrency, then re-batch for the GPU.
+/// Download and decode images one by one, then re-batch for the device.
 ///
-/// Downloads are decoupled from GPU batches: up to `download_concurrency` reads are in flight
-/// across batch boundaries, a slow image never holds back the others, and each read runs in its
-/// own task so the network keeps pulling while this stage waits on the downstream channel.
+/// Every claimed image is downloaded at once (their number is already capped by the in-flight
+/// limit), a slow image never holds back the others, and each read runs in its own task so the
+/// network keeps pulling while this stage waits on the downstream channel.
 #[tracing::instrument(skip_all, err)]
 #[allow(clippy::type_complexity)]
 async fn convert_image(
     op: Operator,
     rx: mpsc::Receiver<Vec<(i64, String)>>,
     tx: mpsc::Sender<Vec<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>)>>,
+    pace: Arc<Pace>,
     batch_size: usize,
-    download_concurrency: usize,
+    decode_concurrency: usize,
 ) -> anyhow::Result<()> {
-    let decode_concurrency = available_parallelism().map(|num| num.get()).unwrap_or(1);
     let batches = stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|r| (r, rx)) })
         .flat_map(stream::iter)
         .map(|(id, name)| {
             let op = op.clone();
+            let pace = pace.clone();
             tokio::spawn(async move {
+                let start = Instant::now();
                 let buf = op
                     .read(&format!("{}.webp", name))
                     .await
                     .inspect_err(|e| tracing::warn!(id, err = %e, "read image"))
                     .ok();
+                pace.service_micros
+                    .fetch_add(start.elapsed().as_micros() as u64, Relaxed);
                 (id, buf)
             })
         })
-        .buffer_unordered(download_concurrency)
-        .map(|res| async move {
-            let (id, buf) = res?;
-            tokio::task::spawn_blocking(move || {
-                (
-                    id,
-                    buf.and_then(|buf| {
-                        let buf = buf.to_bytes();
-                        Some((
-                            wd_tagger::convert_image(Cursor::new(buf.clone()))
-                                .inspect_err(
-                                    |e| tracing::warn!(id, err = %e, "wd_tagger convert image"),
-                                )
-                                .ok()?,
-                            siglip2::convert_image(Cursor::new(buf.clone()))
-                                .inspect_err(
-                                    |e| tracing::warn!(id, err = %e, "siglip2 convert image"),
-                                )
-                                .ok()?,
-                            dinov3::convert_image(Cursor::new(buf))
-                                .inspect_err(
-                                    |e| tracing::warn!(id, err = %e, "dinov3 convert image"),
-                                )
-                                .ok()?,
-                        ))
-                    }),
-                )
-            })
-            .await
+        .buffer_unordered(usize::MAX)
+        .map(|res| {
+            let pace = pace.clone();
+            async move {
+                let (id, buf) = res?;
+                tokio::task::spawn_blocking(move || {
+                    let start = Instant::now();
+                    let image = (
+                        id,
+                        buf.and_then(|buf| {
+                            let buf = buf.to_bytes();
+                            Some((
+                                wd_tagger::convert_image(Cursor::new(buf.clone()))
+                                    .inspect_err(
+                                        |e| tracing::warn!(id, err = %e, "wd_tagger convert image"),
+                                    )
+                                    .ok()?,
+                                siglip2::convert_image(Cursor::new(buf.clone()))
+                                    .inspect_err(
+                                        |e| tracing::warn!(id, err = %e, "siglip2 convert image"),
+                                    )
+                                    .ok()?,
+                                dinov3::convert_image(Cursor::new(buf))
+                                    .inspect_err(
+                                        |e| tracing::warn!(id, err = %e, "dinov3 convert image"),
+                                    )
+                                    .ok()?,
+                            ))
+                        }),
+                    );
+                    pace.service_micros
+                        .fetch_add(start.elapsed().as_micros() as u64, Relaxed);
+                    image
+                })
+                .await
+            }
         })
         .buffer_unordered(decode_concurrency)
         .ready_chunks(batch_size);
@@ -347,8 +396,11 @@ fn infer(
     mut dinov3_session: Session,
     mut rx: mpsc::Receiver<Vec<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>)>>,
     tx: mpsc::Sender<Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>, Vec<f32>)>)>>,
+    pace: Arc<Pace>,
 ) -> anyhow::Result<()> {
     while let Some(images) = rx.blocking_recv() {
+        let start = Instant::now();
+        let batch_len = images.len() as u64;
         let (some_ids, wd_images, clip_images, dino_images, none_ids) = images.into_iter().fold(
             (vec![], vec![], vec![], vec![], vec![]),
             |(mut sids, mut wd_images, mut clip_images, mut dino_images, mut nids), (id, opt)| {
@@ -407,6 +459,9 @@ fn infer(
                     .collect::<Vec<_>>()
             }
         };
+        // every image of the batch waits for the whole batch
+        pace.service_micros
+            .fetch_add(start.elapsed().as_micros() as u64 * batch_len, Relaxed);
         tx.blocking_send(res)?;
     }
     Ok(())
@@ -416,9 +471,13 @@ fn infer(
 #[allow(clippy::type_complexity)]
 async fn record(
     pool: PgPool,
+    in_flight: Arc<Semaphore>,
+    pace: Arc<Pace>,
     mut rx: mpsc::Receiver<Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>, Vec<f32>)>)>>,
 ) -> anyhow::Result<()> {
     while let Some(res) = rx.recv().await {
+        let start = Instant::now();
+        let recorded = res.len();
         let mut wd_ids = vec![];
         let mut tag_names = vec![];
         let mut scores = vec![];
@@ -525,6 +584,77 @@ async fn record(
                 .build()
         });
         (*COMPLETE_COUNTER).add(completed_ids.len() as u64, &[]);
+
+        pace.service_micros.fetch_add(
+            start.elapsed().as_micros() as u64 * recorded as u64,
+            Relaxed,
+        );
+        pace.recorded.fetch_add(recorded as u64, Relaxed);
+        in_flight.add_permits(recorded);
     }
     Ok(())
+}
+
+/// Counters sampled by `pace_in_flight`
+#[derive(Default)]
+struct Pace {
+    /// images written back by `record`, i.e. pipeline throughput
+    recorded: AtomicU64,
+    /// summed per-image service time (µs) of every stage: fetch, download, decode, infer, record
+    service_micros: AtomicU64,
+}
+
+/// Size the in-flight limit by Little's law: an image holds its permit from claim to record, so
+/// keeping every stage busy needs `throughput × latency` images in flight, where latency is the
+/// time an image is being served by the stages. Time spent queued between stages is left out, so
+/// a saturated device doesn't inflate the limit. The limit is kept within
+/// `[2 × batch_size, throughput × max_drain]`, which bounds the SIGINT drain time.
+#[tracing::instrument(skip_all)]
+async fn pace_in_flight(
+    in_flight: Arc<Semaphore>,
+    pace: Arc<Pace>,
+    batch_size: usize,
+    max_drain: Duration,
+) {
+    const HEADROOM: f64 = 1.5;
+    const SMOOTHING: f64 = 0.5;
+
+    let floor = 2 * batch_size;
+    let mut limit = floor;
+    // images/s and seconds per image, exponentially smoothed
+    let (mut throughput, mut latency) = (0f64, 0f64);
+    let (mut recorded, mut service_micros) = (0, 0);
+    let mut last = Instant::now();
+    let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    ticker.tick().await;
+
+    loop {
+        ticker.tick().await;
+        let elapsed = last.elapsed().as_secs_f64();
+        last = Instant::now();
+
+        let now_recorded = pace.recorded.load(Relaxed);
+        let sample = (now_recorded - recorded) as f64 / elapsed;
+        throughput += SMOOTHING * (sample - throughput);
+        // until images get recorded, keep accumulating their service time into the next sample
+        if now_recorded > recorded {
+            let now_service_micros = pace.service_micros.load(Relaxed);
+            let sample = (now_service_micros - service_micros) as f64
+                / 1e6
+                / (now_recorded - recorded) as f64;
+            latency += SMOOTHING * (sample - latency);
+            (recorded, service_micros) = (now_recorded, now_service_micros);
+        }
+
+        let ceiling = ((throughput * max_drain.as_secs_f64()) as usize).max(floor);
+        let target = ((throughput * latency * HEADROOM) as usize + floor).min(ceiling);
+        // only idle permits can be forgotten; the rest are taken back on later ticks
+        if target > limit {
+            in_flight.add_permits(target - limit);
+            limit = target;
+        } else if target < limit {
+            limit -= in_flight.forget_permits(limit - target);
+        }
+        tracing::debug!(throughput, latency, limit, "in-flight limit");
+    }
 }
