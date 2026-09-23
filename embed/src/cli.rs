@@ -636,7 +636,7 @@ impl Pace {
     fn release(&self, in_flight: &Semaphore, n: usize) {
         let retired = self
             .retiring
-            .fetch_update(Relaxed, Relaxed, |r| Some(r - r.min(n)))
+            .try_update(Relaxed, Relaxed, |r| Some(r - r.min(n)))
             .map_or(0, |r| r.min(n));
         in_flight.add_permits(n - retired);
     }
@@ -694,7 +694,7 @@ async fn pace_in_flight(
             let grow = target - limit;
             let cancelled = pace
                 .retiring
-                .fetch_update(Relaxed, Relaxed, |r| Some(r - r.min(grow)))
+                .try_update(Relaxed, Relaxed, |r| Some(r - r.min(grow)))
                 .map_or(0, |r| r.min(grow));
             in_flight.add_permits(grow - cancelled);
         } else if target < limit {
