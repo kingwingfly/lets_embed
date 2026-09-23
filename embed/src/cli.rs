@@ -88,8 +88,9 @@ pub struct EmbedCli {
     #[arg(long, alias = "bs", default_value_t = 4)]
     batch_size: usize,
 
-    /// upper bound (seconds) on draining claimed images after SIGINT; the number of images in
-    /// flight adapts to throughput and storage latency, but never exceeds throughput × this
+    /// target (seconds) for draining claimed images after SIGINT; the number of images in flight
+    /// grows while the device starves, but not past what completes within this, or within 1.5×
+    /// the fastest observed per-image time when that alone is longer
     #[arg(long, alias = "drain", default_value_t = 10)]
     max_drain_secs: u64,
 
@@ -192,7 +193,7 @@ impl EmbedCli {
         let decode_concurrency = available_parallelism().map(|num| num.get()).unwrap_or(1);
         // images claimed but not yet recorded; sized by `pace_in_flight`
         let in_flight = Arc::new(Semaphore::new(2 * batch_size));
-        let pace = Arc::new(Pace::default());
+        let pace = Arc::new(Pace::new());
         let pacer = tokio::spawn(pace_in_flight(
             in_flight.clone(),
             pace.clone(),
@@ -311,11 +312,7 @@ async fn fetch_batch(
         .map(|r| (r.id, r.name))
         .collect::<Vec<_>>();
         pace.release(&in_flight, claim - records.len());
-        // every claimed image waited for this query
-        pace.service_micros.fetch_add(
-            start.elapsed().as_micros() as u64 * records.len() as u64,
-            Relaxed,
-        );
+        pace.served(Stage::Fetch, records.len(), start.elapsed());
 
         if records.is_empty() {
             match no_quit_while_empty {
@@ -358,8 +355,7 @@ async fn convert_image(
                         .await
                         .inspect_err(|e| tracing::warn!(id, err = %e, "read image"))
                         .ok();
-                    pace.service_micros
-                        .fetch_add(start.elapsed().as_micros() as u64, Relaxed);
+                    pace.served(Stage::Download, 1, start.elapsed());
                     (id, buf)
                 }
                 .in_current_span(),
@@ -395,8 +391,7 @@ async fn convert_image(
                             ))
                         }),
                     );
-                    pace.service_micros
-                        .fetch_add(start.elapsed().as_micros() as u64, Relaxed);
+                    pace.served(Stage::Decode, 1, start.elapsed());
                     image
                 })
                 .await
@@ -426,7 +421,9 @@ fn infer(
     tx: mpsc::Sender<Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>, Vec<f32>)>)>>,
     pace: Arc<Pace>,
 ) -> anyhow::Result<()> {
+    pace.infer_idle_start();
     while let Some(image) = rx.blocking_recv() {
+        pace.infer_idle_end();
         // take whatever else is decoded, up to a batch: a backlogged device runs full batches,
         // an idle one starts on what it has instead of waiting for slow downloads
         let mut images = vec![image];
@@ -436,7 +433,7 @@ fn infer(
             images.push(image);
         }
         let start = Instant::now();
-        let batch_len = images.len() as u64;
+        let batch_len = images.len();
         let (some_ids, wd_images, clip_images, dino_images, none_ids) = images.into_iter().fold(
             (vec![], vec![], vec![], vec![], vec![]),
             |(mut sids, mut wd_images, mut clip_images, mut dino_images, mut nids), (id, opt)| {
@@ -500,10 +497,10 @@ fn infer(
                 }
             }
         };
-        // every image of the batch waits for the whole batch
-        pace.service_micros
-            .fetch_add(start.elapsed().as_micros() as u64 * batch_len, Relaxed);
+        pace.served(Stage::Infer, batch_len, start.elapsed());
+        // waiting on `record` below isn't starvation: more images in flight wouldn't help
         tx.blocking_send(res)?;
+        pace.infer_idle_start();
     }
     Ok(())
 }
@@ -626,10 +623,7 @@ async fn record(
         });
         (*COMPLETE_COUNTER).add(completed_ids.len() as u64, &[]);
 
-        pace.service_micros.fetch_add(
-            start.elapsed().as_micros() as u64 * recorded as u64,
-            Relaxed,
-        );
+        pace.served(Stage::Record, recorded, start.elapsed());
         // only successes count as throughput: fast failures (e.g. a storage outage) must not
         // grow the in-flight limit and burn retry attempts across the table
         pace.completed
@@ -639,18 +633,44 @@ async fn record(
     Ok(())
 }
 
+/// Pipeline stages timed for the `pace_in_flight` debug breakdown
+#[derive(Clone, Copy)]
+enum Stage {
+    Fetch,
+    Download,
+    Decode,
+    Infer,
+    Record,
+}
+
 /// Counters sampled by `pace_in_flight`
-#[derive(Default)]
 struct Pace {
+    /// reference point for `infer_idle_since`
+    epoch: Instant,
     /// images `record` marked completed, i.e. useful pipeline throughput
     completed: AtomicU64,
-    /// summed per-image service time (µs) of every stage: fetch, download, decode, infer, record
-    service_micros: AtomicU64,
+    /// finished periods (µs) of `infer` waiting for input, i.e. the device starving
+    infer_idle_micros: AtomicU64,
+    /// µs since `epoch` + 1 at which `infer` started waiting, 0 while it's busy
+    infer_idle_since: AtomicU64,
+    /// per `Stage`: summed per-image service time (µs) and images served
+    stages: [(AtomicU64, AtomicU64); 5],
     /// permits still to retire for a shrink the pacer couldn't apply to idle permits
     retiring: AtomicUsize,
 }
 
 impl Pace {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            completed: AtomicU64::default(),
+            infer_idle_micros: AtomicU64::default(),
+            infer_idle_since: AtomicU64::default(),
+            stages: Default::default(),
+            retiring: AtomicUsize::default(),
+        }
+    }
+
     /// Put `n` permits (back) into circulation, first retiring any the pacer asked to drop
     fn release(&self, in_flight: &Semaphore, n: usize) {
         let retired = self
@@ -659,13 +679,46 @@ impl Pace {
             .map_or(0, |r| r.min(n));
         in_flight.add_permits(n - retired);
     }
+
+    /// `images` were served together by `stage` in `elapsed`, each waiting for all of it
+    fn served(&self, stage: Stage, images: usize, elapsed: Duration) {
+        let (micros, served) = &self.stages[stage as usize];
+        micros.fetch_add(elapsed.as_micros() as u64 * images as u64, Relaxed);
+        served.fetch_add(images as u64, Relaxed);
+    }
+
+    fn micros(&self) -> u64 {
+        self.epoch.elapsed().as_micros() as u64 + 1
+    }
+
+    fn infer_idle_start(&self) {
+        self.infer_idle_since.store(self.micros(), Relaxed);
+    }
+
+    fn infer_idle_end(&self) {
+        let since = self.infer_idle_since.swap(0, Relaxed);
+        self.infer_idle_micros
+            .fetch_add(self.micros() - since, Relaxed);
+    }
+
+    /// Total time `infer` has spent waiting for input, including a wait still in progress
+    fn infer_idle(&self) -> Duration {
+        let since = self.infer_idle_since.load(Relaxed);
+        let ongoing = if since == 0 { 0 } else { self.micros() - since };
+        Duration::from_micros(self.infer_idle_micros.load(Relaxed) + ongoing)
+    }
 }
 
-/// Size the in-flight limit by Little's law: an image holds its permit from claim to record, so
-/// keeping every stage busy needs `throughput × latency` images in flight, where latency is the
-/// time an image is being served by the stages. Time spent queued between stages is left out, so
-/// a saturated device doesn't inflate the limit. The limit is kept within
-/// `[2 × batch_size, throughput × max_drain]`, which bounds the SIGINT drain time.
+/// Size the in-flight limit (images claimed but not yet recorded) from two direct signals,
+/// rather than from modeled service times, so waits no stage accounts for can't trap it:
+///
+/// - growth: while the device waits for input and admission uses the whole limit, the limit
+///   isn't enough to cover storage latency, so it doubles;
+/// - drain bound: by Little's law an image stays `in flight / throughput` in the pipeline, which
+///   is also about how long a SIGINT drain takes. While downloads are the bottleneck that time
+///   stays flat as the limit grows; once something saturates, it rises. The limit therefore
+///   stops growing, and shrinks, where that time would pass `max(max_drain, 1.5 × the fastest
+///   observed)`.
 #[tracing::instrument(skip_all)]
 async fn pace_in_flight(
     in_flight: Arc<Semaphore>,
@@ -674,15 +727,30 @@ async fn pace_in_flight(
     max_drain: Duration,
 ) {
     const HEADROOM: f64 = 1.5;
+    /// limit multiplier per growth step
+    const GROWTH: f64 = 2.0;
     const SMOOTHING: f64 = 0.5;
+    /// share of the tick the device may wait for input before the limit grows
+    const STARVING: f64 = 0.1;
+    /// the fastest residence decays upward by this per tick, to follow a lasting slowdown
+    const FASTEST_DECAY: f64 = 1.05;
+    /// sanity bound on claimed rows and buffered downloads
+    const MAX_IN_FLIGHT: usize = 1024;
 
     let floor = 2 * batch_size;
     // permits in circulation once pending retirements (`Pace::retiring`) are done
     let mut limit = floor;
-    // images/s and seconds per image, exponentially smoothed
-    let (mut throughput, mut latency) = (0f64, 0f64);
-    let (mut completed, mut service_micros) = (0, 0);
+    // completed images/s, exponentially smoothed
+    let mut throughput = 0f64;
+    // lowest seconds an image has stayed in flight, see `FASTEST_DECAY`
+    let mut fastest = f64::INFINITY;
+    let mut completed = 0;
+    let mut idle = Duration::ZERO;
+    let mut stages = [(0u64, 0u64); 5];
     let mut last = Instant::now();
+    // a limit change shows in completions only once the images it admitted went through, so
+    // hold decisions for about one residence after each change
+    let mut settle_until = Instant::now();
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
     // after a stall, don't fire a burst of catch-up ticks with near-zero `elapsed`
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -696,18 +764,42 @@ async fn pace_in_flight(
         let now_completed = pace.completed.load(Relaxed);
         let sample = (now_completed - completed) as f64 / elapsed;
         throughput += SMOOTHING * (sample - throughput);
-        // until images complete, keep accumulating their service time into the next sample
-        if now_completed > completed {
-            let now_service_micros = pace.service_micros.load(Relaxed);
-            let sample = (now_service_micros - service_micros) as f64
-                / 1e6
-                / (now_completed - completed) as f64;
-            latency += SMOOTHING * (sample - latency);
-            (completed, service_micros) = (now_completed, now_service_micros);
-        }
+        completed = now_completed;
 
-        let ceiling = ((throughput * max_drain.as_secs_f64()) as usize).max(floor);
-        let target = ((throughput * latency * HEADROOM) as usize + floor).min(ceiling);
+        let now_idle = pace.infer_idle();
+        let starving = (now_idle - idle).as_secs_f64() / elapsed > STARVING;
+        idle = now_idle;
+
+        // images claimed and not yet recorded: every permit in circulation that isn't free
+        let used =
+            (limit + pace.retiring.load(Relaxed)).saturating_sub(in_flight.available_permits());
+        let residence = match throughput > 0.0 {
+            true => used as f64 / throughput,
+            false => f64::INFINITY,
+        };
+        let saturated = used * 10 >= limit * 9;
+        // sample only while admission uses the whole limit: a near-empty pipeline (idle table,
+        // tail of a run) shows a short residence that says nothing about per-image latency
+        if saturated && residence.is_finite() {
+            fastest = (fastest * FASTEST_DECAY).min(residence);
+        }
+        let drain_bound = max_drain.as_secs_f64().max(fastest * HEADROOM);
+
+        let target = if Instant::now() < settle_until {
+            limit
+        } else if residence > drain_bound {
+            // draining would take too long (or nothing completes): keep what finishes in time
+            (throughput * drain_bound) as usize
+        } else if starving && saturated {
+            // the device waits while admission uses the whole limit
+            (limit as f64 * GROWTH).ceil() as usize
+        } else {
+            limit
+        }
+        .clamp(floor, MAX_IN_FLIGHT);
+        if target != limit {
+            settle_until = Instant::now() + Duration::from_secs_f64(fastest.min(30.0));
+        }
         if target > limit {
             // cancels pending retirements before adding permits
             pace.release(&in_flight, target - limit);
@@ -719,6 +811,28 @@ async fn pace_in_flight(
             pace.retiring.fetch_add(shrink - forgotten, Relaxed);
         }
         limit = target;
-        tracing::debug!(throughput, latency, limit, "in-flight limit");
+
+        // average ms per image each stage spent on the images it served this tick
+        let mut stage_ms = [0f64; 5];
+        for (i, (micros, served)) in pace.stages.iter().enumerate() {
+            let now = (micros.load(Relaxed), served.load(Relaxed));
+            if now.1 > stages[i].1 {
+                stage_ms[i] = (now.0 - stages[i].0) as f64 / 1e3 / (now.1 - stages[i].1) as f64;
+            }
+            stages[i] = now;
+        }
+        tracing::debug!(
+            throughput,
+            residence,
+            starving,
+            used,
+            limit,
+            fetch_ms = stage_ms[0],
+            download_ms = stage_ms[1],
+            decode_ms = stage_ms[2],
+            infer_ms = stage_ms[3],
+            record_ms = stage_ms[4],
+            "in-flight limit"
+        );
     }
 }

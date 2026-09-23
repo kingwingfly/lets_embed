@@ -70,9 +70,11 @@ channels:
 3. `infer` (blocking) — runs all three ONNX models, producing tags + `HalfVector` embeddings.
 4. `record` — upserts results back to Postgres.
 
-Images in flight (claimed → recorded) are capped by a semaphore that `pace_in_flight` resizes by
-Little's law (measured throughput × per-image service time), bounded by `--max-drain-secs` so a
-SIGINT drain stays short. There are no per-stage concurrency flags; only `--batch-size`.
+Images in flight (claimed → recorded) are capped by a semaphore that `pace_in_flight` resizes:
+it doubles while `infer` starves with admission saturated, and shrinks when the measured residence
+(in flight ÷ throughput, ≈ SIGINT drain time) exceeds `max(--max-drain-secs, 1.5 × fastest seen)`.
+There are no per-stage concurrency flags; only `--batch-size`. `RUST_LOG=embed=debug` logs the
+limit plus a per-stage ms/image breakdown every 2s.
 
 Telemetry (`embed/src/telemetry.rs`) exports traces/metrics/logs over OTLP to GreptimeDB; also samples
 host + NVML GPU stats.
