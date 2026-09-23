@@ -519,44 +519,47 @@ async fn record(
     /// writes in flight at once
     const CONCURRENCY: usize = 4;
 
-    let (pool, in_flight, pace) = (&pool, &in_flight, &pace);
     // each write costs 4 sequential DB round trips, which dominate on a remote database: merge
     // whatever batches queued up meanwhile into one write, and overlap writes, so `infer`
     // doesn't block on handing over results. Writes touch disjoint images, and new tag names
     // are inserted in sorted order, so concurrent writes can't deadlock each other.
     let writes = ReceiverStream::new(rx)
         .ready_chunks(COALESCE)
-        .map(|batches| async move {
-            let res = batches.concat();
-            let start = Instant::now();
-            let recorded = res.len();
-            let mut wd_ids = vec![];
-            let mut tag_names = vec![];
-            let mut scores = vec![];
-            let mut embed_ids = vec![];
-            let mut clip_embeddings = vec![];
-            let mut dino_embeddings = vec![];
-            let mut completed_ids = vec![];
-            let mut failed_ids = vec![];
-            for (id, opt_out) in res {
-                match opt_out {
-                    Some((tags, clip_embedding, dino_embedding)) => {
-                        for (tag, score) in tags {
-                            wd_ids.push(id);
-                            tag_names.push(tag.name.as_str());
-                            scores.push(score);
+        .map(move |batches| {
+            // owned handles: borrowing `record`'s locals here trips rust-lang/rust#100013 when
+            // this future is spawned
+            let (pool, in_flight, pace) = (pool.clone(), in_flight.clone(), pace.clone());
+            async move {
+                let res = batches.concat();
+                let start = Instant::now();
+                let recorded = res.len();
+                let mut wd_ids = vec![];
+                let mut tag_names = vec![];
+                let mut scores = vec![];
+                let mut embed_ids = vec![];
+                let mut clip_embeddings = vec![];
+                let mut dino_embeddings = vec![];
+                let mut completed_ids = vec![];
+                let mut failed_ids = vec![];
+                for (id, opt_out) in res {
+                    match opt_out {
+                        Some((tags, clip_embedding, dino_embedding)) => {
+                            for (tag, score) in tags {
+                                wd_ids.push(id);
+                                tag_names.push(tag.name.as_str());
+                                scores.push(score);
+                            }
+                            embed_ids.push(id);
+                            clip_embeddings.push(HalfVector::from_f32_slice(&clip_embedding));
+                            dino_embeddings.push(HalfVector::from_f32_slice(&dino_embedding));
+                            completed_ids.push(id);
                         }
-                        embed_ids.push(id);
-                        clip_embeddings.push(HalfVector::from_f32_slice(&clip_embedding));
-                        dino_embeddings.push(HalfVector::from_f32_slice(&dino_embedding));
-                        completed_ids.push(id);
+                        None => failed_ids.push(id),
                     }
-                    None => failed_ids.push(id),
                 }
-            }
 
-            sqlx::query!(
-                r#"
+                sqlx::query!(
+                    r#"
             WITH input AS (
                 SELECT * FROM unnest($1::BIGINT[], $2::TEXT[], $3::REAL[]) AS _(id, name, score)
             ),
@@ -582,15 +585,15 @@ async fn record(
             ON CONFLICT (wd_tag_id, image_id) DO UPDATE
             SET score = EXCLUDED.score
         "#,
-                &wd_ids,
-                &tag_names as _,
-                &scores
-            )
-            .execute(pool)
-            .await?;
+                    &wd_ids,
+                    &tag_names as _,
+                    &scores
+                )
+                .execute(&pool)
+                .await?;
 
-            sqlx::query!(
-                r#"
+                sqlx::query!(
+                    r#"
             UPDATE images
             SET dinov3_embedding = embeddings.dinov3_embedding,
                 clip_embedding = embeddings.clip_embedding
@@ -598,52 +601,53 @@ async fn record(
                 AS embeddings(id, dinov3_embedding, clip_embedding)
             WHERE embeddings.id = images.id
         "#,
-                &embed_ids,
-                &dino_embeddings as _,
-                &clip_embeddings as _
-            )
-            .execute(pool)
-            .await?;
+                    &embed_ids,
+                    &dino_embeddings as _,
+                    &clip_embeddings as _
+                )
+                .execute(&pool)
+                .await?;
 
-            sqlx::query!(
-                r#"
+                sqlx::query!(
+                    r#"
             UPDATE images SET status = 'completed'::process_status
             FROM unnest($1::BIGINT[]) AS ids (id)
             WHERE ids.id = images.id
         "#,
-                &completed_ids
-            )
-            .execute(pool)
-            .await?;
+                    &completed_ids
+                )
+                .execute(&pool)
+                .await?;
 
-            sqlx::query!(
-                r#"
+                sqlx::query!(
+                    r#"
             UPDATE images SET status = 'pending'::process_status
             FROM unnest($1::BIGINT[]) AS ids (id)
             WHERE ids.id = images.id
         "#,
-                &failed_ids
-            )
-            .execute(pool)
-            .await?;
+                    &failed_ids
+                )
+                .execute(&pool)
+                .await?;
 
-            static COMPLETE_COUNTER: LazyLock<Counter<u64>> = LazyLock::new(|| {
-                let infer = global::meter("infer");
-                infer
-                    .u64_counter("infer.complete")
-                    .with_description("infer counter of the completed")
-                    .with_unit("1")
-                    .build()
-            });
-            (*COMPLETE_COUNTER).add(completed_ids.len() as u64, &[]);
+                static COMPLETE_COUNTER: LazyLock<Counter<u64>> = LazyLock::new(|| {
+                    let infer = global::meter("infer");
+                    infer
+                        .u64_counter("infer.complete")
+                        .with_description("infer counter of the completed")
+                        .with_unit("1")
+                        .build()
+                });
+                (*COMPLETE_COUNTER).add(completed_ids.len() as u64, &[]);
 
-            pace.served(Stage::Record, recorded, start.elapsed());
-            // only successes count as throughput: fast failures (e.g. a storage outage) must not
-            // grow the in-flight limit and burn retry attempts across the table
-            pace.completed
-                .fetch_add(completed_ids.len() as u64, Relaxed);
-            pace.release(in_flight, recorded);
-            anyhow::Ok(())
+                pace.served(Stage::Record, recorded, start.elapsed());
+                // only successes count as throughput: fast failures (e.g. a storage outage) must not
+                // grow the in-flight limit and burn retry attempts across the table
+                pace.completed
+                    .fetch_add(completed_ids.len() as u64, Relaxed);
+                pace.release(&in_flight, recorded);
+                anyhow::Ok(())
+            }
         })
         .buffer_unordered(CONCURRENCY);
     let mut writes = std::pin::pin!(writes);
