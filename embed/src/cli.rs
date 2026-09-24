@@ -1,9 +1,5 @@
 use std::{
-    io::Cursor,
-    iter::repeat,
-    path::PathBuf,
-    sync::LazyLock,
-    thread::available_parallelism,
+    io::Cursor, iter::repeat, path::PathBuf, sync::LazyLock, thread::available_parallelism,
     time::Duration,
 };
 
@@ -184,15 +180,12 @@ impl EmbedCli {
         let batch_size = self.batch_size.max(1);
         let decode_concurrency = available_parallelism().map(|num| num.get()).unwrap_or(1);
 
-        // images claimed but not yet recorded: each carries a ticket from `gate` until `record`
-        // hands it back; the pacer grows the limit while `infer` starves with the gate full, and
-        // shrinks it when draining what's inside would take longer than `--max-drain-secs`
         let floor = 2 * batch_size;
         let gate = Gate::new(floor);
         let device = IdleProbe::new();
         let policy = DrainBounded::builder()
             .floor(floor)
-            .max_drain(Duration::from_secs(self.max_drain_secs))
+            .drain_target(Duration::from_secs(self.max_drain_secs))
             .build();
         let pacer = Pacer::builder(&gate, policy)
             .probe(&device)

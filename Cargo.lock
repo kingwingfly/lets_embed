@@ -6697,9 +6697,9 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "starve-not"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc8363a2cde09a8c0afad456f2b7cd19e25fdfbe4280bb7ef5a5360fddcdb58a"
+checksum = "e3004469c05bfe3de2229a204f6edf09a947d6da405c521e158f5b92321f99bf"
 dependencies = [
  "bon",
  "parking_lot",
