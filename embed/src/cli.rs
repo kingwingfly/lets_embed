@@ -2,7 +2,7 @@ use std::{
     io::Cursor,
     iter::repeat,
     path::PathBuf,
-    sync::{Arc, LazyLock},
+    sync::LazyLock,
     thread::available_parallelism,
     time::Duration,
 };
@@ -19,18 +19,15 @@ use opentelemetry::{global, metrics::Counter};
 use ort::session::Session;
 use pgvector::HalfVector;
 use sqlx::postgres::PgPool;
+use starve_not::{DrainBounded, Gate, IdleProbe, Pacer, Ticket};
 use tokio::{
-    sync::{Semaphore, mpsc},
+    sync::mpsc,
     task::{JoinError, JoinSet},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use wd_tagger::Tag;
-
-mod pacing;
-
-use pacing::{Pace, pace_in_flight};
 
 #[derive(Debug, Parser)]
 #[clap(version)]
@@ -187,23 +184,36 @@ impl EmbedCli {
         let batch_size = self.batch_size.max(1);
         let decode_concurrency = available_parallelism().map(|num| num.get()).unwrap_or(1);
 
-        // images claimed but not yet recorded; sized by `pace_in_flight`
-        let in_flight = Arc::new(Semaphore::new(pacing::min_in_flight(batch_size)));
-        let pace = Arc::new(Pace::new());
-        let pacer = tokio::spawn(pace_in_flight(
-            in_flight.clone(),
-            pace.clone(),
-            batch_size,
-            Duration::from_secs(self.max_drain_secs),
-        ));
+        // images claimed but not yet recorded: each carries a ticket from `gate` until `record`
+        // hands it back; the pacer grows the limit while `infer` starves with the gate full, and
+        // shrinks it when draining what's inside would take longer than `--max-drain-secs`
+        let floor = 2 * batch_size;
+        let gate = Gate::new(floor);
+        let device = IdleProbe::new();
+        let policy = DrainBounded::builder()
+            .floor(floor)
+            .max_drain(Duration::from_secs(self.max_drain_secs))
+            .build();
+        let pacer = Pacer::builder(&gate, policy)
+            .probe(&device)
+            .on_decision(|d, _| {
+                tracing::debug!(
+                    limit = d.limit,
+                    target = d.target,
+                    in_flight = d.sample.in_flight,
+                    diagnostics = %d.diagnostics,
+                    "in-flight limit"
+                )
+            })
+            .build()
+            .spawn();
 
         let mut jhs = JoinSet::new();
 
         let (tx, rx) = mpsc::channel(1);
         jhs.spawn(fetch_batch(
             pool.clone(),
-            in_flight.clone(),
-            pace.clone(),
+            gate.clone(),
             tx,
             Duration::from_secs(self.reclaim_after_secs),
             self.no_quit_while_empty,
@@ -214,7 +224,6 @@ impl EmbedCli {
         jhs.spawn(convert_image(op, rx, tx, decode_concurrency));
         // `record` merges whatever queues here into its next write, so let `infer` run ahead
         let (tx, rx__) = mpsc::channel(32);
-        let infer_pace = pace.clone();
         jhs.spawn_blocking(move || {
             infer(
                 wd_tagger_session,
@@ -227,10 +236,10 @@ impl EmbedCli {
                 batch_size,
                 rx_,
                 tx,
-                infer_pace,
+                device,
             )
         });
-        jhs.spawn(record(pool, in_flight.clone(), pace, rx__));
+        jhs.spawn(record(pool, rx__));
 
         let mut failure: Option<Result<anyhow::Error, JoinError>> = None;
         while let Some(res) = jhs.join_next().await {
@@ -239,12 +248,12 @@ impl EmbedCli {
                 Ok(Err(e)) => Ok(e),
                 Err(e) => Err(e),
             };
-            in_flight.close();
+            gate.close();
             if failure.as_ref().is_none_or(|f| f.is_ok() && err.is_err()) {
                 failure = Some(err);
             }
         }
-        pacer.abort();
+        drop(pacer);
 
         match failure {
             None => Ok(()),
@@ -258,29 +267,25 @@ impl EmbedCli {
 #[tracing::instrument(skip_all, err)]
 async fn fetch_batch(
     pool: PgPool,
-    in_flight: Arc<Semaphore>,
-    pace: Arc<Pace>,
-    tx: mpsc::Sender<Vec<(i64, String)>>,
+    gate: Gate,
+    tx: mpsc::Sender<Vec<(i64, String, Ticket)>>,
     reclaim_after: Duration,
     no_quit_while_empty: bool,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let reclaim_after = reclaim_after.as_secs_f64();
     loop {
-        tokio::select! {
+        // claim as many images as the gate lets in right now
+        let mut ticket = tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
-            permit = in_flight.acquire() => match permit {
-                Ok(permit) => permit.forget(),
+            ticket = gate.acquire_up_to(usize::MAX) => match ticket {
+                Ok(ticket) => ticket,
                 // closed: a downstream stage failed
                 Err(_) => break,
             },
-        }
-        let mut claim = 1;
-        while let Ok(permit) = in_flight.try_acquire() {
-            permit.forget();
-            claim += 1;
-        }
+        };
+        let claim = ticket.len();
 
         let records = sqlx::query!(
             r#"
@@ -306,9 +311,10 @@ async fn fetch_batch(
         .fetch_all(&pool)
         .await?
         .into_iter()
-        .map(|r| (r.id, r.name))
+        .map(|r| (r.id, r.name, ticket.split(1)))
         .collect::<Vec<_>>();
-        pace.release(&in_flight, claim - records.len());
+        // fewer rows than permits: give the rest back
+        ticket.release();
 
         if records.is_empty() {
             match no_quit_while_empty {
@@ -333,13 +339,13 @@ async fn fetch_batch(
 #[allow(clippy::type_complexity)]
 async fn convert_image(
     op: Operator,
-    rx: mpsc::Receiver<Vec<(i64, String)>>,
-    tx: mpsc::Sender<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>)>,
+    rx: mpsc::Receiver<Vec<(i64, String, Ticket)>>,
+    tx: mpsc::Sender<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>, Ticket)>,
     decode_concurrency: usize,
 ) -> anyhow::Result<()> {
     let images = ReceiverStream::new(rx)
         .flat_map(stream::iter)
-        .map(|(id, name)| {
+        .map(|(id, name, ticket)| {
             let op = op.clone();
             let download = tokio::spawn(
                 async move {
@@ -357,41 +363,35 @@ async fn convert_image(
                     .inspect_err(|e| tracing::error!(id, err = %e, "download task"))
                     .ok()
                     .flatten();
-                (id, buf)
+                (id, buf, ticket)
             }
         })
         .buffer_unordered(usize::MAX)
-        .map(|(id, buf)| async move {
-            tokio::task::spawn_blocking(move || {
-                (
-                    id,
-                    buf.and_then(|buf| {
-                        let buf = buf.to_bytes();
-                        Some((
-                            wd_tagger::convert_image(Cursor::new(buf.clone()))
-                                .inspect_err(
-                                    |e| tracing::warn!(id, err = %e, "wd_tagger convert image"),
-                                )
-                                .ok()?,
-                            siglip2::convert_image(Cursor::new(buf.clone()))
-                                .inspect_err(
-                                    |e| tracing::warn!(id, err = %e, "siglip2 convert image"),
-                                )
-                                .ok()?,
-                            dinov3::convert_image(Cursor::new(buf))
-                                .inspect_err(
-                                    |e| tracing::warn!(id, err = %e, "dinov3 convert image"),
-                                )
-                                .ok()?,
-                        ))
-                    }),
-                )
+        .map(|(id, buf, ticket)| async move {
+            let decoded = tokio::task::spawn_blocking(move || {
+                buf.and_then(|buf| {
+                    let buf = buf.to_bytes();
+                    Some((
+                        wd_tagger::convert_image(Cursor::new(buf.clone()))
+                            .inspect_err(
+                                |e| tracing::warn!(id, err = %e, "wd_tagger convert image"),
+                            )
+                            .ok()?,
+                        siglip2::convert_image(Cursor::new(buf.clone()))
+                            .inspect_err(|e| tracing::warn!(id, err = %e, "siglip2 convert image"))
+                            .ok()?,
+                        dinov3::convert_image(Cursor::new(buf))
+                            .inspect_err(|e| tracing::warn!(id, err = %e, "dinov3 convert image"))
+                            .ok()?,
+                    ))
+                })
             })
             .await
             .unwrap_or_else(|e| {
                 tracing::error!(id, err = %e, "decode task");
-                (id, None)
-            })
+                None
+            });
+            (id, decoded, ticket)
         })
         .buffer_unordered(decode_concurrency);
     let mut images = std::pin::pin!(images);
@@ -413,20 +413,27 @@ fn infer(
     mut clip_vision_session: Session,
     mut dinov3_session: Session,
     batch_size: usize,
-    mut rx: mpsc::Receiver<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>)>,
-    tx: mpsc::Sender<Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>, Vec<f32>)>)>>,
-    pace: Arc<Pace>,
+    mut rx: mpsc::Receiver<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>, Ticket)>,
+    tx: mpsc::Sender<(
+        Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>, Vec<f32>)>)>,
+        Ticket,
+    )>,
+    device: IdleProbe,
 ) -> anyhow::Result<()> {
-    pace.infer_idle_start();
-    while let Some(image) = rx.blocking_recv() {
-        pace.infer_idle_end();
+    // waiting for input is the device starving; waiting on `record` below isn't, since more
+    // images in flight wouldn't help
+    while let Some((id, image, mut ticket)) = {
+        let _idle = device.idle();
+        rx.blocking_recv()
+    } {
         // take whatever else is decoded, up to a batch: a backlogged device runs full batches,
         // an idle one starts on what it has instead of waiting for slow downloads
-        let mut images = vec![image];
+        let mut images = vec![(id, image)];
         while images.len() < batch_size
-            && let Ok(image) = rx.try_recv()
+            && let Ok((id, image, more)) = rx.try_recv()
         {
-            images.push(image);
+            images.push((id, image));
+            ticket.merge(more);
         }
         let (some_ids, wd_images, clip_images, dino_images, none_ids) = images.into_iter().fold(
             (vec![], vec![], vec![], vec![], vec![]),
@@ -491,9 +498,7 @@ fn infer(
                 }
             }
         };
-        // waiting on `record` below isn't starvation: more images in flight wouldn't help
-        tx.blocking_send(res)?;
-        pace.infer_idle_start();
+        tx.blocking_send((res, ticket))?;
     }
     Ok(())
 }
@@ -502,9 +507,10 @@ fn infer(
 #[allow(clippy::type_complexity)]
 async fn record(
     pool: PgPool,
-    in_flight: Arc<Semaphore>,
-    pace: Arc<Pace>,
-    mut rx: mpsc::Receiver<Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>, Vec<f32>)>)>>,
+    mut rx: mpsc::Receiver<(
+        Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>, Vec<f32>)>)>,
+        Ticket,
+    )>,
 ) -> anyhow::Result<()> {
     /// batches merged into one write, see below
     const COALESCE: usize = 16;
@@ -524,7 +530,7 @@ async fn record(
     let mut writes = JoinSet::new();
     let mut failure = None;
     while failure.is_none() {
-        let mut res = tokio::select! {
+        let (mut res, mut ticket) = tokio::select! {
             Some(write) = writes.join_next(), if !writes.is_empty() => {
                 failure = reap(write).err();
                 continue;
@@ -536,15 +542,17 @@ async fn record(
         };
         for _ in 1..COALESCE {
             match rx.try_recv() {
-                Ok(more) => res.extend(more),
+                Ok((more, more_ticket)) => {
+                    res.extend(more);
+                    ticket.merge(more_ticket);
+                }
                 Err(_) => break,
             }
         }
 
-        let (pool, in_flight, pace) = (pool.clone(), in_flight.clone(), pace.clone());
+        let pool = pool.clone();
         writes.spawn(
             async move {
-                let recorded = res.len();
                 let mut wd_ids = vec![];
                 let mut tag_names = vec![];
                 let mut scores = vec![];
@@ -653,8 +661,8 @@ async fn record(
 
                 // only successes count as throughput: fast failures (e.g. a storage outage) must not
                 // grow the in-flight limit and burn retry attempts across the table
-                pace.add_completed(completed_ids.len());
-                pace.release(&in_flight, recorded);
+                ticket.complete_n(completed_ids.len());
+                ticket.release();
                 anyhow::Ok(())
             }
             .in_current_span(),
