@@ -37,3 +37,4 @@ url.workspace = true
 sysinfo = "0.39"
 nvml-wrapper = "0.12"
 parking_lot.workspace = true
+starve-not = "0.1.0-alpha.2"
