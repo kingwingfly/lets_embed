@@ -78,8 +78,8 @@ into batches by `infer` and `record`), and `record` completes the successes and 
 a dropped ticket (failed write, panic) also returns its permits. A `Pacer` with the `DrainBounded`
 policy resizes the gate every 2s from an `IdleProbe` around `infer`'s input wait: the limit doubles
 while `infer` starves with the gate full, and shrinks when the measured residence (in flight ÷
-departures, ≈ SIGINT drain time) exceeds `max(--max-drain-secs, 1.5 × fastest seen)`; it never goes
-below two batches. There are no per-stage concurrency flags; only `--batch-size`.
+departures over a window of ≥ 20 departures, ≈ SIGINT drain time) exceeds
+`max(--max-drain-secs, 1.5 × fastest seen)`; it never goes below two batches. There are no per-stage concurrency flags; only `--batch-size`.
 `RUST_LOG=embed=debug` logs each decision.
 
 Telemetry (`embed/src/telemetry.rs`) exports traces/metrics/logs over OTLP to GreptimeDB; also samples
