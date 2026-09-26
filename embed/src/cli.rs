@@ -282,16 +282,26 @@ async fn fetch_batch(
 
         let records = sqlx::query!(
             r#"
-            WITH next_jobs AS (
-                SELECT id, name FROM images
-                WHERE attempt <= 5 AND (
-                    status = 'pending'::process_status
-                    -- stranded by a worker that crashed or failed mid-flight
-                    OR (status = 'processing'::process_status
-                        AND claimed_at < NOW() - make_interval(secs => $2))
-                )
+            -- one branch per partial index: an `OR` of the two turns this into a sequential
+            -- scan of the whole table on every claim
+            WITH pending AS (
+                SELECT id FROM images
+                WHERE status = 'pending'::process_status AND attempt <= 5
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
+            ), stranded AS (
+                -- stranded by a worker that crashed or failed mid-flight; only scanned when
+                -- pending rows don't fill the claim
+                SELECT id FROM images
+                WHERE status = 'processing'::process_status AND attempt <= 5
+                    AND claimed_at < NOW() - make_interval(secs => $2)
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            ), next_jobs AS (
+                SELECT id FROM pending
+                UNION ALL
+                SELECT id FROM stranded
+                LIMIT $1
             )
             UPDATE images SET
             status = 'processing'::process_status, attempt = attempt + 1, claimed_at = NOW()
