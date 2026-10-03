@@ -606,10 +606,11 @@ async fn record(
             .build()
     });
 
-    // each write costs up to 4 sequential DB round trips, which dominate on a remote database:
-    // merge whatever batches queued up meanwhile into one write, and overlap writes, so `infer`
-    // doesn't block on handing over results. Writes touch disjoint images, and new tag names
-    // are inserted in sorted order, so concurrent writes can't deadlock each other.
+    // each write costs up to 5 sequential DB round trips (checking its connection, then one per
+    // statement), which dominate on a remote database: merge whatever batches queued up
+    // meanwhile into one write, and overlap writes, so `infer` doesn't block on handing over
+    // results. Writes touch disjoint images, and new tag names are inserted in sorted order, so
+    // concurrent writes can't deadlock each other.
     // (A plain loop over spawned writes rather than stream combinators: holding those across
     // `.await` with `&'static Tag` inside trips rust-lang/rust#100013.)
     let reap = |write: Result<anyhow::Result<()>, JoinError>| match write {
@@ -672,6 +673,13 @@ async fn record(
                 }
                 tracing::Span::current().record("failed", failed_ids.len());
 
+                // one connection for the whole write: the pool checks each connection it hands
+                // out with a round trip, which doubled the cost of every statement
+                let mut conn = pool
+                    .acquire()
+                    .instrument(tracing::info_span!("acquire connection"))
+                    .await?;
+
                 // each statement is a round trip: skip those with nothing to write
                 if !tag_names.is_empty() {
                     // tags first, then associations in a separate statement: a concurrent writer
@@ -688,7 +696,7 @@ async fn record(
         "#,
                         &tag_names as _
                     )
-                    .execute(&pool)
+                    .execute(&mut *conn)
                     .instrument(tracing::info_span!("insert wd_tags"))
                     .await?;
 
@@ -705,7 +713,7 @@ async fn record(
                         &tag_names as _,
                         &scores
                     )
-                    .execute(&pool)
+                    .execute(&mut *conn)
                     .instrument(tracing::info_span!("upsert wd_tag_images"))
                     .await?;
                 }
@@ -728,7 +736,7 @@ async fn record(
                         &dino_embeddings as _,
                         &clip_embeddings as _
                     )
-                    .execute(&pool)
+                    .execute(&mut *conn)
                     .instrument(tracing::info_span!("complete images"))
                     .await?;
                 }
@@ -742,7 +750,7 @@ async fn record(
         "#,
                         &failed_ids
                     )
-                    .execute(&pool)
+                    .execute(&mut *conn)
                     .instrument(tracing::info_span!("reset failed images"))
                     .await?;
                 }
