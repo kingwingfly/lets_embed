@@ -85,7 +85,13 @@ departures over a window of ≥ 20 departures, ≈ SIGINT drain time) exceeds
 `diagnostics` feature).
 
 Telemetry (`embed/src/telemetry.rs`) exports traces/metrics/logs over OTLP to GreptimeDB; also samples
-host + NVML GPU stats.
+host + NVML GPU stats. A `phase::Tracker` travels with each image next to its `Ticket` through eight
+phases (`claim → download → decode_queue → decode → infer_queue → infer → record_queue → write`),
+exporting images per phase (`embed.items`) and time per phase (`embed.phase.duration`); the phases
+add up to the gate's `in_flight`, so a stall shows as the phase that fills up. Each unit of work
+(claim query, download, decode, device batch, write with one child span per SQL statement) is its
+own short trace. Pacer decisions are exported as `embed.pacer.*` gauges. The "Pipeline" group in
+`assets/dashboard.json` charts all of these.
 
 ### Data layer — `db/`
 Thin crate of `sqlx` types and bulk-upsert functions (`upsert_metas`, `upsert_translations`). Note the

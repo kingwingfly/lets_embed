@@ -83,7 +83,8 @@ impl Telemetry {
             .with(trace_layer)
             .with(log_layer)
             .with(tracing_subscriber::fmt::layer())
-            .with(EnvFilter::try_from_default_env().unwrap_or("embed=info".into()))
+            // opendal's retries and timeouts, which are otherwise invisible
+            .with(EnvFilter::try_from_default_env().unwrap_or("embed=info,opendal=warn".into()))
             .init();
 
         Ok(Self {

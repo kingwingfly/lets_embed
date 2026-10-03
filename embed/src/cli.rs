@@ -1,6 +1,6 @@
 use std::{
-    io::Cursor, iter::repeat, path::PathBuf, sync::LazyLock, thread::available_parallelism,
-    time::Duration,
+    collections::HashMap, io::Cursor, iter::repeat, path::PathBuf, sync::LazyLock,
+    thread::available_parallelism, time::Duration,
 };
 
 use anyhow::bail;
@@ -11,19 +11,24 @@ use opendal::{
     layers::{RetryLayer, TimeoutLayer},
     services::{Fs, Http, S3},
 };
-use opentelemetry::{global, metrics::Counter};
+use opentelemetry::{
+    global,
+    metrics::{Counter, Histogram},
+};
 use ort::session::Session;
 use pgvector::HalfVector;
 use sqlx::postgres::PgPool;
-use starve_not::{DrainBounded, Gate, IdleProbe, Pacer, Policy, Ticket};
+use starve_not::{Decision, DrainBounded, Gate, IdleProbe, Pacer, Policy, Ticket};
 use tokio::{
     sync::mpsc,
     task::{JoinError, JoinSet},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tracing::Instrument as _;
+use tracing::{Instrument as _, field::Empty};
 use wd_tagger::Tag;
+
+use crate::phase::{Phase, Tracker};
 
 #[derive(Debug, Parser)]
 #[clap(version)]
@@ -189,15 +194,7 @@ impl EmbedCli {
             .build();
         let pacer = Pacer::builder(&gate, policy)
             .probe(&device)
-            .on_decision(|d, policy| {
-                tracing::debug!(
-                    limit = d.limit,
-                    target = d.target,
-                    in_flight = d.sample.in_flight,
-                    diagnostics = %policy.diagnostics(),
-                    "in-flight limit"
-                )
-            })
+            .on_decision(report_decisions())
             .build()
             .spawn();
 
@@ -257,11 +254,44 @@ impl EmbedCli {
     }
 }
 
+/// Log each pacer decision, and export it as `embed.pacer.*` gauges.
+fn report_decisions() -> impl FnMut(&Decision, &DrainBounded) + Send + 'static {
+    let meter = global::meter("embed");
+    let limit = meter
+        .f64_gauge("embed.pacer.limit")
+        .with_description("in-flight limit")
+        .build();
+    let in_flight = meter
+        .f64_gauge("embed.pacer.in_flight")
+        .with_description("images in flight")
+        .build();
+    // one gauge per value the policy reports, such as `embed.pacer.residence`
+    let mut diagnostics = HashMap::new();
+    move |d: &Decision, policy: &DrainBounded| {
+        let explained = policy.diagnostics();
+        tracing::debug!(
+            limit = d.limit,
+            target = d.target,
+            in_flight = d.sample.in_flight,
+            diagnostics = %explained,
+            "in-flight limit"
+        );
+        limit.record(d.target as f64, &[]);
+        in_flight.record(d.sample.in_flight as f64, &[]);
+        for (name, value) in explained.iter() {
+            diagnostics
+                .entry(name)
+                .or_insert_with(|| meter.f64_gauge(format!("embed.pacer.{name}")).build())
+                .record(value, &[]);
+        }
+    }
+}
+
 #[tracing::instrument(skip_all, err)]
 async fn fetch_batch(
     pool: PgPool,
     gate: Gate,
-    tx: mpsc::Sender<Vec<(i64, String, Ticket)>>,
+    tx: mpsc::Sender<Vec<(i64, String, Ticket, Tracker)>>,
     reclaim_after: Duration,
     no_quit_while_empty: bool,
     cancel: CancellationToken,
@@ -279,6 +309,11 @@ async fn fetch_batch(
             },
         };
         let claim = ticket.len();
+        // every permit counts as claiming until the query says how many images it got
+        let mut trackers = (0..claim)
+            .map(|_| Tracker::new(Phase::Claim))
+            .collect::<Vec<_>>();
+        let span = tracing::info_span!(parent: None, "claim", permits = claim, images = Empty);
 
         let records = sqlx::query!(
             r#"
@@ -312,11 +347,17 @@ async fn fetch_batch(
             reclaim_after
         )
         .fetch_all(&pool)
-        .await?
-        .into_iter()
-        .map(|r| (r.id, r.name, ticket.split(1)))
-        .collect::<Vec<_>>();
-        // fewer rows than permits: give the rest back
+        .instrument(span.clone())
+        .await?;
+        span.record("images", records.len());
+        drop(span);
+        // fewer rows than permits: the rest stop counting, and their permits go back
+        trackers.truncate(records.len());
+        let records = records
+            .into_iter()
+            .zip(trackers)
+            .map(|(r, tracker)| (r.id, r.name, ticket.split(1), tracker))
+            .collect::<Vec<_>>();
         ticket.release();
 
         if records.is_empty() {
@@ -342,37 +383,58 @@ async fn fetch_batch(
 #[allow(clippy::type_complexity)]
 async fn convert_image(
     op: Operator,
-    rx: mpsc::Receiver<Vec<(i64, String, Ticket)>>,
-    tx: mpsc::Sender<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>, Ticket)>,
+    rx: mpsc::Receiver<Vec<(i64, String, Ticket, Tracker)>>,
+    tx: mpsc::Sender<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>, Ticket, Tracker)>,
     decode_concurrency: usize,
 ) -> anyhow::Result<()> {
+    static DOWNLOAD_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+        global::meter("embed")
+            .u64_counter("embed.download.bytes")
+            .with_description("bytes read from storage")
+            .build()
+    });
+
     let images = ReceiverStream::new(rx)
         .flat_map(stream::iter)
-        .map(|(id, name, ticket)| {
+        .map(|(id, name, ticket, mut tracker)| {
             let op = op.clone();
+            tracker.enter(Phase::Download);
+            let span = tracing::info_span!(parent: None, "download", image.id = id, bytes = Empty);
+            // the image moves on inside the task, so a download that finishes while this stage
+            // waits on the downstream channel stops counting as downloading
             let download = tokio::spawn(
                 async move {
-                    op.read(&format!("{}.webp", name))
+                    let buf = op
+                        .read(&format!("{}.webp", name))
                         .await
+                        .inspect(|buf| {
+                            tracing::Span::current().record("bytes", buf.len());
+                            DOWNLOAD_BYTES.add(buf.len() as u64, &[]);
+                        })
                         .inspect_err(|e| tracing::warn!(id, err = %e, "read image"))
-                        .ok()
+                        .ok();
+                    tracker.enter(Phase::DecodeQueue);
+                    (buf, tracker)
                 }
-                .in_current_span(),
+                .instrument(span),
             );
             // a panic fails only this image, which goes back to `pending` like a failed read
             async move {
-                let buf = download
-                    .await
-                    .inspect_err(|e| tracing::error!(id, err = %e, "download task"))
-                    .ok()
-                    .flatten();
-                (id, buf, ticket)
+                let (buf, tracker) = download.await.unwrap_or_else(|e| {
+                    tracing::error!(id, err = %e, "download task");
+                    (None, Tracker::new(Phase::DecodeQueue))
+                });
+                (id, buf, ticket, tracker)
             }
         })
         .buffer_unordered(usize::MAX)
-        .map(|(id, buf, ticket)| async move {
-            let decoded = tokio::task::spawn_blocking(move || {
-                buf.and_then(|buf| {
+        .map(|(id, buf, ticket, mut tracker)| async move {
+            tracker.enter(Phase::Decode);
+            let span = tracing::info_span!(parent: None, "decode", image.id = id);
+            // the image moves on inside the task, as with the download
+            let (decoded, tracker) = tokio::task::spawn_blocking(move || {
+                let _span = span.enter();
+                let decoded = buf.and_then(|buf| {
                     let buf = buf.to_bytes();
                     Some((
                         wd_tagger::convert_image(Cursor::new(buf.clone()))
@@ -387,14 +449,16 @@ async fn convert_image(
                             .inspect_err(|e| tracing::warn!(id, err = %e, "dinov3 convert image"))
                             .ok()?,
                     ))
-                })
+                });
+                tracker.enter(Phase::InferQueue);
+                (decoded, tracker)
             })
             .await
             .unwrap_or_else(|e| {
                 tracing::error!(id, err = %e, "decode task");
-                None
+                (None, Tracker::new(Phase::InferQueue))
             });
-            (id, decoded, ticket)
+            (id, decoded, ticket, tracker)
         })
         .buffer_unordered(decode_concurrency);
     let mut images = std::pin::pin!(images);
@@ -416,28 +480,35 @@ fn infer(
     mut clip_vision_session: Session,
     mut dinov3_session: Session,
     batch_size: usize,
-    mut rx: mpsc::Receiver<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>, Ticket)>,
+    mut rx: mpsc::Receiver<(i64, Option<(Vec<f32>, Vec<f32>, Vec<f32>)>, Ticket, Tracker)>,
     tx: mpsc::Sender<(
         Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>, Vec<f32>)>)>,
         Ticket,
+        Vec<Tracker>,
     )>,
     device: IdleProbe,
 ) -> anyhow::Result<()> {
     // waiting for input is the device starving; waiting on `record` below isn't, since more
     // images in flight wouldn't help
-    while let Some((id, image, mut ticket)) = {
+    while let Some((id, image, mut ticket, tracker)) = {
         let _idle = device.idle();
         rx.blocking_recv()
     } {
         // take whatever else is decoded, up to a batch: a backlogged device runs full batches,
         // an idle one starts on what it has instead of waiting for slow downloads
         let mut images = vec![(id, image)];
+        let mut trackers = vec![tracker];
         while images.len() < batch_size
-            && let Ok((id, image, more)) = rx.try_recv()
+            && let Ok((id, image, more, tracker)) = rx.try_recv()
         {
             images.push((id, image));
             ticket.merge(more);
+            trackers.push(tracker);
         }
+        for tracker in &mut trackers {
+            tracker.enter(Phase::Infer);
+        }
+        let span = tracing::info_span!(parent: None, "infer", images = images.len()).entered();
         let (some_ids, wd_images, clip_images, dino_images, none_ids) = images.into_iter().fold(
             (vec![], vec![], vec![], vec![], vec![]),
             |(mut sids, mut wd_images, mut clip_images, mut dino_images, mut nids), (id, opt)| {
@@ -501,7 +572,12 @@ fn infer(
                 }
             }
         };
-        tx.blocking_send((res, ticket))?;
+        // the span ends here: waiting on `record` isn't inference
+        drop(span);
+        for tracker in &mut trackers {
+            tracker.enter(Phase::RecordQueue);
+        }
+        tx.blocking_send((res, ticket, trackers))?;
     }
     Ok(())
 }
@@ -513,6 +589,7 @@ async fn record(
     mut rx: mpsc::Receiver<(
         Vec<(i64, Option<(Vec<(&'static Tag, f32)>, Vec<f32>, Vec<f32>)>)>,
         Ticket,
+        Vec<Tracker>,
     )>,
 ) -> anyhow::Result<()> {
     /// batches merged into one write, see below
@@ -520,8 +597,16 @@ async fn record(
     /// writes in flight at once
     const CONCURRENCY: usize = 4;
 
-    // each write costs 5 sequential DB round trips, which dominate on a remote database: merge
-    // whatever batches queued up meanwhile into one write, and overlap writes, so `infer`
+    static WRITE_IMAGES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+        global::meter("embed")
+            .u64_histogram("embed.write.images")
+            .with_description("images in one write")
+            .with_boundaries(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0])
+            .build()
+    });
+
+    // each write costs up to 4 sequential DB round trips, which dominate on a remote database:
+    // merge whatever batches queued up meanwhile into one write, and overlap writes, so `infer`
     // doesn't block on handing over results. Writes touch disjoint images, and new tag names
     // are inserted in sorted order, so concurrent writes can't deadlock each other.
     // (A plain loop over spawned writes rather than stream combinators: holding those across
@@ -533,7 +618,7 @@ async fn record(
     let mut writes = JoinSet::new();
     let mut failure = None;
     while failure.is_none() {
-        let (mut res, mut ticket) = tokio::select! {
+        let (mut res, mut ticket, mut trackers) = tokio::select! {
             Some(write) = writes.join_next(), if !writes.is_empty() => {
                 failure = reap(write).err();
                 continue;
@@ -545,13 +630,19 @@ async fn record(
         };
         for _ in 1..COALESCE {
             match rx.try_recv() {
-                Ok((more, more_ticket)) => {
+                Ok((more, more_ticket, more_trackers)) => {
                     res.extend(more);
                     ticket.merge(more_ticket);
+                    trackers.extend(more_trackers);
                 }
                 Err(_) => break,
             }
         }
+        for tracker in &mut trackers {
+            tracker.enter(Phase::Write);
+        }
+        WRITE_IMAGES.record(res.len() as u64, &[]);
+        let span = tracing::info_span!(parent: None, "write", images = res.len(), failed = Empty);
 
         let pool = pool.clone();
         writes.spawn(
@@ -559,10 +650,9 @@ async fn record(
                 let mut wd_ids = vec![];
                 let mut tag_names = vec![];
                 let mut scores = vec![];
-                let mut embed_ids = vec![];
+                let mut completed_ids = vec![];
                 let mut clip_embeddings = vec![];
                 let mut dino_embeddings = vec![];
-                let mut completed_ids = vec![];
                 let mut failed_ids = vec![];
                 for (id, opt_out) in res {
                     match opt_out {
@@ -572,34 +662,37 @@ async fn record(
                                 tag_names.push(tag.name.as_str());
                                 scores.push(score);
                             }
-                            embed_ids.push(id);
+                            completed_ids.push(id);
                             clip_embeddings.push(HalfVector::from_f32_slice(&clip_embedding));
                             dino_embeddings.push(HalfVector::from_f32_slice(&dino_embedding));
-                            completed_ids.push(id);
                         }
                         None => failed_ids.push(id),
                     }
                 }
+                tracing::Span::current().record("failed", failed_ids.len());
 
-                // tags first, then associations in a separate statement: a concurrent writer
-                // (another write here, or another node) may insert the same new tag, in which
-                // case `DO NOTHING` returns no row and a join in the same statement couldn't see
-                // the winner's row in its snapshot; the next statement's snapshot does
-                sqlx::query!(
-                    r#"
+                // each statement is a round trip: skip those with nothing to write
+                if !tag_names.is_empty() {
+                    // tags first, then associations in a separate statement: a concurrent writer
+                    // (another write here, or another node) may insert the same new tag, in which
+                    // case `DO NOTHING` returns no row and a join in the same statement couldn't
+                    // see the winner's row in its snapshot; the next statement's snapshot does
+                    sqlx::query!(
+                        r#"
             INSERT INTO wd_tags (name)
             SELECT DISTINCT name FROM unnest($1::TEXT[]) AS _(name)
             WHERE trim(name) != ''
             ORDER BY name
             ON CONFLICT DO NOTHING
         "#,
-                    &tag_names as _
-                )
-                .execute(&pool)
-                .await?;
+                        &tag_names as _
+                    )
+                    .execute(&pool)
+                    .instrument(tracing::info_span!("insert wd_tags"))
+                    .await?;
 
-                sqlx::query!(
-                    r#"
+                    sqlx::query!(
+                        r#"
             INSERT INTO wd_tag_images (wd_tag_id, image_id, score)
             SELECT wt.id, i.id, i.score
             FROM unnest($1::BIGINT[], $2::TEXT[], $3::REAL[]) AS i(id, name, score)
@@ -607,50 +700,51 @@ async fn record(
             ON CONFLICT (wd_tag_id, image_id) DO UPDATE
             SET score = EXCLUDED.score
         "#,
-                    &wd_ids,
-                    &tag_names as _,
-                    &scores
-                )
-                .execute(&pool)
-                .await?;
+                        &wd_ids,
+                        &tag_names as _,
+                        &scores
+                    )
+                    .execute(&pool)
+                    .instrument(tracing::info_span!("upsert wd_tag_images"))
+                    .await?;
+                }
 
-                sqlx::query!(
-                    r#"
+                if !completed_ids.is_empty() {
+                    // embeddings and status in one statement: every `UPDATE images` changes an
+                    // indexed column, so it can't be a HOT update and adds the new row version to
+                    // every index on `images`, both HNSW indexes included
+                    sqlx::query!(
+                        r#"
             UPDATE images
             SET dinov3_embedding = embeddings.dinov3_embedding,
-                clip_embedding = embeddings.clip_embedding
+                clip_embedding = embeddings.clip_embedding,
+                status = 'completed'::process_status
             FROM unnest($1::BIGINT[], $2::halfvec[], $3::halfvec[])
                 AS embeddings(id, dinov3_embedding, clip_embedding)
             WHERE embeddings.id = images.id
         "#,
-                    &embed_ids,
-                    &dino_embeddings as _,
-                    &clip_embeddings as _
-                )
-                .execute(&pool)
-                .await?;
+                        &completed_ids,
+                        &dino_embeddings as _,
+                        &clip_embeddings as _
+                    )
+                    .execute(&pool)
+                    .instrument(tracing::info_span!("complete images"))
+                    .await?;
+                }
 
-                sqlx::query!(
-                    r#"
-            UPDATE images SET status = 'completed'::process_status
-            FROM unnest($1::BIGINT[]) AS ids (id)
-            WHERE ids.id = images.id
-        "#,
-                    &completed_ids
-                )
-                .execute(&pool)
-                .await?;
-
-                sqlx::query!(
-                    r#"
+                if !failed_ids.is_empty() {
+                    sqlx::query!(
+                        r#"
             UPDATE images SET status = 'pending'::process_status
             FROM unnest($1::BIGINT[]) AS ids (id)
             WHERE ids.id = images.id
         "#,
-                    &failed_ids
-                )
-                .execute(&pool)
-                .await?;
+                        &failed_ids
+                    )
+                    .execute(&pool)
+                    .instrument(tracing::info_span!("reset failed images"))
+                    .await?;
+                }
 
                 static COMPLETE_COUNTER: LazyLock<Counter<u64>> = LazyLock::new(|| {
                     let infer = global::meter("infer");
@@ -666,9 +760,11 @@ async fn record(
                 // grow the in-flight limit and burn retry attempts across the table
                 ticket.complete_n(completed_ids.len());
                 ticket.release();
+                // the images leave the pipeline with their permits
+                drop(trackers);
                 anyhow::Ok(())
             }
-            .in_current_span(),
+            .instrument(span),
         );
     }
     while let Some(write) = writes.join_next().await {
