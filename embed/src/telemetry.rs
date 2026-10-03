@@ -82,8 +82,12 @@ impl Telemetry {
         Registry::default()
             .with(trace_layer)
             .with(log_layer)
-            .with(tracing_subscriber::fmt::layer())
-            .with(EnvFilter::try_from_default_env().unwrap_or("embed=info".into()))
+            // once stdout is gone (Ctrl-C also stops `tee`), drop console lines quietly: reporting
+            // each failure goes to stderr, and panics if that is a closed pipe too. OTLP still
+            // gets every event
+            .with(tracing_subscriber::fmt::layer().log_internal_errors(false))
+            // opendal's retries and timeouts, which are otherwise invisible
+            .with(EnvFilter::try_from_default_env().unwrap_or("embed=info,opendal=warn".into()))
             .init();
 
         Ok(Self {

@@ -47,7 +47,7 @@
                                 "plugin": {
                                     "kind": "PrometheusTimeSeriesQuery",
                                     "spec": {
-                                        "query": "gpu_memory_B",
+                                        "query": "gpu_memory_B{hostname=~\"$hostname\"}",
                                         "seriesNameFormat": "{{ hostname }}-{{ device_index }}"
                                     }
                                 }
@@ -84,7 +84,7 @@
                                 "plugin": {
                                     "kind": "PrometheusTimeSeriesQuery",
                                     "spec": {
-                                        "query": "gpu_memory_utilization_percent",
+                                        "query": "gpu_memory_utilization_percent{hostname=~\"$hostname\"}",
                                         "seriesNameFormat": "{{ hostname }}-{{ device_index }}"
                                     }
                                 }
@@ -121,7 +121,7 @@
                                 "plugin": {
                                     "kind": "PrometheusTimeSeriesQuery",
                                     "spec": {
-                                        "query": "gpu_utilization_percent",
+                                        "query": "gpu_utilization_percent{hostname=~\"$hostname\"}",
                                         "seriesNameFormat": "{{ hostname }}-{{ device_index }}"
                                     }
                                 }
@@ -158,7 +158,8 @@
                                 "plugin": {
                                     "kind": "PrometheusTimeSeriesQuery",
                                     "spec": {
-                                        "query": "memory_B"
+                                        "query": "memory_B{hostname=~\"$hostname\"}",
+                                        "seriesNameFormat": "{{ hostname }}"
                                     }
                                 }
                             }
@@ -194,7 +195,7 @@
                                 "plugin": {
                                     "kind": "PrometheusTimeSeriesQuery",
                                     "spec": {
-                                        "query": "cpu_usage_ratio",
+                                        "query": "cpu_usage_ratio{hostname=~\"$hostname\"}",
                                         "seriesNameFormat": "{{ hostname }}"
                                     }
                                 }
@@ -224,7 +225,7 @@
                                 "plugin": {
                                     "kind": "PrometheusTimeSeriesQuery",
                                     "spec": {
-                                        "query": "sum(rate(infer_complete_total[1m])) * 60",
+                                        "query": "sum(rate(infer_complete_total{hostname=~\"$hostname\"}[1m])) * 60",
                                         "seriesNameFormat": "sum"
                                     }
                                 }
@@ -254,8 +255,365 @@
                                 "plugin": {
                                     "kind": "PrometheusTimeSeriesQuery",
                                     "spec": {
-                                        "query": "rate(infer_complete_total[1m]) * 60",
+                                        "query": "rate(infer_complete_total{hostname=~\"$hostname\"}[1m]) * 60",
                                         "seriesNameFormat": "{{ hostname }}"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "embedPhaseImages": {
+                "kind": "Panel",
+                "spec": {
+                    "display": {
+                        "name": "images-per-phase"
+                    },
+                    "plugin": {
+                        "kind": "TimeSeriesChart",
+                        "spec": {
+                            "legend": {
+                                "position": "bottom"
+                            }
+                        }
+                    },
+                    "queries": [
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "sum by (hostname, phase) (embed_items{hostname=~\"$hostname\"})",
+                                        "seriesNameFormat": "{{ hostname }}-{{ phase }}"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "sum by (hostname) (embed_pacer_limit{hostname=~\"$hostname\"})",
+                                        "seriesNameFormat": "{{ hostname }}-limit"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "sum by (hostname) (embed_pacer_in_flight{hostname=~\"$hostname\"})",
+                                        "seriesNameFormat": "{{ hostname }}-in_flight"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "embedPhaseDepartures": {
+                "kind": "Panel",
+                "spec": {
+                    "display": {
+                        "name": "departures-per-min-per-phase"
+                    },
+                    "plugin": {
+                        "kind": "TimeSeriesChart",
+                        "spec": {
+                            "legend": {
+                                "position": "bottom"
+                            }
+                        }
+                    },
+                    "queries": [
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "sum by (hostname, phase) (rate(embed_phase_duration_seconds_count{hostname=~\"$hostname\"}[1m])) * 60",
+                                        "seriesNameFormat": "{{ hostname }}-{{ phase }}"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "embedPhaseMean": {
+                "kind": "Panel",
+                "spec": {
+                    "display": {
+                        "name": "mean-time-per-phase"
+                    },
+                    "plugin": {
+                        "kind": "TimeSeriesChart",
+                        "spec": {
+                            "legend": {
+                                "position": "bottom"
+                            },
+                            "yAxis": {
+                                "show": true,
+                                "label": "",
+                                "format": {
+                                    "unit": "seconds"
+                                }
+                            }
+                        }
+                    },
+                    "queries": [
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "sum by (hostname, phase) (rate(embed_phase_duration_seconds_sum{hostname=~\"$hostname\"}[1m])) / sum by (hostname, phase) (rate(embed_phase_duration_seconds_count{hostname=~\"$hostname\"}[1m]))",
+                                        "seriesNameFormat": "{{ hostname }}-{{ phase }}"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "embedPhaseP95": {
+                "kind": "Panel",
+                "spec": {
+                    "display": {
+                        "name": "p95-time-per-phase"
+                    },
+                    "plugin": {
+                        "kind": "TimeSeriesChart",
+                        "spec": {
+                            "legend": {
+                                "position": "bottom"
+                            },
+                            "yAxis": {
+                                "show": true,
+                                "label": "",
+                                "format": {
+                                    "unit": "seconds"
+                                }
+                            }
+                        }
+                    },
+                    "queries": [
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "histogram_quantile(0.95, sum by (le, hostname, phase) (rate(embed_phase_duration_seconds_bucket{hostname=~\"$hostname\"}[1m])))",
+                                        "seriesNameFormat": "{{ hostname }}-{{ phase }}"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "embedDownload": {
+                "kind": "Panel",
+                "spec": {
+                    "display": {
+                        "name": "download-mbps"
+                    },
+                    "plugin": {
+                        "kind": "TimeSeriesChart",
+                        "spec": {
+                            "legend": {
+                                "position": "bottom"
+                            }
+                        }
+                    },
+                    "queries": [
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "sum by (hostname) (rate(embed_download_bytes_total{hostname=~\"$hostname\"}[1m])) * 8 / 1000000",
+                                        "seriesNameFormat": "{{ hostname }}"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "embedWrites": {
+                "kind": "Panel",
+                "spec": {
+                    "display": {
+                        "name": "writes"
+                    },
+                    "plugin": {
+                        "kind": "TimeSeriesChart",
+                        "spec": {
+                            "legend": {
+                                "position": "bottom"
+                            }
+                        }
+                    },
+                    "queries": [
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "sum by (hostname) (rate(embed_write_images_sum{hostname=~\"$hostname\"}[1m])) / sum by (hostname) (rate(embed_write_images_count{hostname=~\"$hostname\"}[1m]))",
+                                        "seriesNameFormat": "{{ hostname }}-images/write"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "sum by (hostname) (rate(embed_write_images_count{hostname=~\"$hostname\"}[1m])) * 60",
+                                        "seriesNameFormat": "{{ hostname }}-writes/min"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "embedPacerTimes": {
+                "kind": "Panel",
+                "spec": {
+                    "display": {
+                        "name": "pacer-times"
+                    },
+                    "plugin": {
+                        "kind": "TimeSeriesChart",
+                        "spec": {
+                            "legend": {
+                                "position": "bottom"
+                            },
+                            "yAxis": {
+                                "show": true,
+                                "label": "",
+                                "format": {
+                                    "unit": "seconds"
+                                }
+                            }
+                        }
+                    },
+                    "queries": [
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "embed_pacer_residence{hostname=~\"$hostname\"} < 1e6",
+                                        "seriesNameFormat": "{{ hostname }}-residence"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "embed_pacer_bound{hostname=~\"$hostname\"} < 1e6",
+                                        "seriesNameFormat": "{{ hostname }}-bound"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "embed_pacer_fastest{hostname=~\"$hostname\"} < 1e6",
+                                        "seriesNameFormat": "{{ hostname }}-fastest"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            "embedPacerFlags": {
+                "kind": "Panel",
+                "spec": {
+                    "display": {
+                        "name": "pacer-flags"
+                    },
+                    "plugin": {
+                        "kind": "TimeSeriesChart",
+                        "spec": {
+                            "legend": {
+                                "position": "bottom"
+                            }
+                        }
+                    },
+                    "queries": [
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "embed_pacer_is_starving{hostname=~\"$hostname\"}",
+                                        "seriesNameFormat": "{{ hostname }}-starving"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "embed_pacer_is_saturated{hostname=~\"$hostname\"}",
+                                        "seriesNameFormat": "{{ hostname }}-saturated"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "embed_pacer_is_raise_useless{hostname=~\"$hostname\"}",
+                                        "seriesNameFormat": "{{ hostname }}-raise-useless"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "kind": "TimeSeriesQuery",
+                            "spec": {
+                                "plugin": {
+                                    "kind": "PrometheusTimeSeriesQuery",
+                                    "spec": {
+                                        "query": "embed_pacer_is_raise_inconclusive{hostname=~\"$hostname\"}",
+                                        "seriesNameFormat": "{{ hostname }}-raise-inconclusive"
                                     }
                                 }
                             }
@@ -265,6 +623,91 @@
             }
         },
         "layouts": [
+            {
+                "kind": "Grid",
+                "spec": {
+                    "display": {
+                        "title": "Pipeline",
+                        "collapse": {
+                            "open": true
+                        }
+                    },
+                    "items": [
+                        {
+                            "x": 0,
+                            "y": 0,
+                            "width": 12,
+                            "height": 8,
+                            "content": {
+                                "$ref": "#/spec/panels/embedPhaseImages"
+                            }
+                        },
+                        {
+                            "x": 12,
+                            "y": 0,
+                            "width": 12,
+                            "height": 8,
+                            "content": {
+                                "$ref": "#/spec/panels/embedPhaseDepartures"
+                            }
+                        },
+                        {
+                            "x": 0,
+                            "y": 8,
+                            "width": 12,
+                            "height": 8,
+                            "content": {
+                                "$ref": "#/spec/panels/embedPhaseMean"
+                            }
+                        },
+                        {
+                            "x": 12,
+                            "y": 8,
+                            "width": 12,
+                            "height": 8,
+                            "content": {
+                                "$ref": "#/spec/panels/embedPhaseP95"
+                            }
+                        },
+                        {
+                            "x": 0,
+                            "y": 16,
+                            "width": 12,
+                            "height": 8,
+                            "content": {
+                                "$ref": "#/spec/panels/embedDownload"
+                            }
+                        },
+                        {
+                            "x": 12,
+                            "y": 16,
+                            "width": 12,
+                            "height": 8,
+                            "content": {
+                                "$ref": "#/spec/panels/embedWrites"
+                            }
+                        },
+                        {
+                            "x": 0,
+                            "y": 24,
+                            "width": 12,
+                            "height": 8,
+                            "content": {
+                                "$ref": "#/spec/panels/embedPacerTimes"
+                            }
+                        },
+                        {
+                            "x": 12,
+                            "y": 24,
+                            "width": 12,
+                            "height": 8,
+                            "content": {
+                                "$ref": "#/spec/panels/embedPacerFlags"
+                            }
+                        }
+                    ]
+                }
+            },
             {
                 "kind": "Grid",
                 "spec": {
@@ -342,7 +785,32 @@
                 }
             }
         ],
-        "variables": [],
+        "variables": [
+            {
+                "kind": "ListVariable",
+                "spec": {
+                    "name": "hostname",
+                    "display": {
+                        "name": "hostname"
+                    },
+                    "defaultValue": "$__all",
+                    "allowAllValue": true,
+                    "allowMultiple": true,
+                    "customAllValue": ".*",
+                    "sort": "alphabetical-asc",
+                    "plugin": {
+                        "kind": "PrometheusLabelValuesVariable",
+                        "spec": {
+                            "labelName": "hostname",
+                            "matchers": [
+                                "embed_items",
+                                "infer_complete_total"
+                            ]
+                        }
+                    }
+                }
+            }
+        ],
         "duration": "15m",
         "refreshInterval": "10s",
         "datasources": {}

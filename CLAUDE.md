@@ -81,11 +81,20 @@ while `infer` starves with the gate ≥ 90% full (each raise is checked, and tak
 departures don't rise), and shrinks while `infer` is busy and the measured residence (in flight ÷
 departures over a window of ≥ 20 departures, ≈ SIGINT drain time) exceeds
 `max(--max-drain-secs, 1.5 × fastest seen)`; it never goes below two batches. There are no per-stage concurrency flags; only `--batch-size`.
-`RUST_LOG=embed=debug` logs each decision with the policy's diagnostics (starve-not's
-`diagnostics` feature).
+`RUST_LOG=embed=debug,opendal=warn` logs each decision with the policy's diagnostics (starve-not's
+`diagnostics` feature). Keep `opendal=warn` in any `RUST_LOG`: the default filter
+(`embed=info,opendal=warn`) applies only when it's unset, and opendal's retries and timeouts are
+otherwise invisible.
 
 Telemetry (`embed/src/telemetry.rs`) exports traces/metrics/logs over OTLP to GreptimeDB; also samples
-host + NVML GPU stats.
+host + NVML GPU stats. A `phase::Tracker` travels with each image next to its `Ticket` through eight
+phases (`claim → download → decode_queue → decode → infer_queue → infer → record_queue → write`),
+exporting images per phase (`embed.items`) and time per phase (`embed.phase.duration`); the phases
+add up to the gate's `in_flight`, so a stall shows as the phase that fills up. Each unit of work
+(claim query, download, decode, `infer batch`, write with one child span per SQL statement) is its
+own short trace. Pacer decisions are exported as `embed.pacer.*` gauges. The "Pipeline" group in
+`assets/dashboard.json` (a Perses dashboard) charts all of these per host; its `hostname` variable
+filters every panel, since many worker nodes run at once.
 
 ### Data layer — `db/`
 Thin crate of `sqlx` types and bulk-upsert functions (`upsert_metas`, `upsert_translations`). Note the
