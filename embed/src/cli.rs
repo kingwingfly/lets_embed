@@ -15,7 +15,7 @@ use opentelemetry::{global, metrics::Counter};
 use ort::session::Session;
 use pgvector::HalfVector;
 use sqlx::postgres::PgPool;
-use starve_not::{DrainBounded, Gate, IdleProbe, Pacer, Ticket};
+use starve_not::{DrainBounded, Gate, IdleProbe, Pacer, Policy, Ticket};
 use tokio::{
     sync::mpsc,
     task::{JoinError, JoinSet},
@@ -189,12 +189,12 @@ impl EmbedCli {
             .build();
         let pacer = Pacer::builder(&gate, policy)
             .probe(&device)
-            .on_decision(|d, _| {
+            .on_decision(|d, policy| {
                 tracing::debug!(
                     limit = d.limit,
                     target = d.target,
                     in_flight = d.sample.in_flight,
-                    diagnostics = %d.diagnostics,
+                    diagnostics = %policy.diagnostics(),
                     "in-flight limit"
                 )
             })
