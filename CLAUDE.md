@@ -81,8 +81,10 @@ while `infer` starves with the gate ≥ 90% full (each raise is checked, and tak
 departures don't rise), and shrinks while `infer` is busy and the measured residence (in flight ÷
 departures over a window of ≥ 20 departures, ≈ SIGINT drain time) exceeds
 `max(--max-drain-secs, 1.5 × fastest seen)`; it never goes below two batches. There are no per-stage concurrency flags; only `--batch-size`.
-`RUST_LOG=embed=debug` logs each decision with the policy's diagnostics (starve-not's
-`diagnostics` feature).
+`RUST_LOG=embed=debug,opendal=warn` logs each decision with the policy's diagnostics (starve-not's
+`diagnostics` feature). Keep `opendal=warn` in any `RUST_LOG`: the default filter
+(`embed=info,opendal=warn`) applies only when it's unset, and opendal's retries and timeouts are
+otherwise invisible.
 
 Telemetry (`embed/src/telemetry.rs`) exports traces/metrics/logs over OTLP to GreptimeDB; also samples
 host + NVML GPU stats. A `phase::Tracker` travels with each image next to its `Ticket` through eight

@@ -109,6 +109,14 @@ impl Tracker {
         self.since = now;
     }
 
+    /// Stop counting a permit that never became an image, such as one the claim found no row
+    /// for. Unlike dropping, this records no time: nothing left the phase.
+    pub fn discard(self) {
+        METERS.items.add(-1, &self.phase.attributes());
+        // nothing else to clean up, and dropping would record a stay
+        std::mem::forget(self);
+    }
+
     /// Record the time spent in the current phase, and stop counting the image in it.
     fn leave(&self, stay: Duration) {
         let attributes = self.phase.attributes();

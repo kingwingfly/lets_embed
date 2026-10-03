@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::bail;
 use clap::Parser;
-use futures::{StreamExt, stream};
+use futures::{StreamExt, TryFutureExt as _, stream};
 use opendal::{
     Operator,
     layers::{RetryLayer, TimeoutLayer},
@@ -347,12 +347,14 @@ async fn fetch_batch(
             reclaim_after
         )
         .fetch_all(&pool)
+        // logged inside the span, which marks the claim's trace as failed
+        .inspect_err(|e| tracing::error!(err = %e, "claim failed"))
         .instrument(span.clone())
         .await?;
         span.record("images", records.len());
         drop(span);
-        // fewer rows than permits: the rest stop counting, and their permits go back
-        trackers.truncate(records.len());
+        // fewer rows than permits: the rest never became images, and their permits go back
+        trackers.drain(records.len()..).for_each(Tracker::discard);
         let records = records
             .into_iter()
             .zip(trackers)
@@ -602,7 +604,8 @@ async fn record(
         global::meter("embed")
             .u64_histogram("embed.write.images")
             .with_description("images in one write")
-            .with_boundaries(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0])
+            // up to COALESCE batches: 512 images at `--batch-size 32`
+            .with_boundaries(vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0])
             .build()
     });
 
@@ -773,6 +776,9 @@ async fn record(
                 drop(trackers);
                 anyhow::Ok(())
             }
+            // logged inside the span, which marks the write's trace as failed; its last statement
+            // span is the one that failed
+            .inspect_err(|e| tracing::error!(err = %e, "write failed"))
             .instrument(span),
         );
     }
