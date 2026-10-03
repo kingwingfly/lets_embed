@@ -508,7 +508,8 @@ fn infer(
         for tracker in &mut trackers {
             tracker.enter(Phase::Infer);
         }
-        let span = tracing::info_span!(parent: None, "infer", images = images.len()).entered();
+        let span =
+            tracing::info_span!(parent: None, "infer batch", images = images.len()).entered();
         let (some_ids, wd_images, clip_images, dino_images, none_ids) = images.into_iter().fold(
             (vec![], vec![], vec![], vec![], vec![]),
             |(mut sids, mut wd_images, mut clip_images, mut dino_images, mut nids), (id, opt)| {

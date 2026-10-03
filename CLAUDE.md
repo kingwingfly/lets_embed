@@ -89,7 +89,7 @@ host + NVML GPU stats. A `phase::Tracker` travels with each image next to its `T
 phases (`claim → download → decode_queue → decode → infer_queue → infer → record_queue → write`),
 exporting images per phase (`embed.items`) and time per phase (`embed.phase.duration`); the phases
 add up to the gate's `in_flight`, so a stall shows as the phase that fills up. Each unit of work
-(claim query, download, decode, device batch, write with one child span per SQL statement) is its
+(claim query, download, decode, `infer batch`, write with one child span per SQL statement) is its
 own short trace. Pacer decisions are exported as `embed.pacer.*` gauges. The "Pipeline" group in
 `assets/dashboard.json` (a Perses dashboard) charts all of these per host; its `hostname` variable
 filters every panel, since many worker nodes run at once.
