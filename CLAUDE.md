@@ -91,7 +91,8 @@ exporting images per phase (`embed.items`) and time per phase (`embed.phase.dura
 add up to the gate's `in_flight`, so a stall shows as the phase that fills up. Each unit of work
 (claim query, download, decode, device batch, write with one child span per SQL statement) is its
 own short trace. Pacer decisions are exported as `embed.pacer.*` gauges. The "Pipeline" group in
-`assets/dashboard.json` charts all of these.
+`assets/dashboard.json` (a Perses dashboard) charts all of these per host; its `hostname` variable
+filters every panel, since many worker nodes run at once.
 
 ### Data layer — `db/`
 Thin crate of `sqlx` types and bulk-upsert functions (`upsert_metas`, `upsert_translations`). Note the
