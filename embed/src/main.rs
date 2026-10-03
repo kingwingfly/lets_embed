@@ -29,9 +29,16 @@ async fn main() -> Result<()> {
         },
         _ = tokio::signal::ctrl_c() => {
             cancel.cancel();
-            status("Ctrl-C received: waiting the last queued batch to finish...");
-            if let Err(e) = task.await {
-                tracing::error!(err = %e, "Cancelled");
+            status("Ctrl-C received: finishing in-flight images, ctrl-c again to force quit...");
+            tokio::select! {
+                res = &mut task => {
+                    if let Err(e) = res {
+                        tracing::error!(err = %e, "Cancelled");
+                    }
+                },
+                // a drain can hang on a stuck download or write; images still in flight stay
+                // `processing` until another run reclaims them
+                _ = tokio::signal::ctrl_c() => status("drain cancelled, force quitting"),
             }
         },
     }
