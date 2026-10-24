@@ -9,10 +9,11 @@ command = "cargo install -q \"worker-build@^0.8\" && worker-build --profile wasm
 enabled = true
 invocation_logs = true
 
-# Worker secrets (not declared here), set once per secret:
-#   wrangler secret put CF_ACCESS_CLIENT_ID      # Access service token for the upstreams
-#   wrangler secret put CF_ACCESS_CLIENT_SECRET
-#   wrangler secret put JWT_SECRET               # must equal user-worker's JWT_SECRET
+# Worker secrets; deploy fails until each is set with `wrangler secret put <NAME>`:
+#   CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET — Access service token for the upstreams
+#   JWT_SECRET — must equal user-worker's JWT_SECRET
+[secrets]
+required = ["CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "JWT_SECRET"]
 
 [[services]]
 binding = "USER_WORKER"
