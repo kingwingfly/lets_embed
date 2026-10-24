@@ -57,15 +57,8 @@ pub struct AppState {
     pub access_aud: Arc<String>,
 }
 
-async fn secret(env: &Env, name: &str) -> Result<String> {
-    env.secret_store(name)?
-        .get()
-        .await?
-        .ok_or_else(|| Error::BindingError(format!("`{name}` not provided")))
-}
-
 async fn router(env: Env, _ctx: Context) -> Result<Router> {
-    let jwt_secret = secret(&env, "lets-embed-jwt-secret").await?;
+    let jwt_secret = env.secret("JWT_SECRET")?.to_string();
     let siwe_domain = env.var("SIWE_DOMAIN")?.to_string();
     let chain_id = env
         .var("CHAIN_ID")?

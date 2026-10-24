@@ -8,7 +8,7 @@ worker does **proxy + enforcement only** — all user state lives in
 - `/user/*` is forwarded to the user-worker via the `USER_WORKER` service
   binding, before any auth (the login page must be reachable).
 - Every other request needs a valid `ue_session` cookie (HS256, signed with
-  `lets-embed-jwt-secret`, `sub` = lowercase 0x eth address). Unauthenticated
+  `JWT_SECRET`, `sub` = lowercase 0x eth address). Unauthenticated
   media GET/HEAD get a plain **401** (an `<img>` tag can't follow a login
   redirect); everything else is **302**'d to `/user/login?next=...`.
 - Authenticated `GET /images/*` and `GET /videos/*` are charged against the
@@ -27,9 +27,16 @@ rejected (and stripped before proxying).
 
 ## Usage
 
-- Prepare bindings in `wrangler.toml`: secrets `lets-embed-client-id`,
-  `lets-embed-client-secret`, `lets-embed-jwt-secret`, plus the two bindings
-  onto the user-worker:
+- Set the worker secrets. `JWT_SECRET` must be the same value as the
+  user-worker's, since the user-worker signs the cookies this worker verifies:
+
+  ```sh
+  wrangler secret put CF_ACCESS_CLIENT_ID
+  wrangler secret put CF_ACCESS_CLIENT_SECRET
+  wrangler secret put JWT_SECRET
+  ```
+
+- Prepare the two bindings onto the user-worker in `wrangler.toml`:
 
   ```toml
   [[services]]

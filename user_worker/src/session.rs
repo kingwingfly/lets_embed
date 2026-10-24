@@ -1,7 +1,7 @@
 //! FROZEN SCAFFOLD (fully implemented): HS256 session tokens + cookie helpers.
 //!
 //! Same 2-part token format (`base64url(payload).base64url(hmac)`) and same
-//! `lets-embed-jwt-secret` as gateway_worker; `sub` is a session **principal** —
+//! `JWT_SECRET` as gateway_worker; `sub` is a session **principal** —
 //! either a lowercase 0x eth address (SIWE) or a base58 Solana pubkey (SIWS).
 //! The `is_valid_principal` check on `sub` rejects legacy `gw_token` values
 //! (UUID subs) signed with the same secret.

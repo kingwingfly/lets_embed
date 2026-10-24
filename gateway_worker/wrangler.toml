@@ -9,20 +9,12 @@ command = "cargo install -q \"worker-build@^0.8\" && worker-build --profile wasm
 enabled = true
 invocation_logs = true
 
-[[secrets_store_secrets]]
-binding = "lets-embed-client-id"
-store_id = "93d561f5fef7447eb3e1fd77e6445903"
-secret_name = "lets-embed-client-id"
-
-[[secrets_store_secrets]]
-binding = "lets-embed-client-secret"
-store_id = "93d561f5fef7447eb3e1fd77e6445903"
-secret_name = "lets-embed-client-secret"
-
-[[secrets_store_secrets]]
-binding = "lets-embed-jwt-secret"
-store_id = "93d561f5fef7447eb3e1fd77e6445903"
-secret_name = "lets-embed-jwt-secret"
+# Worker secrets; deploy fails until each is set with `wrangler secret put <NAME>`:
+#   CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET — Access service token for the upstreams
+#   JWT_SECRET — must equal user-worker's JWT_SECRET. Generate it once with
+#     `openssl rand -base64 48` and put the same value into both workers.
+[secrets]
+required = ["CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "JWT_SECRET"]
 
 [[services]]
 binding = "USER_WORKER"

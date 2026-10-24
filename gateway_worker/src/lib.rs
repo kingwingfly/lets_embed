@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use tower_cookies::{CookieManagerLayer, Cookies};
 use tower_service::Service;
 use worker::{
-    Context, Env, Error, Fetch, HttpRequest, Request, RequestInit, Result, event,
+    Context, Env, Fetch, HttpRequest, Request, RequestInit, Result, event,
     js_sys::Uint8Array, wasm_bindgen::JsValue,
 };
 
@@ -41,17 +41,10 @@ struct AppState {
     client_secret: Arc<String>,
 }
 
-async fn secret(env: &Env, name: &str) -> Result<String> {
-    env.secret_store(name)?
-        .get()
-        .await?
-        .ok_or_else(|| Error::BindingError(format!("`{name}` not provided")))
-}
-
 async fn router(env: Env, _ctx: Context) -> Result<Router> {
-    let client_id = secret(&env, "lets-embed-client-id").await?;
-    let client_secret = secret(&env, "lets-embed-client-secret").await?;
-    let jwt_secret = secret(&env, "lets-embed-jwt-secret").await?;
+    let client_id = env.secret("CF_ACCESS_CLIENT_ID")?.to_string();
+    let client_secret = env.secret("CF_ACCESS_CLIENT_SECRET")?.to_string();
+    let jwt_secret = env.secret("JWT_SECRET")?.to_string();
 
     let state = AppState {
         env: Arc::new(env),

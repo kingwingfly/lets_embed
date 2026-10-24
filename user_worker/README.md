@@ -5,7 +5,7 @@ Worker. Replaces the old apply/approve flow in `gateway_worker`.
 
 - **Auth**: SIWE (EIP-4361) only; EOA wallets via `personal_sign` (EIP-1271
   contract wallets are not supported). A successful verify sets an HS256 session
-  cookie `ue_session` (signed with the same `lets-embed-jwt-secret` as the
+  cookie `ue_session` (signed with the same `JWT_SECRET` as the
   gateway; `sub` = lowercase address). Nonces are single-use, stored in the
   `NONCES` KV namespace with a 300s TTL.
 - **Metering**: every image view (1 pt), video view (5 pts), upload-image
@@ -140,9 +140,12 @@ transaction's sender matches this linked address.
    wrangler d1 execute lets-embed --remote --file user_worker/migrations/0001_users.sql
    ```
 
-5. Deploy **user-worker first**:
+5. Set the session-signing key, then deploy **user-worker first**. Generate
+   the key once (e.g. `openssl rand -base64 48`) and give the gateway-worker
+   the same value:
 
    ```sh
+   npx wrangler secret put JWT_SECRET
    npx wrangler deploy
    ```
 
