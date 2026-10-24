@@ -11,7 +11,8 @@ invocation_logs = true
 
 # Worker secrets; deploy fails until each is set with `wrangler secret put <NAME>`:
 #   CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET — Access service token for the upstreams
-#   JWT_SECRET — must equal user-worker's JWT_SECRET
+#   JWT_SECRET — must equal user-worker's JWT_SECRET. Generate it once with
+#     `openssl rand -base64 48` and put the same value into both workers.
 [secrets]
 required = ["CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "JWT_SECRET"]
 

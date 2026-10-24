@@ -26,7 +26,8 @@ CF_ACCESS_TEAM_DOMAIN = "kingwingfly.cloudflareaccess.com"
 CF_ACCESS_AUD = "5700459f509f888154922a3f93bbf18d7dbd6b4be7fa472716693eb2fefb6ba5"
 
 # Worker secrets; deploy fails until each is set with `wrangler secret put <NAME>`:
-#   JWT_SECRET — HS256 key for `ue_session`; must equal gateway-worker's JWT_SECRET
+#   JWT_SECRET — HS256 key for `ue_session`; must equal gateway-worker's JWT_SECRET.
+#     Generate it once with `openssl rand -base64 48` and put the same value into both workers.
 [secrets]
 required = ["JWT_SECRET"]
 
