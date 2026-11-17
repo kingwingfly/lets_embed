@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-ARG ORT_VERSION=1.28.2
+ARG ORT_VERSION=1.32.0
 ARG VIPS_VERSION=8.18.2
 
 ############################################################
@@ -97,15 +97,40 @@ ENTRYPOINT ["embed"]
 FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04 AS embed-cuda12
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates cuda-compat-12-9 && \
+    rm -f /etc/ld.so.conf.d/*cuda-compat*.conf && \
+    ldconfig && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=ort-cuda12 /opt/onnxruntime /opt/onnxruntime
 COPY --from=embed-builder /app/target/release/embed /usr/local/bin/embed
+COPY <<'EOF' /usr/local/bin/cuda-entrypoint.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+driver_ver=""
+if [[ -r /proc/driver/nvidia/version ]]; then
+    driver_ver=$(sed -nE 's/^NVRM version:.*[[:space:]]([0-9]{3,}\.[0-9.]+).*/\1/p' /proc/driver/nvidia/version | head -n1 || true)
+fi
+if [[ -z "$driver_ver" ]]; then
+    for lib in /usr/local/nvidia/lib64/libcuda.so.[0-9]* /usr/local/nvidia/lib/libcuda.so.[0-9]* /usr/lib/x86_64-linux-gnu/libcuda.so.[0-9]* /usr/lib64/libcuda.so.[0-9]*; do
+        resolved=$(readlink -f "$lib" 2>/dev/null || printf '%s' "$lib")
+        if [[ -e "$resolved" && "$resolved" =~ \.so\.([0-9]{3,}\.[0-9]+(\.[0-9]+)?)$ ]]; then
+            driver_ver="${BASH_REMATCH[1]}"
+            break
+        fi
+    done
+fi
+if [[ -n "$driver_ver" && -d /usr/local/cuda/compat ]] && (( 10#${driver_ver%%.*} < 575 )); then
+    export LD_LIBRARY_PATH="/usr/local/cuda/compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+exec embed "$@"
+EOF
+RUN chmod +x /usr/local/bin/cuda-entrypoint.sh
 WORKDIR /app
 RUN useradd -r -u 10001 appuser
 USER appuser
-ENV LD_LIBRARY_PATH=/usr/local/cuda/compat:${LD_LIBRARY_PATH} \
-    ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
-ENTRYPOINT ["embed"]
+ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
+ENTRYPOINT ["cuda-entrypoint.sh"]
 
 FROM nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04 AS embed-cuda13
 RUN apt-get update && \
@@ -158,6 +183,8 @@ ENTRYPOINT ["start.sh"]
 FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04 AS search-cuda12
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates cuda-compat-12-9 && \
+    rm -f /etc/ld.so.conf.d/*cuda-compat*.conf && \
+    ldconfig && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=ort-cuda12 /opt/onnxruntime /opt/onnxruntime
 COPY --from=search-builder /app/target/release/server /usr/local/bin/server
@@ -168,6 +195,23 @@ COPY <<'EOF' /usr/local/bin/start.sh
 #!/usr/bin/env bash
 set -uo pipefail
 trap 'kill -TERM $(jobs -p) 2>/dev/null' TERM INT
+
+driver_ver=""
+if [[ -r /proc/driver/nvidia/version ]]; then
+    driver_ver=$(sed -nE 's/^NVRM version:.*[[:space:]]([0-9]{3,}\.[0-9.]+).*/\1/p' /proc/driver/nvidia/version | head -n1 || true)
+fi
+if [[ -z "$driver_ver" ]]; then
+    for lib in /usr/local/nvidia/lib64/libcuda.so.[0-9]* /usr/local/nvidia/lib/libcuda.so.[0-9]* /usr/lib/x86_64-linux-gnu/libcuda.so.[0-9]* /usr/lib64/libcuda.so.[0-9]*; do
+        resolved=$(readlink -f "$lib" 2>/dev/null || printf '%s' "$lib")
+        if [[ -e "$resolved" && "$resolved" =~ \.so\.([0-9]{3,}\.[0-9]+(\.[0-9]+)?)$ ]]; then
+            driver_ver="${BASH_REMATCH[1]}"
+            break
+        fi
+    done
+fi
+if [[ -n "$driver_ver" && -d /usr/local/cuda/compat ]] && (( 10#${driver_ver%%.*} < 575 )); then
+    export LD_LIBRARY_PATH="/usr/local/cuda/compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 
 server "$@" &
 gateway &
