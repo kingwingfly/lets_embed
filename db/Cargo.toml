@@ -17,7 +17,7 @@ anyhow.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 futures.workspace = true
-struson = { version = "0.7", features = ["simple-api"] }
+struson = { version = "0.8", features = ["simple-api"] }
 serde_json.workspace = true
 clap.workspace = true
 dotenvy.workspace = true

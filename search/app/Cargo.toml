@@ -11,7 +11,7 @@ documentation.workspace = true
 leptos = { version = "0.8", features = ["nightly"] }
 leptos_meta = { version = "0.8", features = [] }
 leptos_router = { version = "0.8", features = ["nightly"] }
-leptos-use = { version = "0.18", default-features = false, features = [
+leptos-use = { version = "0.20", default-features = false, features = [
     "use_intersection_observer", "use_element_size", "signal_debounced", "use_window_scroll"
 ] }
 
@@ -37,7 +37,7 @@ search_engine = { path = "../../search_engine", optional = true, features = ["se
 axum = { workspace = true, optional = true, features = ["macros"] }
 leptos_axum = { version = "0.8", optional = true }
 futures = { workspace = true, optional = true }
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 
 [features]
 default = []

@@ -182,7 +182,8 @@ pub fn recover_address(message: &str, signature_hex: &str) -> Result<String, Siw
     };
 
     let mut sig = Signature::from_slice(&sig_bytes[..64]).map_err(|_| SiweError::BadSignature)?;
-    if let Some(normalized) = sig.normalize_s() {
+    let normalized = sig.normalize_s();
+    if normalized != sig {
         sig = normalized;
         v ^= 1;
     }
@@ -202,7 +203,7 @@ pub fn recover_address(message: &str, signature_hex: &str) -> Result<String, Siw
 }
 
 fn pubkey_to_address(key: &VerifyingKey) -> String {
-    let point = key.to_encoded_point(false);
+    let point = key.to_sec1_point(false);
     let hash = keccak256(&point.as_bytes()[1..65]);
     format!("0x{}", hex::encode(&hash[12..32]))
 }
@@ -336,7 +337,7 @@ Expiration Time: 2026-07-04T00:10:00Z";
         let sk = SigningKey::from_slice(&[0x11; 32]).unwrap();
         let expected = pubkey_to_address(sk.verifying_key());
 
-        let (sig, rec_id) = sk.sign_prehash_recoverable(&eip191_digest(MSG)).unwrap();
+        let (sig, rec_id) = sk.sign_prehash_recoverable(&eip191_digest(MSG));
         let mut bytes = sig.to_bytes().to_vec();
         bytes.push(rec_id.to_byte());
         let sig_hex = format!("0x{}", hex::encode(&bytes));

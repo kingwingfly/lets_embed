@@ -134,6 +134,18 @@ impl LazyModel {
     }
 }
 
+fn ort_env() -> ort::Result<ort::environment::Environment> {
+    static ENV: std::sync::Mutex<Option<ort::environment::Environment>> =
+        std::sync::Mutex::new(None);
+    let mut guard = ENV.lock().expect("ort env mutex poisoned");
+    if let Some(env) = guard.as_ref() {
+        return Ok(env.clone());
+    }
+    let env = ort::init().with_name("search_engine").build()?;
+    *guard = Some(env.clone());
+    Ok(env)
+}
+
 #[derive(Debug)]
 pub struct Engine {
     pool: PgPool,
@@ -175,19 +187,25 @@ impl Engine {
             None => None,
         };
 
+        let ort_env = (clip_text_model_path.is_some() || dinov3_model_path.is_some())
+            .then(ort_env)
+            .transpose()?;
+
         let clip_text_session = clip_text_model_path.map(|clip_text_model_path| {
             let clip_text_model_path = clip_text_model_path.as_ref().to_owned();
+            let env = ort_env.clone().expect("ort env initialized");
             LazyModel::new(
                 "clip_text",
-                move || siglip2::model(&clip_text_model_path),
+                move || siglip2::model(&env, &clip_text_model_path),
                 idle_timeout,
             )
         });
         let dinov3_session = dinov3_model_path.map(|dinov3_model_path| {
             let dinov3_model_path = dinov3_model_path.as_ref().to_owned();
+            let env = ort_env.expect("ort env initialized");
             LazyModel::new(
                 "dinov3",
-                move || dinov3::model(&dinov3_model_path),
+                move || dinov3::model(&env, &dinov3_model_path),
                 idle_timeout,
             )
         });

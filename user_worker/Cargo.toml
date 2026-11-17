@@ -12,23 +12,23 @@ documentation.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-worker = { version = "0.8", features = ["http", "axum", "d1"] }
+worker = { version = "0.9", features = ["http", "axum", "d1"] }
 # required by the code #[durable_object] generates
 wasm-bindgen = "0.2"
 axum = { workspace = true, features = ["macros", "form", "json", "query"] }
 tower-service = "0.3"
 tower-cookies = "0.11"
 uuid = { version = "1", features = ["v4", "js"] }
-getrandom = { version = "0.2", features = ["js"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
 serde.workspace = true
 serde_json.workspace = true
 hmac = "0.13"
 sha2 = "0.11"
-rsa = { version = "0.10.0-rc.18", features = ["sha2"] }
-base64 = "0.22"
-k256 = { version = "0.13", default-features = false, features = ["ecdsa", "alloc"] }
-sha3 = "0.10"
+rsa = { version = "0.10", features = ["pkcs1v15"] }
+base64 = "0.23"
+k256 = { version = "0.14", default-features = false, features = ["ecdsa", "alloc"] }
+sha3 = "0.12"
 hex = "0.4"
 # Solana wallet-link signature verification (ed25519) + base58 addr/sig codec
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc"] }
 bs58 = "0.5"

@@ -22,7 +22,8 @@ use tracing_subscriber::{
 
 pub static HOSTNAME: LazyLock<String> = LazyLock::new(|| System::host_name().unwrap_or_default());
 pub static NVML: LazyLock<Option<Nvml>> = LazyLock::new(|| Nvml::init().ok());
-pub static SYS: LazyLock<Mutex<System>> = LazyLock::new(|| Mutex::new(System::new()));
+pub static SYS: LazyLock<Option<Mutex<System>>> =
+    LazyLock::new(|| System::new().ok().map(Mutex::new));
 
 pub struct Telemetry {
     tracer_provider: SdkTracerProvider,
@@ -109,7 +110,10 @@ struct CpuDetector;
 
 impl ResourceDetector for CpuDetector {
     fn detect(&self) -> Resource {
-        let mut sys = (*SYS).lock();
+        let Some(sys) = &*SYS else {
+            return Resource::builder().build();
+        };
+        let mut sys = sys.lock();
         sys.refresh_memory();
         let total = sys.total_memory() as f32;
         let swap = sys.total_swap() as f32;
@@ -165,31 +169,33 @@ impl ResourceDetector for GpuDetector {
 }
 
 pub fn register_system_meters() {
-    let cpu = global::meter("cpu");
-    cpu.f64_observable_gauge("cpu.usage")
-        .with_description("global cpu usage")
-        .with_unit("1")
-        .with_callback(|i| {
-            let mut sys = (*SYS).lock();
-            sys.refresh_cpu_usage();
-            let measurement = sys.global_cpu_usage() as f64;
-            drop(sys);
-            i.observe(measurement, &[]);
-        })
-        .build();
-    let memory = global::meter("memory");
-    memory
-        .u64_observable_gauge("memory")
-        .with_description("memory usage")
-        .with_unit("B")
-        .with_callback(|i| {
-            let mut sys = (*SYS).lock();
-            sys.refresh_memory();
-            let measurement = sys.used_memory();
-            drop(sys);
-            i.observe(measurement, &[]);
-        })
-        .build();
+    if let Some(sys) = &*SYS {
+        let cpu = global::meter("cpu");
+        cpu.f64_observable_gauge("cpu.usage")
+            .with_description("global cpu usage")
+            .with_unit("1")
+            .with_callback(move |i| {
+                let mut sys = sys.lock();
+                sys.refresh_cpu_usage();
+                let measurement = sys.global_cpu_usage() as f64;
+                drop(sys);
+                i.observe(measurement, &[]);
+            })
+            .build();
+        let memory = global::meter("memory");
+        memory
+            .u64_observable_gauge("memory")
+            .with_description("memory usage")
+            .with_unit("B")
+            .with_callback(move |i| {
+                let mut sys = sys.lock();
+                sys.refresh_memory();
+                let measurement = sys.used_memory();
+                drop(sys);
+                i.observe(measurement, &[]);
+            })
+            .build();
+    }
     let gpu = global::meter("gpu");
     if let Some(nvml) = &*NVML
         && let Ok(count) = nvml.device_count()

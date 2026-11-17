@@ -10,7 +10,7 @@ use fast_image_resize::{
     FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
     images::{CroppedImageMut, Image},
 };
-use ort::{ep, inputs, session::Session, value::Tensor};
+use ort::{environment::Environment, ep, inputs, session::Session, value::Tensor};
 
 pub const OUT_DIM: usize = 10861;
 
@@ -18,8 +18,8 @@ pub const IMAGE_WIDTH: usize = 448;
 pub const IMAGE_HEIGHT: usize = 448;
 pub const IMAGE_CHANNEL: usize = 3;
 
-pub fn model(model_path: impl AsRef<Path>) -> ort::Result<Session> {
-    let session = Session::builder()?
+pub fn model(env: &Environment, model_path: impl AsRef<Path>) -> ort::Result<Session> {
+    let session = Session::builder(env)?
         .with_execution_providers([
             #[cfg(not(target_os = "macos"))]
             ep::CUDA::default().build(),

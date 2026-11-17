@@ -8,8 +8,7 @@ use std::{
 
 use anyhow::bail;
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer, images::Image};
-use ort::ep;
-use ort::{inputs, session::Session, value::Tensor};
+use ort::{environment::Environment, ep, inputs, session::Session, value::Tensor};
 
 pub const EMBED_DIM: usize = 768;
 
@@ -20,8 +19,8 @@ pub const IMAGE_HEIGHT: usize = 256;
 pub const MEAN: [f64; 3] = [0.485, 0.456, 0.406];
 pub const STD: [f64; 3] = [0.229, 0.224, 0.225];
 
-pub fn model(model_path: impl AsRef<Path>) -> ort::Result<Session> {
-    let session = Session::builder()?
+pub fn model(env: &Environment, model_path: impl AsRef<Path>) -> ort::Result<Session> {
+    let session = Session::builder(env)?
         .with_execution_providers([
             #[cfg(not(target_os = "macos"))]
             ep::CUDA::default().build(),

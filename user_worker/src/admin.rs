@@ -14,7 +14,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
-use rsa::{BoxedUint, Pkcs1v15Sign, RsaPublicKey};
+use rsa::{BoxedUint, Pkcs1v15Sign, PublicKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use worker::{Env, Fetch, Method, Result};
@@ -139,7 +139,7 @@ async fn require_approver(st: &AppState, headers: &HeaderMap) -> Option<String> 
         };
         let n = BoxedUint::from_be_slice_vartime(&b64url(&n_str)?);
         let e = BoxedUint::from_be_slice_vartime(&b64url(&e_str)?);
-        let key = RsaPublicKey::new(n, e).ok()?;
+        let key = PublicKey::new(n, e).ok()?;
 
         let signing_input = format!("{h}.{p}");
         let digest = Sha256::digest(signing_input.as_bytes());

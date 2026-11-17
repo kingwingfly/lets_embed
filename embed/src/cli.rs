@@ -142,13 +142,13 @@ impl EmbedCli {
                     let root = url.path();
                     tracing::info!(dal = "fs", root, "building OpenDAL");
                     let fs = Fs::default().root(root);
-                    Operator::new(fs)?.finish()
+                    Operator::new(fs)?
                 }
                 "http" | "https" => {
                     let endpoint = url.as_str();
                     tracing::info!(dal = "http", endpoint, "building OpenDAL");
                     let http = Http::default().endpoint(endpoint);
-                    Operator::new(http)?.finish()
+                    Operator::new(http)?
                 }
                 _ => bail!("Unsupported storage"),
             },
@@ -163,7 +163,6 @@ impl EmbedCli {
                         .access_key_id(&config.key_id)
                         .secret_access_key(&config.secret),
                 )?
-                .finish()
             }
         }
         .layer(TimeoutLayer::new().with_io_timeout(io_timeout))
@@ -178,9 +177,10 @@ impl EmbedCli {
         let tags = wd_tagger::tags(self.selected_tags)?;
         let tags = tags.leak::<'static>();
 
-        let wd_tagger_session = wd_tagger::model(self.wd_tagger_model)?;
-        let clip_vision_session = siglip2::model(self.clip_vision_model)?;
-        let dinov3_session = dinov3::model(self.dinov3_model)?;
+        let ort_env = ort::init().with_name("embed").build()?;
+        let wd_tagger_session = wd_tagger::model(&ort_env, self.wd_tagger_model)?;
+        let clip_vision_session = siglip2::model(&ort_env, self.clip_vision_model)?;
+        let dinov3_session = dinov3::model(&ort_env, self.dinov3_model)?;
 
         let batch_size = self.batch_size.max(1);
         let decode_concurrency = available_parallelism().map(|num| num.get()).unwrap_or(1);

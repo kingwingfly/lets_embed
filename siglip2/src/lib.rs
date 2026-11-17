@@ -8,8 +8,7 @@ use std::{
 
 use anyhow::{anyhow, bail};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer, images::Image};
-use ort::ep;
-use ort::{inputs, session::Session, value::Tensor};
+use ort::{environment::Environment, ep, inputs, session::Session, value::Tensor};
 use tokenizers::{EncodeInput, Tokenizer};
 
 pub const EMBED_DIM: usize = 1152;
@@ -27,8 +26,8 @@ pub fn tokenizer(config: impl AsRef<Path>) -> anyhow::Result<Tokenizer> {
     Tokenizer::from_file(config).map_err(|e| anyhow!("{e}"))
 }
 
-pub fn model(model_path: impl AsRef<Path>) -> ort::Result<Session> {
-    let session = Session::builder()?
+pub fn model(env: &Environment, model_path: impl AsRef<Path>) -> ort::Result<Session> {
+    let session = Session::builder(env)?
         .with_execution_providers([
             #[cfg(not(target_os = "macos"))]
             ep::CUDA::default().build(),

@@ -7,16 +7,18 @@ edition = "2024"
 db = { path = "../db" }
 
 anyhow = "1.0"
-bytes = "1.11.1"
+bytes = "1.12"
 dotenvy = "0.15"
 futures = "0.3"
-libvips = "2.1"
-opendal = { version = "0.57", features = ["services-s3", "services-fs"] }
-tokio = { version = "1.52", features = ["full"] }
-tokio-util = "0.7.18"
+libvips = "2.3"
+opendal = { version = "0.59", features = ["services-s3", "services-fs"] }
+reqwest = { version = "0.13", features = ["json"] }
+tokio = { version = "1.54", features = ["full"] }
+tokio-util = "0.7.20"
 mime_guess = "2.0.5"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-imagesize = "0.14"
+imagesize = "0.15"

@@ -8,9 +8,9 @@ repository.workspace = true
 documentation.workspace = true
 
 [dependencies]
-pingora = { version = "0.8.0", features = ["proxy"] }
+pingora = { version = "0.9", features = ["proxy"] }
 async-trait = "0.1"
-http = "1.4"
+http = "1.5"
 
 anyhow = { workspace = true, optional = true }
 tracing.workspace = true
@@ -20,8 +20,8 @@ reqwest = { version = "0.13", optional = true, features = ["json", "blocking"] }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 arc-swap = { version = "1.9", optional = true }
-aws-lc-rs = { version = "1.17", optional = true }
-base64 = { version = "0.22", optional = true }
+aws-lc-rs = { version = "1.19", optional = true }
+base64 = { version = "0.23", optional = true }
 
 [features]
 default = []

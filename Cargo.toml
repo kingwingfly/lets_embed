@@ -26,12 +26,12 @@ documentation = "https://github.com/kingwingfly/lets_embed"
 
 [workspace.dependencies]
 # runtime
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "parking_lot", "macros"] }
+tokio = { version = "1.54", default-features = false, features = ["rt-multi-thread", "parking_lot", "macros"] }
 futures = "0.3"
 tokio-util = "0.7"
 tokio-stream = { version = "0.1", features = ["io-util"] }
 tokio-retry = "0.3"
-ort = { version = "2.0.0-rc.13", features = ["load-dynamic"] }
+ort = { version = "2.0.0-rc.15", features = ["load-dynamic"] }
 # observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -49,8 +49,8 @@ pgvector = { version = "0.4", features = ["sqlx", "halfvec"] }
 # util
 tokenizers = "0.23"
 image = "0.25"
-fast_image_resize = { version = "6.0", features = ["image"] }
-parking_lot = "0.12"
+fast_image_resize = { version = "6.1", features = ["image"] }
+parking_lot = "0.13"
 clap = { version = "4.6", features = ["derive"] }
 dotenvy = "0.15"
 
