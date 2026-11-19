@@ -38,6 +38,8 @@ Useful flags:
 
 A prefix or full scan continues after an individual conversion fails. On failure it exits nonzero and prints the total and up to three object keys with their causes to stderr, even with tracing disabled. Set `RUST_LOG=img2webp=error` to log every failed key during the scan. With `-d`, successfully converted originals may already have been deleted when the summary appears.
 
+Spaces at either end of an object key, including nonbreaking spaces, are part of its name. Preserve any leading spaces when passing an album name to `--prefix`.
+
 One-shot metadata recovery:
 - In default one-shot queue mode (without `--daemon`), `img2webp` atomically persists converted metadata to `IMG2WEBP_META_JOURNAL` (or `$TMPDIR/img2webp-meta-<CF_ACCOUNT_ID>-<CF_QUEUE_ID>.json`) *before* acknowledging queue leases. If a later batch fails or the process is interrupted by `SIGINT`/`SIGTERM` (which exits non-zero after releasing unstarted leases), the journal is preserved so the next one-shot run recovers and emits all previously converted metadata before deleting the journal on clean completion.
 - When Cloudflare reports `Message has exhausted maxRetries` for a requested retry, the worker finishes the remaining batches. A one-shot run then exits non-zero with the number of exhausted messages and retains the journal. Recover those messages from the configured dead-letter queue, or process originals still in R2 with `img2webp --prefix 'album directory'`.

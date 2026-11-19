@@ -1,3 +1,5 @@
+mod storage;
+
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -390,7 +392,10 @@ pub async fn walk_convert_prefix_with_concurrency(
     let prefix = normalize_scan_prefix(prefix)?;
     ensure_vips()?;
 
-    let entries = src_op.lister_with(&prefix).recursive(true).await?;
+    let entries = src_op
+        .lister_with(&storage::rooted_path(&prefix))
+        .recursive(true)
+        .await?;
 
     let mut metas: HashMap<String, Meta> = HashMap::new();
     let cancel = CancellationToken::new();
@@ -1402,11 +1407,11 @@ async fn read_source_bytes(
 
     let can_if_match = src_op.info().capability().read_with_if_match;
     let res = if can_if_match && let Some(etag) = src_id.etag.clone() {
-        match src_op.read_with(path).if_match(&etag).await {
+        match storage::read(src_op, path, Some(&etag)).await {
             Ok(buf) => Ok((buf, permit)),
             Err(e) if e.kind() == ErrorKind::ConditionNotMatch => {
                 drop(permit);
-                let fresh = match src_op.stat(path).await {
+                let fresh = match storage::stat(src_op, path).await {
                     Ok(stat) => stat,
                     Err(se) if se.kind() == ErrorKind::NotFound => {
                         return Ok(ReadSourceOutcome::NotFound);
@@ -1423,17 +1428,15 @@ async fn read_source_bytes(
                 let fresh_permit = acquire_budget(src_id.content_length)
                     .await
                     .context("source byte budget semaphore closed")?;
-                let retry_res = if let Some(fresh_etag) = src_id.etag.as_deref() {
-                    src_op.read_with(path).if_match(fresh_etag).await
-                } else {
-                    src_op.read(path).await
-                };
+                let retry_res = storage::read(src_op, path, src_id.etag.as_deref()).await;
                 retry_res.map(|buf| (buf, fresh_permit))
             }
             Err(e) => Err(e),
         }
     } else {
-        src_op.read(path).await.map(|buf| (buf, permit))
+        storage::read(src_op, path, None)
+            .await
+            .map(|buf| (buf, permit))
     };
 
     match res {
@@ -1464,14 +1467,14 @@ async fn delete_source_verified(
     if src_op.info().capability().delete_with_if_match
         && let Some(etag) = src_id.etag.as_deref()
     {
-        match src_op.delete_with(path).if_match(etag).await {
+        match storage::delete(src_op, path, Some(etag)).await {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
             Err(e) if e.kind() == ErrorKind::Unsupported => {}
             Err(e) => return Err(e.into()),
         }
     }
-    match src_op.stat(path).await {
+    match storage::stat(src_op, path).await {
         Ok(current_stat) => {
             let current_id = SourceIdentity::from_meta(&current_stat);
             if !src_id.matches(&current_id) {
@@ -1479,7 +1482,7 @@ async fn delete_source_verified(
                     "source object {path} changed during conversion; refusing to delete newer upload"
                 );
             }
-            src_op.delete(path).await?;
+            storage::delete(src_op, path, None).await?;
             Ok(())
         }
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
@@ -1500,6 +1503,7 @@ async fn publish_and_cleanup(
     delete_origin: bool,
 ) -> anyhow::Result<()> {
     let caps = dst_op.info().capability();
+    let dst_path = storage::rooted_path(new_path);
     let buf_webp = opendal::Buffer::from(webp_bytes);
     let make_user_meta = || {
         let mut um = Vec::with_capacity(5);
@@ -1524,7 +1528,7 @@ async fn publish_and_cleanup(
 
     let mut existing_dst = match pre_dst {
         Some(m) => Some(m),
-        None if !caps.write_with_if_not_exists => match dst_op.stat(new_path).await {
+        None if !caps.write_with_if_not_exists => match storage::stat(dst_op, new_path).await {
             Ok(m) => Some(m),
             Err(e) if e.kind() == ErrorKind::NotFound => None,
             Err(e) => return Err(e.into()),
@@ -1535,7 +1539,7 @@ async fn publish_and_cleanup(
     let mut published = false;
     if existing_dst.is_none() {
         if caps.write_with_if_not_exists {
-            let mut writer = dst_op.write_with(new_path, buf_webp.clone());
+            let mut writer = dst_op.write_with(&dst_path, buf_webp.clone());
             if caps.write_with_user_metadata {
                 writer = writer.user_metadata(make_user_meta());
             }
@@ -1543,13 +1547,13 @@ async fn publish_and_cleanup(
             match writer.await {
                 Ok(_) => published = true,
                 Err(e) if e.kind() == ErrorKind::ConditionNotMatch => {
-                    let m = dst_op.stat(new_path).await?;
+                    let m = storage::stat(dst_op, new_path).await?;
                     existing_dst = Some(m);
                 }
                 Err(e) => return Err(e.into()),
             }
         } else {
-            let current_src = src_op.stat(path).await.with_context(|| {
+            let current_src = storage::stat(src_op, path).await.with_context(|| {
                 format!("source object {path} disappeared before publishing {new_path}")
             })?;
             let current_id = SourceIdentity::from_meta(&current_src);
@@ -1558,7 +1562,7 @@ async fn publish_and_cleanup(
                     "source object {path} changed during conversion; refusing to publish stale version"
                 );
             }
-            let mut writer = dst_op.write_with(new_path, buf_webp.clone());
+            let mut writer = dst_op.write_with(&dst_path, buf_webp.clone());
             if caps.write_with_user_metadata {
                 writer = writer.user_metadata(make_user_meta());
             }
@@ -1572,7 +1576,7 @@ async fn publish_and_cleanup(
     {
         let stored_etag = destination_source_etag(dst_meta, path, new_path)?;
         if stored_etag.is_none() || stored_etag != src_id.etag.as_deref() {
-            let current_src = src_op.stat(path).await.with_context(|| {
+            let current_src = storage::stat(src_op, path).await.with_context(|| {
                 format!("source object {path} disappeared before overwriting {new_path}")
             })?;
             let current_id = SourceIdentity::from_meta(&current_src);
@@ -1581,7 +1585,7 @@ async fn publish_and_cleanup(
                     "source object {path} changed during conversion; refusing to overwrite {new_path} with stale version"
                 );
             }
-            let mut writer = dst_op.write_with(new_path, buf_webp);
+            let mut writer = dst_op.write_with(&dst_path, buf_webp);
             if caps.write_with_user_metadata {
                 writer = writer.user_metadata(make_user_meta());
             }
@@ -1620,14 +1624,15 @@ async fn read_webp_dimensions(
     dst_op: &Operator,
     new_path: &str,
 ) -> anyhow::Result<(usize, usize)> {
-    let head = dst_op.read_with(new_path).range(0..4096).await;
+    let dst_path = storage::rooted_path(new_path);
+    let head = dst_op.read_with(&dst_path).range(0..4096).await;
     if let Ok(buf) = head {
         let bytes = buf.to_bytes();
         if let Ok(sz) = imagesize::blob_size(&bytes) {
             return Ok((sz.width, sz.height));
         }
     }
-    let full = dst_op.read(new_path).await?;
+    let full = dst_op.read(&dst_path).await?;
     let sz = imagesize::blob_size(&full.to_bytes())?;
     Ok((sz.width, sz.height))
 }
@@ -1659,7 +1664,7 @@ async fn recover_missing_source(
     attempts: u32,
 ) -> anyhow::Result<ConvertOutcome> {
     // Another converter may have published the WebP and deleted the source since our first HEAD.
-    let dst_meta = match dst_op.stat(&new_path).await {
+    let dst_meta = match storage::stat(dst_op, &new_path).await {
         Ok(meta) => meta,
         Err(e) if e.kind() == ErrorKind::NotFound => {
             bail!("source object missing in storage (attempt {attempts}): {path}");
@@ -1691,12 +1696,12 @@ async fn convert_object(
     byte_sem: &Arc<Semaphore>,
     cpu_sem: &Arc<Semaphore>,
 ) -> anyhow::Result<ConvertOutcome> {
-    if !is_exact_opendal_key(path) {
+    if !is_valid_object_key(path) {
         bail!("refusing non-canonical object key: {path:?}");
     }
     let (new_path, meta_key) = target_paths(path);
 
-    let existing_dst = match dst_op.stat(&new_path).await {
+    let existing_dst = match storage::stat(dst_op, &new_path).await {
         Ok(m) => Some(m),
         Err(e) if e.kind() == ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
@@ -1709,7 +1714,7 @@ async fn convert_object(
     let mut src_id = if let Some(m) = list_meta.filter(|m| m.etag().is_some()) {
         SourceIdentity::from_meta(m)
     } else {
-        match src_op.stat(path).await {
+        match storage::stat(src_op, path).await {
             Ok(stat) => SourceIdentity::from_meta(&stat),
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 return recover_missing_source(dst_op, path, new_path, meta_key, collect_meta, attempts)
@@ -1785,9 +1790,8 @@ async fn convert_object(
     })
 }
 
-fn is_exact_opendal_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.trim() == key
+fn is_valid_object_key(key: &str) -> bool {
+    !key.trim().is_empty()
         && !key.starts_with('/')
         && !key.ends_with('/')
         && !key.contains("//")
@@ -2109,9 +2113,7 @@ fn decode_v8_webp_task_key(raw: &[u8]) -> Option<V8TaskKey> {
 fn classify_v8_payload(raw: &[u8], expected_bucket: Option<&str>) -> MessageAction {
     match decode_v8_webp_task_key(raw) {
         Some(V8TaskKey::Bare(s)) => classify_text_payload(&s, expected_bucket),
-        Some(V8TaskKey::Field(key)) if !key.trim().is_empty() && is_exact_opendal_key(&key) => {
-            MessageAction::Convert(key)
-        }
+        Some(V8TaskKey::Field(key)) if is_valid_object_key(&key) => MessageAction::Convert(key),
         _ => MessageAction::Malformed,
     }
 }
@@ -2126,7 +2128,7 @@ fn classify_text_payload(s: &str, expected_bucket: Option<&str>) -> MessageActio
         }
         return MessageAction::Malformed;
     }
-    if is_exact_opendal_key(s) {
+    if is_valid_object_key(s) {
         MessageAction::Convert(s.to_owned())
     } else {
         MessageAction::Malformed
@@ -2179,7 +2181,7 @@ fn classify_object_map(
             .and_then(|obj| obj.get("key"))
             .and_then(|v| v.as_str())
         {
-            return if !key.trim().is_empty() && is_exact_opendal_key(key) {
+            return if is_valid_object_key(key) {
                 MessageAction::Convert(key.to_owned())
             } else {
                 MessageAction::Malformed
@@ -2189,7 +2191,7 @@ fn classify_object_map(
     }
 
     if let Some(key) = map.get("key").and_then(|v| v.as_str()) {
-        return if !key.trim().is_empty() && is_exact_opendal_key(key) {
+        return if is_valid_object_key(key) {
             MessageAction::Convert(key.to_owned())
         } else {
             MessageAction::Malformed
@@ -2407,11 +2409,14 @@ mod tests {
             classify_decoded_value(&serde_json::json!("post/photo 4"), None),
             MessageAction::Convert("post/photo 4".to_string())
         );
-        // OpenDAL trims outer whitespace before every operation, including deletion.
-        for key in ["post/photo 4 ", "\u{3000}相册/照片"] {
+        for key in ["post/photo 4 ", "\u{3000}相册/照片", "\u{a0}album/photo 9.bin"] {
             assert_eq!(
                 classify_decoded_value(&serde_json::json!(key), None),
-                MessageAction::Malformed
+                MessageAction::Convert(key.to_owned())
+            );
+            assert_eq!(
+                classify_decoded_value(&serde_json::json!({ "key": key }), None),
+                MessageAction::Convert(key.to_owned())
             );
         }
         assert_eq!(
@@ -2503,7 +2508,7 @@ mod tests {
 
     #[test]
     fn v8_blink_envelope_map_with_utf16_cjk_key_and_padding() {
-        let key = "コスプレ 写真集 Vol.1/photo 1";
+        let key = "\u{a0}コスプレ 写真集 Vol.1/photo 1";
         // Blink header (0xFF 0x14) + V8 header (0xFF 0x0F) + JS Map.
         let mut raw = vec![0xFF, 0x14, 0xFF, 0x0F, b';'];
         raw.extend(v8_one_byte(b"key"));
@@ -3120,17 +3125,16 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct StoredObjMeta {
+    struct StoredObject {
         etag: String,
-        size: usize,
+        data: bytes::Bytes,
         user_meta: HashMap<String, String>,
     }
 
     struct MockS3State {
-        fs_op: Operator,
         bucket: String,
         next_etag: usize,
-        objects: HashMap<String, StoredObjMeta>,
+        objects: HashMap<String, StoredObject>,
         head_src_count: usize,
         head_dst_count: usize,
         get_count: usize,
@@ -3142,17 +3146,12 @@ mod tests {
         endpoint: String,
         bucket: String,
         state: Arc<tokio::sync::Mutex<MockS3State>>,
-        _dir: TestDir,
         _task: AbortOnDrop,
     }
 
     impl MockS3Server {
-        async fn start(label: &str, bucket: &str) -> Self {
-            let dir = TestDir::new(label);
-            let fs_op = Operator::new(opendal::services::Fs::default().root(&dir.path().to_string_lossy()))
-                .unwrap();
+        async fn start(bucket: &str) -> Self {
             let state = Arc::new(tokio::sync::Mutex::new(MockS3State {
-                fs_op,
                 bucket: bucket.to_string(),
                 next_etag: 1,
                 objects: HashMap::new(),
@@ -3187,7 +3186,6 @@ mod tests {
                 endpoint,
                 bucket: bucket.to_string(),
                 state,
-                _dir: dir,
                 _task: AbortOnDrop(handle),
             }
         }
@@ -3210,13 +3208,11 @@ mod tests {
             let mut st = self.state.lock().await;
             let etag = format!("\"etag-{}\"", st.next_etag);
             st.next_etag += 1;
-            let size = bytes.len();
-            st.fs_op.write(key, bytes).await.unwrap();
             st.objects.insert(
                 key.to_string(),
-                StoredObjMeta {
+                StoredObject {
                     etag: etag.clone(),
-                    size,
+                    data: bytes.into(),
                     user_meta: HashMap::new(),
                 },
             );
@@ -3260,7 +3256,6 @@ mod tests {
                     .replace("&quot;", "\"")
                     .replace("&apos;", "'");
                 st.delete_count += 1;
-                let _ = st.fs_op.delete(&del_key).await;
                 st.objects.remove(&del_key);
                 rest_xml = &after[end + 6..];
             }
@@ -3284,7 +3279,7 @@ mod tests {
                     prefix = percent_decode(val);
                 }
             }
-            let mut keys: Vec<(String, StoredObjMeta)> = st
+            let mut keys: Vec<(String, StoredObject)> = st
                 .objects
                 .iter()
                 .filter(|(k, _)| k.starts_with(&prefix))
@@ -3301,7 +3296,7 @@ mod tests {
                     "<Contents><Key>{}</Key><LastModified>2026-11-18T15:36:51.456Z</LastModified><ETag>{}</ETag><Size>{}</Size></Contents>",
                     xml_escape(&k),
                     xml_escape(&m.etag),
-                    m.size
+                    m.data.len()
                 ));
             }
             xml.push_str("</ListBucketResult>");
@@ -3337,7 +3332,7 @@ mod tests {
                 for (mk, mv) in &meta.user_meta {
                     hdrs.push((format!("x-amz-meta-{mk}"), mv.clone()));
                 }
-                write_http_resp(writer, 200, "OK", &hdrs, b"", Some(meta.size)).await
+                write_http_resp(writer, 200, "OK", &hdrs, b"", Some(meta.data.len())).await
             }
             "GET" => {
                 st.get_count += 1;
@@ -3358,7 +3353,7 @@ mod tests {
                     )
                     .await;
                 }
-                let full = st.fs_op.read(&key).await.unwrap().to_bytes();
+                let full = meta.data;
                 let mut hdrs = vec![
                     ("ETag".to_string(), meta.etag),
                     (
@@ -3433,13 +3428,11 @@ mod tests {
                 }
                 let etag = format!("\"etag-{}\"", st.next_etag);
                 st.next_etag += 1;
-                let size = req.body.len();
-                st.fs_op.write(&key, req.body.clone()).await.unwrap();
                 st.objects.insert(
                     key,
-                    StoredObjMeta {
+                    StoredObject {
                         etag: etag.clone(),
-                        size,
+                        data: req.body.clone().into(),
                         user_meta,
                     },
                 );
@@ -3469,7 +3462,6 @@ mod tests {
                     )
                     .await;
                 }
-                let _ = st.fs_op.delete(&key).await;
                 st.objects.remove(&key);
                 write_http_resp(writer, 204, "No Content", &[], b"", None).await
             }
@@ -3679,8 +3671,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_preserves_whitespace_in_r2_keys() {
+        let s3 = MockS3Server::start("test-bucket").await;
+        let op = s3.operator();
+        let src = "\u{a0}Album/by \u{a0}Artist - photo 9.bin";
+        let dst = "\u{a0}Album/by \u{a0}Artist - photo 9.webp";
+        let sibling = src.trim_start();
+        let sibling_png = make_png(4, 5, [50, 100, 150]);
+        let etag = s3.put_raw(src, make_png(12, 9, [100, 50, 120])).await;
+        s3.put_raw(sibling, sibling_png.clone()).await;
+
+        let metas = walk_convert(op.clone(), op.clone(), false).await.unwrap();
+        assert_eq!(metas.len(), 2);
+        {
+            let st = s3.state.lock().await;
+            let webp = &st.objects[dst];
+            let size = imagesize::blob_size(&webp.data).unwrap();
+            assert_eq!((size.width, size.height), (12, 9));
+            assert_eq!(webp.user_meta["source-etag"], etag);
+            assert_eq!(webp.user_meta["source-key-encoding"], "base64");
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(&webp.user_meta["source-key"])
+                    .unwrap(),
+                src.as_bytes()
+            );
+            let other_size = imagesize::blob_size(&st.objects[dst.trim_start()].data).unwrap();
+            assert_eq!((other_size.width, other_size.height), (4, 5));
+        }
+
+        s3.reset_counts().await;
+        let metas = walk_convert_prefix(op.clone(), op, "\u{a0}Album", true)
+            .await
+            .unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas.iter().next().unwrap().title, "\u{a0}Album");
+        let st = s3.state.lock().await;
+        assert!(!st.objects.contains_key(src));
+        assert_eq!(st.objects[sibling].data.as_ref(), sibling_png.as_slice());
+        assert_eq!(st.put_count, 0);
+        assert_eq!(st.get_count, 0);
+    }
+
+    #[tokio::test]
+    async fn conversion_preserves_trailing_whitespace_on_read_and_delete() {
+        let s3 = MockS3Server::start("test-bucket").await;
+        let op = s3.operator();
+        let src = "Album/photo ";
+        let sibling = src.trim_end();
+        let sibling_png = make_png(4, 5, [50, 100, 150]);
+        s3.put_raw(src, make_png(12, 9, [100, 50, 120])).await;
+        s3.put_raw(sibling, sibling_png.clone()).await;
+        let result = convert_object(
+            &op,
+            &op,
+            src,
+            None,
+            true,
+            true,
+            1,
+            &Arc::new(Semaphore::new(SOURCE_BYTE_BUDGET)),
+            &Arc::new(Semaphore::new(1)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            ConvertOutcome::Converted { size: (12, 9), .. }
+        ));
+        let st = s3.state.lock().await;
+        assert!(st.objects.contains_key("Album/photo .webp"));
+        assert!(!st.objects.contains_key(src));
+        assert_eq!(st.objects[sibling].data.as_ref(), sibling_png.as_slice());
+        assert!(!st.objects.contains_key("Album/photo.webp"));
+    }
+
+    #[tokio::test]
     async fn scan_recovers_a_webp_published_after_its_first_head() {
-        let s3 = MockS3Server::start("walk-race", "test-bucket").await;
+        let s3 = MockS3Server::start("test-bucket").await;
         let path = "Album/photo.jpg";
         let png = make_png(8, 6, [10, 20, 30]);
         s3.put_raw(path, png.clone()).await;
@@ -3726,7 +3794,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_scan_reports_keys_and_causes_without_a_log_subscriber() {
-        let s3 = MockS3Server::start("walk-errors", "test-bucket").await;
+        let s3 = MockS3Server::start("test-bucket").await;
         for i in 0..5 {
             s3.put_raw(&format!("Album/bad-{i}.jpg"), vec![0; 128])
                 .await;
@@ -3756,7 +3824,7 @@ mod tests {
 
     #[tokio::test]
     async fn walk_convert_s3_zero_src_head_and_resume_skip() {
-        let s3 = MockS3Server::start("walk-s3", "cos-bucket").await;
+        let s3 = MockS3Server::start("cos-bucket").await;
         s3.put_raw("AuthorX PostA/照片 1.png", make_png(10, 8, [100, 120, 140]))
             .await;
         s3.put_raw("AuthorX PostA/pic2.bin", make_png(14, 10, [40, 80, 160]))
@@ -3815,7 +3883,7 @@ mod tests {
 
     #[tokio::test]
     async fn pull_convert_base64_json_r2_events_and_journal_recovery() {
-        let s3 = MockS3Server::start("pull-ok", "my-bucket").await;
+        let s3 = MockS3Server::start("my-bucket").await;
         s3.put_raw("Post1/img_a.png", make_png(8, 6, [10, 20, 30]))
             .await;
         s3.put_raw("Post1/img_b.bin", make_png(10, 12, [40, 50, 60]))
@@ -3939,7 +4007,7 @@ mod tests {
 
     #[tokio::test]
     async fn exhausted_retry_drains_later_unicode_upload_and_preserves_journal() {
-        let s3 = MockS3Server::start("pull-exhausted", "my-bucket").await;
+        let s3 = MockS3Server::start("my-bucket").await;
         let bad_key = "相册/bad.png";
         let good_key = "相册/照片 1";
         s3.put_raw(bad_key, b"invalid image".to_vec()).await;
@@ -4011,7 +4079,7 @@ mod tests {
 
     #[tokio::test]
     async fn pull_convert_ack_warnings_drains_acks_and_requeues_unstarted() {
-        let s3 = MockS3Server::start("pull-warn", "my-bucket").await;
+        let s3 = MockS3Server::start("my-bucket").await;
         for i in 0..6 {
             s3.put_raw(&format!("Album/p{i}.png"), make_png(8, 8, [i * 20, 50, 90]))
                 .await;
@@ -4117,7 +4185,7 @@ mod tests {
 
     #[tokio::test]
     async fn collision_and_stale_version_overwrite_protection() {
-        let s3 = MockS3Server::start("collision-stale", "my-bucket").await;
+        let s3 = MockS3Server::start("my-bucket").await;
         let jpg = "相册 100%/照片.jpg";
         let png = "相册 100%/照片.png";
         s3.put_raw(jpg, make_png(8, 6, [10, 20, 30]))
@@ -4221,7 +4289,7 @@ mod tests {
 
     #[tokio::test]
     async fn pull_convert_cancellation_exits_nonzero_in_oneshot_and_ok_in_daemon() {
-        let s3 = MockS3Server::start("pull-cancel", "my-bucket").await;
+        let s3 = MockS3Server::start("my-bucket").await;
         s3.put_raw("Album/c1.png", make_png(8, 6, [1, 2, 3])).await;
         let op = s3.operator();
 
