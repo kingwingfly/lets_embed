@@ -119,22 +119,24 @@ transaction's sender matches this linked address.
 
 2. Set `SIWE_DOMAIN` to your public gallery hostname. Configure `RPC_URL`, `CHAIN_ID` and `SOL_RPC_URL` for your deployment. Fresh deployments start with deposits closed. Enter your receiving addresses in **Payments & credits**. Upgrades retain existing `DEPOSIT_ADDRESS` and `SOL_DEPOSIT_ADDRESS` variables through Wrangler’s `keep_vars` setting. Verify those addresses on the dashboard before the first save, which records the original recipients for historical payments.
 3. Protect the public gateway's `/user/admin` path and descendants with an administrator-only Access policy. Put its audience in **gateway_worker/wrangler.toml**. The gateway calls this Worker through the dedicated admin service binding. [Gateway Access setup](../gateway_worker/README.md#cloudflare-access-and-deployment)
-4. From the repository root, apply the schema before deploying. These files can also upgrade installations originally provisioned with `wrangler d1 execute`.
+4. From the repository root, run `npm ci` to install the pinned Wrangler. For a fresh D1 database, apply `0001_users.sql` first. An existing wallet site with the `users`, `payments` and `likes` tables can start at `0002_site_settings.sql`. This migration adds the settings table and seeds revision 0. It is safe to rerun.
 
    ```sh
    npx wrangler d1 execute lets-embed --config user_worker/wrangler.toml --remote --file user_worker/migrations/0001_users.sql
    npx wrangler d1 execute lets-embed --config user_worker/wrangler.toml --remote --file user_worker/migrations/0002_site_settings.sql
+   npx wrangler d1 execute lets-embed --config user_worker/wrangler.toml --remote --command 'SELECT MAX(revision) AS revision FROM site_settings'
    ```
 
 5. New deployments need the same `JWT_SECRET` in both Workers. Upgrades reuse the existing secret. Set the gateway’s upstream service token as described in its README.
 6. Deploy the user Worker first, then the gateway. Run both commands from the repository root.
 
    ```sh
-   npx wrangler --cwd user_worker deploy
-   npx wrangler --cwd gateway_worker deploy
+   npx wrangler deploy --cwd user_worker
+   npx wrangler deploy --cwd gateway_worker
    ```
 
-7. Visit `/user/admin` via the gateway and choose **View gallery** to browse as an administrator without a wallet. Check the published guest policy in a private browser window.
+7. Open `/user/admin` from the public gallery hostname. On an upgrade, verify that each chain accepting payments shows its existing receiving address. If an address is unexpectedly blank or wrong, restore its legacy variable on the user Worker and reload before the first save. The first save snapshots those variables for transfers made before the change.
+8. Leave **Require a wallet** selected for the first save. Choose **View gallery** to check admin browsing without a wallet, then verify a customer account and a signed-out private window. To enable guest browsing, select **Public browsing**, set **Image views → Free per day** to a positive number or `-1` for unlimited, choose any free media folders, and save. To close public browsing again, select **Require a wallet** and save.
 
 ## Limitations
 
