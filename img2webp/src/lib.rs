@@ -256,6 +256,53 @@ struct AckResult {
 #[derive(Debug)]
 struct AckOutcome {
     complete: bool,
+    exhausted_retries: usize,
+    max_retry_delay_secs: Option<u64>,
+}
+
+impl AckResult {
+    fn outcome(&self, req: &AckRequest) -> AckOutcome {
+        let mut exhausted_retries = 0;
+        let mut max_retry_delay_secs = None;
+        for retry in &req.retries {
+            let warning = self.warnings.get(&retry.lease_id).and_then(|v| v.as_str());
+            if warning == Some("Message has exhausted maxRetries") {
+                exhausted_retries += 1;
+            } else {
+                max_retry_delay_secs =
+                    Some(retry.delay_seconds.max(max_retry_delay_secs.unwrap_or(0)));
+            }
+        }
+
+        if exhausted_retries > 0 {
+            tracing::warn!(
+                exhausted_retries,
+                "Cloudflare queue messages reached the retry limit"
+            );
+        }
+        // Each exhausted lease can explain one missing retry in the response counts.
+        let complete = self.warnings.len() == exhausted_retries
+            && self.ack_count.is_none_or(|n| n >= req.acks.len())
+            && self
+                .retry_count
+                .is_none_or(|n| n >= req.retries.len() - exhausted_retries);
+        if !complete {
+            tracing::warn!(
+                sent_acks = req.acks.len(),
+                ack_count = ?self.ack_count,
+                sent_retries = req.retries.len(),
+                retry_count = ?self.retry_count,
+                warning_count = self.warnings.len(),
+                exhausted_retries,
+                "cloudflare queue ack had warnings or short counts"
+            );
+        }
+        AckOutcome {
+            complete,
+            exhausted_retries,
+            max_retry_delay_secs,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -398,7 +445,7 @@ pub async fn walk_convert_prefix_with_concurrency(
         .buffer_unordered(concurrency)
         .inspect_err(move |e| {
             err_item.fetch_add(1, Ordering::Relaxed);
-            tracing::error!(error = %e, "scan item conversion failed");
+            tracing::error!(error = %format_args!("{e:#}"), "scan item conversion failed");
         })
         .filter_map(async |res| res.ok());
 
@@ -565,6 +612,7 @@ async fn pull_convert_inner(
     let mut retry_wait_until: Option<Instant> = None;
     let mut retry_not_before: Option<Instant> = None;
     let mut settle_rounds: u8 = 0;
+    let mut exhausted_retries = 0usize;
 
     let io_concurrency = cfg.concurrency;
     let byte_sem = Arc::new(Semaphore::new(SOURCE_BYTE_BUDGET));
@@ -669,18 +717,15 @@ async fn pull_convert_inner(
                     tracing::warn!(
                         id = %msg_id,
                         attempts = msg.attempts,
+                        content_type = message_content_type(&msg).unwrap_or("<none>"),
+                        meta_keys = ?msg.metadata.keys().collect::<Vec<_>>(),
+                        body_preview = %body_preview(&msg.body),
                         "unrecognized or unsafe queue message payload; scheduling retry"
                     );
                     retries.push(RetryLease {
                         lease_id: msg.lease_id,
                         delay_seconds: RETRY_DELAY_SECS,
                     });
-                    if !cfg.daemon {
-                        update_max_deadline(
-                            &mut retry_wait_until,
-                            Instant::now() + Duration::from_secs(RETRY_DELAY_SECS + 2),
-                        );
-                    }
                 }
                 MessageAction::Convert(key) => {
                     if !should_convert_path(&key) {
@@ -712,7 +757,7 @@ async fn pull_convert_inner(
         let mut journal_err: Option<anyhow::Error> = None;
         let mut ack_fatal_err: Option<anyhow::Error> = None;
         let mut ack_transient_err: Option<anyhow::Error> = None;
-        let mut incomplete_batch_err: Option<anyhow::Error> = None;
+        let mut incomplete_batch = false;
         let mut transient_ack_abort = false;
         let mut active_ack: Option<tokio::task::JoinHandle<AckTaskResult>> = None;
 
@@ -741,7 +786,7 @@ async fn pull_convert_inner(
         loop {
             if !stopping && (cancel.is_cancelled() || Instant::now() >= deadline) {
                 stopping = true;
-                requeue_unstarted(&mut pending, &mut retries, !cfg.daemon, &mut retry_wait_until);
+                requeue_unstarted(&mut pending, &mut retries);
             }
 
             if !stopping {
@@ -756,12 +801,7 @@ async fn pull_convert_inner(
                 }
                 if cancel.is_cancelled() || Instant::now() >= deadline {
                     stopping = true;
-                    requeue_unstarted(
-                        &mut pending,
-                        &mut retries,
-                        !cfg.daemon,
-                        &mut retry_wait_until,
-                    );
+                    requeue_unstarted(&mut pending, &mut retries);
                 }
             }
 
@@ -786,12 +826,7 @@ async fn pull_convert_inner(
                             journal_err = Some(e);
                         }
                         stopping = true;
-                        requeue_unstarted(
-                            &mut pending,
-                            &mut retries,
-                            !cfg.daemon,
-                            &mut retry_wait_until,
-                        );
+                        requeue_unstarted(&mut pending, &mut retries);
                         for a in acks.drain(..) {
                             retries.push(RetryLease {
                                 lease_id: a.lease_id,
@@ -870,17 +905,18 @@ async fn pull_convert_inner(
                             acks.push(AckLease { lease_id });
                         }
                         Err(e) => {
-                            tracing::error!(id = %id, %key, attempts, error = %e, "conversion failed; scheduling retry");
+                            tracing::error!(
+                                cause = %e.root_cause(),
+                                id = %id,
+                                attempts,
+                                error = %format_args!("{e:#}"),
+                                %key,
+                                "conversion failed; scheduling retry"
+                            );
                             retries.push(RetryLease {
                                 lease_id,
                                 delay_seconds: RETRY_DELAY_SECS,
                             });
-                            if !cfg.daemon {
-                                update_max_deadline(
-                                    &mut retry_wait_until,
-                                    Instant::now() + Duration::from_secs(RETRY_DELAY_SECS + 2),
-                                );
-                            }
                         }
                     }
                 }
@@ -891,19 +927,19 @@ async fn pull_convert_inner(
                             if let Some(rnb) = task_rnb {
                                 update_max_deadline(&mut retry_not_before, rnb);
                             }
-                            if !outcome.complete && !cfg.daemon {
-                                if incomplete_batch_err.is_none() {
-                                    incomplete_batch_err = Some(anyhow::anyhow!(
-                                        "cloudflare queue ack had warnings or short counts"
-                                    ));
+                            if !cfg.daemon {
+                                exhausted_retries += outcome.exhausted_retries;
+                                if let Some(delay) = outcome.max_retry_delay_secs {
+                                    update_max_deadline(
+                                        &mut retry_wait_until,
+                                        Instant::now() + Duration::from_secs(delay + 2),
+                                    );
                                 }
-                                stopping = true;
-                                requeue_unstarted(
-                                    &mut pending,
-                                    &mut retries,
-                                    !cfg.daemon,
-                                    &mut retry_wait_until,
-                                );
+                                if !outcome.complete {
+                                    incomplete_batch = true;
+                                    stopping = true;
+                                    requeue_unstarted(&mut pending, &mut retries);
+                                }
                             }
                         }
                         Ok((task_rnb, Err(ApiError::Transient(err, maybe_rnb)))) => {
@@ -924,12 +960,7 @@ async fn pull_convert_inner(
                             }
                             ack_disabled = true;
                             stopping = true;
-                            requeue_unstarted(
-                                &mut pending,
-                                &mut retries,
-                                !cfg.daemon,
-                                &mut retry_wait_until,
-                            );
+                            requeue_unstarted(&mut pending, &mut retries);
                         }
                         Ok((task_rnb, Err(ApiError::Fatal(err)))) => {
                             if let Some(rnb) = task_rnb {
@@ -940,12 +971,7 @@ async fn pull_convert_inner(
                             }
                             ack_disabled = true;
                             stopping = true;
-                            requeue_unstarted(
-                                &mut pending,
-                                &mut retries,
-                                !cfg.daemon,
-                                &mut retry_wait_until,
-                            );
+                            requeue_unstarted(&mut pending, &mut retries);
                         }
                         Err(e) => {
                             if ack_fatal_err.is_none() {
@@ -953,12 +979,7 @@ async fn pull_convert_inner(
                             }
                             ack_disabled = true;
                             stopping = true;
-                            requeue_unstarted(
-                                &mut pending,
-                                &mut retries,
-                                !cfg.daemon,
-                                &mut retry_wait_until,
-                            );
+                            requeue_unstarted(&mut pending, &mut retries);
                         }
                     }
                 }
@@ -969,7 +990,7 @@ async fn pull_convert_inner(
                 _ = tokio::time::sleep_until(deadline), if !stopping => {
                     tracing::warn!("batch approaching visibility timeout, requeuing unstarted leases");
                     stopping = true;
-                    requeue_unstarted(&mut pending, &mut retries, !cfg.daemon, &mut retry_wait_until);
+                    requeue_unstarted(&mut pending, &mut retries);
                 }
             }
         }
@@ -992,9 +1013,8 @@ async fn pull_convert_inner(
                 acks: Vec::new(),
                 retries: std::mem::take(&mut retries),
             };
-            let len_retries = release_req.retries.len();
             if let Err(ApiError::Transient(_, Some(ra))) =
-                ack_once(&http, &ack_url, &release_req, 0, len_retries).await
+                ack_once(&http, &ack_url, &release_req).await
             {
                 update_max_deadline(&mut retry_not_before, Instant::now() + ra);
             }
@@ -1018,8 +1038,8 @@ async fn pull_convert_inner(
             }
             bail!("transient ack failure aborted queue batch");
         }
-        if let Some(err) = incomplete_batch_err {
-            return Err(err);
+        if incomplete_batch {
+            bail!("cloudflare queue ack had warnings or short counts");
         }
     }
 
@@ -1029,6 +1049,9 @@ async fn pull_convert_inner(
 
     if !cfg.daemon && cancel.is_cancelled() {
         bail!("queue pull interrupted by signal");
+    }
+    if exhausted_retries > 0 {
+        bail!("queue drained with failed messages (exhausted_retries={exhausted_retries})");
     }
 
     if let Some(jp) = &journal_path {
@@ -1045,8 +1068,6 @@ fn update_max_deadline(slot: &mut Option<Instant>, candidate: Instant) {
 fn requeue_unstarted(
     pending: &mut std::vec::IntoIter<(String, String, u32, String)>,
     retries: &mut Vec<RetryLease>,
-    track_wait: bool,
-    retry_wait_until: &mut Option<Instant>,
 ) {
     let count = pending.len();
     if count > 0 {
@@ -1056,9 +1077,6 @@ fn requeue_unstarted(
                 lease_id,
                 delay_seconds: 0,
             });
-        }
-        if track_wait {
-            update_max_deadline(retry_wait_until, Instant::now() + Duration::from_secs(2));
         }
     }
 }
@@ -1224,13 +1242,11 @@ async fn ack_messages(
     req: &AckRequest,
     retry_not_before: &mut Option<Instant>,
 ) -> Result<AckOutcome, ApiError> {
-    let sent_acks = req.acks.len();
-    let sent_retries = req.retries.len();
     let max_attempts = 3usize;
     let mut last_err: Option<ApiError> = None;
 
     for attempt in 0..max_attempts {
-        match ack_once(http, ack_url, req, sent_acks, sent_retries).await {
+        match ack_once(http, ack_url, req).await {
             Ok(outcome) => return Ok(outcome),
             Err(ApiError::Fatal(e)) => return Err(ApiError::Fatal(e)),
             Err(ApiError::Transient(e, retry_after)) => {
@@ -1254,8 +1270,6 @@ async fn ack_once(
     http: &reqwest::Client,
     ack_url: &str,
     req: &AckRequest,
-    sent_acks: usize,
-    sent_retries: usize,
 ) -> Result<AckOutcome, ApiError> {
     let resp = http
         .post(ack_url)
@@ -1288,26 +1302,7 @@ async fn ack_once(
         )));
     }
 
-    let mut complete = true;
-    if let Some(res) = env.result {
-        if !res.warnings.is_empty() {
-            complete = false;
-            tracing::warn!(warnings = ?res.warnings, "cloudflare queue ack warnings");
-        }
-        if matches!(res.ack_count, Some(c) if c < sent_acks)
-            || matches!(res.retry_count, Some(c) if c < sent_retries)
-        {
-            complete = false;
-            tracing::warn!(
-                sent_acks,
-                ack_count = ?res.ack_count,
-                sent_retries,
-                retry_count = ?res.retry_count,
-                "cloudflare queue ack partially applied"
-            );
-        }
-    }
-    Ok(AckOutcome { complete })
+    Ok(env.result.unwrap_or_default().outcome(req))
 }
 
 #[derive(Clone, Debug)]
@@ -1358,25 +1353,27 @@ enum ConvertOutcome {
     SkippedNoMeta,
 }
 
-fn check_dst_collision(dst_meta: &Metadata, path: &str, new_path: &str) -> anyhow::Result<()> {
-    if let Some(existing_src) = dst_meta.user_metadata().and_then(|um| um.get("source-key"))
-        && existing_src != path
-    {
-        bail!(
-            "destination collision for {new_path}: owned by {existing_src}, refusing overwrite by {path}"
-        );
-    }
-    Ok(())
-}
-
-fn dst_matches_source(dst_meta: &Metadata, path: &str, src_id: &SourceIdentity) -> bool {
-    let Some(src_etag) = src_id.etag.as_deref() else {
-        return false;
-    };
+/// A destination's source ETag is usable only after checking which key owns it.
+fn destination_source_etag<'a>(
+    dst_meta: &'a Metadata,
+    path: &str,
+    new_path: &str,
+) -> anyhow::Result<Option<&'a str>> {
     let Some(um) = dst_meta.user_metadata() else {
-        return false;
+        return Ok(None);
     };
-    um.get("source-key") == Some(path) && um.get("source-etag") == Some(src_etag)
+    let matches = match (um.get("source-key"), um.get("source-key-encoding")) {
+        (None, None) => return Ok(None),
+        (Some(key), None) => key == path,
+        (Some(key), Some("base64")) => {
+            key == base64::engine::general_purpose::STANDARD.encode(path)
+        }
+        _ => bail!("invalid source-key metadata for {new_path}"),
+    };
+    if !matches {
+        bail!("destination collision for {new_path}: source key metadata does not match {path}");
+    }
+    Ok(um.get("source-etag"))
 }
 
 enum ReadSourceOutcome {
@@ -1508,8 +1505,18 @@ async fn publish_and_cleanup(
     let caps = dst_op.info().capability();
     let buf_webp = opendal::Buffer::from(webp_bytes);
     let make_user_meta = || {
-        let mut um = Vec::with_capacity(4);
-        um.push(("source-key".to_string(), path.to_string()));
+        let mut um = Vec::with_capacity(5);
+        // Keep the legacy header when signing and HTTP whitespace normalization preserve it.
+        let header_safe = path
+            .split(' ')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_graphic()));
+        let source_key = if header_safe {
+            path.to_owned()
+        } else {
+            um.push(("source-key-encoding".to_string(), "base64".to_string()));
+            base64::engine::general_purpose::STANDARD.encode(path)
+        };
+        um.push(("source-key".to_string(), source_key));
         if let Some(etag) = &src_id.etag {
             um.push(("source-etag".to_string(), etag.clone()));
         }
@@ -1566,8 +1573,8 @@ async fn publish_and_cleanup(
     if !published
         && let Some(ref dst_meta) = existing_dst
     {
-        check_dst_collision(dst_meta, path, new_path)?;
-        if !dst_matches_source(dst_meta, path, src_id) {
+        let stored_etag = destination_source_etag(dst_meta, path, new_path)?;
+        if stored_etag.is_none() || stored_etag != src_id.etag.as_deref() {
             let current_src = src_op.stat(path).await.with_context(|| {
                 format!("source object {path} disappeared before overwriting {new_path}")
             })?;
@@ -1664,12 +1671,13 @@ async fn convert_object(
     let (new_path, meta_key) = target_paths(path);
 
     let existing_dst = match dst_op.stat(&new_path).await {
-        Ok(m) => {
-            check_dst_collision(&m, path, &new_path)?;
-            Some(m)
-        }
+        Ok(m) => Some(m),
         Err(e) if e.kind() == ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
+    };
+    let stored_etag = match &existing_dst {
+        Some(m) => destination_source_etag(m, path, &new_path)?,
+        None => None,
     };
 
     let mut src_id = if let Some(m) = list_meta.filter(|m| m.etag().is_some()) {
@@ -1697,8 +1705,8 @@ async fn convert_object(
         }
     };
 
-    if let Some(ref dst_meta) = existing_dst
-        && dst_matches_source(dst_meta, path, &src_id)
+    if let (Some(dst_meta), Some(etag)) = (&existing_dst, stored_etag)
+        && Some(etag) == src_id.etag.as_deref()
     {
         let size = if collect_meta {
             Some(recover_webp_dimensions(dst_op, &new_path, dst_meta).await?)
@@ -1776,6 +1784,7 @@ async fn convert_object(
 
 fn is_exact_opendal_key(key: &str) -> bool {
     !key.is_empty()
+        && key.trim() == key
         && !key.starts_with('/')
         && !key.ends_with('/')
         && !key.contains("//")
@@ -1783,32 +1792,92 @@ fn is_exact_opendal_key(key: &str) -> bool {
         && !key.split('/').any(|seg| seg == "." || seg == "..")
 }
 
+fn message_content_type(msg: &QueueMessage) -> Option<&str> {
+    msg.metadata
+        .iter()
+        .find(|(k, _)| {
+            ["CF-Content-Type", "contentType", "content_type"]
+                .iter()
+                .any(|name| k.eq_ignore_ascii_case(name))
+        })
+        .and_then(|(_, v)| v.as_str())
+}
+
+/// Standard base64, falling back to unpadded.
+fn decode_base64_flex(s: &str) -> Option<Vec<u8>> {
+    let t = s.trim();
+    base64::engine::general_purpose::STANDARD
+        .decode(t)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(t.trim_end_matches('=')))
+        .ok()
+}
+
+/// Char-safe preview of at most `max` chars.
+fn preview(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+/// Diagnostic preview of a message body (plus decoded text if it is base64 UTF-8).
+fn body_preview(body: &serde_json::Value) -> String {
+    let text = match body {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let mut out = preview(&text, 120);
+    if let serde_json::Value::String(s) = body
+        && let Some(raw) = decode_base64_flex(s)
+    {
+        match std::str::from_utf8(&raw) {
+            Ok(t) => out.push_str(&format!(" | decoded_utf8={}", preview(t, 120))),
+            Err(_) => out.push_str(&format!(" | decoded_bytes={}", raw.len())),
+        }
+    }
+    out
+}
+
+/// Classifies a string body that may be raw JSON, base64 JSON, or a plain key.
+fn classify_string_body(s: &str, expected_bucket: Option<&str>) -> MessageAction {
+    if !s.trim_start().starts_with('{')
+        && let Some(raw) = decode_base64_flex(s)
+        && let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(&raw)
+        && (map.contains_key("key") || map.contains_key("object") || map.contains_key("action"))
+    {
+        return classify_object_map(&map, expected_bucket);
+    }
+    classify_text_payload(s, expected_bucket)
+}
+
 fn decode_and_classify_message(
     msg: &QueueMessage,
     expected_bucket: Option<&str>,
 ) -> MessageAction {
-    let content_type = msg
-        .metadata
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("CF-Content-Type"))
-        .and_then(|(_, v)| v.as_str());
+    let content_type = message_content_type(msg);
 
     match content_type {
         Some(ct) if ct.eq_ignore_ascii_case("json") => match &msg.body {
-            serde_json::Value::String(b64) => {
-                let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else {
+            serde_json::Value::String(s) => {
+                if matches!(s.trim_start().chars().next(), Some('{' | '"')) {
+                    let Ok(val) = serde_json::from_str::<serde_json::Value>(s) else {
+                        return MessageAction::Malformed;
+                    };
+                    return classify_decoded_value(&val, expected_bucket);
+                }
+                let Some(raw) = decode_base64_flex(s) else {
                     return MessageAction::Malformed;
                 };
-                let Ok(val) = serde_json::from_slice::<serde_json::Value>(&raw) else {
-                    return MessageAction::Malformed;
-                };
-                classify_decoded_value(&val, expected_bucket)
+                match serde_json::from_slice::<serde_json::Value>(&raw) {
+                    Ok(val) => classify_decoded_value(&val, expected_bucket),
+                    Err(_) if raw.first() == Some(&0xFF) => {
+                        classify_v8_payload(&raw, expected_bucket)
+                    }
+                    Err(_) => MessageAction::Malformed,
+                }
             }
             other => classify_decoded_value(other, expected_bucket),
         },
         Some(ct) if ct.eq_ignore_ascii_case("bytes") => match &msg.body {
             serde_json::Value::String(b64) => {
-                let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) else {
+                let Some(raw) = decode_base64_flex(b64) else {
                     return MessageAction::Malformed;
                 };
                 let Ok(text) = String::from_utf8(raw) else {
@@ -1818,9 +1887,229 @@ fn decode_and_classify_message(
             }
             _ => MessageAction::Malformed,
         },
-        Some(ct) if ct.eq_ignore_ascii_case("v8") => MessageAction::Malformed,
+        Some(ct) if ct.eq_ignore_ascii_case("v8") => match &msg.body {
+            serde_json::Value::String(b64) => {
+                let Some(raw) = decode_base64_flex(b64) else {
+                    return MessageAction::Malformed;
+                };
+                classify_v8_payload(&raw, expected_bucket)
+            }
+            _ => MessageAction::Malformed,
+        },
         Some(ct) if !ct.eq_ignore_ascii_case("text") => MessageAction::Malformed,
-        _ => classify_decoded_value(&msg.body, expected_bucket),
+        _ => match &msg.body {
+            serde_json::Value::String(s) => classify_string_body(s, expected_bucket),
+            other => classify_decoded_value(other, expected_bucket),
+        },
+    }
+}
+
+/// Upper bound on nesting when skipping unrelated V8 values inside a task object.
+const V8_MAX_DEPTH: usize = 4;
+/// Upper bound on a single V8 header version varint (Blink and V8 versions are small).
+const V8_MAX_VERSION: u64 = 64;
+
+/// Result of decoding a `CF-Content-Type: v8` queue payload.
+#[derive(Debug, PartialEq, Eq)]
+enum V8TaskKey {
+    /// `"key"` property of a JS `Object` / `Map` (e.g. `WebpTask { key }` via `serde_wasm_bindgen`).
+    Field(String),
+    /// A bare JS string at the root (`queue.send(key)`).
+    Bare(String),
+}
+
+/// Bounds-checked cursor over a V8 `ValueSerializer` buffer.
+struct V8Reader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> V8Reader<'a> {
+    fn peek(&self) -> Option<u8> {
+        self.buf.get(self.pos).copied()
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        let b = self.peek()?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let out = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(out)
+    }
+
+    /// Base-128 little-endian varint (max 10 bytes, overflow rejected).
+    fn varint(&mut self) -> Option<u64> {
+        let mut value: u64 = 0;
+        for i in 0..10u32 {
+            let b = self.byte()?;
+            let chunk = u64::from(b & 0x7F);
+            let shift = 7 * i;
+            if shift == 63 && chunk > 1 {
+                return None;
+            }
+            value |= chunk << shift;
+            if b & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn len(&mut self) -> Option<usize> {
+        usize::try_from(self.varint()?).ok()
+    }
+
+    /// Next tag, skipping `kPadding` (0x00) and `kVerifyObjectCount` ('?' + varint).
+    fn tag(&mut self) -> Option<u8> {
+        loop {
+            match self.byte()? {
+                0x00 => {}
+                b'?' => {
+                    self.varint()?;
+                }
+                t => return Some(t),
+            }
+        }
+    }
+
+    /// Reads a string body for a string tag; `None` for non-string tags or invalid data.
+    fn string(&mut self, tag: u8) -> Option<String> {
+        match tag {
+            // kOneByteString: Latin-1
+            b'"' => {
+                let n = self.len()?;
+                Some(self.take(n)?.iter().map(|&b| char::from(b)).collect())
+            }
+            // kUtf8String
+            b'S' => {
+                let n = self.len()?;
+                String::from_utf8(self.take(n)?.to_vec()).ok()
+            }
+            // kTwoByteString: UTF-16LE
+            b'c' => {
+                let n = self.len()?;
+                if n % 2 != 0 {
+                    return None;
+                }
+                let units: Vec<u16> = self
+                    .take(n)?
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&c| u16::from_le_bytes(c))
+                    .collect();
+                String::from_utf16(&units).ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Skips one value of a small, safe subset of V8 tags.
+    fn skip_value(&mut self, tag: u8, depth: usize) -> Option<()> {
+        match tag {
+            b'"' | b'S' | b'c' => self.string(tag).map(drop),
+            b'_' | b'0' | b'T' | b'F' => Some(()),
+            b'I' | b'U' => self.varint().map(drop),
+            b'N' => self.take(8).map(drop),
+            b'o' | b';' => {
+                if depth >= V8_MAX_DEPTH {
+                    return None;
+                }
+                self.container_key(tag, depth + 1).map(drop)
+            }
+            _ => None,
+        }
+    }
+
+    /// Reads a JS `Object` (`o` … `{` n) or `Map` (`;` … `:` 2n) and returns its `"key"` string
+    /// property, if any. Rejects non-string `"key"` values, duplicate `"key"`s and bad counts.
+    fn container_key(&mut self, open: u8, depth: usize) -> Option<Option<String>> {
+        let (close, per_entry) = match open {
+            b'o' => (b'{', 1u64),
+            b';' => (b':', 2u64),
+            _ => return None,
+        };
+        let mut found: Option<String> = None;
+        let mut entries: u64 = 0;
+        loop {
+            let tag = self.tag()?;
+            if tag == close {
+                let count = self.varint()?;
+                return (count == entries.checked_mul(per_entry)?).then_some(found);
+            }
+            let name = match tag {
+                b'"' | b'S' | b'c' => Some(self.string(tag)?),
+                b'I' | b'U' => {
+                    self.varint()?;
+                    None
+                }
+                b'N' => {
+                    self.take(8)?;
+                    None
+                }
+                _ => return None,
+            };
+            let value_tag = self.tag()?;
+            if name.as_deref() == Some("key") {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(self.string(value_tag)?);
+            } else {
+                self.skip_value(value_tag, depth)?;
+            }
+            entries = entries.checked_add(1)?;
+        }
+    }
+}
+
+/// Decodes a `CF-Content-Type: v8` (V8 `ValueSerializer`, optionally wrapped in a Blink/Workers
+/// envelope) queue payload produced by e.g. `workers-rs` `QueueContentType::V8`.
+///
+/// Accepts one or two `0xFF <varint version>` headers (Blink + V8), an optional Blink trailer
+/// offset record (`0xFE` + 12 bytes), then a root JS `Object`/`Map` carrying a string `"key"`, or
+/// a bare root string. Everything is bounds-checked; anything else yields `None`.
+fn decode_v8_webp_task_key(raw: &[u8]) -> Option<V8TaskKey> {
+    let mut r = V8Reader { buf: raw, pos: 0 };
+    let mut headers = 0;
+    while r.peek() == Some(0xFF) {
+        if headers == 2 {
+            return None;
+        }
+        r.pos += 1;
+        let version = r.varint()?;
+        if version == 0 || version > V8_MAX_VERSION {
+            return None;
+        }
+        headers += 1;
+        if r.peek() == Some(0xFE) {
+            r.pos += 1;
+            r.take(12)?;
+        }
+    }
+    if headers == 0 {
+        return None;
+    }
+    let tag = r.tag()?;
+    match tag {
+        b'"' | b'S' | b'c' => r.string(tag).map(V8TaskKey::Bare),
+        b'o' | b';' => r.container_key(tag, 0)?.map(V8TaskKey::Field),
+        _ => None,
+    }
+}
+
+fn classify_v8_payload(raw: &[u8], expected_bucket: Option<&str>) -> MessageAction {
+    match decode_v8_webp_task_key(raw) {
+        Some(V8TaskKey::Bare(s)) => classify_text_payload(&s, expected_bucket),
+        Some(V8TaskKey::Field(key)) if !key.trim().is_empty() && is_exact_opendal_key(&key) => {
+            MessageAction::Convert(key)
+        }
+        _ => MessageAction::Malformed,
     }
 }
 
@@ -2111,9 +2400,16 @@ mod tests {
             MessageAction::Convert("post/photo 3".to_string())
         );
         assert_eq!(
-            classify_decoded_value(&serde_json::json!("post/photo 4 "), None),
-            MessageAction::Convert("post/photo 4 ".to_string())
+            classify_decoded_value(&serde_json::json!("post/photo 4"), None),
+            MessageAction::Convert("post/photo 4".to_string())
         );
+        // OpenDAL trims outer whitespace before every operation, including deletion.
+        for key in ["post/photo 4 ", "\u{3000}相册/照片"] {
+            assert_eq!(
+                classify_decoded_value(&serde_json::json!(key), None),
+                MessageAction::Malformed
+            );
+        }
         assert_eq!(
             classify_decoded_value(&serde_json::json!("post//photo.jpg"), None),
             MessageAction::Malformed
@@ -2173,6 +2469,242 @@ mod tests {
         .unwrap();
         assert_eq!(
             decode_and_classify_message(&msg_v8, None),
+            MessageAction::Malformed
+        );
+    }
+
+    fn v8_one_byte(s: &[u8]) -> Vec<u8> {
+        let mut out = vec![b'"', u8::try_from(s.len()).unwrap()];
+        out.extend_from_slice(s);
+        out
+    }
+
+    fn v8_two_byte(s: &str) -> Vec<u8> {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        let mut out = vec![b'c', u8::try_from(units.len() * 2).unwrap()];
+        for u in units {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        out
+    }
+
+    fn v8_msg(raw: &[u8]) -> QueueMessage {
+        serde_json::from_value(serde_json::json!({
+            "lease_id": "lease-v8",
+            "metadata": { "CF-Content-Type": "v8" },
+            "body": base64::engine::general_purpose::STANDARD.encode(raw)
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn v8_blink_envelope_map_with_utf16_cjk_key_and_padding() {
+        let key = "コスプレ 写真集 Vol.1/photo 1";
+        // Blink header (0xFF 0x14) + V8 header (0xFF 0x0F) + JS Map.
+        let mut raw = vec![0xFF, 0x14, 0xFF, 0x0F, b';'];
+        raw.extend(v8_one_byte(b"key"));
+        raw.push(0x00); // kPadding aligning the two-byte string
+        raw.extend(v8_two_byte(key));
+        raw.extend([b':', 2]);
+        assert_eq!(
+            decode_v8_webp_task_key(&raw),
+            Some(V8TaskKey::Field(key.to_string()))
+        );
+        assert_eq!(
+            decode_and_classify_message(&v8_msg(&raw), None),
+            MessageAction::Convert(key.to_string())
+        );
+
+        // Blink trailer-offset record (0xFE + 12 bytes) and a padded, unrelated entry are tolerated.
+        let mut raw = vec![0xFF, 0x15, 0xFE];
+        raw.extend([0u8; 12]);
+        raw.extend([0xFF, 0x0F, b';']);
+        raw.extend(v8_one_byte(b"n"));
+        raw.extend([b'I', 0x04]);
+        raw.extend([0x00, 0x00]);
+        raw.extend(v8_one_byte(b"key"));
+        raw.extend(v8_two_byte(key));
+        raw.extend([b':', 4]);
+        assert_eq!(
+            decode_and_classify_message(&v8_msg(&raw), None),
+            MessageAction::Convert(key.to_string())
+        );
+    }
+
+    #[test]
+    fn v8_single_header_object_with_latin1_key() {
+        let mut raw = vec![0xFF, 0x0F, b'o'];
+        raw.extend(v8_one_byte(b"key"));
+        raw.extend(v8_one_byte(b"caf\xe9 album/photo 2"));
+        raw.extend([b'{', 1]);
+        assert_eq!(
+            decode_v8_webp_task_key(&raw),
+            Some(V8TaskKey::Field("café album/photo 2".to_string()))
+        );
+        assert_eq!(
+            decode_and_classify_message(&v8_msg(&raw), None),
+            MessageAction::Convert("café album/photo 2".to_string())
+        );
+    }
+
+    #[test]
+    fn v8_bare_root_string() {
+        let mut raw = vec![0xFF, 0x0F, b'S', 13];
+        raw.extend_from_slice(b"album/photo 3");
+        assert_eq!(
+            decode_v8_webp_task_key(&raw),
+            Some(V8TaskKey::Bare("album/photo 3".to_string()))
+        );
+        assert_eq!(
+            decode_and_classify_message(&v8_msg(&raw), None),
+            MessageAction::Convert("album/photo 3".to_string())
+        );
+
+        let mut raw = vec![0xFF, 0x14, 0xFF, 0x0F];
+        raw.extend(v8_one_byte(b"album/photo 4"));
+        assert_eq!(
+            decode_and_classify_message(&v8_msg(&raw), None),
+            MessageAction::Convert("album/photo 4".to_string())
+        );
+    }
+
+    #[test]
+    fn json_body_variants_raw_unpadded_and_missing_content_type() {
+        let mk = |meta: serde_json::Value, body: &str| -> QueueMessage {
+            serde_json::from_value(serde_json::json!({
+                "lease_id": "l", "metadata": meta, "body": body
+            }))
+            .unwrap()
+        };
+        let want = MessageAction::Convert("album/photo 8".to_string());
+
+        // Raw JSON string under json content type (not base64).
+        let m = mk(
+            serde_json::json!({"CF-Content-Type": "json"}),
+            r#"{"key":"album/photo 8"}"#,
+        );
+        assert_eq!(decode_and_classify_message(&m, None), want);
+
+        // Unpadded base64 JSON ({"key":"album/photo 8"} is 23 bytes → padding needed).
+        let b64 = base64::engine::general_purpose::STANDARD_NO_PAD
+            .encode(br#"{"key":"album/photo 8"}"#);
+        assert!(!b64.ends_with('='));
+        let m = mk(serde_json::json!({"CF-Content-Type": "json"}), &b64);
+        assert_eq!(decode_and_classify_message(&m, None), want);
+
+        // Base64 JSON with no content-type metadata at all.
+        let b64 = base64::engine::general_purpose::STANDARD.encode(br#"{"key":"album/photo 8"}"#);
+        let m = mk(serde_json::json!({}), &b64);
+        assert_eq!(decode_and_classify_message(&m, None), want);
+
+        // Alternate metadata key spelling.
+        let m = mk(serde_json::json!({"contentType": "JSON"}), &b64);
+        assert_eq!(decode_and_classify_message(&m, None), want);
+
+        // Plain key without metadata still works; random non-JSON base64-looking name stays a key.
+        let m = mk(serde_json::json!({}), "album/photo 9");
+        assert_eq!(
+            decode_and_classify_message(&m, None),
+            MessageAction::Convert("album/photo 9".to_string())
+        );
+        let m = mk(serde_json::json!({}), "abcd");
+        assert_eq!(
+            decode_and_classify_message(&m, None),
+            MessageAction::Convert("abcd".to_string())
+        );
+
+        // v8 bytes delivered under json content type are still recovered.
+        let mut raw = vec![0xFF, 0x0F, b'o'];
+        raw.extend(v8_one_byte(b"key"));
+        raw.extend(v8_one_byte(b"album/photo 8"));
+        raw.extend([b'{', 1]);
+        let m = mk(
+            serde_json::json!({"CF-Content-Type": "json"}),
+            &base64::engine::general_purpose::STANDARD.encode(&raw),
+        );
+        assert_eq!(decode_and_classify_message(&m, None), want);
+
+        assert!(body_preview(&serde_json::json!("日本語")).starts_with("日本語"));
+    }
+
+    #[test]
+    fn v8_malformed_or_unsafe_payloads_are_rejected() {
+        let mut good = vec![0xFF, 0x0F, b'o'];
+        good.extend(v8_one_byte(b"key"));
+        good.extend(v8_one_byte(b"album/photo 5"));
+        good.extend([b'{', 1]);
+        assert!(decode_v8_webp_task_key(&good).is_some());
+
+        // Every strict truncation is rejected.
+        for n in 0..good.len() {
+            assert_eq!(decode_v8_webp_task_key(&good[..n]), None, "prefix {n}");
+        }
+
+        let cases: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0x00, 0x00, 0x00],             // padding only, no header
+            vec![b'o', b'{', 0],                // missing version header
+            vec![0xFF, 0x0F, 0xFF, 0x0F, 0xFF, 0x0F, b'_'], // too many headers
+            vec![0xFF, 0x00, b'S', 1, b'a'],    // zero version
+            vec![0xFF, 0x0F, b'S', 0x7F, b'a'], // length past end of buffer
+            vec![0xFF, 0x0F, b'S', 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F],
+            vec![0xFF, 0x0F, b'c', 3, b'a', 0, b'b'], // odd two-byte length
+            vec![0xFF, 0x0F, b'c', 2, 0x00, 0xD8],    // lone surrogate
+            vec![0xFF, 0x0F, b'S', 2, 0xC3, 0x28],    // invalid UTF-8
+            vec![0xFF, 0x0F, b'o', b'{', 0],          // object without key
+            vec![0xFF, 0x0F, b'I', 0x02],             // non-string root
+        ];
+        for raw in &cases {
+            assert_eq!(decode_v8_webp_task_key(raw), None, "{raw:?}");
+        }
+
+        // Wrong property count, non-string key value, duplicate key.
+        let mut bad_count = good.clone();
+        *bad_count.last_mut().unwrap() = 2;
+        assert_eq!(decode_v8_webp_task_key(&bad_count), None);
+
+        let mut non_string = vec![0xFF, 0x0F, b'o'];
+        non_string.extend(v8_one_byte(b"key"));
+        non_string.extend([b'I', 0x02, b'{', 1]);
+        assert_eq!(decode_v8_webp_task_key(&non_string), None);
+
+        let mut dup = vec![0xFF, 0x0F, b';'];
+        for _ in 0..2 {
+            dup.extend(v8_one_byte(b"key"));
+            dup.extend(v8_one_byte(b"album/photo 6"));
+        }
+        dup.extend([b':', 4]);
+        assert_eq!(decode_v8_webp_task_key(&dup), None);
+
+        // Structurally valid but unsafe keys are Malformed, as is non-base64 / non-string body.
+        for unsafe_key in [&b"../etc/passwd"[..], b"/abs/photo", b"a//b", b"  "] {
+            let mut raw = vec![0xFF, 0x0F, b'o'];
+            raw.extend(v8_one_byte(b"key"));
+            raw.extend(v8_one_byte(unsafe_key));
+            raw.extend([b'{', 1]);
+            assert_eq!(
+                decode_and_classify_message(&v8_msg(&raw), None),
+                MessageAction::Malformed
+            );
+        }
+        let not_b64: QueueMessage = serde_json::from_value(serde_json::json!({
+            "lease_id": "lease-v8",
+            "metadata": { "CF-Content-Type": "v8" },
+            "body": "!!not base64!!"
+        }))
+        .unwrap();
+        assert_eq!(
+            decode_and_classify_message(&not_b64, None),
+            MessageAction::Malformed
+        );
+        let not_string: QueueMessage = serde_json::from_value(serde_json::json!({
+            "lease_id": "lease-v8",
+            "metadata": { "CF-Content-Type": "v8" },
+            "body": { "key": "album/photo 7" }
+        }))
+        .unwrap();
+        assert_eq!(
+            decode_and_classify_message(&not_string, None),
             MessageAction::Malformed
         );
     }
@@ -2276,6 +2808,59 @@ mod tests {
         let dbg = format!("{cfg:?}");
         assert!(!dbg.contains("super-secret-token"));
         assert!(dbg.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn exhausted_warning_only_accounts_for_its_retry_lease() {
+        let req = AckRequest {
+            acks: vec![AckLease {
+                lease_id: "ok".into(),
+            }],
+            retries: vec![
+                RetryLease {
+                    lease_id: "failed".into(),
+                    delay_seconds: 15,
+                },
+                RetryLease {
+                    lease_id: "pending".into(),
+                    delay_seconds: 0,
+                },
+            ],
+        };
+        let mut result: AckResult = serde_json::from_value(serde_json::json!({
+            "ackCount": 1, "retryCount": 1,
+            "warnings": { "failed": "Message has exhausted maxRetries" }
+        }))
+        .unwrap();
+        for count in [1, 2] {
+            result.retry_count = Some(count);
+            let outcome = result.outcome(&req);
+            assert!(outcome.complete);
+            assert_eq!(outcome.exhausted_retries, 1);
+            assert_eq!(outcome.max_retry_delay_secs, Some(0));
+        }
+
+        result.retry_count = Some(0);
+        assert!(!result.outcome(&req).complete);
+        result.warnings.insert("pending".into(), result.warnings["failed"].clone());
+        let outcome = result.outcome(&req);
+        assert!(outcome.complete);
+        assert_eq!(outcome.exhausted_retries, 2);
+        assert_eq!(outcome.max_retry_delay_secs, None);
+        result.warnings.remove("pending");
+        result.retry_count = Some(2);
+        result.ack_count = Some(0);
+        assert!(!result.outcome(&req).complete);
+        result.ack_count = Some(1);
+        let warning = result.warnings.remove("failed").unwrap();
+        for lease in ["ok", "unknown"] {
+            result.warnings.insert(lease.into(), warning.clone());
+            let outcome = result.outcome(&req);
+            assert!(!outcome.complete);
+            assert_eq!(outcome.exhausted_retries, 0);
+            assert_eq!(outcome.max_retry_delay_secs, Some(15));
+            result.warnings.remove(lease);
+        }
     }
 
     #[test]
@@ -3092,7 +3677,7 @@ mod tests {
     #[tokio::test]
     async fn walk_convert_s3_zero_src_head_and_resume_skip() {
         let s3 = MockS3Server::start("walk-s3", "cos-bucket").await;
-        s3.put_raw("AuthorX PostA/pic1.png", make_png(10, 8, [100, 120, 140]))
+        s3.put_raw("AuthorX PostA/照片 1.png", make_png(10, 8, [100, 120, 140]))
             .await;
         s3.put_raw("AuthorX PostA/pic2.bin", make_png(14, 10, [40, 80, 160]))
             .await;
@@ -3114,6 +3699,17 @@ mod tests {
             assert_eq!(st.head_dst_count, 3);
             assert_eq!(st.get_count, 3);
             assert_eq!(st.put_count, 3);
+            let legacy = &st.objects["root_photo.webp"].user_meta;
+            assert_eq!(legacy["source-key"], "root_photo.jpg");
+            assert!(!legacy.contains_key("source-key-encoding"));
+            let encoded = &st.objects["AuthorX PostA/照片 1.webp"].user_meta;
+            assert_eq!(encoded["source-key-encoding"], "base64");
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(&encoded["source-key"])
+                    .unwrap(),
+                "AuthorX PostA/照片 1.png".as_bytes(),
+            );
         }
 
         let root_meta = metas1.iter().find(|m| m.title == "/").unwrap();
@@ -3262,6 +3858,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exhausted_retry_drains_later_unicode_upload_and_preserves_journal() {
+        let s3 = MockS3Server::start("pull-exhausted", "my-bucket").await;
+        let bad_key = "相册/bad.png";
+        let good_key = "相册/照片 1";
+        s3.put_raw(bad_key, b"invalid image".to_vec()).await;
+        s3.put_raw(good_key, make_png(12, 8, [1, 2, 3])).await;
+
+        let mut task = vec![0xff, 0x0f, b'o'];
+        task.extend(v8_one_byte(b"key"));
+        task.extend(v8_two_byte(good_key));
+        task.extend([b'{', 1]);
+        let q = MockQueueServer::start(
+            vec![
+                serde_json::json!([{ "lease_id": "failed", "body": { "key": bad_key } }]),
+                serde_json::json!([{
+                    "lease_id": "good",
+                    "metadata": { "CF-Content-Type": "v8" },
+                    "body": base64::engine::general_purpose::STANDARD.encode(task)
+                }]),
+            ],
+            Some(serde_json::json!({ "failed": "Message has exhausted maxRetries" })),
+            None,
+        )
+        .await;
+        let cfg = QueueConfig {
+            account_id: "acct".into(),
+            queue_id: "q1".into(),
+            api_token: "tok".into(),
+            batch_size: 32,
+            visibility_timeout_ms: 60_000,
+            daemon: false,
+            poll_interval: Duration::from_secs(1),
+            concurrency: 2,
+        };
+        let dir = TestDir::new("exhausted-journal");
+        let journal = dir.path().join("metas.json");
+        let op = s3.operator();
+        let err = pull_convert_inner(
+            op.clone(),
+            op.clone(),
+            cfg,
+            true,
+            &q.base_url,
+            Some(&journal),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("exhausted_retries=1"));
+        assert!(op.exists(bad_key).await.unwrap());
+        assert!(!op.exists(good_key).await.unwrap());
+        let output = op
+            .read(&format!("{good_key}.webp"))
+            .await
+            .unwrap()
+            .to_bytes();
+        let size = imagesize::blob_size(&output).unwrap();
+        assert_eq!((size.width, size.height), (12, 8));
+        assert_eq!(
+            load_journal(&journal).unwrap()["相册"].images[0].name,
+            good_key
+        );
+        let state = q.state.lock().await;
+        assert_eq!(state.received_acks.len(), 2);
+        assert!(state.received_acks[0].acks.is_empty());
+        assert_eq!(state.received_acks[0].retries[0].lease_id, "failed");
+        assert_eq!(state.received_acks[1].acks[0].lease_id, "good");
+        assert!(state.received_acks[1].retries.is_empty());
+    }
+
+    #[tokio::test]
     async fn pull_convert_ack_warnings_drains_acks_and_requeues_unstarted() {
         let s3 = MockS3Server::start("pull-warn", "my-bucket").await;
         for i in 0..6 {
@@ -3370,9 +4038,11 @@ mod tests {
     #[tokio::test]
     async fn collision_and_stale_version_overwrite_protection() {
         let s3 = MockS3Server::start("collision-stale", "my-bucket").await;
-        s3.put_raw("Album/photo.jpg", make_png(8, 6, [10, 20, 30]))
+        let jpg = "相册 100%/照片.jpg";
+        let png = "相册 100%/照片.png";
+        s3.put_raw(jpg, make_png(8, 6, [10, 20, 30]))
             .await;
-        s3.put_raw("Album/photo.png", make_png(12, 9, [40, 50, 60]))
+        s3.put_raw(png, make_png(12, 9, [40, 50, 60]))
             .await;
 
         let op = s3.operator();
@@ -3383,7 +4053,7 @@ mod tests {
         convert_object(
             &op,
             &op,
-            "Album/photo.jpg",
+            jpg,
             None,
             true,
             true,
@@ -3399,7 +4069,7 @@ mod tests {
         let col_err = convert_object(
             &op,
             &op,
-            "Album/photo.png",
+            png,
             None,
             true,
             true,
@@ -3417,7 +4087,7 @@ mod tests {
             "collision must be caught before downloading source"
         );
         assert!(
-            op.exists("Album/photo.png").await.unwrap(),
+            op.exists(png).await.unwrap(),
             "colliding source must not be deleted"
         );
 
