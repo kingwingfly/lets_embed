@@ -1,6 +1,7 @@
 {
     "scripts": {
-        "dev": "wrangler dev",
+        "dev": "wrangler dev -c wrangler.toml -c wrangler.user.toml",
+        "deploy:user": "wrangler deploy -c wrangler.user.toml",
         "deploy": "wrangler deploy"
     },
     "devDependencies": {

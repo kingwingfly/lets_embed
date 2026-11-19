@@ -112,28 +112,28 @@ transaction's sender matches this linked address.
 
 ## Setup & deployment
 
-1. Create the nonce KV namespace and put its id into `wrangler.toml`:
+1. Run `npm ci` from the repository root. For a new installation, create the nonce KV namespace and put its ID in the `NONCES` binding in `wrangler.user.toml`.
 
    ```sh
-   wrangler kv namespace create NONCES     # fill id into [[kv_namespaces]] binding = "NONCES"
+   npx wrangler kv namespace create NONCES -c wrangler.user.toml
    ```
 
-2. Set `SIWE_DOMAIN` to your public gallery hostname. Configure `RPC_URL`, `CHAIN_ID` and `SOL_RPC_URL` for your deployment. Fresh deployments start with deposits closed. Enter your receiving addresses in **Payments & credits**. Upgrades retain existing `DEPOSIT_ADDRESS` and `SOL_DEPOSIT_ADDRESS` variables through Wrangler’s `keep_vars` setting. Verify those addresses on the dashboard before the first save, which records the original recipients for historical payments.
-3. Protect the public gateway's `/user/admin` path and descendants with an administrator-only Access policy. Put its audience in **gateway_worker/wrangler.toml**. The gateway calls this Worker through the dedicated admin service binding. [Gateway Access setup](../gateway_worker/README.md#cloudflare-access-and-deployment)
-4. From the repository root, run `npm ci` to install the pinned Wrangler. For a fresh D1 database, apply `0001_users.sql` first. An existing wallet site with the `users`, `payments` and `likes` tables can start at `0002_site_settings.sql`. This migration adds the settings table and seeds revision 0. It is safe to rerun.
+2. Set `SIWE_DOMAIN` to your public gallery hostname in `wrangler.user.toml`. Configure `RPC_URL`, `CHAIN_ID` and `SOL_RPC_URL` there. Fresh deployments start with deposits closed. Enter your receiving addresses in **Payments & credits**.
+3. Protect the public gateway's `/user/admin` path and descendants with an administrator-only Access policy. Put its audience in the root `wrangler.toml`. The gateway calls the user Worker through the dedicated admin service binding. [Gateway Access setup](../gateway_worker/README.md#cloudflare-access-and-deployment)
+4. For a fresh D1 database, apply `0001_users.sql` first. An existing wallet site with the `users`, `payments` and `likes` tables can start at `0002_site_settings.sql`. This migration adds the settings table and seeds revision 0. It is safe to rerun.
 
    ```sh
-   npx wrangler d1 execute lets-embed --config user_worker/wrangler.toml --remote --file user_worker/migrations/0001_users.sql
-   npx wrangler d1 execute lets-embed --config user_worker/wrangler.toml --remote --file user_worker/migrations/0002_site_settings.sql
-   npx wrangler d1 execute lets-embed --config user_worker/wrangler.toml --remote --command 'SELECT MAX(revision) AS revision FROM site_settings'
+   npx wrangler d1 execute lets-embed -c wrangler.user.toml --remote --file user_worker/migrations/0001_users.sql
+   npx wrangler d1 execute lets-embed -c wrangler.user.toml --remote --file user_worker/migrations/0002_site_settings.sql
+   npx wrangler d1 execute lets-embed -c wrangler.user.toml --remote --command 'SELECT MAX(revision) AS revision FROM site_settings'
    ```
 
-5. New deployments need the same `JWT_SECRET` in both Workers. Upgrades reuse the existing secret. Set the gateway’s upstream service token as described in its README.
-6. Deploy the user Worker first, then the gateway. Run both commands from the repository root.
+5. New deployments need the same `JWT_SECRET` in both Workers. Run `npx wrangler secret put JWT_SECRET -c wrangler.user.toml` for the user Worker and `npx wrangler secret put JWT_SECRET` for the gateway. Upgrades reuse the existing secret. Set the gateway’s upstream service token as described in its README.
+6. Deploy the user Worker first, then the gateway. If the site still uses `DEPOSIT_ADDRESS` or `SOL_DEPOSIT_ADDRESS` and has yet to publish settings from the dashboard, add `--keep-vars` to the user Worker command until the first dashboard save imports those addresses.
 
    ```sh
-   npx wrangler deploy --cwd user_worker
-   npx wrangler deploy --cwd gateway_worker
+   npx wrangler deploy -c wrangler.user.toml
+   npx wrangler deploy
    ```
 
 7. Open `/user/admin` from the public gallery hostname. On an upgrade, verify that each chain accepting payments shows its existing receiving address. If an address is unexpectedly blank or wrong, restore its legacy variable on the user Worker and reload before the first save. The first save snapshots those variables for transfers made before the change.

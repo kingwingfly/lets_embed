@@ -7,6 +7,7 @@ models
 rustc-ice*
 .env
 .env.local
+**/.dev.vars*
 node_modules
 .wrangler
 gateway_worker/build
