@@ -11,61 +11,38 @@ const SWIPE_RATIO: f64 = 0.05;
 #[component]
 pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -> impl IntoView {
     let total = images.with_value(|v| v.len());
-    let track = NodeRef::<leptos::html::Div>::new();
-
-    let animating = RwSignal::new(false);
+    let dragging = RwSignal::new(false);
     let drag = RwSignal::new(0.0_f64);
 
     let has_prev = move || matches!(index.get(), Some(i) if i > 0);
     let has_next = move || matches!(index.get(), Some(i) if i + 1 < total);
 
-    let slide = move |dir: i32| {
-        if animating.get_untracked() {
-            return;
-        }
-        match dir {
-            -1 if matches!(index.get_untracked(), Some(i) if i > 0) => {
-                animating.set(true);
-                index.update(|i| {
-                    if let Some(c) = i {
-                        *c -= 1;
-                    }
-                });
-            }
-            1 if matches!(index.get_untracked(), Some(i) if i + 1 < total) => {
-                animating.set(true);
-                index.update(|i| {
-                    if let Some(c) = i {
-                        *c += 1;
-                    }
-                });
-            }
-            _ => {}
+    let slide = move |offset: isize| {
+        if let Some(next) = index
+            .get_untracked()
+            .and_then(|i| i.checked_add_signed(offset))
+            && next < total
+        {
+            index.set(Some(next));
         }
     };
 
-    let _ = use_event_listener(track, ev::transitionend, move |_| {
-        animating.set(false);
-    });
-
     let _ = use_event_listener(window(), ev::keydown, move |e| {
-        e.prevent_default();
+        if e.alt_key() || e.ctrl_key() || e.meta_key() {
+            return;
+        }
         match e.key().as_str() {
             "ArrowLeft" => slide(-1),
             "ArrowRight" => slide(1),
             "Escape" | " " => index.set(None),
-            _ => {}
+            _ => return,
         }
+        e.prevent_default();
     });
 
     let start_x = StoredValue::new(0.0_f64);
     let width = StoredValue::new(1.0_f64);
-    let dragging = StoredValue::new(false);
-
     let on_touch_start = move |ev: TouchEvent| {
-        if animating.get_untracked() {
-            return;
-        }
         if let Some(t) = ev.touches().get(0) {
             start_x.set_value(t.client_x() as f64);
             let w = window()
@@ -75,11 +52,11 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
                 .unwrap_or(1.0)
                 .max(1.0);
             width.set_value(w);
-            dragging.set_value(true);
+            dragging.set(true);
         }
     };
     let on_touch_move = move |ev: TouchEvent| {
-        if !dragging.get_value() {
+        if !dragging.get_untracked() {
             return;
         }
         if let Some(t) = ev.changed_touches().get(0) {
@@ -94,25 +71,15 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
         }
     };
     let on_touch_end = move |_: TouchEvent| {
-        if !dragging.get_value() {
+        if !dragging.get_untracked() {
             return;
         }
-        dragging.set_value(false);
+        dragging.set(false);
         let frac = drag.get_untracked() / width.get_value();
-        if frac <= -SWIPE_RATIO && has_next() {
-            index.update(|i| {
-                if let Some(c) = i {
-                    *c += 1;
-                    animating.set(true);
-                }
-            });
-        } else if frac >= SWIPE_RATIO && has_prev() {
-            index.update(|i| {
-                if let Some(c) = i {
-                    *c -= 1;
-                    animating.set(true);
-                }
-            });
+        if frac <= -SWIPE_RATIO {
+            slide(1);
+        } else if frac >= SWIPE_RATIO {
+            slide(-1);
         }
         drag.set(0.0);
     };
@@ -123,10 +90,10 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
             "transform: translateX(calc(-{i}00vw + {d}px)); transition: {t};",
             i = i,
             d = drag.get(),
-            t = if animating.get() {
-                "transform 0.3s ease"
-            } else {
+            t = if dragging.get() {
                 "none"
+            } else {
+                "transform 0.3s ease"
             },
         )
     };
@@ -139,7 +106,7 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
                 let alt = im.name.clone();
                 view! {
                     <div class="flex-none w-screen h-full grid place-items-center p-2">
-                        <a href=href on:click=|ev| ev.stop_propagation()>
+                        <a href=href>
                             <img
                                 src=src
                                 alt=alt
@@ -156,17 +123,20 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
     view! {
         <div
             class="fixed inset-0 bg-black/95 z-[60] overflow-hidden cursor-zoom-out select-none touch-none"
-            on:click=move |ev| { ev.stop_propagation(); index.set(None); }
+            on:click=move |ev| {
+                if !(ev.alt_key() || ev.ctrl_key() || ev.meta_key() || ev.shift_key()) {
+                    index.set(None);
+                }
+            }
             on:touchstart=on_touch_start
             on:touchmove=on_touch_move
             on:touchend=on_touch_end
             on:touchcancel=move |_: TouchEvent| {
-                dragging.set_value(false);
-                animating.set(true);
+                dragging.set(false);
                 drag.set(0.0);
             }
         >
-            <div node_ref=track class="flex h-full will-change-transform" style=track_style>
+            <div class="flex h-full will-change-transform" style=track_style>
                 {slides}
             </div>
 

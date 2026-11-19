@@ -8,16 +8,13 @@ use worker::{Fetch, Method, Request, RequestInit};
 
 use crate::config::TokenSpec;
 
-/// Result of verifying a Solana top-up. No side effects — `payments.rs` maps
-/// each variant onto the payment-row lifecycle (mirrors the Ethereum path):
-/// `Credited` -> credit + mark row credited; `Reject` -> row 'rejected' (400,
-/// permanent for any submitter); `WrongSender`/`RpcError` -> delete
-/// the pending row so the tx can be resubmitted (403 / 502).
+/// Verification for the requested wallet, recipient and asset. Only a verified
+/// transfer can reserve a credit in the payment ledger.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SolOutcome {
     /// Verified: raw base units received (lamports for SOL, minor units for SPL).
     Credited { amount: u128 },
-    /// Tx-intrinsic, permanent failure (wrong recipient, reverted, dust, ...).
+    /// The transaction does not qualify for the requested deposit.
     Reject(&'static str),
     /// Sender is not the linked wallet — submitter-relative.
     WrongSender,
@@ -87,14 +84,38 @@ fn pubkey_at(keys: &[Value], i: usize) -> Option<&str> {
     }
 }
 
-/// Parse `entry.uiTokenAmount.amount` (a decimal string of base units).
-fn token_amount(entry: &Value) -> Option<u128> {
-    entry
-        .get("uiTokenAmount")?
-        .get("amount")?
-        .as_str()?
-        .parse::<u128>()
-        .ok()
+const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
+const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+
+/// jsonParsed includes transfers made directly and by programs invoked by the wallet.
+fn transfer_total(
+    tx: &Value,
+    program: &str,
+    mut amount: impl FnMut(&Value) -> Option<u64>,
+) -> Option<u128> {
+    let outer = tx["transaction"]["message"]["instructions"].as_array()?;
+    let mut total = 0;
+    let mut add = |instructions: &[Value]| -> Option<()> {
+        for ix in instructions {
+            if ix["programId"] == program
+                && matches!(
+                    ix["parsed"]["type"].as_str(),
+                    Some("transfer" | "transferChecked" | "transferWithSeed")
+                )
+            {
+                total += u128::from(amount(&ix["parsed"]["info"])?);
+            }
+        }
+        Some(())
+    };
+    add(outer)?;
+    let inner = &tx["meta"]["innerInstructions"];
+    if !inner.is_null() {
+        for group in inner.as_array()? {
+            add(group["instructions"].as_array()?)?;
+        }
+    }
+    Some(total)
 }
 
 /// Verify a finalized (non-null) `getTransaction` result. Pure and side-effect
@@ -109,10 +130,10 @@ pub(crate) fn verify_solana(
 
     // A non-null `meta.err` means the transaction failed on-chain: no transfer
     // took effect, permanent for any submitter.
-    if let Some(err) = meta.get("err")
-        && !err.is_null()
-    {
-        return SolOutcome::Reject("tx failed on-chain");
+    match meta.get("err") {
+        Some(Value::Null) => {}
+        Some(_) => return SolOutcome::Reject("tx failed on-chain"),
+        None => return SolOutcome::RpcError("missing transaction status".into()),
     }
 
     let Some(keys) = result["transaction"]["message"]["accountKeys"].as_array() else {
@@ -128,61 +149,100 @@ pub(crate) fn verify_solana(
         return SolOutcome::WrongSender;
     }
 
-    match spec.contract {
-        // -------------------------------------------------------------- native
+    if sender == deposit_address || deposit_address.is_empty() {
+        return SolOutcome::Reject("no deposit received");
+    }
+
+    let (received, funded) = match spec.contract {
         None => {
             let Some(i) = (0..keys.len()).find(|&i| pubkey_at(keys, i) == Some(deposit_address))
             else {
                 return SolOutcome::Reject("deposit address not in transaction");
             };
-            let pre = meta["preBalances"].get(i).and_then(Value::as_u64);
-            let post = meta["postBalances"].get(i).and_then(Value::as_u64);
-            let (Some(pre), Some(post)) = (pre, post) else {
+            let (Some(pre), Some(post)) = (
+                meta["preBalances"][i].as_u64(),
+                meta["postBalances"][i].as_u64(),
+            ) else {
                 return SolOutcome::RpcError("malformed transaction: missing balances".into());
             };
-            let credited = post as i128 - pre as i128;
-            if credited <= 0 {
+            if post <= pre {
                 return SolOutcome::Reject("no SOL received");
             }
-            SolOutcome::Credited {
-                amount: credited as u128,
-            }
+            let funded = transfer_total(result, SYSTEM_PROGRAM, |info| {
+                if info["source"] == sender && info["destination"] == deposit_address {
+                    info["lamports"].as_u64()
+                } else {
+                    Some(0)
+                }
+            });
+            (u128::from(post - pre), funded)
         }
-        // ----------------------------------------------------------------- SPL
         Some(mint) => {
-            let empty: Vec<Value> = Vec::new();
-            let post_balances = meta["postTokenBalances"].as_array().unwrap_or(&empty);
-            let pre_balances = meta["preTokenBalances"].as_array().unwrap_or(&empty);
-
-            // The deposit's token account for this mint, after the tx.
-            let Some(post_entry) = post_balances.iter().find(|e| {
-                e.get("mint").and_then(Value::as_str) == Some(mint)
-                    && e.get("owner").and_then(Value::as_str) == Some(deposit_address)
-            }) else {
-                return SolOutcome::Reject("no token received");
-            };
-            let Some(post_amount) = token_amount(post_entry) else {
-                return SolOutcome::RpcError("malformed transaction: bad token amount".into());
-            };
-            // The matching pre-balance shares the same accountIndex; a missing
-            // pre entry means the token account started at zero.
-            let acct_index = post_entry.get("accountIndex").and_then(Value::as_u64);
-            let pre_amount = pre_balances
-                .iter()
-                .find(|e| {
-                    acct_index.is_some()
-                        && e.get("accountIndex").and_then(Value::as_u64) == acct_index
-                })
-                .and_then(token_amount)
-                .unwrap_or(0);
-
-            if post_amount <= pre_amount {
+            let mut destinations = std::collections::HashSet::new();
+            let mut sources = std::collections::HashSet::new();
+            let mut totals = [0u128; 2];
+            for (side, field) in ["preTokenBalances", "postTokenBalances"]
+                .into_iter()
+                .enumerate()
+            {
+                let Some(entries) = meta[field].as_array() else {
+                    return SolOutcome::RpcError(format!("missing {field}"));
+                };
+                for entry in entries.iter().filter(|e| e["mint"] == mint) {
+                    if entry["owner"] != deposit_address && entry["owner"] != sender {
+                        continue;
+                    }
+                    let Some(key) = entry["accountIndex"]
+                        .as_u64()
+                        .and_then(|i| usize::try_from(i).ok())
+                        .and_then(|i| pubkey_at(keys, i))
+                    else {
+                        return SolOutcome::RpcError("missing token account key".into());
+                    };
+                    if entry["owner"] == sender {
+                        sources.insert(key);
+                    } else {
+                        let Some(amount) = entry["uiTokenAmount"]["amount"]
+                            .as_str()
+                            .and_then(|v| v.parse::<u64>().ok())
+                        else {
+                            return SolOutcome::RpcError("malformed deposit token balance".into());
+                        };
+                        totals[side] += u128::from(amount);
+                        if side == 1 {
+                            destinations.insert(key);
+                        }
+                    }
+                }
+            }
+            if totals[1] <= totals[0] {
                 return SolOutcome::Reject("no token received");
             }
-            SolOutcome::Credited {
-                amount: post_amount - pre_amount,
-            }
+            let funded = transfer_total(result, TOKEN_PROGRAM, |info| {
+                let destination = info["destination"].as_str()?;
+                let source = info["source"].as_str()?;
+                if !destinations.contains(destination)
+                    || source == destination
+                    || !sources.contains(source)
+                    || info["mint"].as_str().is_some_and(|m| m != mint)
+                {
+                    return Some(0);
+                }
+                info["amount"]
+                    .as_str()
+                    .or_else(|| info["tokenAmount"]["amount"].as_str())?
+                    .parse()
+                    .ok()
+            });
+            (totals[1] - totals[0], funded)
         }
+    };
+    match funded {
+        Some(0) => SolOutcome::WrongSender,
+        Some(amount) => SolOutcome::Credited {
+            amount: received.min(amount),
+        },
+        None => SolOutcome::RpcError("incomplete transfer instructions".into()),
     }
 }
 
@@ -213,6 +273,16 @@ mod tests {
         })
     }
 
+    fn sol_transfer(lamports: u64) -> Value {
+        serde_json::json!({"programId": SYSTEM_PROGRAM, "parsed":{"type":"transfer",
+            "info":{"source":LINKED,"destination":DEPOSIT,"lamports":lamports}}})
+    }
+
+    fn spl_transfer(amount: &str) -> Value {
+        serde_json::json!({"programId": TOKEN_PROGRAM, "parsed":{"type":"transfer",
+            "info":{"authority":LINKED,"source":"source-token-account","destination":"deposit-token-account","amount":amount}}})
+    }
+
     #[test]
     fn signature_length_check() {
         // 64 zero bytes -> valid length
@@ -232,11 +302,13 @@ mod tests {
             "meta": {
                 "err": null,
                 "preBalances": [1_000_000_000u64, 5_000_000_000u64],
-                "postBalances": [999_995_000u64, 6_000_000_000u64],
+                "postBalances": [0u64, 6_000_000_000u64],
+                "innerInstructions": [{"index": 1, "instructions": [sol_transfer(400_000_000)]}],
             },
             "transaction": {
                 "message": {
                     "accountKeys": [key(LINKED, true), key(DEPOSIT, false)],
+                    "instructions": [sol_transfer(600_000_000), {"programId": "another-program"}],
                 }
             }
         });
@@ -311,8 +383,11 @@ mod tests {
     #[test]
     fn spl_usdc_credited() {
         let mint = usdc_spec().contract.expect("usdc mint");
-        // deposit's USDC token account (accountIndex 3) goes 0 -> 1.0 USDC.
-        let result = serde_json::json!({
+        // The wallet contributes 1 USDC to a batched payment that delivers 3 USDC.
+        let mut other_transfer = spl_transfer("2000000");
+        other_transfer["parsed"]["info"]["authority"] = OTHER.into();
+        other_transfer["parsed"]["info"]["source"] = "other-token-account".into();
+        let mut result = serde_json::json!({
             "meta": {
                 "err": null,
                 "preTokenBalances": [{
@@ -320,17 +395,21 @@ mod tests {
                     "mint": mint,
                     "owner": DEPOSIT,
                     "uiTokenAmount": { "amount": "0" },
+                }, {
+                    "accountIndex": 2, "mint": mint, "owner": LINKED,
+                    "uiTokenAmount": { "amount": "1000000" },
                 }],
                 "postTokenBalances": [{
                     "accountIndex": 3,
                     "mint": mint,
                     "owner": DEPOSIT,
-                    "uiTokenAmount": { "amount": "1000000" },
+                    "uiTokenAmount": { "amount": "3000000" },
                 }],
             },
             "transaction": {
                 "message": {
-                    "accountKeys": [key(LINKED, true), key(DEPOSIT, false)],
+                    "accountKeys": [key(LINKED, true), key(DEPOSIT, false), "source-token-account", "deposit-token-account"],
+                    "instructions": [spl_transfer("1000000"), other_transfer],
                 }
             }
         });
@@ -338,16 +417,22 @@ mod tests {
             verify_solana(&result, usdc_spec(), DEPOSIT, LINKED),
             SolOutcome::Credited { amount: 1_000_000 }
         );
+        result["meta"]["preTokenBalances"][0]["uiTokenAmount"]["amount"] = Value::Null;
+        assert!(matches!(
+            verify_solana(&result, usdc_spec(), DEPOSIT, LINKED),
+            SolOutcome::RpcError(_)
+        ));
     }
 
     #[test]
     fn spl_usdc_missing_pre_treated_as_zero() {
         let mint = usdc_spec().contract.expect("usdc mint");
-        // No preTokenBalances entry: pre amount defaults to 0.
+        // The transfer creates the recipient's account, so only the source existed before.
         let result = serde_json::json!({
             "meta": {
                 "err": null,
-                "preTokenBalances": [],
+                "preTokenBalances": [{"accountIndex": 2, "mint": mint, "owner": LINKED,
+                    "uiTokenAmount": {"amount": "2500000"}}],
                 "postTokenBalances": [{
                     "accountIndex": 3,
                     "mint": mint,
@@ -357,7 +442,8 @@ mod tests {
             },
             "transaction": {
                 "message": {
-                    "accountKeys": [key(LINKED, true), key(DEPOSIT, false)],
+                    "accountKeys": [key(LINKED, true), key(DEPOSIT, false), "source-token-account", "deposit-token-account"],
+                    "instructions": [spl_transfer("2500000")],
                 }
             }
         });
@@ -421,10 +507,10 @@ mod tests {
             "meta": {
                 "err": null,
                 "preBalances": [1_000_000_000u64, 5_000_000_000u64],
-                "postBalances": [999_995_000u64, 6_000_000_000u64],
+                "postBalances": [0u64, 6_000_000_000u64],
             },
             "transaction": {
-                "message": { "accountKeys": [LINKED, DEPOSIT] }
+                "message": { "accountKeys": [LINKED, DEPOSIT], "instructions": [sol_transfer(1_000_000_000)] }
             }
         });
         assert_eq!(

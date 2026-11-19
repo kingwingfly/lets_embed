@@ -67,13 +67,28 @@ fn crop_to_base64(img: &HtmlImageElement, region: Region) -> Option<String> {
 #[component]
 pub fn ImageDetails() -> impl IntoView {
     let params = use_params_map();
-    let id = Memo::new(move |_| params.with(|p| p.get("id")));
+    view! {
+        <div class="w-full min-h-full flex flex-col">
+            <For each=move || params.with(|p| p.get("id")) key=String::clone let(id)>
+                <ImageDetailPage id />
+            </For>
+            <div class="w-full px-3 md:px-4 pb-4 mt-2">
+                <h2 class="text-sky-700 text-lg md:text-xl font-semibold mb-3">"Similar \u{1f49e}"</h2>
+                <Results />
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn ImageDetailPage(id: String) -> impl IntoView {
     let img_query = expect_context::<ImageQuery>();
 
-    let details =
-        OnceResource::new(
-            async move { fetch_image_details(id()).await.map_err(|e| e.to_string()) },
-        );
+    let details = OnceResource::new(async move {
+        fetch_image_details(Some(id))
+            .await
+            .map_err(|e| e.to_string())
+    });
     let post_images = OnceResource::new(async move {
         let details = details.await?;
         let post_id = details
@@ -468,28 +483,20 @@ pub fn ImageDetails() -> impl IntoView {
     };
 
     view! {
-        <div class="w-full min-h-full flex flex-col">
-            <Transition fallback=move || view! { <div class="w-full h-[72vh]" /> }>
-                {
-                    move || {
-                        details.get().map(|details| match details {
-                            Ok(details) => render_details(details).into_any(),
-                            Err(e) => view! {
-                                <div class="text-rose-500 p-4">{ e.to_string() }</div>
-                            }.into_any(),
-                        })
-                    }
+        <Transition fallback=move || view! { <div class="w-full h-[72vh]" /> }>
+            {
+                move || {
+                    details.get().map(|details| match details {
+                        Ok(details) => render_details(details).into_any(),
+                        Err(e) => view! {
+                            <div class="text-rose-500 p-4">{ e.to_string() }</div>
+                        }.into_any(),
+                    })
                 }
-            </Transition>
-
-            <div class="w-full px-3 md:px-4 pb-4 mt-2">
-                <h2 class="text-sky-700 text-lg md:text-xl font-semibold mb-3">"Similar \u{1f49e}"</h2>
-                <Results />
-            </div>
-
-            {lightbox_view}
-            {viewer_view}
-        </div>
+            }
+        </Transition>
+        {lightbox_view}
+        {viewer_view}
     }
 }
 

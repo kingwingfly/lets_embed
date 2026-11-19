@@ -131,18 +131,31 @@ test('embedded resources navigate only for a same-origin gallery allowance denia
 test('gallery access, billing and administrator controls use the published policy', async (t) => {
   const oldBlockTime = Math.floor(Date.now() / 1000) - 300;
   const usdc = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
+  const solanaUsdc = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
   const topic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
   const rpcReplies = {
     getTransaction: {
       blockTime: oldBlockTime,
-      transaction: { message: { accountKeys: [linkedSolana] } },
+      transaction: { message: {
+        accountKeys: [linkedSolana, 'source-token-account', 'deposit-token-account'],
+        instructions: [{
+          programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+          parsed: { type: 'transferChecked', info: {
+            source: 'source-token-account', destination: 'deposit-token-account',
+            authority: linkedSolana, mint: solanaUsdc, tokenAmount: { amount: '1000000' },
+          } },
+        }],
+      } },
       meta: {
         err: null,
-        preTokenBalances: [],
+        preTokenBalances: [{
+          accountIndex: 1, mint: solanaUsdc, owner: linkedSolana,
+          uiTokenAmount: { amount: '1000000' },
+        }],
         postTokenBalances: [
           {
-            accountIndex: 1,
-            mint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+            accountIndex: 2,
+            mint: solanaUsdc,
             owner: originalSolanaDeposit,
             uiTokenAmount: { amount: '1000000' },
           },
@@ -224,6 +237,8 @@ test('gallery access, billing and administrator controls use the published polic
     assert.equal(r.status, status, (await r.text()).slice(0, 250));
   };
   await check(site('/'), 303);
+  const login = await site('/?q=C++');
+  assert.equal(new URL(login.headers.get('location'), 'https://' + appHost).searchParams.get('next'), '/?q=C++');
   await check(site('/images/one.webp'), 401);
   await check(site('/user/admin'), 403);
   await check(site('/user/admin/browse'), 403);
@@ -281,9 +296,13 @@ test('gallery access, billing and administrator controls use the published polic
   assert.equal(headDenied.status, 402);
   assert.equal(headDenied.headers.get('location'), '/user/upgrade');
   await check(site('/videos/a.mp4'), 402);
-  const direct = await site('/videos/a.mp4', { headers: { accept: 'text/html', 'sec-fetch-mode': 'navigate' } });
+  const direct = await site('/videos/a.mp4', { headers: { accept: 'text/html', 'sec-fetch-mode': 'navigate', 'sec-fetch-dest': 'document' } });
   assert.equal(direct.status, 303);
   assert.equal(direct.headers.get('location'), '/user/upgrade');
+  const background = await site('/videos/a.mp4', { headers: { accept: 'text/html', 'sec-fetch-mode': 'cors' } });
+  assert.equal(background.status, 402);
+  assert.equal((await background.json()).redirect_to, '/user/upgrade');
+  await check(site('/videos/a.mp4', { headers: { accept: 'text/html;q=0,application/json' } }), 402);
   const guestPage = await site(direct.headers.get('location'));
   assert.equal(guestPage.status, 200);
   const guestHtml = await guestPage.text();
@@ -300,6 +319,28 @@ test('gallery access, billing and administrator controls use the published polic
   assert.equal(search.headers.get('server-timing'), 'gallery-allowance');
   assert.equal((await search.json()).redirect_to, '/user/upgrade');
   const ns = await mf.getDurableObjectNamespace('USER_ACCOUNT', 'user-worker');
+  const subscriberAddress = '0x' + '7'.repeat(40);
+  const subscriber = ns.get(ns.idFromName(subscriberAddress));
+  const change = async (path, body) => {
+    const reply = await subscriber.fetch('https://account/' + path, {
+      method: 'POST', body: JSON.stringify(body),
+    });
+    assert.equal(reply.status, 200);
+    return reply.json();
+  };
+  const earlyCredit = await change('credit', { key: 'admin:early', points: 9, reason: 'adjustment' });
+  const initialized = await change('init', { address: subscriberAddress });
+  assert.equal(initialized.balance, 59);
+  assert.equal(initialized.balance, earlyCredit.balance);
+  await change('subscribe', { plan: 'basic' });
+  const used = await change('charge', { path: 'search:desc:spring', kind: 'description' });
+  const renewed = await change('subscribe', { plan: 'basic' });
+  assert.equal(renewed.searches_remaining, used.searches_remaining);
+  assert.equal(renewed.window_reset, used.window_reset);
+  await change('unsubscribe', {});
+  const rejoined = await change('subscribe', { plan: 'basic' });
+  assert.equal(rejoined.searches_remaining, used.searches_remaining);
+  assert.equal(rejoined.window_reset, used.window_reset);
   const account = ns.get(ns.idFromName(wallet));
   await check(
     account.fetch('https://account/init', {
@@ -375,6 +416,7 @@ test('gallery access, billing and administrator controls use the published polic
   await check(site('/images/suspended.webp', { headers: walletHeaders }), 403);
   await check(post('/ban', { address: wallet, banned: '0' }), 303);
   const tx = { chain: 'ethereum', token: 'usdc', tx_hash: '0x' + '4'.repeat(64) };
+  await check(command('topup', { ...tx, token: 'usdt' }), 400);
   await check(command('topup', tx), 200);
   assert.equal((await status()).balance, granted.balance + 10000);
   await check(command('topup', tx), 409);
@@ -382,8 +424,43 @@ test('gallery access, billing and administrator controls use the published polic
   assert.equal((await status()).balance, granted.balance + 20000);
   rpcReplies.eth_getBlockByNumber.timestamp = '0x' + Math.floor(Date.now() / 1000).toString(16);
   rpcReplies.eth_getTransactionReceipt.logs[0].topics[2] = updatedDeposit;
-  await check(command('topup', { ...tx, tx_hash: '0x' + '5'.repeat(64) }), 200);
+  const interrupted = { ...tx, tx_hash: '0x' + '5'.repeat(64) };
+  await db.prepare(`CREATE TRIGGER interrupt_finalization BEFORE UPDATE OF status ON payments
+    WHEN NEW.status='credited' BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END`).run();
+  await check(command('topup', interrupted), 503);
   assert.equal((await status()).balance, granted.balance + 20100);
+  const payment = () => db.prepare('SELECT status, points, amount FROM payments WHERE tx_hash=?')
+    .bind(interrupted.tx_hash).first();
+  assert.deepEqual(await payment(), { status: 'pending', points: 100, amount: '1000000' });
+  await db.prepare('DROP TRIGGER interrupt_finalization').run();
+  const receipt = rpcReplies.eth_getTransactionReceipt;
+  rpcReplies.eth_getTransactionReceipt = null;
+  const retried = await Promise.all([command('topup', interrupted), command('topup', interrupted)]);
+  assert.ok(retried.some(r => r.status === 200));
+  assert.ok(retried.every(r => [200, 409].includes(r.status)));
+  assert.equal((await status()).balance, granted.balance + 20100);
+  assert.deepEqual(await payment(), { status: 'credited', points: 100, amount: '1000000' });
+  rpcReplies.eth_getTransactionReceipt = receipt;
+  const legacy = { ...tx, tx_hash: '0x' + '6'.repeat(64) };
+  await db.prepare('INSERT INTO payments(tx_hash,address,chain,token,created_at) VALUES(?,?,?,?,1)')
+    .bind(legacy.tx_hash, wallet, legacy.chain, legacy.token).run();
+  await check(command('topup', legacy), 200);
+  assert.equal((await status()).balance, granted.balance + 20200);
+  const legacyPaid = { ...tx, tx_hash: '0x' + '8'.repeat(64) };
+  await db.prepare('INSERT INTO payments(tx_hash,address,chain,token,created_at) VALUES(?,?,?,?,1)')
+    .bind(legacyPaid.tx_hash, wallet, legacyPaid.chain, legacyPaid.token).run();
+  await check(account.fetch('https://account/credit', {
+    method: 'POST', body: JSON.stringify({ key: 'tx:' + legacyPaid.tx_hash, points: 73, reason: 'topup' }),
+  }), 200);
+  const reconcile = await command('topup', legacyPaid);
+  assert.equal(reconcile.status, 409);
+  assert.match((await reconcile.json()).error, /reconcile the original receipt/);
+  assert.equal((await status()).balance, granted.balance + 20273);
+  const abandoned = { ...tx, tx_hash: '0x' + '9'.repeat(64) };
+  await db.prepare('INSERT INTO payments(tx_hash,address,chain,token,created_at) VALUES(?,?,?,?,1)')
+    .bind(abandoned.tx_hash, subscriberAddress, abandoned.chain, abandoned.token).run();
+  await check(command('topup', abandoned), 200);
+  assert.equal((await status()).balance, granted.balance + 20373);
   const page = await site('/user/account', { headers: walletHeaders });
   const accountHtml = await page.text();
   assert.match(accountHtml, /id="topup"/);

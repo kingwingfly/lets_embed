@@ -1,8 +1,8 @@
-use std::{path::PathBuf, time::Duration};
+use std::{io::Write, path::PathBuf, time::Duration};
 
 use clap::Parser;
 use img2webp::{
-    QueueConfig, default_io_concurrency, operator, pull_convert,
+    QueueConfig, default_io_concurrency, operator, pull_convert_and_then,
     walk_convert_prefix_with_concurrency,
 };
 use opendal::{Operator, services::Fs};
@@ -58,6 +58,14 @@ struct Cli {
     concurrency: Option<usize>,
     /// If presented, walk through this local filesystem path
     src_path: Option<PathBuf>,
+}
+
+fn print_metadata(metas: impl serde::Serialize) -> anyhow::Result<()> {
+    let mut output = std::io::stdout().lock();
+    serde_json::to_writer(&mut output, &metas)?;
+    output.write_all(b"\n")?;
+    output.flush()?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -120,12 +128,18 @@ async fn main() -> anyhow::Result<()> {
                     Duration::from_secs(cli.poll_interval_secs),
                 )?
                 .with_concurrency(concurrency);
-                pull_convert(s3.clone(), s3, cfg, cli.delete_origin).await?
+                return pull_convert_and_then(
+                    s3.clone(),
+                    s3,
+                    cfg,
+                    cli.delete_origin,
+                    print_metadata,
+                )
+                .await;
             }
         }
     };
-    println!("{}", serde_json::to_string(&metas)?);
-    Ok(())
+    print_metadata(metas)
 }
 
 #[cfg(test)]

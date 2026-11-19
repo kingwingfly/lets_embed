@@ -22,6 +22,20 @@ enum Item {
     Image(Image),
 }
 
+impl Item {
+    fn cover_dimensions(&self) -> Option<(i32, i32)> {
+        let (w, h) = match self {
+            Self::Image(im) => (im.width, im.height),
+            Self::Post(post) => post
+                .images
+                .first()
+                .map(|im| (im.width, im.height))
+                .or_else(|| post.videos.first().map(|v| (v.width, v.height)))?,
+        };
+        Some(if w > 0 && h > 0 { (w, h) } else { (16, 9) })
+    }
+}
+
 /// An item already placed into a column, carrying its rendered pixel box so we can
 /// hand the browser a `contain-intrinsic-size` and skip off-screen decode/layout.
 #[derive(Debug, Clone)]
@@ -35,7 +49,7 @@ struct Placed {
 struct Column {
     items: Vec<Placed>,
     width: u32,
-    height: u32,
+    height: u64,
 }
 
 #[component]
@@ -81,39 +95,7 @@ pub fn Results() -> impl IntoView {
         for placed in
             (0..max_row).flat_map(|row| old.iter().filter_map(move |c| c.items.get(row).cloned()))
         {
-            match placed.item {
-                Item::Post(p) => {
-                    let Some(cover) = p.images.first() else {
-                        continue;
-                    };
-                    let Some(column) = new.iter_mut().min_by_key(|c| c.height) else {
-                        continue;
-                    };
-                    let height = ((cover.height as f64 / cover.width as f64) * column.width as f64)
-                        .round() as u32;
-                    let w = column.width;
-                    column.height += height + COLUMN_PAD;
-                    column.items.push(Placed {
-                        item: Item::Post(p),
-                        w,
-                        h: height,
-                    });
-                }
-                Item::Image(im) => {
-                    let Some(column) = new.iter_mut().min_by_key(|c| c.height) else {
-                        continue;
-                    };
-                    let height =
-                        ((im.height as f64 / im.width as f64) * column.width as f64).round() as u32;
-                    let w = column.width;
-                    column.height += height + COLUMN_PAD;
-                    column.items.push(Placed {
-                        item: Item::Image(im),
-                        w,
-                        h: height,
-                    });
-                }
-            }
+            place_item(&mut new, placed.item);
         }
         columns.set(new);
     });
@@ -135,6 +117,8 @@ pub fn Results() -> impl IntoView {
 
     Effect::new(move |_| {
         let _ = params.get();
+        viewer.set(None);
+        lightbox.set(None);
         columns.update(|cs| {
             cs.iter_mut().for_each(|c| {
                 c.items.clear();
@@ -176,6 +160,11 @@ pub fn Results() -> impl IntoView {
             "content-visibility:auto;contain-intrinsic-size:{}px {}px;",
             placed.w, placed.h
         );
+        let (width, height) = placed
+            .item
+            .cover_dimensions()
+            .expect("placed item has media");
+        let aspect = format!("aspect-ratio: {width} / {height}");
         match placed.item {
             Item::Post(p) => {
                 let cover = p.images.first().cloned();
@@ -191,11 +180,16 @@ pub fn Results() -> impl IntoView {
                                 <img
                                     loading="lazy"
                                     decoding="async"
-                                    style=format!("aspect-ratio: {} / {}", c.width, c.height)
+                                    style=aspect.clone()
                                     class="w-full h-auto block bg-sky-100 select-none group-hover:scale-[1.03] transition-transform duration-300"
                                     src=format!("/images/{}.webp", encode_path(&c.name))
                                 />
-                            })}
+                            }.into_any()).unwrap_or_else(|| view! {
+                                <div class="w-full grid place-items-center text-sky-700 text-3xl"
+                                    style=aspect>
+                                    <span aria-label="Video">"▶"</span>
+                                </div>
+                            }.into_any())}
                             <div class="absolute top-1.5 right-1.5 bg-sky-500/85 text-white text-xs font-medium px-2 py-0.5 rounded-full shadow-sm">
                                 {img_count}"p "{video_count}"v"
                             </div>
@@ -215,7 +209,7 @@ pub fn Results() -> impl IntoView {
                         <img
                             loading="lazy"
                             decoding="async"
-                            style=format!("aspect-ratio: {} / {}", im.width, im.height)
+                            style=aspect
                             class="w-full h-auto block rounded-xl bg-sky-100 ring-1 ring-sky-200/70 shadow-sm shadow-sky-200/50
                                 cursor-zoom-in select-none hover:shadow-md hover:shadow-sky-300/50 hover:scale-[1.02] transition-all"
                             src=url
@@ -310,43 +304,19 @@ pub fn Results() -> impl IntoView {
     }
 }
 
-/// Place a post into the shortest column, mirroring the masonry layout logic.
-fn place_post(columns: RwSignal<Vec<Column>>, p: PostItem) {
-    columns.update(move |columns| {
-        let Some(cover) = p.images.first() else {
-            return;
-        };
-        let Some(column) = columns.iter_mut().min_by_key(|c| c.height) else {
-            return;
-        };
-        let height =
-            ((cover.height as f64 / cover.width as f64) * column.width as f64).round() as u32;
-        let w = column.width;
-        column.height += height + COLUMN_PAD;
-        column.items.push(Placed {
-            item: Item::Post(p),
-            w,
-            h: height,
-        });
-    });
-}
-
-/// Place an image into the shortest column and remember it for the viewer.
-fn place_image(columns: RwSignal<Vec<Column>>, images: StoredValue<Vec<Image>>, im: Image) {
-    images.update_value(|v| v.push(im.clone()));
-    columns.update(|columns| {
-        let Some(column) = columns.iter_mut().min_by_key(|c| c.height) else {
-            return;
-        };
-        let height = ((im.height as f64 / im.width as f64) * column.width as f64).round() as u32;
-        let w = column.width;
-        column.height += height + COLUMN_PAD;
-        column.items.push(Placed {
-            item: Item::Image(im),
-            w,
-            h: height,
-        });
-    });
+/// Use the same cover and aspect ratio when loading a page and when reflowing it.
+fn place_item(columns: &mut [Column], item: Item) {
+    let Some((width, height)) = item.cover_dimensions() else {
+        return;
+    };
+    let Some(column) = columns.iter_mut().min_by_key(|c| c.height) else {
+        return;
+    };
+    let ratio = f64::from(height) / f64::from(width);
+    let w = column.width;
+    let h = (ratio * f64::from(w)).round().max(1.0) as u32;
+    column.height += u64::from(h) + u64::from(COLUMN_PAD);
+    column.items.push(Placed { item, w, h });
 }
 
 /// Fetch one page of results through the REST search endpoints and merge it into
@@ -380,7 +350,7 @@ fn load_page(
                 // shared `search_image` URL has none. Degrade to an empty result
                 // instead of sending an empty body that would fail to decode.
                 None => {
-                    if req_id.get_value() == this_id {
+                    if req_id.try_get_value() == Some(this_id) {
                         has_more.set(false);
                         loading.set(false);
                     }
@@ -397,18 +367,21 @@ fn load_page(
         };
 
         // A newer request started while we were awaiting: discard this response.
-        if req_id.get_value() != this_id {
+        if req_id.try_get_value() != Some(this_id) {
             return;
         }
 
         match result {
             Ok(resp) => {
-                for p in resp.posts {
-                    place_post(columns, p);
-                }
-                for im in resp.images {
-                    place_image(columns, images, im);
-                }
+                images.update_value(|v| v.extend(resp.images.iter().cloned()));
+                columns.update(|cs| {
+                    for post in resp.posts {
+                        place_item(cs, Item::Post(post));
+                    }
+                    for image in resp.images {
+                        place_item(cs, Item::Image(image));
+                    }
+                });
                 has_more.set(resp.has_more);
             }
             Err(e) => {
@@ -481,12 +454,8 @@ async fn search_query(
         let mut items = Vec::new();
         let mut count = 0i64;
         while let Some(post) = posts.next().await {
-            let Ok(images) = engine.list_post_images(post.id).await else {
-                continue;
-            };
-            let Ok(videos) = engine.list_post_videos(post.id).await else {
-                continue;
-            };
+            let images = engine.list_post_images(post.id).await.map_err(to_err)?;
+            let videos = engine.list_post_videos(post.id).await.map_err(to_err)?;
             count += 1;
             items.push(PostItem {
                 id: post.id,
@@ -704,4 +673,28 @@ fn pinned_paths() {
     assert_eq!(SearchSimilar::PATH, "/api/search_similar");
     assert_eq!(SearchByImage::PATH, "/api/search_by_image");
     assert_eq!(SearchByDesc::PATH, "/api/search_by_desc");
+}
+
+#[test]
+fn video_only_post_keeps_its_place_at_different_widths() {
+    let post = Item::Post(PostItem {
+        id: 42,
+        title: "Video album".into(),
+        images: vec![],
+        videos: vec![search_types::Video {
+            width: 0,
+            height: 0,
+            ..Default::default()
+        }],
+    });
+    for width in [160, 320] {
+        let mut columns = [Column {
+            items: vec![],
+            width,
+            height: 0,
+        }];
+        place_item(&mut columns, post.clone());
+        assert_eq!(columns[0].items.len(), 1);
+        assert_eq!(columns[0].items[0].h, width * 9 / 16);
+    }
 }

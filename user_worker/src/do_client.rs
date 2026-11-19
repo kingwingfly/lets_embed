@@ -60,3 +60,9 @@ pub async fn do_credit(env: &Env, address: &str, req: &CreditReq) -> Result<Bala
     expect_ok(&resp, "do credit")?;
     resp.json().await
 }
+
+pub async fn payment_applied(env: &Env, address: &str, hash: &str) -> Result<bool> {
+    let mut resp = call_do(env, address, Method::Post, "/payment-applied", Some(&hash)).await?;
+    expect_ok(&resp, "payment lookup")?;
+    resp.json().await
+}

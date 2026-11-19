@@ -112,41 +112,47 @@ struct RpcLog {
 /// event signature (`topics[0]`).
 const TRANSFER_TOPIC0: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
-/// The 20-byte address packed into a 32-byte indexed topic: strip `0x`, take
-/// the low 40 hex nibbles, lowercased. Robust to nodes that omit zero padding.
-fn topic_address(topic: &str) -> String {
-    let h = topic.strip_prefix("0x").unwrap_or(topic).to_lowercase();
-    match h.len().checked_sub(40) {
-        Some(off) => h[off..].to_string(),
-        None => h,
-    }
+/// Read the indexed 20-byte address, accepting RPC nodes that omit ABI padding.
+fn topic_address(topic: &str) -> Option<&str> {
+    let hex = topic.strip_prefix("0x")?;
+    let address = match hex.len() {
+        64 => hex.strip_prefix("000000000000000000000000")?,
+        40 => hex,
+        _ => return None,
+    };
+    address
+        .bytes()
+        .all(|c| c.is_ascii_hexdigit())
+        .then_some(address)
 }
 
-/// Scan `logs` for the FIRST ERC-20 `Transfer(from=sender, to=deposit)` emitted
-/// by `token_addr`, returning the transferred amount. Pure; host-tested.
-/// `token_addr` is lowercase 0x; `deposit_no0x`/`sender_no0x` are lowercase
-/// 40-hex addresses without the `0x` prefix.
+/// A single transaction can carry several transfers of the selected asset.
 fn match_transfer_log(
     logs: &[RpcLog],
     token_addr: &str,
     deposit_no0x: &str,
     sender_no0x: &str,
 ) -> Option<u128> {
-    logs.iter().find_map(|log| {
-        if log.address.to_lowercase() != token_addr || log.topics.len() < 3 {
-            return None;
-        }
-        if log.topics[0].to_lowercase() != TRANSFER_TOPIC0 {
-            return None;
-        }
-        if topic_address(&log.topics[2]) != deposit_no0x
-            || topic_address(&log.topics[1]) != sender_no0x
+    if sender_no0x.eq_ignore_ascii_case(deposit_no0x) {
+        return None;
+    }
+    let mut total = None;
+    for log in logs {
+        if !log.address.eq_ignore_ascii_case(token_addr)
+            || log.topics.len() != 3
+            || !log.topics[0].eq_ignore_ascii_case(TRANSFER_TOPIC0)
+            || !topic_address(&log.topics[1]).is_some_and(|a| a.eq_ignore_ascii_case(sender_no0x))
+            || !topic_address(&log.topics[2]).is_some_and(|a| a.eq_ignore_ascii_case(deposit_no0x))
         {
-            return None;
+            continue;
         }
-        // data = the uint256 value (`0x` + up to 64 hex); parse as the amount.
-        hex_to_u128(&log.data)
-    })
+        total = Some(
+            total
+                .unwrap_or(0u128)
+                .checked_add(hex_to_u128(&log.data)?)?,
+        );
+    }
+    total
 }
 
 /// Verify a native-ETH transfer and return its value in wei. Only checks
@@ -158,6 +164,9 @@ fn verify_native_tx(tx: &RpcTx, deposit_address: &str) -> Result<u128, &'static 
         .as_deref()
         .ok_or("tx has no recipient")?
         .to_lowercase();
+    if tx.from.eq_ignore_ascii_case(deposit_address) {
+        return Err("sender and deposit address are the same");
+    }
     if to != deposit_address {
         return Err("tx recipient is not the deposit address");
     }
@@ -181,44 +190,119 @@ async fn d1_exec(env: &Env, sql: &str, binds: &[JsValue]) -> worker::Result<()> 
     Ok(())
 }
 
-/// Permanent, tx-intrinsic failure: mark the payment row rejected, answer 400.
-async fn reject(env: &Env, tx_hash: &str, msg: &str) -> Response {
-    if let Err(e) = d1_exec(
-        env,
-        "UPDATE payments SET status='rejected' WHERE tx_hash=?",
-        &[tx_hash.into()],
-    )
-    .await
-    {
-        worker::console_error!("payments reject update failed for {tx_hash}: {e:?}");
-    }
-    api_err(StatusCode::BAD_REQUEST, msg)
+struct Deposit<'a> {
+    address: &'a str,
+    hash: &'a str,
+    token: &'a config::TokenSpec,
 }
 
-/// Transient failure: release the replay lock so the tx can be resubmitted.
-async fn delete_pending(env: &Env, tx_hash: &str) {
-    if let Err(e) = d1_exec(
-        env,
-        "DELETE FROM payments WHERE tx_hash=? AND status='pending'",
-        &[tx_hash.into()],
-    )
-    .await
-    {
-        worker::console_error!("payments pending delete failed for {tx_hash}: {e:?}");
+impl Deposit<'_> {
+    // A positive pending quote was verified and saved before contacting the DO.
+    // Legacy pending rows have zero points and still need on-chain verification.
+    async fn resume(&self, st: &AppState) -> worker::Result<Option<Response>> {
+        #[derive(Deserialize)]
+        struct Receipt {
+            address: String,
+            chain: String,
+            token: String,
+            status: String,
+            points: String,
+        }
+        let row = st.env.d1(crate::D1_BINDING)?
+            .prepare("SELECT address, chain, token, status, CAST(points AS TEXT) AS points FROM payments WHERE tx_hash=?")
+            .bind(&[self.hash.into()])?.first::<Receipt>(None).await?;
+        let Some(row) = row else { return Ok(None) };
+        if row.status == "rejected" {
+            return Ok(None);
+        }
+        if row.status == "pending" {
+            if row.points == "0" {
+                // Older Workers saved only a boolean in the account. A new quote
+                // could misstate an earlier credit if its ledger write failed.
+                if !do_client::payment_applied(&st.env, &row.address, self.hash).await? {
+                    return Ok(None);
+                }
+                if row.address == self.address {
+                    return Ok(Some(api_err(
+                        StatusCode::CONFLICT,
+                        "This payment was already credited. If it still shows as pending, contact support to reconcile the original receipt.",
+                    )));
+                }
+            } else if row.address == self.address
+                && row.token == self.token.symbol
+                && row.chain == self.token.chain.as_str()
+            {
+                let points = row
+                    .points
+                    .parse::<i64>()
+                    .map_err(|e| worker::Error::RustError(e.to_string()))?;
+                return Ok(Some(
+                    finalize_credit(st, self.address, self.hash, points).await,
+                ));
+            }
+        }
+        Ok(Some(api_err(StatusCode::CONFLICT, "tx already submitted")))
+    }
+
+    async fn reject(&self, env: &Env, msg: &str) -> Response {
+        if let Err(e) = d1_exec(env,
+            "INSERT INTO payments(tx_hash,address,chain,token,created_at,status) VALUES(?,?,?,?,unixepoch(),'rejected') ON CONFLICT(tx_hash) DO NOTHING",
+            &[self.hash.into(), self.address.into(), self.token.chain.as_str().into(), self.token.symbol.into()],
+        ).await {
+            worker::console_error!("recording rejected payment failed: {e:?}");
+        }
+        api_err(StatusCode::BAD_REQUEST, msg)
+    }
+
+    async fn credit_verified(&self, st: &AppState, amount: u128, points: i64) -> Response {
+        // The first verified claimant fixes the wallet, asset and quote. A retry
+        // can finish that same credit even if the market price has since changed.
+        let write = d1_exec(
+            &st.env,
+            "INSERT INTO payments(tx_hash,address,chain,token,amount,points,created_at,status)
+             VALUES(?,?,?,?,?,?,unixepoch(),'pending') ON CONFLICT(tx_hash) DO UPDATE SET
+             address=excluded.address, chain=excluded.chain, token=excluded.token,
+             amount=excluded.amount, points=excluded.points, status='pending'
+             WHERE payments.status='rejected' OR
+             (payments.status='pending' AND payments.points=0)",
+            &[
+                self.hash.into(),
+                self.address.into(),
+                self.token.chain.as_str().into(),
+                self.token.symbol.into(),
+                amount.to_string().into(),
+                points.to_string().into(),
+            ],
+        )
+        .await;
+        if let Err(e) = write {
+            return payment_db_error(e);
+        }
+        match self.resume(st).await {
+            Ok(Some(response)) => response,
+            Ok(None) => api_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Retry the verified payment",
+            ),
+            Err(e) => payment_db_error(e),
+        }
     }
 }
 
-/// RPC transport failure mid-flow: release the lock and let the client retry.
-async fn rpc_unavailable(env: &Env, tx_hash: &str, method: &str, e: worker::Error) -> Response {
-    worker::console_error!("{method} failed for {tx_hash}: {e:?}");
-    delete_pending(env, tx_hash).await;
+fn payment_db_error(e: worker::Error) -> Response {
+    worker::console_error!("payment database error: {e:?}");
+    api_err(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "database unavailable, retry later",
+    )
+}
+
+fn rpc_unavailable(method: &str, e: worker::Error) -> Response {
+    worker::console_error!("{method} failed: {e:?}");
     api_err(StatusCode::BAD_GATEWAY, "rpc unavailable, retry later")
 }
 
-/// Not mined / not enough confirmations: release the lock and ask the client
-/// to retry once the chain has caught up.
-async fn too_early(env: &Env, tx_hash: &str) -> Response {
-    delete_pending(env, tx_hash).await;
+fn too_early() -> Response {
     api_err(
         StatusCode::TOO_EARLY,
         "not enough confirmations yet, retry later",
@@ -288,25 +372,47 @@ pub async fn topup(
         return api_err(StatusCode::BAD_REQUEST, "unsupported token");
     };
 
+    let hash = match chain {
+        Chain::Ethereum => {
+            let hash = req.tx_hash.trim().to_ascii_lowercase();
+            if !valid_tx_hash(&hash) {
+                return api_err(StatusCode::BAD_REQUEST, "invalid tx hash");
+            }
+            hash
+        }
+        Chain::Solana => {
+            let sig = req.tx_hash.trim();
+            if !solana::valid_signature(sig) {
+                return api_err(StatusCode::BAD_REQUEST, "invalid transaction signature");
+            }
+            sig.to_owned()
+        }
+    };
+    let deposit = Deposit {
+        address: &addr,
+        hash: &hash,
+        token: spec,
+    };
+    match deposit.resume(&st).await {
+        Ok(Some(response)) => return response,
+        Err(e) => return payment_db_error(e),
+        Ok(None) => {}
+    }
     match chain {
-        Chain::Ethereum => topup_ethereum(&st, &addr, spec, &req.tx_hash).await,
-        Chain::Solana => topup_solana(&st, &addr, spec, &req.tx_hash).await,
+        Chain::Ethereum => topup_ethereum(&st, &deposit).await,
+        Chain::Solana => topup_solana(&st, &deposit).await,
     }
 }
 
 /// The token's USD price with 8 decimals, or `None` for a $1 stablecoin.
 /// Chainlink feeds live on Ethereum mainnet, so this always uses `rpc_url`
 /// (even to price SOL). On RPC failure returns a ready retry-later response.
-async fn resolve_price(
-    st: &AppState,
-    spec: &config::TokenSpec,
-    tx_hash: &str,
-) -> Result<Option<u128>, Response> {
+async fn resolve_price(st: &AppState, spec: &config::TokenSpec) -> Result<Option<u128>, Response> {
     match spec.feed {
         None => Ok(None),
         Some(feed) => match rates::chainlink_price(&st.rpc_url, feed, session::now_secs()).await {
             Ok(p) => Ok(Some(p)),
-            Err(e) => Err(rpc_unavailable(&st.env, tx_hash, "chainlink_price", e).await),
+            Err(e) => Err(rpc_unavailable("chainlink_price", e)),
         },
     }
 }
@@ -328,20 +434,9 @@ async fn linked_solana(env: &Env, addr: &str) -> worker::Result<Option<String>> 
 
 /// Solana top-up (native SOL + SPL USDT/USDC). Verification lives in
 /// `crate::solana`. This handler owns the payment row and account credit.
-async fn topup_solana(
-    st: &AppState,
-    addr: &str,
-    spec: &config::TokenSpec,
-    signature_in: &str,
-) -> Response {
-    // 1) validate the signature
-    let sig = signature_in.trim().to_string();
-    if !solana::valid_signature(&sig) {
-        return api_err(StatusCode::BAD_REQUEST, "invalid transaction signature");
-    }
-
-    // 2) the top-up must originate from a linked Solana wallet — or, for a
-    //    standalone Solana (SIWS) account, from the account's own principal.
+async fn topup_solana(st: &AppState, deposit: &Deposit<'_>) -> Response {
+    let (addr, sig, spec) = (deposit.address, deposit.hash, deposit.token);
+    // Standalone Solana accounts can deposit from their own principal.
     let linked = match linked_solana(&st.env, addr).await {
         Ok(Some(l)) => l,
         Ok(None) if session::is_sol_principal(addr) => addr.to_string(),
@@ -360,87 +455,54 @@ async fn topup_solana(
         }
     };
 
-    // 3) replay lock (signature is the payments PK)
-    if let Err(e) = d1_exec(
-        &st.env,
-        "INSERT INTO payments (tx_hash, address, chain, token, created_at) VALUES (?, ?, ?, ?, ?)",
-        &[
-            sig.as_str().into(),
-            addr.into(),
-            spec.chain.as_str().into(),
-            spec.symbol.into(),
-            (session::now_secs() as f64).into(),
-        ],
-    )
-    .await
-    {
-        if format!("{e:?}").to_lowercase().contains("constraint") {
-            return api_err(StatusCode::CONFLICT, "tx already submitted");
-        }
-        worker::console_error!("payments insert failed for {sig}: {e:?}");
-        return api_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "database error, retry later",
-        );
-    }
-
-    // 4) fetch + verify on-chain
-    let tx = match solana::get_transaction(&st.sol_rpc_url, &sig).await {
-        Ok(tx) if tx.is_null() => return too_early(&st.env, &sig).await,
+    let tx = match solana::get_transaction(&st.sol_rpc_url, sig).await {
+        Ok(tx) if tx.is_null() => return too_early(),
         Ok(tx) => tx,
-        Err(e) => return rpc_unavailable(&st.env, &sig, "getTransaction", e).await,
+        Err(e) => return rpc_unavailable("getTransaction", e),
     };
     let Some(timestamp) = tx["blockTime"].as_u64() else {
-        return too_early(&st.env, &sig).await;
+        return too_early();
     };
-    let policy = match deposit_terms(st, &sig, timestamp).await {
+    let policy = match deposit_terms(st, timestamp).await {
         Ok(p) => p,
         Err(response) => return response,
     };
+    if policy.sol_deposit.is_empty() {
+        return deposit
+            .reject(&st.env, "Deposits disabled at transfer time")
+            .await;
+    }
     let amount = match solana::verify_solana(&tx, spec, &policy.sol_deposit, &linked) {
         SolOutcome::Credited { amount } => amount,
-        SolOutcome::Reject(msg) => return reject(&st.env, &sig, msg).await,
+        SolOutcome::Reject(msg) => return deposit.reject(&st.env, msg).await,
         SolOutcome::WrongSender => {
-            delete_pending(&st.env, &sig).await;
             return api_err(
                 StatusCode::FORBIDDEN,
                 "tx sender is not your linked Solana wallet",
             );
         }
         SolOutcome::RpcError(e) => {
-            return rpc_unavailable(
-                &st.env,
-                &sig,
-                "getTransaction decode",
-                worker::Error::RustError(e),
-            )
-            .await;
+            return rpc_unavailable("getTransaction decode", worker::Error::RustError(e));
         }
     };
 
-    // 5) price + points
-    let price = match resolve_price(st, spec, &sig).await {
+    let price = match resolve_price(st, spec).await {
         Ok(p) => p,
         Err(resp) => return resp,
     };
     let points = rates::points_at_rate(amount, spec.decimals, price, policy.points_per_usd);
     if points < policy.minimum_topup {
-        return reject(&st.env, &sig, "amount below minimum top-up").await;
+        return deposit.reject(&st.env, "amount below minimum top-up").await;
     }
 
-    finalize_credit(st, addr, &sig, amount, points).await
+    deposit.credit_verified(st, amount, points).await
 }
 
-async fn deposit_terms(
-    st: &AppState,
-    hash: &str,
-    timestamp: u64,
-) -> Result<crate::settings::Policy, Response> {
+async fn deposit_terms(st: &AppState, timestamp: u64) -> Result<crate::settings::Policy, Response> {
     match crate::settings::Published::at_block(&st.env, timestamp).await {
         Ok(policy) => Ok(policy),
         Err(e) => {
             worker::console_error!("Could not load payment terms: {e}");
-            delete_pending(&st.env, hash).await;
             Err(api_err(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Payment settings unavailable, retry later",
@@ -450,43 +512,8 @@ async fn deposit_terms(
 }
 
 /// Native ETH and ERC-20 share the same sender, receipt, confirmation and block-time checks.
-async fn topup_ethereum(
-    st: &AppState,
-    addr: &str,
-    spec: &config::TokenSpec,
-    tx_hash_in: &str,
-) -> Response {
-    // 1) normalize + validate the hash
-    let tx_hash = tx_hash_in.trim().to_lowercase();
-    if !valid_tx_hash(&tx_hash) {
-        return api_err(StatusCode::BAD_REQUEST, "invalid tx hash");
-    }
-
-    // 2) replay lock: tx_hash is the payments PK.
-    if let Err(e) = d1_exec(
-        &st.env,
-        "INSERT INTO payments (tx_hash, address, chain, token, created_at) VALUES (?, ?, ?, ?, ?)",
-        &[
-            tx_hash.as_str().into(),
-            addr.into(),
-            spec.chain.as_str().into(),
-            spec.symbol.into(),
-            (session::now_secs() as f64).into(),
-        ],
-    )
-    .await
-    {
-        if format!("{e:?}").to_lowercase().contains("constraint") {
-            return api_err(StatusCode::CONFLICT, "tx already submitted");
-        }
-        worker::console_error!("payments insert failed for {tx_hash}: {e:?}");
-        return api_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "database error, retry later",
-        );
-    }
-
-    // 3) the transaction itself: sender + recipient + value
+async fn topup_ethereum(st: &AppState, deposit: &Deposit<'_>) -> Response {
+    let (addr, tx_hash, spec) = (deposit.address, deposit.hash, deposit.token);
     let tx_json = match rpc(
         &st.rpc_url,
         "eth_getTransactionByHash",
@@ -495,28 +522,25 @@ async fn topup_ethereum(
     .await
     {
         Ok(v) => v,
-        Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionByHash", e).await,
+        Err(e) => return rpc_unavailable("eth_getTransactionByHash", e),
     };
     if tx_json.is_null() {
-        delete_pending(&st.env, &tx_hash).await;
         return api_err(StatusCode::BAD_REQUEST, "tx not found");
     }
     let tx: RpcTx = match serde_json::from_value(tx_json) {
         Ok(t) => t,
         Err(e) => {
             let e = worker::Error::RustError(e.to_string());
-            return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionByHash decode", e).await;
+            return rpc_unavailable("eth_getTransactionByHash decode", e);
         }
     };
     if tx.from.to_lowercase() != addr {
-        delete_pending(&st.env, &tx_hash).await;
         return api_err(
             StatusCode::FORBIDDEN,
             "tx sender does not match logged-in address",
         );
     }
 
-    // 4) receipt: mined + successful
     let receipt_json = match rpc(
         &st.rpc_url,
         "eth_getTransactionReceipt",
@@ -525,7 +549,7 @@ async fn topup_ethereum(
     .await
     {
         Ok(v) => v,
-        Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionReceipt", e).await,
+        Err(e) => return rpc_unavailable("eth_getTransactionReceipt", e),
     };
     let receipt: Option<RpcReceipt> = if receipt_json.is_null() {
         None
@@ -534,8 +558,7 @@ async fn topup_ethereum(
             Ok(r) => Some(r),
             Err(e) => {
                 let e = worker::Error::RustError(e.to_string());
-                return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionReceipt decode", e)
-                    .await;
+                return rpc_unavailable("eth_getTransactionReceipt decode", e);
             }
         }
     };
@@ -543,7 +566,7 @@ async fn topup_ethereum(
         Some(RpcReceipt {
             status: Some(s), ..
         }) if s != "0x1" => {
-            return reject(&st.env, &tx_hash, "tx failed on-chain").await;
+            return deposit.reject(&st.env, "tx failed on-chain").await;
         }
         Some(RpcReceipt {
             status: Some(_),
@@ -553,22 +576,21 @@ async fn topup_ethereum(
             Some(b) => b,
             None => {
                 let e = worker::Error::RustError(format!("bad receipt blockNumber: {b}"));
-                return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionReceipt", e).await;
+                return rpc_unavailable("eth_getTransactionReceipt", e);
             }
         },
-        _ => return too_early(&st.env, &tx_hash).await,
+        _ => return too_early(),
     };
 
-    // 5) confirmations
     let head = match rpc(&st.rpc_url, "eth_blockNumber", serde_json::json!([])).await {
         Ok(v) => v.as_str().and_then(hex_to_u64),
-        Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_blockNumber", e).await,
+        Err(e) => return rpc_unavailable("eth_blockNumber", e),
     };
     let confirmed = head
         .and_then(|h| h.checked_sub(block))
         .is_some_and(|d| d + 1 >= MIN_CONFIRMATIONS);
     if !confirmed {
-        return too_early(&st.env, &tx_hash).await;
+        return too_early();
     }
 
     let block_time = match rpc(
@@ -579,56 +601,51 @@ async fn topup_ethereum(
     .await
     {
         Ok(v) => v["timestamp"].as_str().and_then(hex_to_u64),
-        Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_getBlockByNumber", e).await,
+        Err(e) => return rpc_unavailable("eth_getBlockByNumber", e),
     };
     let Some(timestamp) = block_time else {
-        return too_early(&st.env, &tx_hash).await;
+        return too_early();
     };
-    let policy = match deposit_terms(st, &tx_hash, timestamp).await {
+    let policy = match deposit_terms(st, timestamp).await {
         Ok(p) => p,
         Err(response) => return response,
     };
     let amount = match spec.contract {
         Some(contract) => {
-            let deposit = policy.eth_deposit.strip_prefix("0x").unwrap_or("");
+            let recipient = policy.eth_deposit.strip_prefix("0x").unwrap_or("");
             let sender = addr.strip_prefix("0x").unwrap_or(addr);
             let logs = &receipt.as_ref().expect("confirmed receipt").logs;
-            if deposit.is_empty() {
-                return reject(&st.env, &tx_hash, "Deposits disabled at transfer time").await;
+            if recipient.is_empty() {
+                return deposit
+                    .reject(&st.env, "Deposits disabled at transfer time")
+                    .await;
             }
-            match match_transfer_log(logs, contract, deposit, sender) {
+            match match_transfer_log(logs, contract, recipient, sender) {
                 Some(amount) => amount,
-                None => return reject(&st.env, &tx_hash, "no matching token transfer").await,
+                None => return deposit.reject(&st.env, "no matching token transfer").await,
             }
         }
         None => match verify_native_tx(&tx, &policy.eth_deposit) {
             Ok(amount) => amount,
-            Err(msg) => return reject(&st.env, &tx_hash, msg).await,
+            Err(msg) => return deposit.reject(&st.env, msg).await,
         },
     };
 
-    // 6) price + points
-    let price = match resolve_price(st, spec, &tx_hash).await {
+    let price = match resolve_price(st, spec).await {
         Ok(p) => p,
         Err(resp) => return resp,
     };
     let points = rates::points_at_rate(amount, spec.decimals, price, policy.points_per_usd);
     if points < policy.minimum_topup {
-        return reject(&st.env, &tx_hash, "amount below minimum top-up").await;
+        return deposit.reject(&st.env, "amount below minimum top-up").await;
     }
 
-    finalize_credit(st, addr, &tx_hash, amount, points).await
+    deposit.credit_verified(st, amount, points).await
 }
 
 /// Credit points via the DO ("tx:{hash}" idempotency key), then finalize the
 /// payment row. Shared by every chain/token path.
-async fn finalize_credit(
-    st: &AppState,
-    addr: &str,
-    tx_hash: &str,
-    amount: u128,
-    points: i64,
-) -> Response {
+async fn finalize_credit(st: &AppState, addr: &str, tx_hash: &str, points: i64) -> Response {
     let credit = CreditReq {
         points,
         key: format!("tx:{tx_hash}"),
@@ -638,7 +655,6 @@ async fn finalize_credit(
         Ok(b) => b,
         Err(e) => {
             worker::console_error!("do_credit failed for {tx_hash}: {e:?}");
-            delete_pending(&st.env, tx_hash).await;
             return api_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "credit failed, retry later",
@@ -648,16 +664,12 @@ async fn finalize_credit(
 
     if let Err(e) = d1_exec(
         &st.env,
-        "UPDATE payments SET amount=?, points=?, status='credited' WHERE tx_hash=?",
-        &[
-            amount.to_string().into(),
-            (points as f64).into(),
-            tx_hash.into(),
-        ],
+        "UPDATE payments SET status='credited' WHERE tx_hash=? AND address=? AND status='pending'",
+        &[tx_hash.into(), addr.into()],
     )
     .await
     {
-        worker::console_error!("payments finalize failed for {tx_hash}: {e:?}");
+        return payment_db_error(e);
     }
 
     Json(TopupResp {
@@ -808,6 +820,15 @@ mod tests {
         assert_eq!(
             match_transfer_log(&logs, USDC, &DEPOSIT[2..], &SENDER[2..]),
             Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn multiple_transfers_in_one_payment_are_added() {
+        let logs = [transfer_log(30), transfer_log(70)];
+        assert_eq!(
+            match_transfer_log(&logs, USDC, &DEPOSIT[2..], &SENDER[2..]),
+            Some(100)
         );
     }
 

@@ -354,6 +354,7 @@ fn encode_next(s: &str) -> String {
     for ch in s.chars() {
         match ch {
             '%' => out.push_str("%25"),
+            '+' => out.push_str("%2B"),
             '?' => out.push_str("%3F"),
             '#' => out.push_str("%23"),
             '&' => out.push_str("%26"),
@@ -388,24 +389,33 @@ fn payment_required(headers: &HeaderMap, guest: bool) -> Response {
     use axum::http::header::{ACCEPT, CACHE_CONTROL};
     use site_access::UPGRADE_PATH;
 
-    let navigation = headers
-        .get("sec-fetch-mode")
-        .is_some_and(|v| v == "navigate")
-        || headers
-            .get("sec-fetch-dest")
-            .is_some_and(|v| v == "document")
-        || headers
+    let mode = headers.get("sec-fetch-mode");
+    let dest = headers.get("sec-fetch-dest");
+    let navigation = if mode.is_some() || dest.is_some() {
+        mode.is_some_and(|value| value == "navigate")
+            || dest.is_some_and(|value| value == "document")
+    } else {
+        headers
             .get(ACCEPT)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| {
                 v.split(',').any(|item| {
-                    item.split(';')
+                    let mut parts = item.split(';').map(str::trim);
+                    parts
                         .next()
-                        .unwrap_or("")
-                        .trim()
-                        .eq_ignore_ascii_case("text/html")
+                        .is_some_and(|mime| mime.eq_ignore_ascii_case("text/html"))
+                        && parts
+                            .filter_map(|param| param.split_once('='))
+                            .filter(|(key, _)| key.trim().eq_ignore_ascii_case("q"))
+                            .all(|(_, value)| {
+                                value
+                                    .trim()
+                                    .parse::<f32>()
+                                    .is_ok_and(|q| q > 0.0 && q <= 1.0)
+                            })
                 })
-            });
+            })
+    };
     let mut response = if navigation {
         Redirect::to(UPGRADE_PATH).into_response()
     } else {
@@ -717,6 +727,18 @@ async fn proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clients_without_fetch_metadata_can_negotiate_the_upgrade_page() {
+        let mut headers = HeaderMap::new();
+        for (accept, expected) in [
+            ("application/json, text/html;q=0.8", StatusCode::SEE_OTHER),
+            ("text/html; q=0, application/json", StatusCode::PAYMENT_REQUIRED),
+        ] {
+            headers.insert("accept", accept.parse().unwrap());
+            assert_eq!(payment_required(&headers, true).status(), expected);
+        }
+    }
 
     #[test]
     fn segment_prefix_matches_whole_segments_only() {

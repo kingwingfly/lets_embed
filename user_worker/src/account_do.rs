@@ -167,7 +167,12 @@ impl DurableObject for UserAccount {
             (Method::Post, "/init") => self.init(req.json().await?, &policy).await,
             (Method::Post, "/charge") => self.charge(req.json().await?, &policy, false).await,
             (Method::Post, "/can-charge") => self.charge(req.json().await?, &policy, true).await,
-            (Method::Post, "/credit") => self.credit(req.json().await?).await,
+            (Method::Post, "/credit") => self.credit(req.json().await?, &policy).await,
+            (Method::Post, "/payment-applied") => {
+                let hash: String = req.json().await?;
+                let applied = self.get_or(&format!("credit:tx:{hash}"), false).await?;
+                json(&applied, 200)
+            }
             (Method::Get, "/status") => json(&self.status_resp(&policy).await?, 200),
             (Method::Post, "/subscribe") => self.subscribe(req.json().await?, &policy).await,
             (Method::Post, "/unsubscribe") => self.unsubscribe(&policy).await,
@@ -192,12 +197,9 @@ impl DurableObject for UserAccount {
                 .await?;
             return Response::ok("");
         }
-        // period elapsed: no auto-renew — lapse to PAYG and close the window so a
-        // lapsed account reports `None` for views/searches.
+        // An inactive plan already hides its allowances. Keep the counters in
+        // case the user subscribes again during the same five-hour window.
         storage.delete("plan").await?;
-        storage.delete("win_start").await?;
-        storage.delete("win_views").await?;
-        storage.delete("win_search").await?;
         Response::ok("")
     }
 }
@@ -210,6 +212,24 @@ impl UserAccount {
             .serialize_large_number_types_as_bigints(true);
         let object = serde::Serialize::serialize(&fields, &serializer)?;
         self.state.storage().put_multiple_raw(object.into()).await
+    }
+
+    async fn write_plan(&self, mut fields: serde_json::Value, end: u64, now: u64) -> Result<()> {
+        fields["period_end"] = end.into();
+        let storage = self.state.storage();
+        if end > now && should_roll(storage.get("win_start").await?, now) {
+            fields["win_start"] = now.into();
+            fields["win_views"] = 0.into();
+            fields["win_search"] = 0.into();
+        }
+        self.write_fields(fields).await?;
+        if end > now {
+            storage.set_alarm(((end - now) * 1000) as i64).await?;
+        } else {
+            storage.delete("plan").await?;
+            storage.delete_alarm().await?;
+        }
+        Ok(())
     }
 
     // Refund the historical price actually paid. Legacy subscriptions were
@@ -306,17 +326,11 @@ impl UserAccount {
         let previous_end = self.get_or("period_end", 0).await?;
         let refund = self.refund(current.as_deref(), previous_end, now).await?;
         let balance: i64 = self.get_or("balance", 0).await?;
-        self.write_fields(
-            serde_json::json!({"plan":id,"period_end":end,"plan_paid":0,"win_start":now,
-            "win_views":0,"win_search":0,"balance":balance.saturating_add(refund),(marker):true}),
+        self.write_plan(
+            serde_json::json!({"plan":id,"plan_paid":0,"balance":balance.saturating_add(refund),(marker):true}),
+            end, now,
         )
         .await?;
-        if end > now {
-            storage.set_alarm(((end - now) * 1000) as i64).await?;
-        } else {
-            storage.delete("plan").await?;
-            storage.delete_alarm().await?;
-        }
         json(&self.status_resp(policy).await?, 200)
     }
 
@@ -328,7 +342,8 @@ impl UserAccount {
     async fn ensure_init(&self, policy: &Policy) -> Result<()> {
         let storage = self.state.storage();
         if storage.get::<bool>("init").await?.is_none() {
-            self.write_fields(serde_json::json!({"init":true, "balance": policy.signup_points}))
+            let existing: i64 = self.get_or("balance", 0).await?;
+            self.write_fields(serde_json::json!({"init":true, "balance": existing.saturating_add(policy.signup_points)}))
                 .await?;
         }
         Ok(())
@@ -412,13 +427,10 @@ impl UserAccount {
         let rule = policy.item(req.kind);
         let cost = rule.price;
         // A first GET receives the signup grant. A HEAD can evaluate it without creating a wallet.
-        let mut balance: i64 = match storage.get("balance").await? {
-            Some(balance) => balance,
-            None if check_only && storage.get::<bool>("init").await?.is_none() => {
-                policy.signup_points
-            }
-            None => 0,
-        };
+        let mut balance: i64 = self.get_or("balance", 0).await?;
+        if check_only && storage.get::<bool>("init").await?.is_none() {
+            balance = balance.saturating_add(policy.signup_points);
+        }
 
         let active = self.plan_active(now).await?;
         let plan_cfg = if active {
@@ -545,7 +557,8 @@ impl UserAccount {
         )
     }
 
-    async fn credit(&self, req: CreditReq) -> Result<Response> {
+    async fn credit(&self, req: CreditReq, policy: &Policy) -> Result<Response> {
+        self.ensure_init(policy).await?;
         let storage = self.state.storage();
         let marker = format!("credit:{}", req.key);
         let balance: i64 = self.get_or("balance", 0).await?;
@@ -607,11 +620,13 @@ impl UserAccount {
         // Always a fresh full period from now — never stacks past one period.
         let new_end = now + target.period_secs;
 
-        self.write_fields(serde_json::json!({"balance":new_balance, "plan":target.id,
-            "period_end":new_end, "plan_paid":target.price_points, "win_start":now, "win_views":0,"win_search":0})).await?;
-        storage
-            .set_alarm((new_end.saturating_sub(now) * 1000) as i64)
-            .await?;
+        self.write_plan(
+            serde_json::json!({"balance":new_balance, "plan":target.id,
+            "plan_paid":target.price_points}),
+            new_end,
+            now,
+        )
+        .await?;
         json(&self.status_resp(policy).await?, 200)
     }
 
@@ -626,13 +641,12 @@ impl UserAccount {
 
         let refund = self.refund(current.as_deref(), period_end, now).await?;
         let balance: i64 = self.get_or("balance", 0).await?;
-        self.write_fields(
-            serde_json::json!({"balance":balance.saturating_add(refund), "period_end":0,
-            "plan_paid":0,"win_start":0,"win_views":0,"win_search":0}),
+        self.write_plan(
+            serde_json::json!({"balance":balance.saturating_add(refund), "plan_paid":0}),
+            0,
+            now,
         )
         .await?;
-        storage.delete("plan").await?;
-        let _ = storage.delete_alarm().await;
         json(&self.status_resp(policy).await?, 200)
     }
 

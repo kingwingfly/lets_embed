@@ -342,17 +342,15 @@ async fn shutdown_signal() {
 }
 
 fn normalize_scan_prefix(prefix: &str) -> anyhow::Result<String> {
-    if prefix.is_empty() {
-        bail!("prefix cannot be empty (use \"/\" for root)");
-    }
     if prefix == "/" {
         return Ok("/".to_string());
     }
-    if prefix.ends_with('/') {
-        Ok(prefix.to_string())
-    } else {
-        Ok(format!("{prefix}/"))
+    let relative = prefix.strip_prefix('/').unwrap_or(prefix);
+    let directory = relative.strip_suffix('/').unwrap_or(relative);
+    if !valid_key_segments(directory) {
+        bail!("invalid scan prefix {prefix:?} (use \"/\" for root)");
     }
+    Ok(format!("{directory}/"))
 }
 
 pub async fn walk_convert(
@@ -523,6 +521,24 @@ fn load_journal(path: &Path) -> anyhow::Result<HashMap<String, Meta>> {
     }
 }
 
+// Lock a separate inode: the journal itself is replaced on every checkpoint.
+fn lock_journal(path: &Path) -> anyhow::Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    file.try_lock()
+        .with_context(|| format!("cannot lock metadata journal {}", path.display()))?;
+    Ok(file)
+}
+
 fn persist_journal(path: &Path, metas: &HashMap<String, Meta>) -> anyhow::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
@@ -544,6 +560,17 @@ pub async fn pull_convert(
     cfg: QueueConfig,
     delete_origin: bool,
 ) -> anyhow::Result<HashSet<Meta>> {
+    pull_convert_and_then(src_op, dst_op, cfg, delete_origin, Ok).await
+}
+
+/// Keep the one-shot checkpoint until the consumer successfully accepts the metadata.
+pub async fn pull_convert_and_then<T>(
+    src_op: Operator,
+    dst_op: Operator,
+    cfg: QueueConfig,
+    delete_origin: bool,
+    deliver: impl FnOnce(HashSet<Meta>) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
     let cancel = CancellationToken::new();
     let _signal_guard = AbortOnDrop(tokio::spawn({
         let cancel = cancel.clone();
@@ -560,11 +587,13 @@ pub async fn pull_convert(
         DEFAULT_CF_API_BASE_URL,
         None,
         cancel,
+        deliver,
     )
     .await
 }
 
-async fn pull_convert_inner(
+#[allow(clippy::too_many_arguments)]
+async fn pull_convert_inner<T>(
     src_op: Operator,
     dst_op: Operator,
     cfg: QueueConfig,
@@ -572,7 +601,8 @@ async fn pull_convert_inner(
     api_base_url: &str,
     journal_override: Option<&Path>,
     cancel: CancellationToken,
-) -> anyhow::Result<HashSet<Meta>> {
+    deliver: impl FnOnce(HashSet<Meta>) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
     cfg.validate()?;
     ensure_vips()?;
 
@@ -606,6 +636,7 @@ async fn pull_convert_inner(
             .map(Path::to_path_buf)
             .unwrap_or_else(|| one_shot_journal_path(&cfg))
     });
+    let _journal_lock = journal_path.as_deref().map(lock_journal).transpose()?;
     let mut metas: HashMap<String, Meta> = match &journal_path {
         Some(p) => load_journal(p)?,
         None => HashMap::new(),
@@ -1056,11 +1087,19 @@ async fn pull_convert_inner(
         bail!("queue drained with failed messages (exhausted_retries={exhausted_retries})");
     }
 
+    let result = deliver(metas.into_values().collect())?;
     if let Some(jp) = &journal_path {
-        let _ = std::fs::remove_file(jp);
+        match std::fs::remove_file(jp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("metadata delivered but could not remove journal {}", jp.display())
+                });
+            }
+        }
     }
-
-    Ok(metas.into_values().collect())
+    Ok(result)
 }
 
 fn update_max_deadline(slot: &mut Option<Instant>, candidate: Instant) {
@@ -1791,12 +1830,11 @@ async fn convert_object(
 }
 
 fn is_valid_object_key(key: &str) -> bool {
-    !key.trim().is_empty()
-        && !key.starts_with('/')
-        && !key.ends_with('/')
-        && !key.contains("//")
-        && !key.contains('\0')
-        && !key.split('/').any(|seg| seg == "." || seg == "..")
+    !key.trim().is_empty() && valid_key_segments(key)
+}
+
+fn valid_key_segments(key: &str) -> bool {
+    !key.contains('\0') && key.split('/').all(|seg| !matches!(seg, "" | "." | ".."))
 }
 
 fn message_content_type(msg: &QueueMessage) -> Option<&str> {
@@ -2274,7 +2312,7 @@ fn record_meta(
 pub fn convert(bytes: &[u8]) -> Result<Vec<u8>, libvips::error::Error> {
     let inp = VipsImage::new_from_buffer(bytes, "")?;
     webpsave_buffer_with_opts(
-        &inp,
+        &libvips::ops::autorot(&inp)?,
         &WebpsaveBufferOptions {
             q: 80,
             preset: ForeignWebpPreset::Photo,
@@ -3670,6 +3708,45 @@ mod tests {
         assert_eq!((img2.width, img2.height), (12, 9));
     }
 
+    #[test]
+    fn scan_prefix_preserves_directory_names_and_rejects_ambiguous_roots() {
+        for path in [
+            "",
+            "//",
+            "album//",
+            "album//sub",
+            "album/../",
+            "./",
+            "al\0bum",
+        ] {
+            assert!(normalize_scan_prefix(path).is_err(), "{path:?}");
+        }
+        assert_eq!(normalize_scan_prefix("/").unwrap(), "/");
+        assert_eq!(normalize_scan_prefix("/ album /").unwrap(), " album /");
+        assert_eq!(normalize_scan_prefix("  ").unwrap(), "  /");
+    }
+
+    #[test]
+    fn webp_bakes_in_camera_orientation_before_removing_exif() {
+        use libvips::ops::{JpegsaveBufferOptions, jpegsave_buffer_with_opts};
+        ensure_vips().unwrap();
+        let png = make_png(8, 6, [80, 120, 200]);
+        let image = VipsImage::new_from_buffer(&png, "").unwrap();
+        let mut jpeg = jpegsave_buffer_with_opts(
+            &image,
+            &JpegsaveBufferOptions {
+                keep: ForeignKeep::None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // JPEG APP1 containing a single EXIF orientation tag (6 = portrait, 90° clockwise).
+        jpeg.splice(2..2, *b"\xff\xe1\x00\x22Exif\0\0II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0");
+        let out = convert_checked(&jpeg).unwrap();
+        let size = imagesize::blob_size(&out).unwrap();
+        assert_eq!((size.width, size.height), (6, 8));
+    }
+
     #[tokio::test]
     async fn scan_preserves_whitespace_in_r2_keys() {
         let s3 = MockS3Server::start("test-bucket").await;
@@ -3971,6 +4048,25 @@ mod tests {
             concurrency: 4,
         };
 
+        let failed = pull_convert_inner(
+            op.clone(),
+            op.clone(),
+            cfg.clone(),
+            true,
+            &q.base_url,
+            Some(&journal_file),
+            CancellationToken::new(),
+            |_| {
+                assert!(
+                    lock_journal(&journal_file).is_err(),
+                    "journal must stay locked through delivery"
+                );
+                Err::<(), _>(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into())
+            },
+        )
+        .await;
+        assert!(failed.is_err());
+        assert!(load_journal(&journal_file).unwrap().contains_key("Post1"));
         let metas = pull_convert_inner(
             op.clone(),
             op.clone(),
@@ -3979,6 +4075,7 @@ mod tests {
             &q.base_url,
             Some(&journal_file),
             CancellationToken::new(),
+            Ok,
         )
         .await
         .unwrap();
@@ -4051,6 +4148,7 @@ mod tests {
             &q.base_url,
             Some(&journal),
             CancellationToken::new(),
+            Ok,
         )
         .await
         .unwrap_err();
@@ -4145,6 +4243,7 @@ mod tests {
             &q.base_url,
             Some(&journal_file),
             CancellationToken::new(),
+            Ok,
         )
         .await
         .unwrap_err();
@@ -4330,6 +4429,7 @@ mod tests {
             &q1.base_url,
             Some(&jfile),
             cancel_oneshot,
+            Ok,
         )
         .await
         .unwrap_err();
@@ -4363,6 +4463,7 @@ mod tests {
             &q2.base_url,
             None,
             cancel_daemon,
+            Ok,
         )
         .await
         .unwrap();
