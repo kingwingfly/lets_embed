@@ -3,10 +3,7 @@ use std::{
     fmt,
     future::ready,
     path::{Path, PathBuf},
-    sync::{
-        Arc, LazyLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
+    sync::{Arc, LazyLock},
     thread::available_parallelism,
     time::{Duration, SystemTime},
 };
@@ -407,84 +404,84 @@ pub async fn walk_convert_prefix_with_concurrency(
 
     let byte_sem = Arc::new(Semaphore::new(SOURCE_BYTE_BUDGET));
     let cpu_sem = Arc::new(Semaphore::new(cpu_concurrency()));
-    let error_count = Arc::new(AtomicUsize::new(0));
-    let list_failed = Arc::new(AtomicBool::new(false));
-    let list_failed_flag = Arc::clone(&list_failed);
-    let err_item = Arc::clone(&error_count);
-
     let finished_paths = entries
         .take_until(cancel.cancelled())
-        .inspect_err(move |e| {
-            list_failed_flag.store(true, Ordering::Relaxed);
-            tracing::error!(error = %e, "storage list failed");
+        .try_filter(|e| ready(e.metadata().is_file() && should_convert_path(e.path())))
+        .map(async |entry| {
+            let (path, entry_meta) = entry?.into_parts();
+            let outcome = convert_object(
+                &src_op,
+                &dst_op,
+                &path,
+                Some(&entry_meta),
+                delete_origin,
+                true,
+                1,
+                &byte_sem,
+                &cpu_sem,
+            )
+            .await;
+            Ok::<_, opendal::Error>((path, outcome))
         })
-        .filter_map(|e| ready(e.ok()))
-        .filter(|e| ready(e.metadata().is_file() && should_convert_path(e.path())))
-        .map(|e| {
-            let (path, entry_meta) = e.into_parts();
-            let src_op = src_op.clone();
-            let dst_op = dst_op.clone();
-            let byte_sem = Arc::clone(&byte_sem);
-            let cpu_sem = Arc::clone(&cpu_sem);
-            async move {
-                convert_object(
-                    &src_op,
-                    &dst_op,
-                    &path,
-                    Some(&entry_meta),
-                    delete_origin,
-                    true,
-                    1,
-                    &byte_sem,
-                    &cpu_sem,
-                )
-                .await
-                .map(|outcome| (path, outcome))
-            }
-        })
-        .buffer_unordered(concurrency)
-        .inspect_err(move |e| {
-            err_item.fetch_add(1, Ordering::Relaxed);
-            tracing::error!(error = %format_args!("{e:#}"), "scan item conversion failed");
-        })
-        .filter_map(async |res| res.ok());
+        .buffer_unordered(concurrency);
 
+    let mut first_list_error = None;
+    let mut item_errors = 0usize;
+    let mut examples = Vec::new();
     tokio::pin!(finished_paths);
-    while let Some((path, outcome)) = finished_paths.next().await {
+    while let Some(entry) = finished_paths.next().await {
+        let (path, outcome) = match entry {
+            Ok(item) => item,
+            Err(e) => {
+                tracing::error!(error = %e, "storage list failed");
+                first_list_error.get_or_insert(e);
+                continue;
+            }
+        };
         match outcome {
-            ConvertOutcome::Converted {
+            Ok(ConvertOutcome::Converted {
                 new_path,
                 meta_key,
                 size: (width, height),
-            } => {
+            }) => {
                 tracing::info!(path, new_path, "converted");
                 record_meta(&mut metas, &new_path, meta_key, width, height);
             }
-            ConvertOutcome::SkippedWithMeta {
+            Ok(ConvertOutcome::SkippedWithMeta {
                 new_path,
                 meta_key,
                 size: (width, height),
-            } => {
+            }) => {
                 tracing::debug!(path, new_path, "unchanged, skipping conversion");
                 record_meta(&mut metas, &new_path, meta_key, width, height);
             }
-            ConvertOutcome::SkippedNoMeta => {}
+            Ok(ConvertOutcome::SkippedNoMeta) => {}
+            Err(e) => {
+                tracing::error!(key = ?path, error = %format_args!("{e:#}"), "scan item conversion failed");
+                item_errors += 1;
+                if examples.len() < 3 {
+                    examples.push(format!("  {path:?}: {e:#}"));
+                }
+            }
         }
     }
 
-    let errors = error_count.load(Ordering::Relaxed);
-    if cancel.is_cancelled() {
-        bail!(
-            "walk interrupted by signal after converting {} image(s) (errors={errors})",
+    let list_failed = first_list_error.is_some();
+    let summary = if cancel.is_cancelled() {
+        format!(
+            "walk interrupted by signal after converting {} image(s) (errors={item_errors})",
             metas.values().map(|m| m.images.len()).sum::<usize>()
-        );
+        )
+    } else if list_failed || item_errors > 0 {
+        format!("walk completed with errors (list_failed={list_failed}, item_errors={item_errors})")
+    } else {
+        return Ok(metas.into_values().collect());
+    };
+    if let Some(error) = first_list_error {
+        examples.insert(0, format!("  listing {prefix:?}: {error}"));
     }
-    let lf = list_failed.load(Ordering::Relaxed);
-    if lf || errors > 0 {
-        bail!("walk completed with errors (list_failed={lf}, item_errors={errors})");
-    }
-
-    Ok(metas.into_values().collect())
+    examples.insert(0, summary);
+    bail!("{}", examples.join("\n"))
 }
 
 fn one_shot_journal_path(cfg: &QueueConfig) -> PathBuf {
@@ -1653,6 +1650,35 @@ async fn recover_webp_dimensions(
     read_webp_dimensions(dst_op, new_path).await
 }
 
+async fn recover_missing_source(
+    dst_op: &Operator,
+    path: &str,
+    new_path: String,
+    meta_key: String,
+    collect_meta: bool,
+    attempts: u32,
+) -> anyhow::Result<ConvertOutcome> {
+    // Another converter may have published the WebP and deleted the source since our first HEAD.
+    let dst_meta = match dst_op.stat(&new_path).await {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            bail!("source object missing in storage (attempt {attempts}): {path}");
+        }
+        Err(e) => return Err(e.into()),
+    };
+    destination_source_etag(&dst_meta, path, &new_path)?;
+    if collect_meta {
+        let size = recover_webp_dimensions(dst_op, &new_path, &dst_meta).await?;
+        Ok(ConvertOutcome::SkippedWithMeta {
+            new_path,
+            meta_key,
+            size,
+        })
+    } else {
+        Ok(ConvertOutcome::SkippedNoMeta)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn convert_object(
     src_op: &Operator,
@@ -1686,20 +1712,8 @@ async fn convert_object(
         match src_op.stat(path).await {
             Ok(stat) => SourceIdentity::from_meta(&stat),
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                if let Some(ref dst_meta) = existing_dst {
-                    if collect_meta {
-                        let size = recover_webp_dimensions(dst_op, &new_path, dst_meta).await?;
-                        tracing::debug!(path, %new_path, "already converted, recovered metadata");
-                        return Ok(ConvertOutcome::SkippedWithMeta {
-                            new_path,
-                            meta_key,
-                            size,
-                        });
-                    }
-                    tracing::debug!(path, %new_path, "already converted, skipping");
-                    return Ok(ConvertOutcome::SkippedNoMeta);
-                }
-                bail!("source object missing in storage (attempt {attempts}): {path}");
+                return recover_missing_source(dst_op, path, new_path, meta_key, collect_meta, attempts)
+                    .await;
             }
             Err(e) => return Err(e.into()),
         }
@@ -1729,19 +1743,8 @@ async fn convert_object(
     let (buf, byte_permit) = match read_source_bytes(src_op, path, &mut src_id, byte_sem).await? {
         ReadSourceOutcome::Loaded(buf, permit) => (buf, permit),
         ReadSourceOutcome::NotFound => {
-            if let Some(ref dst_meta) = existing_dst {
-                if collect_meta {
-                    let size = recover_webp_dimensions(dst_op, &new_path, dst_meta).await?;
-                    tracing::debug!(path, %new_path, "already converted, recovered metadata");
-                    return Ok(ConvertOutcome::SkippedWithMeta {
-                        new_path,
-                        meta_key,
-                        size,
-                    });
-                }
-                return Ok(ConvertOutcome::SkippedNoMeta);
-            }
-            bail!("source object missing in storage (attempt {attempts}): {path}");
+            return recover_missing_source(dst_op, path, new_path, meta_key, collect_meta, attempts)
+                .await;
         }
     };
 
@@ -2336,6 +2339,7 @@ pub async fn operator() -> anyhow::Result<Operator> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn extract_key_formats() {
@@ -3672,6 +3676,82 @@ mod tests {
             .find(|i| i.name == "album/legacy")
             .unwrap();
         assert_eq!((img2.width, img2.height), (12, 9));
+    }
+
+    #[tokio::test]
+    async fn scan_recovers_a_webp_published_after_its_first_head() {
+        let s3 = MockS3Server::start("walk-race", "test-bucket").await;
+        let path = "Album/photo.jpg";
+        let png = make_png(8, 6, [10, 20, 30]);
+        s3.put_raw(path, png.clone()).await;
+        let op = s3.operator();
+        let listed = op.stat(path).await.unwrap();
+        let budget = Arc::new(Semaphore::new(0));
+        let scan = tokio::spawn({
+            let op = op.clone();
+            let budget = Arc::clone(&budget);
+            async move {
+                convert_object(
+                    &op,
+                    &op,
+                    path,
+                    Some(&listed),
+                    true,
+                    true,
+                    1,
+                    &budget,
+                    &Arc::new(Semaphore::new(1)),
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while s3.state.lock().await.head_dst_count == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        op.write_with("Album/photo.webp", convert_checked(&png).unwrap())
+            .user_metadata([("source-key".to_owned(), path.to_owned())])
+            .await
+            .unwrap();
+        op.delete(path).await.unwrap();
+        budget.add_permits(png.len());
+        assert!(matches!(
+            scan.await.unwrap().unwrap(),
+            ConvertOutcome::SkippedWithMeta { size: (8, 6), .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_scan_reports_keys_and_causes_without_a_log_subscriber() {
+        let s3 = MockS3Server::start("walk-errors", "test-bucket").await;
+        for i in 0..5 {
+            s3.put_raw(&format!("Album/bad-{i}.jpg"), vec![0; 128])
+                .await;
+        }
+        s3.put_raw("Album/good.png", make_png(8, 6, [10, 20, 30]))
+            .await;
+        let op = s3.operator();
+        let err = walk_convert_prefix_with_concurrency(op.clone(), op, "/", true, 2)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("list_failed=false, item_errors=5"),
+            "{message}"
+        );
+        assert_eq!(message.matches("  \"Album/bad-").count(), 3, "{message}");
+        assert_eq!(
+            message.matches("Could not decode image").count(),
+            3,
+            "{message}"
+        );
+        let st = s3.state.lock().await;
+        assert!(st.objects.contains_key("Album/good.webp"));
+        assert!(!st.objects.contains_key("Album/good.png"));
+        assert!((0..5).all(|i| st.objects.contains_key(&format!("Album/bad-{i}.jpg"))));
     }
 
     #[tokio::test]
