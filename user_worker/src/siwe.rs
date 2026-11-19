@@ -365,6 +365,28 @@ Expiration Time: 2026-07-04T00:10:00Z";
     }
 
     #[test]
+    fn ecrecover_high_s_normalizes() {
+        use k256::{NonZeroScalar, Scalar, elliptic_curve::scalar::IsHigh};
+
+        let sk = SigningKey::from_slice(&[0x22; 32]).unwrap();
+        let expected = pubkey_to_address(sk.verifying_key());
+        let (sig, rec_id) = sk.sign_prehash_recoverable(&eip191_digest(MSG));
+
+        let (r, s) = sig.split_scalars();
+        let neg_s = NonZeroScalar::new(-Scalar::from(s)).unwrap();
+        assert!(bool::from(neg_s.is_high()));
+        let high_sig = Signature::from_scalars(r, neg_s).unwrap();
+        let flipped_v = rec_id.to_byte() ^ 1;
+
+        let mut raw = high_sig.to_bytes().to_vec();
+        raw.push(flipped_v);
+        assert_eq!(
+            recover_address(MSG, &format!("0x{}", hex::encode(&raw))).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn eip55_vectors() {
         for want in [
             "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",

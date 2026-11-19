@@ -26,7 +26,12 @@ pub fn tokenizer(config: impl AsRef<Path>) -> anyhow::Result<Tokenizer> {
     Tokenizer::from_file(config).map_err(|e| anyhow!("{e}"))
 }
 
-pub fn model(env: &Environment, model_path: impl AsRef<Path>) -> ort::Result<Session> {
+pub fn model(model_path: impl AsRef<Path>) -> ort::Result<Session> {
+    let env = ort::init().build()?;
+    model_with_env(&env, model_path)
+}
+
+pub fn model_with_env(env: &Environment, model_path: impl AsRef<Path>) -> ort::Result<Session> {
     let session = Session::builder(env)?
         .with_execution_providers([
             #[cfg(not(target_os = "macos"))]

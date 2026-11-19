@@ -8,9 +8,9 @@ use crate::{
 
 use leptos::{prelude::*, task::spawn_local};
 use leptos_router::hooks::use_query_map;
-use leptos_use::{
-    UseElementSizeReturn, signal_debounced, use_element_size, use_intersection_observer,
-};
+use leptos_use_element_size::{UseElementSizeReturn, use_element_size};
+use leptos_use_intersection_observer::use_intersection_observer;
+use leptos_use_signal_debounce_throttle::signal_debounced;
 use search_types::Image;
 
 const COLUMN_WIDTH: u32 = 360;

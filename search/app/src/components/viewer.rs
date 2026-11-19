@@ -1,6 +1,6 @@
 use leptos::ev;
 use leptos::prelude::*;
-use leptos_use::use_event_listener;
+use leptos_use_event_listener::use_event_listener;
 use search_types::Image;
 use web_sys::TouchEvent;
 

@@ -176,7 +176,7 @@ async fn gateway(
         .get(SESSION_COOKIE)
         .and_then(|tok| jwt_verify(tok.value(), &st.jwt_secret, now_secs()));
     let Some(claims) = claims else {
-        let media = path.starts_with("/images/") || path.starts_with("/videos/");
+        let media = is_segment_prefix(path, "/images") || is_segment_prefix(path, "/videos");
         if media && matches!(method, Method::GET | Method::HEAD) {
             // an <img> tag can't follow a login redirect
             return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
@@ -187,9 +187,9 @@ async fn gateway(
 
     // charge GET media views against the user's account DO (HEAD is free)
     if method == Method::GET {
-        let kind = if path.starts_with("/images/") {
+        let kind = if is_segment_prefix(path, "/images") {
             Some(ChargeKind::Image)
-        } else if path.starts_with("/videos/") {
+        } else if is_segment_prefix(path, "/videos") {
             Some(ChargeKind::Video)
         } else {
             None
@@ -219,7 +219,22 @@ async fn gateway(
     // through unchanged. Dedupe (same key within 24h) lives in the DO, so
     // paginated re-searches with the same `q` are automatically free.
     if method == Method::POST
-        && let Some((charge_key, kind)) =
+        && matches!(
+            path,
+            "/api/search_similar" | "/api/search_by_image" | "/api/search_by_desc"
+        )
+    {
+        let content_type_ok = headers
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| {
+                ct.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+            });
+        let charge = if content_type_ok {
             match path {
                 // By-id search reuses a stored embedding (cheap) -> view-class EmbedSearch.
                 "/api/search_similar" => form_field(&body, "q")
@@ -232,13 +247,18 @@ async fn gateway(
                     )
                 }),
                 "/api/search_by_desc" => form_field(&body, "q")
-                    .map(|q| (format!("search:desc:{}", q), ChargeKind::Search)),
+                    .map(|q| (format!("search:desc:{q}"), ChargeKind::Search)),
                 _ => None,
             }
-    {
-        // If the field is absent/unparseable we PROXY WITHOUT CHARGING (and warn):
-        // a body-shape change must never break search. `None` charge_key means we
-        // did match an intercepted path but couldn't read the field.
+        } else {
+            None
+        };
+
+        let Some((charge_key, kind)) = charge else {
+            worker::console_warn!("search rejected: invalid or unmeterable form body on {path}");
+            return (StatusCode::BAD_REQUEST, "invalid search payload").into_response();
+        };
+
         match charge_do(&st, &claims.sub, &charge_key, kind).await {
             Ok(200) => {}
             Ok(402) => {
@@ -260,12 +280,6 @@ async fn gateway(
                 return (StatusCode::BAD_GATEWAY, "charge failed").into_response();
             }
         }
-    } else if method == Method::POST
-        && matches!(path, "/api/search_similar" | "/api/search_by_image")
-    {
-        // matched an intercepted path but the expected form field was missing:
-        // proxy uncharged rather than break search on an unexpected body shape.
-        worker::console_warn!("search charge skipped: missing form field on {path}");
     }
 
     proxy(uri, method, headers, body, &st.client_id, &st.client_secret).await
@@ -335,19 +349,30 @@ fn sha256_hex(s: &str) -> String {
 }
 
 /// Read one `application/x-www-form-urlencoded` field value from a raw body,
-/// without adding a dependency. Splits on `&`, then `=`, matches `key`, and
-/// percent-decodes the value (`+` → space, `%XX` → byte). Returns `None` if the
-/// field is absent (caller then proxies without charging).
+/// decoding both field names and values (`+` -> space, `%XX` -> byte).
+/// Rejects non-UTF-8 or duplicate matching keys so gateway metering stays
+/// aligned with `serde_urlencoded`.
 fn form_field(body: &Bytes, key: &str) -> Option<String> {
-    let s = String::from_utf8_lossy(body);
-    s.split('&').find_map(|pair| {
+    let s = std::str::from_utf8(body).ok()?;
+    let mut found: Option<String> = None;
+    for pair in s.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
         let (k, v) = pair.split_once('=')?;
-        (k == key).then(|| percent_decode(v))
-    })
+        let decoded_k = percent_decode(k)?;
+        if decoded_k == key {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(percent_decode(v)?);
+        }
+    }
+    found
 }
 
-/// Minimal `application/x-www-form-urlencoded` value decoder.
-fn percent_decode(s: &str) -> String {
+/// Strict `application/x-www-form-urlencoded` component decoder (UTF-8).
+fn percent_decode(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -357,20 +382,24 @@ fn percent_decode(s: &str) -> String {
                 out.push(b' ');
                 i += 1;
             }
-            b'%' if i + 2 < bytes.len()
-                && let Some(hi) = (bytes[i + 1] as char).to_digit(16)
-                && let Some(lo) = (bytes[i + 2] as char).to_digit(16) =>
-            {
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16)?;
+                let lo = (bytes[i + 2] as char).to_digit(16)?;
                 out.push((hi * 16 + lo) as u8);
                 i += 3;
             }
+            b'%' => return None,
             b => {
                 out.push(b);
                 i += 1;
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8(out).ok()
+}
+
+fn is_segment_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'))
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +482,38 @@ fn sanitize_cookie(headers: &HeaderMap) -> Option<String> {
     (!kept.is_empty()).then(|| kept.join("; "))
 }
 
+fn build_upstream_target(uri: &Uri) -> std::result::Result<(String, worker::Url), ()> {
+    let path = uri.path();
+    if !path.starts_with('/') {
+        return Err(());
+    }
+    let (upstream, upstream_path) = if is_segment_prefix(path, "/images") {
+        (IMAGE_UPSTREAM, path.strip_prefix("/images").unwrap_or(""))
+    } else if is_segment_prefix(path, "/videos") {
+        (VIDEO_UPSTREAM, path.strip_prefix("/videos").unwrap_or(""))
+    } else {
+        (API_UPSTREAM, path)
+    };
+
+    let mut target = format!("{upstream}{upstream_path}");
+    if let Some(q) = uri.query() {
+        target.push('?');
+        target.push_str(q);
+    }
+
+    let base_url = worker::Url::parse(upstream).map_err(|_| ())?;
+    let target_url = worker::Url::parse(&target).map_err(|_| ())?;
+    if target_url.scheme() != base_url.scheme()
+        || target_url.host_str() != base_url.host_str()
+        || target_url.port_or_known_default() != base_url.port_or_known_default()
+        || !target_url.username().is_empty()
+        || target_url.password().is_some()
+    {
+        return Err(());
+    }
+    Ok((target, target_url))
+}
+
 async fn proxy(
     uri: Uri,
     method: Method,
@@ -461,19 +522,13 @@ async fn proxy(
     client_id: &str,
     client_secret: &str,
 ) -> Response {
-    let target = match uri.path_and_query() {
-        Some(pq) if let Some(pq) = pq.as_str().strip_prefix("/images") => {
-            format!("{IMAGE_UPSTREAM}{pq}")
-        }
-        Some(pq) if let Some(pq) = pq.as_str().strip_prefix("/videos") => {
-            format!("{VIDEO_UPSTREAM}{pq}")
-        }
-        Some(pq) => format!("{API_UPSTREAM}{pq}"),
-        None => API_UPSTREAM.to_string(),
+    let Ok((target, _target_url)) = build_upstream_target(&uri) else {
+        return (StatusCode::BAD_REQUEST, "invalid request URI").into_response();
     };
 
     let mut req_init = RequestInit::new();
     req_init.with_method(method.to_string().into());
+    req_init.with_redirect(worker::RequestRedirect::Manual);
 
     if !matches!(method, Method::GET | Method::HEAD) && !body.is_empty() {
         req_init.with_body(Some(Uint8Array::from(&body[..]).into()));
@@ -481,7 +536,11 @@ async fn proxy(
 
     for (k, v) in &headers {
         let name = k.as_str();
-        if is_hop_by_hop(name) || name == "cookie" {
+        if is_hop_by_hop(name)
+            || name == "cookie"
+            || name.eq_ignore_ascii_case("cf-access-client-id")
+            || name.eq_ignore_ascii_case("cf-access-client-secret")
+        {
             continue;
         }
         if let Ok(v) = v.to_str() {
@@ -575,4 +634,31 @@ fn page(title: &str, body: &str) -> String {
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title>{STYLE}
 </head><body><div class="wrap">{body}</div></body></html>"#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segment_prefix_matches_whole_segments_only() {
+        assert!(is_segment_prefix("/images", "/images"));
+        assert!(is_segment_prefix("/images/a.webp", "/images"));
+        assert!(!is_segment_prefix("/images@evil.com", "/images"));
+        assert!(!is_segment_prefix("/images.evil.com/x", "/images"));
+        assert!(is_segment_prefix("/videos/a.mp4", "/videos"));
+        assert!(!is_segment_prefix("/videos@evil.com", "/videos"));
+    }
+
+    #[test]
+    fn form_field_decodes_keys_and_rejects_duplicates() {
+        let body = Bytes::from_static(b"limit=20&%71=cat+ears&offset=0");
+        assert_eq!(form_field(&body, "q").as_deref(), Some("cat ears"));
+
+        let dup = Bytes::from_static(b"q=first&%71=second");
+        assert_eq!(form_field(&dup, "q"), None);
+
+        let missing = Bytes::from_static(b"limit=20");
+        assert_eq!(form_field(&missing, "q"), None);
+    }
 }

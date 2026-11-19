@@ -178,9 +178,9 @@ impl EmbedCli {
         let tags = tags.leak::<'static>();
 
         let ort_env = ort::init().with_name("embed").build()?;
-        let wd_tagger_session = wd_tagger::model(&ort_env, self.wd_tagger_model)?;
-        let clip_vision_session = siglip2::model(&ort_env, self.clip_vision_model)?;
-        let dinov3_session = dinov3::model(&ort_env, self.dinov3_model)?;
+        let wd_tagger_session = wd_tagger::model_with_env(&ort_env, self.wd_tagger_model)?;
+        let clip_vision_session = siglip2::model_with_env(&ort_env, self.clip_vision_model)?;
+        let dinov3_session = dinov3::model_with_env(&ort_env, self.dinov3_model)?;
 
         let batch_size = self.batch_size.max(1);
         let decode_concurrency = available_parallelism().map(|num| num.get()).unwrap_or(1);

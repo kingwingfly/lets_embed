@@ -1,0 +1,72 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH input AS (\n                SELECT * FROM unnest($1::meta[])\n                AS _(title, authors, tags, images)\n            ),\n            post_images AS (\n                INSERT INTO post_images (post_id, image_id)\n                SELECT DISTINCT p.id, img.id\n                FROM input i\n                JOIN posts p ON p.title = i.title\n                CROSS JOIN LATERAL unnest(i.images::image[]) AS u(name, width, height)\n                JOIN images img ON img.name = u.name\n                WHERE trim(i.title) != '' AND trim(u.name) != ''\n                ORDER BY p.id, img.id\n                ON CONFLICT (post_id, image_id) DO NOTHING\n            ),\n            author_posts AS (\n                INSERT INTO author_posts (author_id, post_id)\n                SELECT DISTINCT a.id, p.id\n                FROM input i\n                JOIN posts p ON p.title = i.title\n                CROSS JOIN LATERAL unnest(i.authors::VARCHAR[]) AS u(name)\n                JOIN authors a ON a.name = u.name\n                WHERE trim(i.title) != '' AND trim(u.name) != ''\n                ORDER BY a.id, p.id\n                ON CONFLICT (author_id, post_id) DO NOTHING\n            )\n            INSERT INTO tag_posts (tag_id, post_id)\n            SELECT DISTINCT t.id, p.id\n            FROM input i\n            JOIN posts p ON p.title = i.title\n            CROSS JOIN LATERAL unnest(i.tags::VARCHAR[]) AS u(name)\n            JOIN tags t ON t.name = u.name\n            WHERE trim(i.title) != '' AND trim(u.name) != ''\n            ORDER BY t.id, p.id\n            ON CONFLICT (tag_id, post_id) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "meta[]",
+            "kind": {
+              "Array": {
+                "Custom": {
+                  "name": "meta",
+                  "kind": {
+                    "Composite": [
+                      [
+                        "title",
+                        "Text"
+                      ],
+                      [
+                        "authors",
+                        "TextArray"
+                      ],
+                      [
+                        "tags",
+                        "TextArray"
+                      ],
+                      [
+                        "images",
+                        {
+                          "Custom": {
+                            "name": "image[]",
+                            "kind": {
+                              "Array": {
+                                "Custom": {
+                                  "name": "image",
+                                  "kind": {
+                                    "Composite": [
+                                      [
+                                        "name",
+                                        "Text"
+                                      ],
+                                      [
+                                        "width",
+                                        "Int4"
+                                      ],
+                                      [
+                                        "height",
+                                        "Int4"
+                                      ]
+                                    ]
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "db17ebd184cb20202246f64859fd0e4468eaa1548e7ddbe8b804cd9d372e0806"
+}

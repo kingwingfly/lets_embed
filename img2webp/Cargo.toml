@@ -7,9 +7,11 @@ edition = "2024"
 db = { path = "../db" }
 
 anyhow = "1.0"
+base64 = "0.23"
 bytes = "1.12"
 dotenvy = "0.15"
 futures = "0.3"
+httpdate = "1"
 libvips = "2.3"
 opendal = { version = "0.59", features = ["services-s3", "services-fs"] }
 reqwest = { version = "0.13", features = ["json"] }
