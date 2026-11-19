@@ -5,26 +5,58 @@ ARG VIPS_VERSION=8.18.2
 ############################################################
 # onnxruntime download stage
 ############################################################
+# github.com/microsoft/onnxruntime release assets are currently unavailable
+# (repo returns 404), so pull the official Microsoft NuGet packages instead.
+# They ship the same linux-x64 shared libraries under
+# runtimes/linux-x64/native/. The sha256 pins are for ORT_VERSION=1.32.0;
+# update them together with ORT_VERSION.
+#   cpu    : nuget.org  Microsoft.ML.OnnxRuntime
+#   cuda13 : nuget.org  Microsoft.ML.OnnxRuntime.Gpu.Linux (CUDA 13 build)
+#   cuda12 : MS ADO feed onnxruntime-cuda-12, Microsoft.ML.OnnxRuntime.Gpu.Linux
 FROM debian:bookworm-slim AS dl-base
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates && \
+    apt-get install -y --no-install-recommends curl ca-certificates unzip && \
     rm -rf /var/lib/apt/lists/*
+COPY <<'EOF' /usr/local/bin/fetch-ort
+#!/bin/sh
+# usage: fetch-ort <nupkg-url> <sha256>
+set -eu
+url="$1"
+sha="$2"
+curl -fsSL --retry 5 --retry-delay 2 -o /tmp/ort.nupkg "$url"
+echo "${sha}  /tmp/ort.nupkg" | sha256sum -c -
+unzip -q /tmp/ort.nupkg 'runtimes/linux-x64/native/*' -d /tmp/ort
+mkdir -p /opt/onnxruntime/lib
+mv /tmp/ort/runtimes/linux-x64/native/* /opt/onnxruntime/lib/
+ln -s libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so.1
+rm -rf /tmp/ort /tmp/ort.nupkg
+test -f /opt/onnxruntime/lib/libonnxruntime.so
+EOF
+RUN chmod +x /usr/local/bin/fetch-ort
 WORKDIR /opt
 
 FROM dl-base AS ort-cpu
 ARG ORT_VERSION
-RUN curl -fL https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz | tar xz && \
-    mv onnxruntime-linux-x64-${ORT_VERSION} onnxruntime
+ARG ORT_CPU_SHA256=a9150bc2992cbbb6722070da9910e1ffa989a8bfc67bdd5bb8e745ca755641db
+RUN fetch-ort \
+    "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${ORT_VERSION}/microsoft.ml.onnxruntime.${ORT_VERSION}.nupkg" \
+    "${ORT_CPU_SHA256}"
 
 FROM dl-base AS ort-cuda12
 ARG ORT_VERSION
-RUN curl -fL https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-gpu_cuda12-${ORT_VERSION}.tgz | tar xz && \
-    mv onnxruntime-linux-x64-gpu_cuda12-${ORT_VERSION} onnxruntime
+ARG ORT_CUDA12_SHA256=aa4220de9938f974657d9c29fec5f87f3897c4b57eaa7419efa3cfb810e56c43
+RUN fetch-ort \
+    "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/nuget/v3/flat2/microsoft.ml.onnxruntime.gpu.linux/${ORT_VERSION}/microsoft.ml.onnxruntime.gpu.linux.${ORT_VERSION}.nupkg" \
+    "${ORT_CUDA12_SHA256}" && \
+    test -f /opt/onnxruntime/lib/libonnxruntime_providers_cuda.so
 
 FROM dl-base AS ort-cuda13
 ARG ORT_VERSION
-RUN curl -fL https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-gpu_cuda13-${ORT_VERSION}.tgz | tar xz && \
-    mv onnxruntime-linux-x64-gpu_cuda13-${ORT_VERSION} onnxruntime
+ARG ORT_CUDA13_SHA256=3d01949bc846d41961b37988d1e63d782a6effcb93b650a6e0577fef982d38b5
+RUN fetch-ort \
+    "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.gpu.linux/${ORT_VERSION}/microsoft.ml.onnxruntime.gpu.linux.${ORT_VERSION}.nupkg" \
+    "${ORT_CUDA13_SHA256}" && \
+    test -f /opt/onnxruntime/lib/libonnxruntime_providers_cuda.so
 
 ############################################################
 # builders
@@ -95,7 +127,7 @@ USER appuser
 ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
 ENTRYPOINT ["embed"]
 
-FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04 AS embed-cuda12
+FROM nvcr.io/nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04 AS embed-cuda12
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates cuda-compat-12-9 && \
     rm -f /etc/ld.so.conf.d/*cuda*compat*.conf && \
@@ -151,7 +183,7 @@ USER appuser
 ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
 ENTRYPOINT ["cuda-entrypoint.sh"]
 
-FROM nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04 AS embed-cuda13
+FROM nvcr.io/nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04 AS embed-cuda13
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
@@ -223,7 +255,7 @@ ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so \
     LEPTOS_HASH_FILE_NAME=/hash.txt
 ENTRYPOINT ["start.sh"]
 
-FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04 AS search-cuda12
+FROM nvcr.io/nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04 AS search-cuda12
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates cuda-compat-12-9 && \
     rm -f /etc/ld.so.conf.d/*cuda*compat*.conf && \
@@ -317,7 +349,7 @@ ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so \
     LEPTOS_HASH_FILE_NAME=/hash.txt
 ENTRYPOINT ["start.sh"]
 
-FROM nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04 AS search-cuda13
+FROM nvcr.io/nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04 AS search-cuda13
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
