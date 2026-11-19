@@ -36,6 +36,8 @@ Useful flags:
 - `--prefix <PREFIX>`: walk only a specific R2/FS directory prefix (`/` appended for directory scoping; empty prefix rejected).
 - `--full-scan`: walk the entire R2 bucket (`"/"`) recursively (e.g. one-time backfill). Resumed scans without `--delete-origin` skip downloading/re-encoding objects whose destination `source-etag` already matches.
 
+A prefix or full scan continues after an individual conversion fails. On failure it exits nonzero and prints the total and up to three object keys with their causes to stderr, even with tracing disabled. Set `RUST_LOG=img2webp=error` to log every failed key during the scan. With `-d`, successfully converted originals may already have been deleted when the summary appears.
+
 One-shot metadata recovery:
 - In default one-shot queue mode (without `--daemon`), `img2webp` atomically persists converted metadata to `IMG2WEBP_META_JOURNAL` (or `$TMPDIR/img2webp-meta-<CF_ACCOUNT_ID>-<CF_QUEUE_ID>.json`) *before* acknowledging queue leases. If a later batch fails or the process is interrupted by `SIGINT`/`SIGTERM` (which exits non-zero after releasing unstarted leases), the journal is preserved so the next one-shot run recovers and emits all previously converted metadata before deleting the journal on clean completion.
 - When Cloudflare reports `Message has exhausted maxRetries` for a requested retry, the worker finishes the remaining batches. A one-shot run then exits non-zero with the number of exhausted messages and retains the journal. Recover those messages from the configured dead-letter queue, or process originals still in R2 with `img2webp --prefix 'album directory'`.
