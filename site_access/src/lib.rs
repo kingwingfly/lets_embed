@@ -54,6 +54,7 @@ pub struct GuestReq {
 }
 
 pub const ADMIN_HEADER: &str = "x-gallery-admin-email";
+pub const UPGRADE_PATH: &str = "/user/upgrade";
 pub const ADMIN_VIEW_COOKIE: &str = "__Host-ue_admin_view";
 pub const VIEW_TTL: u64 = 15 * 60;
 

@@ -5,7 +5,7 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, Method, StatusCode, Uri, header::CONTENT_TYPE},
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::any,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 use tower_cookies::{CookieManagerLayer, Cookies};
 use tower_service::Service;
 use worker::{
-    Context, Env, Fetch, HttpRequest, Request, RequestInit, Result, event,
-    js_sys::Uint8Array, wasm_bindgen::JsValue,
+    Context, Env, Fetch, HttpRequest, Request, RequestInit, Result, event, js_sys::Uint8Array,
+    wasm_bindgen::JsValue,
 };
 
 const API_UPSTREAM: &str = "https://lets-embed-api.louisfly.icu";
@@ -206,8 +206,13 @@ async fn gateway(
     };
     let guest = claims.is_none();
     let decision = match (claims, item) {
-        (Some(claims), Some(item)) if method != Method::HEAD => {
-            account_call(&st, &claims.sub, "charge", &item).await
+        (Some(claims), Some(item)) => {
+            let operation = if method == Method::HEAD {
+                "can-charge"
+            } else {
+                "charge"
+            };
+            account_call(&st, &claims.sub, operation, &item).await
         }
         (Some(_), _) => Ok(200),
         (None, item) => {
@@ -234,24 +239,7 @@ async fn gateway(
     match decision {
         Ok(200) => proxy(uri, method, headers, body, &st.client_id, &st.client_secret).await,
         Ok(401) => login_response(&uri, &method),
-        Ok(402) if method == Method::POST => {
-            let message = if guest {
-                "Sign in to continue beyond the free allowance"
-            } else {
-                "out of points"
-            };
-            (
-                StatusCode::PAYMENT_REQUIRED,
-                axum::Json(serde_json::json!({"error":message})),
-            )
-                .into_response()
-        }
-        Ok(402) if guest => (
-            StatusCode::PAYMENT_REQUIRED,
-            "Free allowance reached. Sign in to continue.",
-        )
-            .into_response(),
-        Ok(402) => out_of_points(),
+        Ok(402) => payment_required(&headers, guest),
         Ok(403) => (StatusCode::FORBIDDEN, "Account suspended").into_response(),
         other => {
             worker::console_error!("access decision failed: {other:?}");
@@ -396,19 +384,50 @@ async fn account_call(
     Ok(stub.fetch_with_request(req).await?.status_code())
 }
 
-fn out_of_points() -> Response {
-    let body = r#"<div class="card center">
-<div class="icon">🪙</div>
-<span class="badge warn">Out of points</span>
-<h1 style="margin-top:14px">Out of points</h1>
-<p class="sub" style="margin-bottom:0">You have run out of points.
-<a href="/user/account">Top up your account &rarr;</a></p>
-</div>"#;
-    (
-        StatusCode::PAYMENT_REQUIRED,
-        Html(page("Out of points", body)),
-    )
-        .into_response()
+fn payment_required(headers: &HeaderMap, guest: bool) -> Response {
+    use axum::http::header::{ACCEPT, CACHE_CONTROL};
+    use site_access::UPGRADE_PATH;
+
+    let navigation = headers
+        .get("sec-fetch-mode")
+        .is_some_and(|v| v == "navigate")
+        || headers
+            .get("sec-fetch-dest")
+            .is_some_and(|v| v == "document")
+        || headers
+            .get(ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                v.split(',').any(|item| {
+                    item.split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .eq_ignore_ascii_case("text/html")
+                })
+            });
+    let mut response = if navigation {
+        Redirect::to(UPGRADE_PATH).into_response()
+    } else {
+        let reason = if guest {
+            "Free access does not cover this item"
+        } else {
+            "out of points"
+        };
+        (
+            StatusCode::PAYMENT_REQUIRED,
+            [
+                ("location", UPGRADE_PATH),
+                ("server-timing", "gallery-allowance"),
+            ],
+            axum::Json(serde_json::json!({"error": reason, "redirect_to": UPGRADE_PATH})),
+        )
+            .into_response()
+    };
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, "private, no-store".parse().unwrap());
+    response
 }
 
 /// Lowercase hex SHA-256 of `s` (reuses the sha2 dep already pulled in for HS256).
@@ -473,7 +492,10 @@ fn percent_decode(s: &str) -> Option<String> {
 }
 
 fn is_segment_prefix(path: &str, prefix: &str) -> bool {
-    path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'))
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 // ---------------------------------------------------------------------------
@@ -690,61 +712,6 @@ async fn proxy(
                 .into_response()
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// simple pages
-// ---------------------------------------------------------------------------
-
-const STYLE: &str = r#"<style>
-:root{--bg:#f5f6f8;--card:#fff;--fg:#1f2329;--muted:#6b7280;--border:#e5e7eb;
---accent:#4f46e5;--accent-h:#4338ca;--danger:#dc2626;--ok:#059669;--warn:#d97706;
---radius:14px;--shadow:0 10px 30px rgba(0,0,0,.08)}
-@media(prefers-color-scheme:dark){:root{--bg:#0e1116;--card:#171b22;--fg:#e6e8eb;
---muted:#9aa4b2;--border:#262c36;--shadow:0 10px 30px rgba(0,0,0,.45)}}
-*{box-sizing:border-box}
-body{margin:0;min-height:100vh;display:flex;justify-content:center;align-items:flex-start;
-background:radial-gradient(1200px 600px at 50% -10%,rgba(79,70,229,.14),transparent),var(--bg);
-color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-line-height:1.55;padding:8vh 16px 6vh}
-.wrap{width:100%;max-width:580px}
-.card,.app{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)}
-.card{padding:30px}.app{padding:20px;margin:14px 0}
-h1{font-size:22px;margin:0 0 4px;letter-spacing:-.01em}
-.sub{color:var(--muted);font-size:14px;margin:0 0 22px}
-label{display:block;font-size:13px;font-weight:600;color:var(--muted);margin-bottom:8px}
-textarea{width:100%;min-height:132px;padding:12px 14px;border:1px solid var(--border);border-radius:10px;
-background:transparent;color:var(--fg);font:inherit;resize:vertical;transition:border-color .15s,box-shadow .15s}
-textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,70,229,.2)}
-select{padding:9px 10px;border:1px solid var(--border);border-radius:9px;background:var(--card);color:var(--fg);font:inherit}
-.btn{display:inline-flex;align-items:center;gap:6px;border:0;border-radius:10px;padding:10px 18px;font:inherit;
-font-weight:600;cursor:pointer;color:#fff;background:var(--accent);transition:background .15s,transform .05s}
-.btn:hover{background:var(--accent-h)}.btn:active{transform:translateY(1px)}
-.btn.ghost{background:transparent;color:var(--danger);border:1px solid var(--border)}
-.btn.ghost:hover{background:rgba(220,38,38,.08);border-color:var(--danger)}
-.full{width:100%;justify-content:center;margin-top:20px}
-.badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:4px 11px;border-radius:999px}
-.badge.ok{color:var(--ok);background:rgba(5,150,105,.13)}
-.badge.warn{color:var(--warn);background:rgba(217,119,6,.13)}
-.badge.err{color:var(--danger);background:rgba(220,38,38,.13)}
-a{color:var(--accent);text-decoration:none;font-weight:600}a:hover{text-decoration:underline}
-.center{text-align:center}.icon{font-size:46px;line-height:1;margin-bottom:12px}
-.meta{color:var(--muted);font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
-.reason{white-space:pre-wrap;margin:12px 0 16px;padding:12px 14px;background:rgba(127,127,127,.07);
-border:1px solid var(--border);border-radius:10px}
-.actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
-.actions form{display:inline-flex;gap:8px;align-items:center;margin:0}
-.empty{text-align:center;color:var(--muted);padding:48px 0;font-size:15px}
-.headrow{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}
-.you{color:var(--muted);font-size:13px}
-</style>"#;
-
-fn page(title: &str, body: &str) -> String {
-    format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title>{STYLE}
-</head><body><div class="wrap">{body}</div></body></html>"#
-    )
 }
 
 #[cfg(test)]

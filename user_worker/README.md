@@ -23,6 +23,7 @@ Worker. Replaces the old apply/approve flow in `gateway_worker`.
 | Route | Method | What |
 | --- | --- | --- |
 | `/user/login` | GET | wallet login page (`?next=` redirect target) |
+| `/user/upgrade` | GET | sign in after reaching a free limit, then open the account top-up form. Signed-in visitors go directly to top-up. |
 | `/user/account` | GET | balance, plan, top-up (submit tx hash), payment history |
 | `/user/favorites` | GET | liked posts/images/videos |
 | `/user/api/nonce` | GET | issue a SIWE / link nonce (KV, 300s, single-use) |

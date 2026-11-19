@@ -86,6 +86,48 @@ function policyForm(html) {
   return out;
 }
 
+test('embedded resources navigate only for a same-origin gallery allowance denial', async () => {
+  const origin = 'https://' + appHost;
+  const destinations = [];
+  let observeEntries;
+  let mediaError, pageShow;
+  let probeStatus = 404;
+  const probes = [];
+  class PerformanceObserver {
+    constructor(callback) { observeEntries = callback; }
+    observe() {}
+    disconnect() {}
+  }
+  require('node:vm').runInNewContext(fs.readFileSync(path.join(root, 'assets/gallery-allowance.js'), 'utf8'), {
+    PerformanceObserver,
+    URL,
+    window: { PerformanceObserver, addEventListener: (_, fn) => { pageShow = fn; } },
+    document: { addEventListener: (_, fn) => { mediaError = fn; } },
+    location: { origin, href: origin + '/', assign: url => destinations.push(url) },
+    fetch: async (url, options) => {
+      probes.push([url.href, options.method]);
+      return new Response(null, { status: probeStatus, headers: { location: '/user/upgrade' } });
+    },
+  });
+  const report = (name, metrics) => observeEntries({
+    getEntries: () => [{ name, serverTiming: metrics.map(name => ({ name })) }],
+  });
+  report(origin + '/images/missing.webp', []);
+  report('https://another.test/videos/a.mp4', ['gallery-allowance']);
+  assert.deepEqual(destinations, []);
+  report(origin + '/videos/a.mp4', ['gallery-allowance']);
+  assert.deepEqual(destinations, ['/user/upgrade']);
+  pageShow({persisted: true});
+  const failedVideo = {target: {tagName: 'VIDEO', currentSrc: origin + '/videos/a.mp4'}};
+  await mediaError(failedVideo);
+  assert.equal(destinations.length, 1);
+  probeStatus = 402;
+  await mediaError(failedVideo);
+  await mediaError(failedVideo);
+  assert.deepEqual(probes, Array(2).fill([failedVideo.target.currentSrc, 'HEAD']));
+  assert.deepEqual(destinations, ['/user/upgrade', '/user/upgrade']);
+});
+
 test('gallery access, billing and administrator controls use the published policy', async (t) => {
   const oldBlockTime = Math.floor(Date.now() / 1000) - 300;
   const usdc = '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
@@ -210,7 +252,7 @@ test('gallery access, billing and administrator controls use the published polic
   fields.set('login_required', 'no');
   fields.set('image_free', '1');
   fields.set('image_price', '7');
-  fields.set('video_price', '3');
+  fields.set('video_price', '70');
   fields.set('basic_price', '12');
   fields.set('signup_points', '50');
   fields.set('minimum_topup', '1');
@@ -227,18 +269,36 @@ test('gallery access, billing and administrator controls use the published polic
   assert.equal(listing.status, 200);
   assert.equal(listing.headers.get('cache-control'), 'private, no-store');
   const media = ['/images/a.webp', '/images/b.webp'];
+  for (const url of media) await check(site(url, { method: 'HEAD' }), 200);
   const concurrent = await Promise.all(media.map((url) => site(url)));
   assert.deepEqual(concurrent.map((r) => r.status).sort(), [200, 402]);
+  const denied = concurrent.find((r) => r.status === 402);
+  assert.equal(denied.headers.get('server-timing'), 'gallery-allowance');
+  assert.equal(denied.headers.get('cache-control'), 'private, no-store');
+  assert.equal(concurrent.find((r) => r.status === 200).headers.get('server-timing'), null);
   await check(site(media[concurrent.findIndex((r) => r.status === 200)]), 200);
+  const headDenied = await site(media[concurrent.findIndex((r) => r.status === 402)], { method: 'HEAD' });
+  assert.equal(headDenied.status, 402);
+  assert.equal(headDenied.headers.get('location'), '/user/upgrade');
   await check(site('/videos/a.mp4'), 402);
-  await check(
-    site('/api/search_by_desc', {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: 'q=fixture',
-    }),
-    402
-  );
+  const direct = await site('/videos/a.mp4', { headers: { accept: 'text/html', 'sec-fetch-mode': 'navigate' } });
+  assert.equal(direct.status, 303);
+  assert.equal(direct.headers.get('location'), '/user/upgrade');
+  const guestPage = await site(direct.headers.get('location'));
+  assert.equal(guestPage.status, 200);
+  const guestHtml = await guestPage.text();
+  assert.match(guestHtml, /outside your free allowance/);
+  assert.match(guestHtml, /Sign in with Ethereum/);
+  assert.match(guestHtml, /Sign in with Solana/);
+  assert.match(guestHtml, /Points per USD<\/dt><dd>100<\/dd>/);
+  const search = await site('/api/search_by_desc', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: 'q=fixture',
+  });
+  assert.equal(search.status, 402);
+  assert.equal(search.headers.get('server-timing'), 'gallery-allowance');
+  assert.equal((await search.json()).redirect_to, '/user/upgrade');
   const ns = await mf.getDurableObjectNamespace('USER_ACCOUNT', 'user-worker');
   const account = ns.get(ns.idFromName(wallet));
   await check(
@@ -254,7 +314,23 @@ test('gallery access, billing and administrator controls use the published polic
     .run();
   const status = async () => (await account.fetch('https://account/status')).json();
   const walletHeaders = { cookie: signedWalletSession() };
+  const walletUpgrade = await site('/user/upgrade', { headers: walletHeaders });
+  assert.equal(walletUpgrade.status, 303);
+  assert.equal(walletUpgrade.headers.get('location'), '/user/account#topup');
+  const walletLimit = await site('/api/search_by_desc', {
+    method: 'POST',
+    headers: { ...walletHeaders, 'content-type': 'application/x-www-form-urlencoded' },
+    body: 'q=fixture',
+  });
+  assert.equal(walletLimit.status, 402);
+  assert.equal((await walletLimit.json()).redirect_to, '/user/upgrade');
   assert.equal((await status()).balance, 50);
+  const firstStatus = await status();
+  for (const url of ['/images/one.webp', '/images/two.webp']) {
+    await check(site(url, { method: 'HEAD', headers: walletHeaders }), 200);
+  }
+  await check(site('/videos/a.mp4', { method: 'HEAD', headers: walletHeaders }), 402);
+  assert.deepEqual(await status(), firstStatus);
   await check(site('/images/one.webp', { headers: walletHeaders }), 200);
   await check(site('/images/two.webp', { headers: walletHeaders }), 200);
   await check(site('/images/two.webp', { headers: walletHeaders }), 200);
@@ -309,7 +385,9 @@ test('gallery access, billing and administrator controls use the published polic
   await check(command('topup', { ...tx, tx_hash: '0x' + '5'.repeat(64) }), 200);
   assert.equal((await status()).balance, granted.balance + 20100);
   const page = await site('/user/account', { headers: walletHeaders });
-  assert.match(await page.text(), new RegExp(updatedDeposit));
+  const accountHtml = await page.text();
+  assert.match(accountHtml, /id="topup"/);
+  assert.match(accountHtml, new RegExp(updatedDeposit));
   const selected = await admin('?address=' + wallet);
   assert.match(await selected.text(), /Apply subscription/);
 });

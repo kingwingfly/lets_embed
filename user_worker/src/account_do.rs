@@ -165,7 +165,8 @@ impl DurableObject for UserAccount {
         let policy = settings::load(&self.env).await?;
         match (req.method(), path.as_str()) {
             (Method::Post, "/init") => self.init(req.json().await?, &policy).await,
-            (Method::Post, "/charge") => self.charge(req.json().await?, &policy).await,
+            (Method::Post, "/charge") => self.charge(req.json().await?, &policy, false).await,
+            (Method::Post, "/can-charge") => self.charge(req.json().await?, &policy, true).await,
             (Method::Post, "/credit") => self.credit(req.json().await?).await,
             (Method::Get, "/status") => json(&self.status_resp(&policy).await?, 200),
             (Method::Post, "/subscribe") => self.subscribe(req.json().await?, &policy).await,
@@ -221,11 +222,11 @@ impl UserAccount {
         Ok(prorated_refund(paid, plan.period_secs, end - now))
     }
 
-    fn free_item(&self, req: &ChargeReq, limit: i64, day: u64, head: bool) -> Result<bool> {
+    fn free_item(&self, req: &ChargeReq, limit: i64, day: u64, check_only: bool) -> Result<bool> {
         if limit == 0 {
             return Ok(false);
         }
-        if limit < 0 || head {
+        if limit < 0 {
             return Ok(true);
         }
         // Synchronous DO SQLite calls complete before another request can enter.
@@ -238,10 +239,12 @@ impl UserAccount {
         }
         let db = self.state.storage().sql();
         db.exec("CREATE TABLE IF NOT EXISTS free_usage (day INTEGER,kind TEXT,resource BLOB, PRIMARY KEY(day,kind,resource)) WITHOUT ROWID",None)?;
-        db.exec(
-            "DELETE FROM free_usage WHERE day < ?",
-            vec![(day as i64).into()],
-        )?;
+        if !check_only {
+            db.exec(
+                "DELETE FROM free_usage WHERE day < ?",
+                vec![(day as i64).into()],
+            )?;
+        }
         let hash = Sha256::digest(req.path.as_bytes()).to_vec();
         let kind = req.kind.name();
         let used:Usage=db.exec("SELECT EXISTS(SELECT 1 FROM free_usage WHERE day=?1 AND kind=?2 AND resource=?3) AS seen, COUNT(*) AS used FROM free_usage WHERE day=?1 AND kind=?2",
@@ -252,10 +255,12 @@ impl UserAccount {
         if used.used >= limit {
             return Ok(false);
         }
-        db.exec(
-            "INSERT INTO free_usage VALUES(?,?,?)",
-            vec![(day as i64).into(), kind.into(), hash.into()],
-        )?;
+        if !check_only {
+            db.exec(
+                "INSERT INTO free_usage VALUES(?,?,?)",
+                vec![(day as i64).into(), kind.into(), hash.into()],
+            )?;
+        }
         Ok(true)
     }
 
@@ -388,8 +393,10 @@ impl UserAccount {
         json(&self.status_resp(policy).await?, 200)
     }
 
-    async fn charge(&self, req: ChargeReq, policy: &Policy) -> Result<Response> {
-        self.ensure_init(policy).await?;
+    async fn charge(&self, req: ChargeReq, policy: &Policy, check_only: bool) -> Result<Response> {
+        if !check_only {
+            self.ensure_init(policy).await?;
+        }
         if self.get_or("banned", false).await? {
             return Response::error("banned", 403);
         }
@@ -404,7 +411,14 @@ impl UserAccount {
 
         let rule = policy.item(req.kind);
         let cost = rule.price;
-        let mut balance: i64 = self.get_or("balance", 0).await?;
+        // A first GET receives the signup grant. A HEAD can evaluate it without creating a wallet.
+        let mut balance: i64 = match storage.get("balance").await? {
+            Some(balance) => balance,
+            None if check_only && storage.get::<bool>("init").await?.is_none() => {
+                policy.signup_points
+            }
+            None => 0,
+        };
 
         let active = self.plan_active(now).await?;
         let plan_cfg = if active {
@@ -453,7 +467,7 @@ impl UserAccount {
 
         let included = cost == 0
             || (policy.free_media_in_scope(&req)
-                && self.free_item(&req, rule.daily_free, day, false)?);
+                && self.free_item(&req, rule.daily_free, day, check_only)?);
         let source = if included {
             ChargeSource::FreeUnlimited
         } else {
@@ -482,6 +496,9 @@ impl UserAccount {
                 },
                 402,
             );
+        }
+        if check_only {
+            return Response::ok("");
         }
         match source {
             ChargeSource::FreeUnlimited => {} // pro media view: deduct nothing

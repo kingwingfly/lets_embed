@@ -27,9 +27,7 @@ pub fn settings_form(published: &Published, saved: bool) -> String {
         "All changes saved"
     };
     let mut out = format!(
-        r##"<header class="page-head"><div><h1>Gallery controls</h1></div>
-<a class="gallery-link" href="/">View gallery <span aria-hidden="true">↗</span></a></header>
-<form id="settings" method="post" action="/user/admin/settings"><input type="hidden" name="revision" value="{rev}">
+        r##"<form id="settings" method="post" action="/user/admin/settings"><input type="hidden" name="revision" value="{rev}">
 <section class="panel" id="access"><div class="section-head"><h2>Browsing access</h2><span class="pill">{mode}</span></div>
 <fieldset class="modes"><legend class="sr">Visitor access</legend>
 <label class="mode"><input type="radio" name="login_required" value="yes" {wallet}><span><strong>Require a wallet</strong><small>Visitors sign in before opening the gallery.</small></span></label>

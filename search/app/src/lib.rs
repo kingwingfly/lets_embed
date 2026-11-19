@@ -1,3 +1,5 @@
+#![cfg_attr(test, recursion_limit = "256")]
+
 pub mod components;
 pub mod types;
 
@@ -35,6 +37,7 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
                     href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&display=swap"
                 />
                 <HashedStylesheet options />
+                <script inner_html=include_str!("../../../assets/gallery-allowance.js")></script>
             </head>
             <body class="bg-sky-50 text-slate-700">
                 <App />
@@ -59,5 +62,28 @@ pub fn App() -> impl IntoView {
                 </Routes>
             </main>
         </Router>
+    }
+}
+
+#[cfg(all(test, feature = "ssr"))]
+mod tests {
+    use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::Request,
+    };
+
+    #[tokio::test]
+    async fn gallery_installs_the_allowance_listener_before_loading_media() {
+        // Route discovery initializes the SSR runtime, as it does at server startup.
+        leptos_axum::generate_route_list(App);
+        let render = leptos_axum::render_app_to_stream(|| {
+            shell(LeptosOptions::builder().output_name("search").build())
+        });
+        let response = render(Request::builder().uri("/").body(Body::empty()).unwrap()).await;
+        let bytes = to_bytes(response.into_body(), 1_000_000).await.unwrap();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        let (head, _) = html.split_once("</head>").expect("gallery document");
+        assert!(head.contains(include_str!("../../../assets/gallery-allowance.js")));
     }
 }

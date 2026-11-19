@@ -1,72 +1,66 @@
-<div class="card">
-<div class="headrow"><h1>Your account</h1><span class="badge err" id="banned-badge" hidden>Banned</span></div>
-<p class="sub meta" id="acct-address">loading&hellip;</p>
-<dl class="stats">
-<dt>Balance</dt><dd id="acct-balance">&mdash;</dd>
-<dt>Plan</dt><dd id="acct-plan">&mdash;</dd>
-<dt>Usage left</dt><dd id="acct-quota">&mdash;</dd>
-<dt>Period ends</dt><dd id="acct-period-end">&mdash;</dd>
-<dt>Total views</dt><dd id="acct-views">&mdash;</dd>
-</dl>
-<div class="links"><a href="/user/favorites">My favorites</a><a href="/">&larr; Back to site</a></div>
+<header class="page-hero">
+  <div><div class="headrow"><h1>Your account</h1><span class="badge err" id="banned-badge" hidden>Banned</span></div>
+    <p class="meta" id="acct-address" aria-label="Wallet address">Loading wallet…</p></div>
+  <span class="cloud-friend" aria-hidden="true"><i></i></span>
+</header>
+<div class="summary card">
+  <dl class="metrics">
+    <div class="balance"><dt>Point balance</dt><dd id="acct-balance">—</dd></div>
+    <div><dt>Current plan</dt><dd id="acct-plan">—</dd></div>
+    <div><dt>Plan allowance left</dt><dd id="acct-quota">—</dd></div>
+    <div><dt>Period ends</dt><dd id="acct-period-end">—</dd></div>
+    <div><dt>Total views</dt><dd id="acct-views">—</dd></div>
+  </dl>
 </div>
 
-<div class="card">
-<h2>Pricing</h2>
-<p class="sub">Pay-as-you-go: your point balance is charged per action. New accounts start with a free grant.</p>
-__PRICING__
+<div class="account-grid">
+<section class="card" id="topup" tabindex="-1">
+  <h2>Top up</h2>
+  <p class="sub">Send a transfer from your wallet, then enter its transaction hash or signature to claim your points. Stablecoins are valued at $1. ETH and SOL use a live price.</p>
+  <form id="topup-form">
+    <div class="form-pair"><div><label for="topup-chain">Chain</label>
+      <select id="topup-chain"><option value="ethereum">Ethereum</option><option value="solana">Solana</option></select></div>
+      <div><label for="topup-token">Asset</label><select id="topup-token"></select></div></div>
+    <div id="sol-link" hidden>
+      <p class="hint" id="sol-linked-state">No Solana wallet linked yet.</p>
+      <p class="hint">Send Solana top-ups from your linked wallet.</p>
+      <button class="btn small secondary" type="button" id="sol-link-btn">Link Solana wallet</button>
+      <div class="msg" id="sol-link-msg" role="status" hidden></div>
+    </div>
+    <div class="deposit"><strong>Deposit address</strong>
+      <p class="meta" id="deposit-address">__DEPOSIT_ADDRESS__</p></div>
+    <label for="tx-hash" id="tx-label">Transaction hash</label>
+    <input type="text" id="tx-hash" placeholder="0x…" autocomplete="off" required>
+    <button class="btn full" type="submit" id="topup-btn">Credit top-up</button>
+  </form>
+  <div class="msg" id="topup-msg" role="status" hidden></div>
+</section>
+
+<section class="card" id="plans">
+  <h2>Subscriptions</h2>
+  <p class="sub">Use your points to buy a plan. View and search allowances refresh every five hours.</p>
+  __PLANS_TABLE__
+  <details class="plan-management"><summary>Manage subscription</summary>
+    <p class="hint">Renew when you choose. Switching or canceling refunds unused paid time. Complimentary time has no refund value.</p>
+    <button class="btn small ghost" type="button" id="unsub-btn">Unsubscribe</button>
+  </details>
+  <div class="msg" id="sub-msg" role="status" hidden></div>
+</section>
 </div>
 
-<div class="card">
-<h2>Top up</h2>
-<p class="sub">Pick an asset, send it to the deposit address shown, then paste the transaction hash (Ethereum) or signature (Solana) to credit your balance. Stablecoins price at $1; ETH/SOL use a live price feed.</p>
-<form id="topup-form">
-<label for="topup-chain">Chain</label>
-<select id="topup-chain">
-<option value="ethereum">Ethereum</option>
-<option value="solana">Solana</option>
-</select>
-<label for="topup-token">Asset</label>
-<select id="topup-token"></select>
-<div id="sol-link" hidden>
-<p class="sub" style="margin:0 0 10px" id="sol-linked-state">No Solana wallet linked yet.</p>
-<p class="sub" style="margin:0 0 10px">Solana top-ups must originate from your linked wallet. Works with MetaMask (Solana account), Phantom, or another Solana wallet.</p>
-<button class="btn small" type="button" id="sol-link-btn">Link Solana wallet</button>
-<div class="msg" id="sol-link-msg" hidden></div>
-</div>
-<label>Deposit address</label>
-<p class="meta" id="deposit-address">__DEPOSIT_ADDRESS__</p>
-<label for="tx-hash" id="tx-label">Transaction hash</label>
-<input type="text" id="tx-hash" placeholder="0x&hellip;" autocomplete="off" required>
-<button class="btn full" type="submit" id="topup-btn">Credit top-up</button>
-</form>
-<div class="msg" id="topup-msg" hidden></div>
-</div>
-
-<div class="card">
-<h2>Subscription</h2>
-<p class="sub">Purchased plans last 30 days. Renew from your point balance when you choose. Switching or canceling refunds unused paid time. Complimentary time has no refund value.</p>
-__PLANS_TABLE__
-<div class="actions" style="margin-top:14px">
-<button class="btn ghost small" type="button" id="unsub-btn">Unsubscribe</button>
-</div>
-<div class="msg" id="sub-msg" hidden></div>
-</div>
-
-<div class="card">
-<h2>Payment history</h2>
-<div class="tablewrap"><table>
-<thead><tr><th>Tx</th><th>Chain</th><th>Asset</th><th>Amount</th><th>Points</th><th>Status</th><th>Date</th></tr></thead>
-<tbody id="payments-body"></tbody>
-</table></div>
-<div class="empty" id="payments-empty" hidden>No payments yet.</div>
-</div>
-
-<div class="card">
-<div class="actions">
-<button class="btn ghost" type="button" id="logout-btn">Log out</button>
-</div>
-</div>
+<section class="card" id="pricing"><h2>Gallery pricing</h2>
+  <p class="sub">Each action uses its free allowance first. Pay-as-you-go charges come from your point balance.</p>
+  __PRICING__
+</section>
+<section class="card"><h2>Payment history</h2>
+  <div class="tablewrap"><table>
+  <thead><tr><th>Transaction</th><th>Chain</th><th>Asset</th><th>Amount</th><th>Points</th><th>Status</th><th>Date</th></tr></thead>
+  <tbody id="payments-body"></tbody>
+  </table></div>
+  <p class="empty" id="payments-empty" hidden>No payments yet.</p>
+  <div class="msg err" id="payments-msg" role="status" hidden></div>
+</section>
+<div class="account-footer"><button class="btn ghost small" type="button" id="logout-btn">Log out</button></div>
 
 <script>
 "use strict";
@@ -88,26 +82,29 @@ function setText(id, text) {
 var currentMe = null;
 
 async function loadMe() {
-  var r = await fetch("/user/api/me");
-  if (r.status === 401) {
-    location = "/user/login?next=/user/account";
+  var me;
+  try {
+    var r = await fetch("/user/api/me");
+    if (r.status === 401) {
+      location = location.hash === "#topup" ? "/user/upgrade" : "/user/login?next=/user/account";
+      return;
+    }
+    if (!r.ok) throw new Error();
+    me = await r.json();
+  } catch (_) {
+    setText("acct-address", "Couldn’t load wallet details. Reload to try again.");
     return;
   }
-  if (!r.ok) {
-    setText("acct-address", "failed to load account (" + r.status + ")");
-    return;
-  }
-  var me = await r.json();
   currentMe = me;
   setText("acct-address", me.address);
-  setText("acct-balance", String(me.balance) + " points");
-  setText("acct-plan", me.plan ? me.plan : "none");
+  setText("acct-balance", me.balance.toLocaleString() + (me.balance === 1 ? " point" : " points"));
+  setText("acct-plan", me.plan || "Pay as you go");
   var hasPlan = !!me.plan;
   var viewsStr = me.views_remaining != null
     ? String(me.views_remaining)
     : (hasPlan ? "unlimited" : "—");
   var searchesStr = me.searches_remaining != null ? String(me.searches_remaining) : "—";
-  setText("acct-quota", "Views: " + viewsStr + "  ·  Searches: " + searchesStr);
+  setText("acct-quota", hasPlan ? viewsStr + " views · " + searchesStr + " searches" : "—");
   setText("acct-period-end", me.period_end ? fmtDate(me.period_end) : "—");
   setText("acct-views", String(me.total_views));
   document.getElementById("banned-badge").hidden = !me.banned;
@@ -116,9 +113,16 @@ async function loadMe() {
 async function loadPayments() {
   var body = document.getElementById("payments-body");
   var empty = document.getElementById("payments-empty");
-  var r = await fetch("/user/api/payments");
-  if (!r.ok) return;
-  var rows = await r.json();
+  var rows;
+  try {
+    var r = await fetch("/user/api/payments");
+    if (!r.ok) throw new Error();
+    rows = await r.json();
+  } catch (_) {
+    setMsg("payments-msg", "Couldn’t load payment history. Reload to try again.", "err");
+    return;
+  }
+  document.getElementById("payments-msg").hidden = true;
   body.textContent = "";
   empty.hidden = rows.length !== 0;
   for (var i = 0; i < rows.length; i++) {
@@ -165,6 +169,7 @@ function applyChain() {
   document.getElementById("tx-hash").placeholder = eth ? "0x…" : "base58 signature…";
 }
 chainSel.addEventListener("change", applyChain);
+if (!DEPOSIT.ethereum && DEPOSIT.solana) chainSel.value = "solana";
 applyChain();
 
 // Minimal base58 (Bitcoin alphabet) encoder for the wallet's signature bytes.

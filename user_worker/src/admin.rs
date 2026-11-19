@@ -409,8 +409,6 @@ pub async fn set_plan(
 // Rendering
 // ---------------------------------------------------------------------------
 
-const STYLE: &str = include_str!("pages/admin.css");
-
 fn banned_badge(banned: bool) -> &'static str {
     if banned {
         r#"<span class="badge err">Banned</span>"#
@@ -459,8 +457,8 @@ fn render_detail(s: &StatusResp) -> String {
 <form method="post" action="/user/admin/credit">
 <input type="hidden" name="address" value="{addr}">
 <input type="hidden" name="token" value="{token}">
-<input type="number" name="points" required placeholder="points (&plusmn;)">
-<input type="text" name="reason" required placeholder="reason">
+<input type="number" name="points" aria-label="Point adjustment" required placeholder="points (&plusmn;)">
+<input type="text" name="reason" aria-label="Adjustment reason" required placeholder="reason">
 <button class="btn" type="submit">Adjust credit</button>
 </form>
 <form method="post" action="/user/admin/ban">
@@ -528,10 +526,10 @@ fn render_admin(
     body.push_str("</div>");
 
     body.push_str("</section>");
-    include_str!("pages/admin.html")
-        .replace("__STYLE__", STYLE)
+    let content = include_str!("pages/admin.html")
         .replace("__EMAIL__", &html_escape(email))
-        .replace("__CONTENT__", &body)
+        .replace("__CONTENT__", &body);
+    crate::pages::Page::Admin.render(&content)
 }
 
 fn fmt_ts(secs: i64) -> String {

@@ -1,44 +1,30 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="color-scheme" content="light dark" />
-    <title>Gallery controls · Let's Embed</title>
-    <style>
-      __STYLE__
-    </style>
-  </head>
-  <body>
-    <a class="skip" href="#main">Skip to controls</a>
-    <aside>
-      <a class="brand" href="/user/admin"><span class="brand-mark" aria-hidden="true">◈</span> Let's Embed</a>
-      <nav aria-label="Admin sections">
-        <a href="#access">Browsing access</a>
-        <a href="#pricing">Prices &amp; free access</a>
-        <a href="#plans">Subscriptions</a>
-        <a href="#payments">Payments &amp; credits</a>
-        <a href="#accounts">Accounts</a>
-      </nav>
-      <div class="identity">
-        <span class="dot"></span>
-        <div><strong>Administrator</strong><small>__EMAIL__</small></div>
-      </div>
-    </aside>
-    <main id="main">__CONTENT__</main>
-    <script>
-      const form = document.getElementById('settings');
-      form.addEventListener('input', () => document.getElementById('save-state').textContent = 'Unsaved changes');
-      const links = Array.from(document.querySelectorAll('nav a'));
-      function markSection() {
-        const current = links.filter(link => document.querySelector(link.hash).getBoundingClientRect().top < 160).pop() || links[0];
-        links.forEach(link => {
-          if (link === current) link.setAttribute('aria-current', 'location');
-          else link.removeAttribute('aria-current');
-        });
-      }
-      document.addEventListener('scroll', markSection, {passive: true});
-      markSection();
-    </script>
-  </body>
-</html>
+<div class="page-hero">
+  <div><h1>Gallery controls</h1><p class="identity">Signed in as <strong>__EMAIL__</strong></p></div>
+  <span class="cloud-friend" aria-hidden="true"><i></i></span>
+</div>
+<div class="admin-layout">
+  <aside class="admin-rail card">
+    <nav aria-label="Admin sections">
+      <a href="#access">Browsing access</a>
+      <a href="#pricing">Prices &amp; free access</a>
+      <a href="#plans">Subscriptions</a>
+      <a href="#payments">Payments &amp; credits</a>
+      <a href="#accounts">Accounts</a>
+    </nav>
+  </aside>
+  <div class="admin-content">__CONTENT__</div>
+</div>
+<script>
+  const settingsForm = document.getElementById('settings');
+  settingsForm.addEventListener('input', () => document.getElementById('save-state').textContent = 'Unsaved changes');
+  const sections = Array.from(document.querySelectorAll('.admin-rail nav a'));
+  function markSection() {
+    const current = sections.filter(link => document.querySelector(link.hash).getBoundingClientRect().top < 160).pop() || sections[0];
+    sections.forEach(link => {
+      if (link === current) link.setAttribute('aria-current', 'location');
+      else link.removeAttribute('aria-current');
+    });
+  }
+  document.addEventListener('scroll', markSection, {passive: true});
+  markSection();
+</script>

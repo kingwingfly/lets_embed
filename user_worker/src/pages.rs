@@ -1,20 +1,9 @@
-//! UNIT 6: HTML pages (inline HTML + JS, gateway_worker aesthetic).
-//!
-//! Three server-rendered shells with inline vanilla JS that talks to the
-//! `/user/api/*` endpoints:
-//! - GET /user/login: SIWE wallet sign-in (EIP-4361 message, strict shape).
-//! - GET /user/account: balance / plan / top-up / payments / logout.
-//! - GET /user/favorites: paged list of likes with preview thumbnails.
-//!
-//! The markup/JS lives in the `pages/` directory next to this file and is pulled
-//! in with `include_str!`; only the dynamic values are substituted here. Values
-//! coming from Rust are passed through [`html_escape`]; JSON fetched client-side
-//! is rendered with `textContent` (never innerHTML).
+//! Server-rendered gallery pages. Wallet and payment actions use the existing user APIs.
 
 use axum::{
     extract::State,
     http::{StatusCode, header},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
 };
 use tower_cookies::Cookies;
 
@@ -30,11 +19,63 @@ const SHELL: &str = include_str!("pages/shell.html");
 /// Shared stylesheet, inlined into the shell's `<style>`.
 const STYLE: &str = include_str!("pages/style.css");
 
-fn page(title: &str, body: &str) -> String {
-    SHELL
-        .replace("__TITLE__", title)
-        .replace("__STYLE__", STYLE)
-        .replace("__BODY__", body)
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum Page {
+    Login,
+    Upgrade,
+    Account,
+    Favorites,
+    Admin,
+}
+
+impl Page {
+    pub(crate) fn render(self, body: &str) -> String {
+        let title = match self {
+            Self::Login => "Sign in",
+            Self::Upgrade => "Continue exploring",
+            Self::Account => "Your account",
+            Self::Favorites => "Favorites",
+            Self::Admin => "Gallery controls",
+        };
+        let gallery = if self == Self::Admin {
+            "View gallery"
+        } else {
+            "Gallery"
+        };
+        let mut nav = format!(r#"<a href="/">{gallery}</a>"#);
+        if matches!(self, Self::Account | Self::Favorites) {
+            for (screen, path, label) in [
+                (Self::Account, "/user/account", "Account"),
+                (Self::Favorites, "/user/favorites", "Favorites"),
+            ] {
+                let current = if self == screen {
+                    r#" aria-current="page""#
+                } else {
+                    ""
+                };
+                nav.push_str(&format!(r#"<a href="{path}"{current}>{label}</a>"#));
+            }
+        } else if self == Self::Admin {
+            nav.push_str(r#"<a href="/user/admin" aria-current="page">Admin</a>"#);
+        }
+        let extra_css = if self == Self::Admin {
+            include_str!("pages/admin.css")
+        } else {
+            ""
+        };
+        let media_script = if self == Self::Favorites {
+            include_str!("../../assets/gallery-allowance.js")
+        } else {
+            ""
+        };
+        SHELL
+            .replace("__TITLE__", title)
+            .replace("__STYLE__", STYLE)
+            .replace("__EXTRA_STYLE__", extra_css)
+            .replace("__MEDIA_SCRIPT__", media_script)
+            .replace("__NAV__", &nav)
+            .replace("__BODY__", body)
+    }
 }
 
 fn html_escape(s: &str) -> String {
@@ -62,15 +103,52 @@ const LOGIN_BODY: &str = include_str!("pages/login.html");
 
 #[worker::send]
 pub async fn login_page(State(st): State<AppState>) -> Response {
+    wallet_page(&st, Page::Login, "")
+}
+
+#[worker::send]
+pub async fn upgrade_page(State(st): State<AppState>, cookies: Cookies) -> Response {
+    if session_address(&cookies, &st.jwt_secret).is_some() {
+        return Redirect::to("/user/account#topup").into_response();
+    }
+    let terms = match crate::settings::load(&st.env).await {
+        Ok(p) if p.eth_deposit.is_empty() && p.sol_deposit.is_empty() =>
+            "<p class=\"hint\">New deposits are currently closed. You can still use existing points.</p>".to_owned(),
+        Ok(p) => format!(
+            r#"<dl class="wallet-terms"><div><dt>Points per USD</dt><dd>{}</dd></div><div><dt>Minimum top-up</dt><dd>{}</dd></div></dl>"#,
+            p.points_per_usd, points(p.minimum_topup)
+        ),
+        Err(_) => String::new(),
+    };
+    wallet_page(&st, Page::Upgrade, &terms)
+}
+
+fn wallet_page(st: &AppState, screen: Page, terms: &str) -> Response {
+    let (heading, intro) = if screen == Page::Upgrade {
+        (
+            "Continue exploring",
+            "This item is outside your free allowance. Sign in to use your wallet’s points and see your payment options.",
+        )
+    } else {
+        ("Sign in", "Choose a wallet to open your gallery account.")
+    };
     let body = LOGIN_BODY
+        .replace("__HEADING__", heading)
+        .replace("__INTRO__", intro)
+        .replace("__TERMS__", terms)
         .replace("__CHAIN_ID__", &st.chain_id.to_string())
         .replace("__SIWE_DOMAIN__", &st.siwe_domain);
-    Html(page("Sign in — lets_embed", &body)).into_response()
+    Html(screen.render(&body)).into_response()
 }
 
 // ---------------------------------------------------------------------------
 // GET /user/account
 // ---------------------------------------------------------------------------
+
+fn points(amount: i64) -> String {
+    let unit = if amount == 1 { "point" } else { "points" };
+    format!("{amount} {unit}")
+}
 
 /// Render the plan terms currently offered to customers.
 fn plans_table(policy: &crate::settings::Policy) -> String {
@@ -81,18 +159,16 @@ fn plans_table(policy: &crate::settings::Policy) -> String {
             .views_per_window
             .map_or_else(|| "unlimited".to_string(), |v| v.to_string());
         rows.push_str(&format!(
-            r##"<tr><td>{id}</td><td>{price}</td><td>{views}</td><td>{searches}</td><td>{days}</td>
-<td><button class="btn small subscribe-btn" type="button" data-plan="{id}" data-price="{price}">Subscribe</button></td></tr>"##,
+            r#"<div class="plan-offer"><div><h3>{id}</h3><strong>{display_price} · {days} days</strong>
+<p>{views} view units · {searches} searches per 5h</p></div>
+<button class="btn small secondary subscribe-btn" type="button" aria-label="Subscribe to {id}" data-plan="{id}" data-price="{price}">Subscribe</button></div>"#,
             price = p.price_points,
+            display_price = points(p.price_points),
             searches = p.searches_per_window,
             days = p.period_secs / 86_400,
         ));
     }
-    format!(
-        r##"<div class="tablewrap"><table>
-<thead><tr><th>Plan</th><th>Price (points)</th><th>Views / 5h</th><th>Searches / 5h</th><th>Period (days)</th><th></th></tr></thead>
-<tbody>{rows}</tbody></table></div>"##
-    )
+    rows
 }
 
 /// Display prices and free allowances from the same revision used by the account service.
@@ -115,12 +191,12 @@ fn pricing_table(policy: &crate::settings::Policy) -> String {
         .unwrap();
     }
     format!(
-        r#"<dl class="stats"><dt>Points per USD</dt><dd>{}</dd><dt>Minimum top-up</dt><dd>{} points</dd><dt>New wallet grant</dt><dd>{} points</dd></dl>
+        r#"<dl class="stats"><dt>Points per USD</dt><dd>{}</dd><dt>Minimum top-up</dt><dd>{}</dd><dt>New wallet grant</dt><dd>{}</dd></dl>
 <div class="tablewrap"><table><thead><tr><th>Item</th><th>Points</th><th>USD</th><th>Free per UTC day</th></tr></thead><tbody>{rows}</tbody></table></div>
 <p class="sub meta">Repeat views of the same item within {} hours are free.</p>"#,
         policy.points_per_usd,
-        policy.minimum_topup,
-        policy.signup_points,
+        points(policy.minimum_topup),
+        points(policy.signup_points),
         config::DEDUPE_WINDOW_SECS / 3600
     )
 }
@@ -149,7 +225,7 @@ pub async fn account_page(State(st): State<AppState>, cookies: Cookies) -> Respo
         .replace("__SOL_DEPOSIT_ADDRESS__", &html_escape(&policy.sol_deposit))
         .replace("__PRICING__", &pricing_table(&policy))
         .replace("__PLANS_TABLE__", &plans_table(&policy));
-    Html(page("Account — lets_embed", &body)).into_response()
+    Html(Page::Account.render(&body)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -166,5 +242,5 @@ pub async fn favorites_page(State(st): State<AppState>, cookies: Cookies) -> Res
     if session_address(&cookies, &st.jwt_secret).is_none() {
         return redirect_to_login("/user/favorites");
     }
-    Html(page("Favorites — lets_embed", FAVORITES_BODY)).into_response()
+    Html(Page::Favorites.render(FAVORITES_BODY)).into_response()
 }

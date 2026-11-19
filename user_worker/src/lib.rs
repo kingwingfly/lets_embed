@@ -77,6 +77,7 @@ async fn router(env: Env, ctx: Context) -> Result<Router> {
     Ok(Router::new()
         // Pages
         .route("/user/login", get(pages::login_page))
+        .route(site_access::UPGRADE_PATH, get(pages::upgrade_page))
         .route("/user/account", get(pages::account_page))
         .route("/user/favorites", get(pages::favorites_page))
         // Auth (SIWE)
