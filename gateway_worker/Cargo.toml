@@ -11,8 +11,9 @@ documentation.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
+site_access = { path = "../site_access" }
 worker = { version = "0.9", features = ["http", "axum"] }
-axum = { workspace = true, features = ["macros", "form"] }
+axum = { workspace = true, features = ["macros", "form", "json"] }
 tower-service = "0.3"
 tower-cookies = "0.11"
 serde.workspace = true

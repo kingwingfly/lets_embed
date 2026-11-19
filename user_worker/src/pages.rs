@@ -72,10 +72,10 @@ pub async fn login_page(State(st): State<AppState>) -> Response {
 // GET /user/account
 // ---------------------------------------------------------------------------
 
-/// Server-rendered subscription plans table (from the frozen `config::PLANS`).
-fn plans_table() -> String {
+/// Render the plan terms currently offered to customers.
+fn plans_table(policy: &crate::settings::Policy) -> String {
     let mut rows = String::new();
-    for p in config::PLANS {
+    for p in config::PLANS.iter().filter_map(|p| policy.plan(p.id)) {
         let id = html_escape(p.id);
         let views = p
             .views_per_window
@@ -95,42 +95,33 @@ fn plans_table() -> String {
     )
 }
 
-/// Server-rendered pay-as-you-go pricing summary, derived entirely from the
-/// `config::*` cost constants so it stays in sync with billing.
-fn pricing_table() -> String {
-    // USD equivalent of a point cost, e.g. 100 points -> "$0.0100".
-    let usd = |points: i64| -> String {
-        format!("${:.4}", points as f64 / config::POINTS_PER_USD as f64)
-    };
-    let dedupe_hours = config::DEDUPE_WINDOW_SECS / 3_600;
+/// Display prices and free allowances from the same revision used by the account service.
+fn pricing_table(policy: &crate::settings::Policy) -> String {
+    use std::fmt::Write;
+    let mut rows = String::new();
+    for kind in site_access::ChargeKind::ALL {
+        let item = policy.item(kind);
+        let free = match item.daily_free {
+            -1 => "Unlimited".to_owned(),
+            n => n.to_string(),
+        };
+        let usd = item.price as f64 / policy.points_per_usd as f64;
+        write!(
+            rows,
+            "<tr><th>{}</th><td>{}</td><td>${usd:.4}</td><td>{free}</td></tr>",
+            kind.label(),
+            item.price
+        )
+        .unwrap();
+    }
     format!(
-        r##"<dl class="stats">
-<dt>Rate</dt><dd>$1 = {rate} points</dd>
-<dt>Free signup grant</dt><dd>{grant} points ({grant_usd})</dd>
-</dl>
-<div class="tablewrap"><table>
-<thead><tr><th>Action</th><th>Cost (points)</th><th>&asymp; USD</th></tr></thead>
-<tbody>
-<tr><td>Image view</td><td>{img}</td><td>{img_usd}</td></tr>
-<tr><td>Video view</td><td>{vid}</td><td>{vid_usd}</td></tr>
-<tr><td>Description search (by text)</td><td>{sim}</td><td>{sim_usd}</td></tr>
-<tr><td>Similarity search (upload image)</td><td>{desc}</td><td>{desc_usd}</td></tr>
-<tr><td>Similarity search (by id)</td><td>{emb}</td><td>{emb_usd}</td></tr>
-</tbody></table></div>
-<p class="sub meta">Repeat views of the same item within {dedupe_hours} hours are free.</p>"##,
-        rate = config::POINTS_PER_USD,
-        grant = config::FREE_GRANT_POINTS,
-        grant_usd = usd(config::FREE_GRANT_POINTS),
-        img = config::COST_IMAGE_VIEW,
-        img_usd = usd(config::COST_IMAGE_VIEW),
-        vid = config::COST_VIDEO_VIEW,
-        vid_usd = usd(config::COST_VIDEO_VIEW),
-        sim = config::COST_SEARCH,
-        sim_usd = usd(config::COST_SEARCH),
-        desc = config::COST_SEARCH,
-        desc_usd = usd(config::COST_SEARCH),
-        emb = config::COST_EMBED_SEARCH,
-        emb_usd = usd(config::COST_EMBED_SEARCH),
+        r#"<dl class="stats"><dt>Points per USD</dt><dd>{}</dd><dt>Minimum top-up</dt><dd>{} points</dd><dt>New wallet grant</dt><dd>{} points</dd></dl>
+<div class="tablewrap"><table><thead><tr><th>Item</th><th>Points</th><th>USD</th><th>Free per UTC day</th></tr></thead><tbody>{rows}</tbody></table></div>
+<p class="sub meta">Repeat views of the same item within {} hours are free.</p>"#,
+        policy.points_per_usd,
+        policy.minimum_topup,
+        policy.signup_points,
+        config::DEDUPE_WINDOW_SECS / 3600
     )
 }
 
@@ -143,14 +134,21 @@ pub async fn account_page(State(st): State<AppState>, cookies: Cookies) -> Respo
     if session_address(&cookies, &st.jwt_secret).is_none() {
         return redirect_to_login("/user/account");
     }
+    let policy = match crate::settings::load(&st.env).await {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "Account settings unavailable",
+            )
+                .into_response();
+        }
+    };
     let body = ACCOUNT_BODY
-        .replace("__DEPOSIT_ADDRESS__", &html_escape(&st.deposit_address))
-        .replace(
-            "__SOL_DEPOSIT_ADDRESS__",
-            &html_escape(&st.sol_deposit_address),
-        )
-        .replace("__PRICING__", &pricing_table())
-        .replace("__PLANS_TABLE__", &plans_table());
+        .replace("__DEPOSIT_ADDRESS__", &html_escape(&policy.eth_deposit))
+        .replace("__SOL_DEPOSIT_ADDRESS__", &html_escape(&policy.sol_deposit))
+        .replace("__PRICING__", &pricing_table(&policy))
+        .replace("__PLANS_TABLE__", &plans_table(&policy));
     Html(page("Account — lets_embed", &body)).into_response()
 }
 

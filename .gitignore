@@ -10,5 +10,6 @@ rustc-ice*
 node_modules
 .wrangler
 gateway_worker/build
+user_worker/build
 .claude
 cloudbuild-search-cpu.yaml

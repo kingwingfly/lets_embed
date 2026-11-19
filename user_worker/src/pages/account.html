@@ -45,7 +45,7 @@ __PRICING__
 
 <div class="card">
 <h2>Subscription</h2>
-<p class="sub">Plans are paid from your point balance and last up to 30 days &mdash; they do <strong>not</strong> auto-renew. Switching plans or unsubscribing refunds the unused days of your current plan, prorated to the day.</p>
+<p class="sub">Purchased plans last 30 days. Renew from your point balance when you choose. Switching or canceling refunds unused paid time. Complimentary time has no refund value.</p>
 __PLANS_TABLE__
 <div class="actions" style="margin-top:14px">
 <button class="btn ghost small" type="button" id="unsub-btn">Unsubscribe</button>
@@ -158,7 +158,7 @@ function applyChain() {
     o.textContent = opts[i][1];
     tokenSel.appendChild(o);
   }
-  document.getElementById("deposit-address").textContent = DEPOSIT[chain] || "";
+  document.getElementById("deposit-address").textContent = DEPOSIT[chain] || "New deposits on this chain are closed. You can still submit a transfer made while deposits were open.";
   document.getElementById("sol-link").hidden = chain !== "solana";
   var eth = chain === "ethereum";
   document.getElementById("tx-label").textContent = eth ? "Transaction hash" : "Transaction signature";
@@ -367,32 +367,23 @@ for (var i = 0; i < subBtns.length; i++) {
     var plan = ev.currentTarget.getAttribute("data-plan");
     var price = ev.currentTarget.getAttribute("data-price");
     // Warn that this spends points before committing.
-    var msg;
-    if (currentMe && currentMe.plan && currentMe.plan === plan) {
-      msg = "Renew " + plan + "? This resets your plan to a fresh 30 days. "
-        + "The unused days of your current period are refunded first, so you pay "
-        + "only for the days already used (up to " + price + " points).";
-    } else if (currentMe && currentMe.plan) {
-      msg = "Switch from " + currentMe.plan + " to " + plan + " for up to " + price
-        + " points? The unused days of your current " + currentMe.plan
-        + " plan are refunded first, reducing what you pay.";
-    } else {
-      msg = "Subscribe to " + plan + " for " + price
-        + " points, charged from your balance? The plan lasts 30 days and does not auto-renew.";
+    var msg = "Buy 30 days of " + plan + " for " + price + " points?";
+    if (currentMe && currentMe.plan) {
+      msg += " This replaces your current period. Any unused paid time is credited first.";
     }
     if (!confirm(msg)) return;
     try {
       var r = await fetch("/user/api/subscribe", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ plan: plan }),
+        body: JSON.stringify({ plan: plan, expected_price: Number(price) }),
       });
       if (r.ok) {
         setMsg("sub-msg", "Subscribed to " + plan + ".", "ok");
         loadMe();
       } else {
-        var err;
-        try { err = (await r.json()).error; } catch (_) {}
+        var err = await r.text();
+        try { err = JSON.parse(err).error || err; } catch (_) {}
         setMsg("sub-msg", err || "subscribe failed (" + r.status + ")", "err");
       }
     } catch (e) {

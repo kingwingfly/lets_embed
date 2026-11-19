@@ -12,6 +12,7 @@ members = [
     "search_types",
     "gateway",
     "gateway_worker",
+    "site_access",
     "user_worker",
     "img2webp",
 ]

@@ -20,5 +20,15 @@ required = ["CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "JWT_SECRET"]
 binding = "USER_WORKER"
 service = "user-worker"
 
+# Only the gateway's verified admin path selects this binding.
+[[services]]
+binding = "ADMIN_WORKER"
+service = "user-worker"
+props = { gallery_admin = true }
+
+[vars]
+# Audience of the Access application protecting /user/admin and its descendants.
+CF_ACCESS_AUD = "5700459f509f888154922a3f93bbf18d7dbd6b4be7fa472716693eb2fefb6ba5"
+
 [durable_objects]
 bindings = [{ name = "USER_ACCOUNT", class_name = "UserAccount", script_name = "user-worker" }]

@@ -1,21 +1,7 @@
 //! UNIT 4: Solana top-up verification (native SOL + SPL USDT/USDC).
 //!
-//! Boundary with `payments.rs` (UNIT 3): this module owns everything Solana —
-//! the JSON-RPC call and the parse/verify — behind ONE side-effect-free entry
-//! point, `topup_solana`. It touches neither D1 nor the DO; `payments.rs` runs
-//! the payment-row lifecycle and crediting from the returned `SolOutcome`.
-//!
-//! `topup_solana` fetches the transaction via `getTransaction`
-//! (encoding `jsonParsed`, commitment `finalized`) and delegates to the pure,
-//! host-tested `verify_solana`:
-//!  - null result -> TooEarly (not found / not finalized); meta.err -> Reject.
-//!  - native SOL (spec.contract == None): credited = postBalances[i] -
-//!    preBalances[i] for the deposit account in accountKeys; sender = fee payer
-//!    accountKeys[0], must equal `linked_address` else WrongSender.
-//!  - SPL (spec.contract == Some(mint)): meta.pre/postTokenBalances filtered by
-//!    mint + owner == deposit_address, delta of uiTokenAmount.amount; sender =
-//!    fee payer accountKeys[0] (the SPL owner signs as fee payer here), must
-//!    equal `linked_address` else WrongSender.
+//! The payments handler fetches a finalized transaction, selects the recipient and
+//! pricing effective at its block time, then verifies the transfer here.
 
 use serde_json::Value;
 use worker::{Fetch, Method, Request, RequestInit};
@@ -25,46 +11,23 @@ use crate::config::TokenSpec;
 /// Result of verifying a Solana top-up. No side effects — `payments.rs` maps
 /// each variant onto the payment-row lifecycle (mirrors the Ethereum path):
 /// `Credited` -> credit + mark row credited; `Reject` -> row 'rejected' (400,
-/// permanent for any submitter); `WrongSender`/`TooEarly`/`RpcError` -> delete
-/// the pending row so the tx can be resubmitted (403 / 425 / 502).
+/// permanent for any submitter); `WrongSender`/`RpcError` -> delete
+/// the pending row so the tx can be resubmitted (403 / 502).
 #[derive(Debug, PartialEq, Eq)]
-pub enum SolOutcome {
+pub(crate) enum SolOutcome {
     /// Verified: raw base units received (lamports for SOL, minor units for SPL).
     Credited { amount: u128 },
     /// Tx-intrinsic, permanent failure (wrong recipient, reverted, dust, ...).
     Reject(&'static str),
     /// Sender is not the linked wallet — submitter-relative.
     WrongSender,
-    /// Not visible / not finalized yet — retry later.
-    TooEarly,
-    /// RPC transport/decoding failure — retry later.
+    /// Incomplete or malformed upstream data. The customer can retry.
     RpcError(String),
 }
 
 /// A base58 Solana tx signature decodes to 64 bytes.
 pub fn valid_signature(sig: &str) -> bool {
     matches!(bs58::decode(sig).into_vec(), Ok(v) if v.len() == 64)
-}
-
-/// Fetch + verify a Solana top-up transaction. `deposit_address` and
-/// `linked_address` are base58. Owns the JSON-RPC round-trip; the actual
-/// verification is delegated to the pure `verify_solana`.
-pub async fn topup_solana(
-    sol_rpc_url: &str,
-    spec: &TokenSpec,
-    deposit_address: &str,
-    linked_address: &str,
-    signature: &str,
-) -> SolOutcome {
-    let result = match get_transaction(sol_rpc_url, signature).await {
-        Ok(r) => r,
-        Err(e) => return SolOutcome::RpcError(e.to_string()),
-    };
-    // `result == null` means the tx is unknown to the node or not finalized yet.
-    if result.is_null() {
-        return SolOutcome::TooEarly;
-    }
-    verify_solana(&result, spec, deposit_address, linked_address)
 }
 
 // ---------------------------------------------------------------------------
@@ -75,7 +38,7 @@ pub async fn topup_solana(
 /// maxSupportedTransactionVersion:0})`. Returns the `result` field (which may be
 /// JSON `null`). A non-2xx HTTP response, a JSON-RPC-level `error`, or a decode
 /// failure is turned into `Err`.
-async fn get_transaction(url: &str, signature: &str) -> worker::Result<Value> {
+pub(crate) async fn get_transaction(url: &str, signature: &str) -> worker::Result<Value> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -136,7 +99,7 @@ fn token_amount(entry: &Value) -> Option<u128> {
 
 /// Verify a finalized (non-null) `getTransaction` result. Pure and side-effect
 /// free. `deposit_address` / `linked_address` are base58.
-fn verify_solana(
+pub(crate) fn verify_solana(
     result: &Value,
     spec: &TokenSpec,
     deposit_address: &str,

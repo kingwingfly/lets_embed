@@ -1,38 +1,29 @@
-//! UNIT 1: the per-user `UserAccount` Durable Object.
-//!
-//! One instance per user (id = lowercase 0x address). Tracks PAYG balance,
-//! subscription plan + rolling usage window, view/search dedupe and ban state.
-//! See `types.rs` for the wire protocol (duplicated in gateway_worker) and
-//! `config.rs` for pricing.
-//!
-//! SCAFFOLD STATE: a working PAYG-only base (dedupe + balance charging,
-//! subscribe deducts from balance, alarm lapses the plan). UNIT 1 layers in the
-//! 5-hour usage window (`views_per_window` / `searches_per_window`), the
-//! quota-then-PAYG fallback order, and search metering, then reports the
-//! `views_remaining` / `searches_remaining` / `window_reset` fields.
+//! Wallet and guest metering in the account Durable Object. Wallet instances own
+//! balances, subscriptions and usage. Guest instances enforce the published
+//! daily free allowances for a pseudonymous client IP.
 
 use std::collections::HashMap;
 
 use serde::de::DeserializeOwned;
 use worker::{Date, DurableObject, Env, Method, Request, Response, Result, State, durable_object};
 
-use crate::config;
 use crate::types::{
     BalanceResp, BanReq, ChargeKind, ChargeReq, ChargeResp, CreditReq, InitReq, StatusResp,
     SubscribeReq,
 };
+use crate::{
+    config,
+    settings::{self, Policy},
+};
+use site_access::GuestReq;
 
 // ---------------------------------------------------------------------------
 // Pure decision logic (host-testable)
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 fn view_cost(kind: ChargeKind) -> i64 {
-    match kind {
-        ChargeKind::Image => config::COST_IMAGE_VIEW,
-        ChargeKind::Video => config::COST_VIDEO_VIEW,
-        ChargeKind::Search => config::COST_SEARCH,
-        ChargeKind::EmbedSearch => config::COST_EMBED_SEARCH,
-    }
+    Policy::default().item(kind).price
 }
 
 /// A repeat charge is free if the key was first seen within the dedupe window.
@@ -92,7 +83,7 @@ fn decide_charge(
                 }
             }
             // The expensive upload-image search draws from the scarce search quota.
-            ChargeKind::Search => {
+            ChargeKind::Search | ChargeKind::Description => {
                 if win_search < plan.searches_per_window {
                     return ChargeSource::Window;
                 }
@@ -161,7 +152,6 @@ fn json<T: serde::Serialize>(v: &T, status: u16) -> Result<Response> {
 #[durable_object]
 pub struct UserAccount {
     state: State,
-    #[allow(dead_code)]
     env: Env,
 }
 
@@ -172,14 +162,17 @@ impl DurableObject for UserAccount {
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         let path = req.path();
+        let policy = settings::load(&self.env).await?;
         match (req.method(), path.as_str()) {
-            (Method::Post, "/init") => self.init(req.json().await?).await,
-            (Method::Post, "/charge") => self.charge(req.json().await?).await,
+            (Method::Post, "/init") => self.init(req.json().await?, &policy).await,
+            (Method::Post, "/charge") => self.charge(req.json().await?, &policy).await,
             (Method::Post, "/credit") => self.credit(req.json().await?).await,
-            (Method::Get, "/status") => json(&self.status_resp().await?, 200),
-            (Method::Post, "/subscribe") => self.subscribe(req.json().await?).await,
-            (Method::Post, "/unsubscribe") => self.unsubscribe().await,
-            (Method::Post, "/ban") => self.ban(req.json().await?).await,
+            (Method::Get, "/status") => json(&self.status_resp(&policy).await?, 200),
+            (Method::Post, "/subscribe") => self.subscribe(req.json().await?, &policy).await,
+            (Method::Post, "/unsubscribe") => self.unsubscribe(&policy).await,
+            (Method::Post, "/ban") => self.ban(req.json().await?, &policy).await,
+            (Method::Post, "/guest") => self.guest(req.json().await?, &policy),
+            (Method::Post, "/admin-plan") => self.admin_plan(req.json().await?, &policy).await,
             _ => Response::error("not found", 404),
         }
     }
@@ -209,16 +202,129 @@ impl DurableObject for UserAccount {
 }
 
 impl UserAccount {
+    async fn write_fields(&self, fields: serde_json::Value) -> Result<()> {
+        // DO multi-put takes a plain JS object. BigInt preserves exact i64 balances.
+        let serializer = serde_wasm_bindgen::Serializer::new()
+            .serialize_maps_as_objects(true)
+            .serialize_large_number_types_as_bigints(true);
+        let object = serde::Serialize::serialize(&fields, &serializer)?;
+        self.state.storage().put_multiple_raw(object.into()).await
+    }
+
+    // Refund the historical price actually paid. Legacy subscriptions were
+    // sold at the compile-time price. Admin-granted periods have zero basis.
+    async fn refund(&self, id: Option<&str>, end: u64, now: u64) -> Result<i64> {
+        let Some(plan) = id.and_then(config::plan).filter(|_| end > now) else {
+            return Ok(0);
+        };
+        let paid = self.get_or("plan_paid", plan.price_points).await?;
+        Ok(prorated_refund(paid, plan.period_secs, end - now))
+    }
+
+    fn free_item(&self, req: &ChargeReq, limit: i64, day: u64, head: bool) -> Result<bool> {
+        if limit == 0 {
+            return Ok(false);
+        }
+        if limit < 0 || head {
+            return Ok(true);
+        }
+        // Synchronous DO SQLite calls complete before another request can enter.
+        // Store single resource hashes rather than an ever-growing KV value.
+        use sha2::{Digest, Sha256};
+        #[derive(serde::Deserialize)]
+        struct Usage {
+            seen: i64,
+            used: i64,
+        }
+        let db = self.state.storage().sql();
+        db.exec("CREATE TABLE IF NOT EXISTS free_usage (day INTEGER,kind TEXT,resource BLOB, PRIMARY KEY(day,kind,resource)) WITHOUT ROWID",None)?;
+        db.exec(
+            "DELETE FROM free_usage WHERE day < ?",
+            vec![(day as i64).into()],
+        )?;
+        let hash = Sha256::digest(req.path.as_bytes()).to_vec();
+        let kind = req.kind.name();
+        let used:Usage=db.exec("SELECT EXISTS(SELECT 1 FROM free_usage WHERE day=?1 AND kind=?2 AND resource=?3) AS seen, COUNT(*) AS used FROM free_usage WHERE day=?1 AND kind=?2",
+            vec![(day as i64).into(),kind.into(),hash.clone().into()])?.one()?;
+        if used.seen != 0 {
+            return Ok(true);
+        }
+        if used.used >= limit {
+            return Ok(false);
+        }
+        db.exec(
+            "INSERT INTO free_usage VALUES(?,?,?)",
+            vec![(day as i64).into(), kind.into(), hash.into()],
+        )?;
+        Ok(true)
+    }
+
+    fn guest(&self, req: GuestReq, policy: &Policy) -> Result<Response> {
+        if policy.login_required {
+            return Response::error("Login required", 401);
+        }
+        if let Some(item) = req.item {
+            let limit = policy.item(item.kind).daily_free;
+            if !policy.free_media_in_scope(&item)
+                || !self.free_item(&item, limit, now_secs() / 86_400, req.head)?
+            {
+                return Response::error(
+                    "Sign in to access this item or continue beyond the daily free allowance",
+                    402,
+                );
+            }
+        }
+        Response::ok("")
+    }
+
+    async fn admin_plan(
+        &self,
+        req: crate::types::AdminPlanReq,
+        policy: &Policy,
+    ) -> Result<Response> {
+        let storage = self.state.storage();
+        let marker = format!("admin-plan:{}", req.token);
+        if storage.get::<bool>(&marker).await?.is_some() {
+            return json(&self.status_resp(policy).await?, 200);
+        }
+        let now = now_secs();
+        let (id, end) = match req.plan.as_str() {
+            "none" => ("", 0),
+            id => match policy.plan(id) {
+                Some(p) if (1..=3650).contains(&req.days) => {
+                    (p.id, now + u64::from(req.days) * 86_400)
+                }
+                _ => return Response::error("Unknown plan", 400),
+            },
+        };
+        let current: Option<String> = storage.get("plan").await?;
+        let previous_end = self.get_or("period_end", 0).await?;
+        let refund = self.refund(current.as_deref(), previous_end, now).await?;
+        let balance: i64 = self.get_or("balance", 0).await?;
+        self.write_fields(
+            serde_json::json!({"plan":id,"period_end":end,"plan_paid":0,"win_start":now,
+            "win_views":0,"win_search":0,"balance":balance.saturating_add(refund),(marker):true}),
+        )
+        .await?;
+        if end > now {
+            storage.set_alarm(((end - now) * 1000) as i64).await?;
+        } else {
+            storage.delete("plan").await?;
+            storage.delete_alarm().await?;
+        }
+        json(&self.status_resp(policy).await?, 200)
+    }
+
     async fn get_or<T: DeserializeOwned>(&self, key: &str, default: T) -> Result<T> {
         Ok(self.state.storage().get(key).await?.unwrap_or(default))
     }
 
     /// First touch of a brand-new account: grant the free points.
-    async fn ensure_init(&self) -> Result<()> {
+    async fn ensure_init(&self, policy: &Policy) -> Result<()> {
         let storage = self.state.storage();
         if storage.get::<bool>("init").await?.is_none() {
-            storage.put("balance", config::FREE_GRANT_POINTS).await?;
-            storage.put("init", true).await?;
+            self.write_fields(serde_json::json!({"init":true, "balance": policy.signup_points}))
+                .await?;
         }
         Ok(())
     }
@@ -255,18 +361,18 @@ impl UserAccount {
         ))
     }
 
-    async fn status_resp(&self) -> Result<StatusResp> {
+    async fn status_resp(&self, policy: &Policy) -> Result<StatusResp> {
         let now = now_secs();
         let period_end: u64 = self.get_or("period_end", 0).await?;
         let active = self.plan_active(now).await?;
         let plan_id: Option<String> = self.state.storage().get("plan").await?;
-        let plan_cfg = plan_id.as_deref().and_then(config::plan);
+        let plan_cfg = plan_id.as_deref().and_then(|id| policy.plan(id));
         let (views_remaining, searches_remaining, window_reset) =
-            self.window_fields(active, plan_cfg, now).await?;
+            self.window_fields(active, plan_cfg.as_ref(), now).await?;
         Ok(StatusResp {
             address: self.get_or("address", String::new()).await?,
             balance: self.get_or("balance", 0).await?,
-            plan: plan_id,
+            plan: plan_id.filter(|_| active),
             period_end: if active { period_end } else { 0 },
             views_remaining,
             searches_remaining,
@@ -276,14 +382,14 @@ impl UserAccount {
         })
     }
 
-    async fn init(&self, req: InitReq) -> Result<Response> {
-        self.ensure_init().await?;
+    async fn init(&self, req: InitReq, policy: &Policy) -> Result<Response> {
+        self.ensure_init(policy).await?;
         self.state.storage().put("address", &req.address).await?;
-        json(&self.status_resp().await?, 200)
+        json(&self.status_resp(policy).await?, 200)
     }
 
-    async fn charge(&self, req: ChargeReq) -> Result<Response> {
-        self.ensure_init().await?;
+    async fn charge(&self, req: ChargeReq, policy: &Policy) -> Result<Response> {
+        self.ensure_init(policy).await?;
         if self.get_or("banned", false).await? {
             return Response::error("banned", 403);
         }
@@ -296,7 +402,8 @@ impl UserAccount {
             .get_or(&format!("seen:{}", day - 1), HashMap::new())
             .await?;
 
-        let cost = view_cost(req.kind);
+        let rule = policy.item(req.kind);
+        let cost = rule.price;
         let mut balance: i64 = self.get_or("balance", 0).await?;
 
         let active = self.plan_active(now).await?;
@@ -305,7 +412,7 @@ impl UserAccount {
                 .get::<String>("plan")
                 .await?
                 .as_deref()
-                .and_then(config::plan)
+                .and_then(|id| policy.plan(id))
         } else {
             None
         };
@@ -317,7 +424,7 @@ impl UserAccount {
         // still report the current window figures.
         if is_recent_view(&req.path, now, [&today_map, &yesterday]) {
             let (views_remaining, searches_remaining, window_reset) =
-                self.window_fields(active, plan_cfg, now).await?;
+                self.window_fields(active, plan_cfg.as_ref(), now).await?;
             return json(
                 &ChargeResp {
                     charged: false,
@@ -344,12 +451,25 @@ impl UserAccount {
             window_dirty = true;
         }
 
-        let source = decide_charge(
-            plan_cfg, active, req.kind, win_views, win_search, balance, cost,
-        );
+        let included = cost == 0
+            || (policy.free_media_in_scope(&req)
+                && self.free_item(&req, rule.daily_free, day, false)?);
+        let source = if included {
+            ChargeSource::FreeUnlimited
+        } else {
+            decide_charge(
+                plan_cfg.as_ref(),
+                active,
+                req.kind,
+                win_views,
+                win_search,
+                balance,
+                cost,
+            )
+        };
         if source == ChargeSource::Refuse {
-            let views_remaining = views_remaining(plan_cfg, active, win_views);
-            let searches_remaining = searches_remaining(plan_cfg, active, win_search);
+            let views_remaining = views_remaining(plan_cfg.as_ref(), active, win_views);
+            let searches_remaining = searches_remaining(plan_cfg.as_ref(), active, win_search);
             let window_reset = window_reset(active, win_start, now);
             return json(
                 &ChargeResp {
@@ -367,7 +487,7 @@ impl UserAccount {
             ChargeSource::FreeUnlimited => {} // pro media view: deduct nothing
             ChargeSource::Window => {
                 match req.kind {
-                    ChargeKind::Search => win_search += 1,
+                    ChargeKind::Search | ChargeKind::Description => win_search += 1,
                     ChargeKind::Image | ChargeKind::Video | ChargeKind::EmbedSearch => {
                         win_views += cost
                     }
@@ -384,27 +504,21 @@ impl UserAccount {
         }
         today_map.insert(req.path, now);
         let total_views: i64 = self.get_or("total_views", 0).await? + 1;
-        storage.put(&today_key, &today_map).await?;
-        storage.put("balance", balance).await?;
-        storage.put("total_views", total_views).await?;
+        let mut fields = serde_json::json!({(today_key): today_map, "balance":balance, "total_views":total_views});
         if window_dirty {
-            storage
-                .put(
-                    "win_start",
-                    win_start.expect("rolled/active window has a start"),
-                )
-                .await?;
-            storage.put("win_views", win_views).await?;
-            storage.put("win_search", win_search).await?;
+            fields["win_start"] = win_start.expect("active window has a start").into();
+            fields["win_views"] = win_views.into();
+            fields["win_search"] = win_search.into();
         }
+        self.write_fields(fields).await?;
 
-        let views_remaining = views_remaining(plan_cfg, active, win_views);
-        let searches_remaining = searches_remaining(plan_cfg, active, win_search);
+        let views_remaining = views_remaining(plan_cfg.as_ref(), active, win_views);
+        let searches_remaining = searches_remaining(plan_cfg.as_ref(), active, win_search);
         let window_reset = window_reset(active, win_start, now);
         json(
             &ChargeResp {
-                charged: true,
-                cost,
+                charged: !included,
+                cost: if included { 0 } else { cost },
                 balance,
                 views_remaining,
                 searches_remaining,
@@ -427,9 +541,9 @@ impl UserAccount {
                 200,
             );
         }
-        let balance = (balance + req.points).max(0);
-        storage.put("balance", balance).await?;
-        storage.put(&marker, true).await?;
+        let balance = balance.saturating_add(req.points).max(0);
+        self.write_fields(serde_json::json!({"balance":balance, (marker):true}))
+            .await?;
         json(
             &BalanceResp {
                 balance,
@@ -445,26 +559,25 @@ impl UserAccount {
     /// one plan period (30d) — clicking Subscribe repeatedly no longer stacks
     /// days — and switching (upgrade/downgrade/renew) only charges the
     /// difference net of the refund. A pure renew (same plan) costs ~0 net.
-    async fn subscribe(&self, req: SubscribeReq) -> Result<Response> {
-        let Some(target) = config::plan(&req.plan) else {
+    async fn subscribe(&self, req: SubscribeReq, policy: &Policy) -> Result<Response> {
+        let Some(target) = policy.plan(&req.plan) else {
             return Response::error("unknown plan", 400);
         };
+        if req
+            .expected_price
+            .is_some_and(|price| price != target.price_points)
+        {
+            return Response::error(
+                "Plan price changed. Reload your account to review the current price.",
+                409,
+            );
+        }
         let storage = self.state.storage();
         let now = now_secs();
         let current: Option<String> = storage.get("plan").await?;
         let period_end: u64 = self.get_or("period_end", 0).await?;
-        let active = current.is_some() && period_end > now;
 
-        // Refund the unused remainder of the currently active plan (if any).
-        let refund = if active {
-            current
-                .as_deref()
-                .and_then(config::plan)
-                .map(|cur| prorated_refund(cur.price_points, cur.period_secs, period_end - now))
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        let refund = self.refund(current.as_deref(), period_end, now).await?;
 
         let balance: i64 = self.get_or("balance", 0).await?;
         // Net cost of the switch: full target price offset by the refund. May be
@@ -473,55 +586,42 @@ impl UserAccount {
         if net_cost > 0 && balance < net_cost {
             return Response::error("insufficient balance", 402);
         }
-        let new_balance = (balance - net_cost).max(0);
+        let new_balance = balance.saturating_sub(net_cost).max(0);
         // Always a fresh full period from now — never stacks past one period.
         let new_end = now + target.period_secs;
 
-        storage.put("balance", new_balance).await?;
-        storage.put("plan", target.id).await?;
-        storage.put("period_end", new_end).await?;
-        // Reset the usage window on any successful subscribe (new / renew / switch).
-        storage.put("win_start", now).await?;
-        storage.put("win_views", 0i64).await?;
-        storage.put("win_search", 0i64).await?;
+        self.write_fields(serde_json::json!({"balance":new_balance, "plan":target.id,
+            "period_end":new_end, "plan_paid":target.price_points, "win_start":now, "win_views":0,"win_search":0})).await?;
         storage
             .set_alarm((new_end.saturating_sub(now) * 1000) as i64)
             .await?;
-        json(&self.status_resp().await?, 200)
+        json(&self.status_resp(policy).await?, 200)
     }
 
     /// Cancel the active plan, refunding the unused (prorated) remainder to the
     /// PAYG balance and lapsing to pay-as-you-go immediately. Idempotent: with
     /// no active plan it just clears any stale state and returns 200.
-    async fn unsubscribe(&self) -> Result<Response> {
+    async fn unsubscribe(&self, policy: &Policy) -> Result<Response> {
         let storage = self.state.storage();
         let now = now_secs();
         let current: Option<String> = storage.get("plan").await?;
         let period_end: u64 = self.get_or("period_end", 0).await?;
-        let active = current.is_some() && period_end > now;
 
-        if active {
-            let refund = current
-                .as_deref()
-                .and_then(config::plan)
-                .map(|cur| prorated_refund(cur.price_points, cur.period_secs, period_end - now))
-                .unwrap_or(0);
-            let balance: i64 = self.get_or("balance", 0).await?;
-            storage.put("balance", balance + refund).await?;
-        }
-        // Lapse to PAYG and close the window (mirrors the alarm's lapse path).
+        let refund = self.refund(current.as_deref(), period_end, now).await?;
+        let balance: i64 = self.get_or("balance", 0).await?;
+        self.write_fields(
+            serde_json::json!({"balance":balance.saturating_add(refund), "period_end":0,
+            "plan_paid":0,"win_start":0,"win_views":0,"win_search":0}),
+        )
+        .await?;
         storage.delete("plan").await?;
-        storage.delete("period_end").await?;
-        storage.delete("win_start").await?;
-        storage.delete("win_views").await?;
-        storage.delete("win_search").await?;
         let _ = storage.delete_alarm().await;
-        json(&self.status_resp().await?, 200)
+        json(&self.status_resp(policy).await?, 200)
     }
 
-    async fn ban(&self, req: BanReq) -> Result<Response> {
+    async fn ban(&self, req: BanReq, policy: &Policy) -> Result<Response> {
         self.state.storage().put("banned", req.banned).await?;
-        json(&self.status_resp().await?, 200)
+        json(&self.status_resp(policy).await?, 200)
     }
 }
 

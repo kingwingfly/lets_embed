@@ -1,11 +1,7 @@
 //! UNIT 7: admin user management, protected by Cloudflare Access.
 //!
-//! Every handler first verifies the `Cf-Access-Jwt-Assertion` header (RS256,
-//! JWKS from `https://{team_domain}/cdn-cgi/access/certs` cached in KV
-//! `crate::JWKS_BINDING`). The `require_approver` implementation is
-//! deliberately duplicated from the old gateway_worker admin (the gateway
-//! copy is being removed): it is a deployment-level trust boundary, not
-//! shared Rust.
+//! Only the dedicated, platform-configured admin service binding can convey the
+//! identity authenticated at the gateway. Direct HTTP and ordinary bindings deny access.
 
 use axum::{
     Form,
@@ -13,15 +9,13 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
-use rsa::{BoxedUint, Pkcs1v15Sign, PublicKey};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use worker::{Env, Fetch, Method, Result};
+use std::collections::HashMap;
+use worker::{Env, Method, Result};
 
 use crate::{
     AppState, do_client,
-    session::{is_valid_principal, now_secs},
+    session::is_valid_principal,
     types::{BanReq, CreditReq, StatusResp},
 };
 
@@ -31,6 +25,7 @@ pub struct AdminQuery {
     pub q: Option<String>,
     /// Show DO status + actions for this user.
     pub address: Option<String>,
+    pub saved: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,134 +50,43 @@ pub struct BanForm {
 }
 
 // ---------------------------------------------------------------------------
-// Cloudflare Access gate (RS256 + JWKS)
+// Administrator identity forwarded by the gateway through its privileged binding
 // ---------------------------------------------------------------------------
 
-async fn require_approver(st: &AppState, headers: &HeaderMap) -> Option<String> {
-    #[derive(Deserialize)]
-    struct Jwk {
-        kid: String,
-        n: String,
-        e: String,
+fn require_approver<'a>(st: &AppState, headers: &'a HeaderMap) -> Option<&'a str> {
+    if !st.admin_binding {
+        return None;
     }
-    #[derive(Deserialize)]
-    struct Jwks {
-        keys: Vec<Jwk>,
+    headers
+        .get(site_access::ADMIN_HEADER)?
+        .to_str()
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+fn same_origin(headers: &HeaderMap, domain: &str) -> bool {
+    headers
+        .get("origin")
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|origin| {
+            origin == format!("https://{domain}")
+                || (domain
+                    .split(':')
+                    .next()
+                    .is_some_and(|h| matches!(h, "localhost" | "127.0.0.1"))
+                    && origin == format!("http://{domain}"))
+        })
+}
+
+fn editor<'a>(st: &AppState, h: &'a HeaderMap) -> Option<&'a str> {
+    if !same_origin(h, &st.siwe_domain) {
+        return None;
     }
-    #[derive(Deserialize)]
-    struct JwtHeader {
-        kid: String,
-        alg: String,
-    }
-    #[derive(Deserialize)]
-    struct AccessClaims {
-        aud: serde_json::Value,
-        email: Option<String>,
-        iss: String,
-        exp: u64,
-        nbf: Option<u64>,
-    }
-
-    fn b64url(s: &str) -> Option<Vec<u8>> {
-        B64.decode(s).ok()
-    }
-
-    async fn load_jwks(env: &Env, team_domain: &str, force: bool) -> Option<Jwks> {
-        let kv = env.kv(crate::JWKS_BINDING).ok()?;
-
-        if !force
-            && let Ok(Some(text)) = kv.get(crate::JWKS_KEY).text().await
-            && let Ok(j) = serde_json::from_str::<Jwks>(&text)
-        {
-            return Some(j);
-        }
-
-        let url = format!("https://{team_domain}/cdn-cgi/access/certs");
-        let mut resp = Fetch::Url(url.parse().ok()?).send().await.ok()?;
-        let text = resp.text().await.ok()?;
-        let jwks: Jwks = serde_json::from_str(&text).ok()?;
-
-        if let Ok(builder) = kv.put(crate::JWKS_KEY, &text) {
-            let _ = builder.expiration_ttl(crate::JWKS_TTL).execute().await;
-        }
-        Some(jwks)
-    }
-
-    async fn verify_access_jwt(
-        env: &Env,
-        token: &str,
-        team_domain: &str,
-        expected_aud: &str,
-        now: u64,
-    ) -> Option<AccessClaims> {
-        let mut parts = token.split('.');
-        let (h, p, s) = (parts.next()?, parts.next()?, parts.next()?);
-        if parts.next().is_some() {
-            return None;
-        }
-
-        let header: JwtHeader = serde_json::from_slice(&b64url(h)?).ok()?;
-        if header.alg != "RS256" {
-            return None;
-        }
-
-        let (n_str, e_str) = {
-            let cached = load_jwks(env, team_domain, false).await?;
-            match cached.keys.iter().find(|k| k.kid == header.kid) {
-                Some(j) => (j.n.clone(), j.e.clone()),
-                None => {
-                    let fresh = load_jwks(env, team_domain, true).await?;
-                    let j = fresh.keys.iter().find(|k| k.kid == header.kid)?;
-                    (j.n.clone(), j.e.clone())
-                }
-            }
-        };
-        let n = BoxedUint::from_be_slice_vartime(&b64url(&n_str)?);
-        let e = BoxedUint::from_be_slice_vartime(&b64url(&e_str)?);
-        let key = PublicKey::new(n, e).ok()?;
-
-        let signing_input = format!("{h}.{p}");
-        let digest = Sha256::digest(signing_input.as_bytes());
-        let sig = b64url(s)?;
-        key.verify(Pkcs1v15Sign::new::<Sha256>(), &digest, &sig)
-            .ok()?;
-
-        let claims: AccessClaims = serde_json::from_slice(&b64url(p)?).ok()?;
-
-        // exp
-        if claims.exp < now {
-            return None;
-        }
-        if matches!(claims.nbf, Some(nbf) if nbf > now) {
-            return None;
-        }
-        // iss
-        if claims.iss.trim_end_matches('/')
-            != format!("https://{team_domain}").trim_end_matches('/')
-        {
-            return None;
-        }
-        // aud
-        let aud_ok = match &claims.aud {
-            serde_json::Value::String(a) => a == expected_aud,
-            serde_json::Value::Array(arr) => arr.iter().any(|v| v.as_str() == Some(expected_aud)),
-            _ => false,
-        };
-        if !aud_ok {
-            return None;
-        }
-
-        Some(claims)
-    }
-
-    let token = headers.get("cf-access-jwt-assertion")?.to_str().ok()?;
-    let claims =
-        verify_access_jwt(&st.env, token, &st.team_domain, &st.access_aud, now_secs()).await?;
-    claims.email
+    require_approver(st, h)
 }
 
 fn forbidden() -> Response {
-    (StatusCode::FORBIDDEN, "Access not configured").into_response()
+    (StatusCode::FORBIDDEN, "Administrator access required").into_response()
 }
 
 fn internal_error() -> Response {
@@ -260,7 +164,7 @@ pub async fn admin_page(
     headers: HeaderMap,
     Query(q): Query<AdminQuery>,
 ) -> Response {
-    let Some(email) = require_approver(&st, &headers).await else {
+    let Some(admin) = require_approver(&st, &headers) else {
         return forbidden();
     };
 
@@ -287,13 +191,22 @@ pub async fn admin_page(
         None => None,
     };
 
-    Html(render_admin(
-        &email,
+    let published = match crate::settings::Published::load(&st.env).await {
+        Ok(p) => p,
+        Err(e) => {
+            worker::console_error!("site settings: {e}");
+            return internal_error();
+        }
+    };
+    let page = render_admin(
+        admin,
         filter.as_deref().unwrap_or(""),
         &rows,
         detail.as_ref(),
-    ))
-    .into_response()
+        &published,
+        q.saved == Some(1),
+    );
+    Html(page).into_response()
 }
 
 #[worker::send]
@@ -302,13 +215,24 @@ pub async fn credit(
     headers: HeaderMap,
     Form(form): Form<CreditForm>,
 ) -> Response {
-    if require_approver(&st, &headers).await.is_none() {
+    let Some(actor) = editor(&st, &headers) else {
         return forbidden();
-    }
+    };
     if let Err(resp) = validate_form_address(&st.env, &form.address).await {
         return resp;
     }
 
+    if form.points == 0
+        || form.points.unsigned_abs() > crate::settings::MAX_VALUE as u64
+        || form.reason.trim().is_empty()
+        || form.reason.len() > 300
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Enter a nonzero adjustment and a reason",
+        )
+            .into_response();
+    }
     // Prefer the form's idempotency token so a refresh/replay of the same form
     // dedupes in the DO; fall back to a fresh uuid only if it's missing.
     let token = if form.token.trim().is_empty() {
@@ -321,12 +245,21 @@ pub async fn credit(
         key: format!("admin:{token}"),
         reason: form.reason,
     };
-    if let Err(e) = do_client::do_credit(&st.env, &form.address, &req).await {
-        worker::console_error!("do credit for {} failed: {e:?}", form.address);
-        return internal_error();
+    match do_client::do_credit(&st.env, &form.address, &req).await {
+        Ok(receipt) if receipt.applied => worker::console_log!(
+            "Administrator {actor} adjusted {} by {} points, reason {:?}",
+            form.address,
+            req.points,
+            req.reason
+        ),
+        Ok(_) => {}
+        Err(e) => {
+            worker::console_error!("do credit for {} failed: {e:?}", form.address);
+            return internal_error();
+        }
     }
 
-    Redirect::to(&format!("/user/admin?address={}", form.address)).into_response()
+    Redirect::to(&format!("/user/admin?address={}#accounts", form.address)).into_response()
 }
 
 #[worker::send]
@@ -335,7 +268,7 @@ pub async fn ban(
     headers: HeaderMap,
     Form(form): Form<BanForm>,
 ) -> Response {
-    if require_approver(&st, &headers).await.is_none() {
+    if editor(&st, &headers).is_none() {
         return forbidden();
     }
     if let Err(resp) = validate_form_address(&st.env, &form.address).await {
@@ -377,68 +310,106 @@ pub async fn ban(
         }
     }
 
-    Redirect::to(&format!("/user/admin?address={}", form.address)).into_response()
+    Redirect::to(&format!("/user/admin?address={}#accounts", form.address)).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Persist admin changes
+
+#[worker::send]
+pub async fn save_settings(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Form(fields): Form<HashMap<String, String>>,
+) -> Response {
+    let Some(admin) = editor(&st, &headers) else {
+        return forbidden();
+    };
+    let (revision, policy) = match crate::settings::Policy::from_form(&fields) {
+        Ok(p) => p,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    match crate::settings::Published::save(&st.env, revision, &policy, admin).await {
+        Ok(true) => Redirect::to("/user/admin?saved=1").into_response(),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            "Settings changed in another tab. Reload the dashboard and reapply your edits.",
+        )
+            .into_response(),
+        Err(e) => {
+            worker::console_error!("save settings: {e}");
+            internal_error()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PlanForm {
+    address: String,
+    plan: String,
+    days: u32,
+    token: String,
+}
+#[worker::send]
+pub async fn set_plan(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Form(f): Form<PlanForm>,
+) -> Response {
+    if editor(&st, &headers).is_none() {
+        return forbidden();
+    }
+    if let Err(r) = validate_form_address(&st.env, &f.address).await {
+        return r;
+    }
+    if (f.plan != "none" && crate::config::plan(&f.plan).is_none())
+        || !(1..=3650).contains(&f.days)
+        || uuid::Uuid::parse_str(&f.token).is_err()
+    {
+        return (StatusCode::BAD_REQUEST, "Invalid subscription adjustment").into_response();
+    }
+    let req = crate::types::AdminPlanReq {
+        plan: f.plan,
+        days: f.days,
+        token: f.token,
+    };
+    let status = match do_client::call_do(
+        &st.env,
+        &f.address,
+        Method::Post,
+        "/admin-plan",
+        Some(&req),
+    )
+    .await
+    {
+        Ok(mut r) if r.status_code() == 200 => r.json::<StatusResp>().await,
+        _ => return internal_error(),
+    };
+    let Ok(status) = status else {
+        return internal_error();
+    };
+    let mirror = st.env.d1(crate::D1_BINDING).and_then(|db| {
+        db.prepare("UPDATE users SET plan=? WHERE address=?")
+            .bind(&[
+                status
+                    .plan
+                    .map(Into::into)
+                    .unwrap_or(worker::wasm_bindgen::JsValue::NULL),
+                f.address.as_str().into(),
+            ])
+    });
+    match mirror {
+        Ok(q) if q.run().await.is_ok() => {}
+        _ => return internal_error(),
+    }
+    Redirect::to(&format!("/user/admin?address={}#accounts", f.address)).into_response()
 }
 
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
-const STYLE: &str = r#"<style>
-:root{--bg:#f5f6f8;--card:#fff;--fg:#1f2329;--muted:#6b7280;--border:#e5e7eb;
---accent:#4f46e5;--accent-h:#4338ca;--danger:#dc2626;--ok:#059669;--warn:#d97706;
---radius:14px;--shadow:0 10px 30px rgba(0,0,0,.08)}
-@media(prefers-color-scheme:dark){:root{--bg:#0e1116;--card:#171b22;--fg:#e6e8eb;
---muted:#9aa4b2;--border:#262c36;--shadow:0 10px 30px rgba(0,0,0,.45)}}
-*{box-sizing:border-box}
-body{margin:0;min-height:100vh;display:flex;justify-content:center;align-items:flex-start;
-background:radial-gradient(1200px 600px at 50% -10%,rgba(79,70,229,.14),transparent),var(--bg);
-color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-line-height:1.55;padding:8vh 16px 6vh}
-.wrap{width:100%;max-width:960px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
-box-shadow:var(--shadow);padding:24px;margin:14px 0}
-h1{font-size:22px;margin:0 0 4px;letter-spacing:-.01em}
-h2{font-size:17px;margin:0 0 12px;letter-spacing:-.01em}
-.sub{color:var(--muted);font-size:14px;margin:0 0 22px}
-input[type=text],input[type=number]{padding:9px 10px;border:1px solid var(--border);border-radius:9px;
-background:transparent;color:var(--fg);font:inherit;transition:border-color .15s,box-shadow .15s}
-input[type=text]:focus,input[type=number]:focus{outline:none;border-color:var(--accent);
-box-shadow:0 0 0 3px rgba(79,70,229,.2)}
-.btn{display:inline-flex;align-items:center;gap:6px;border:0;border-radius:10px;padding:10px 18px;font:inherit;
-font-weight:600;cursor:pointer;color:#fff;background:var(--accent);transition:background .15s,transform .05s}
-.btn:hover{background:var(--accent-h)}.btn:active{transform:translateY(1px)}
-.btn.ghost{background:transparent;color:var(--danger);border:1px solid var(--border)}
-.btn.ghost:hover{background:rgba(220,38,38,.08);border-color:var(--danger)}
-.badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:4px 11px;border-radius:999px}
-.badge.ok{color:var(--ok);background:rgba(5,150,105,.13)}
-.badge.warn{color:var(--warn);background:rgba(217,119,6,.13)}
-.badge.err{color:var(--danger);background:rgba(220,38,38,.13)}
-a{color:var(--accent);text-decoration:none;font-weight:600}a:hover{text-decoration:underline}
-.meta{color:var(--muted);font-size:12px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
-table{width:100%;border-collapse:collapse;font-size:14px}
-th{color:var(--muted);font-size:12px;font-weight:600;text-align:left;text-transform:uppercase;letter-spacing:.04em}
-th,td{padding:9px 12px;border-bottom:1px solid var(--border)}
-tr:last-child td{border-bottom:0}
-.tablewrap{overflow-x:auto}
-dl.status{display:grid;grid-template-columns:auto 1fr;gap:6px 18px;margin:0 0 18px}
-dl.status dt{color:var(--muted);font-size:13px;font-weight:600}
-dl.status dd{margin:0;font-size:14px}
-.actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
-.actions form{display:inline-flex;gap:8px;align-items:center;margin:0}
-.empty{text-align:center;color:var(--muted);padding:48px 0;font-size:15px}
-.headrow{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}
-.you{color:var(--muted);font-size:13px}
-</style>"#;
-
-fn page(title: &str, body: &str) -> String {
-    format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title>{STYLE}
-</head><body><div class="wrap">{body}</div></body></html>"#
-    )
-}
+const STYLE: &str = include_str!("pages/admin.css");
 
 fn banned_badge(banned: bool) -> &'static str {
     if banned {
@@ -490,14 +461,20 @@ fn render_detail(s: &StatusResp) -> String {
 <input type="hidden" name="token" value="{token}">
 <input type="number" name="points" required placeholder="points (&plusmn;)">
 <input type="text" name="reason" required placeholder="reason">
-<button class="btn" type="submit">Credit</button>
+<button class="btn" type="submit">Adjust credit</button>
 </form>
 <form method="post" action="/user/admin/ban">
 <input type="hidden" name="address" value="{addr}">
 <input type="hidden" name="banned" value="{ban_value}">
 <button class="btn ghost" type="submit">{ban_label}</button>
 </form>
-</div></div>"#,
+</div><form class="plan-action" method="post" action="/user/admin/plan">
+<input type="hidden" name="address" value="{addr}"><input type="hidden" name="token" value="{plan_token}">
+<label>Subscription<select name="plan"><option value="basic">Grant Basic</option><option value="pro">Grant Pro</option><option value="none">Revoke plan</option></select></label>
+<label>Days<input type="number" min="1" max="3650" name="days" value="30" required></label>
+<button class="btn" type="submit">Apply subscription</button>
+</form><p class="hint">Replacing a plan refunds its unused paid portion. Granted days carry no refund value.</p></div>"#,
+        plan_token = uuid::Uuid::new_v4(),
         balance = s.balance,
         views = s.total_views,
         badge = banned_badge(s.banned),
@@ -505,23 +482,24 @@ fn render_detail(s: &StatusResp) -> String {
     )
 }
 
-fn render_admin(email: &str, q: &str, rows: &[UserRow], detail: Option<&StatusResp>) -> String {
-    let mut body = format!(
-        r#"<div class="headrow">
-<h1>Users</h1>
-<span class="you">👤 {email}</span>
-</div>"#,
-        email = html_escape(email)
-    );
-
+fn render_admin(
+    email: &str,
+    q: &str,
+    rows: &[UserRow],
+    detail: Option<&StatusResp>,
+    published: &crate::settings::Published,
+    saved: bool,
+) -> String {
+    let mut body = crate::dashboard::settings_form(published, saved);
+    body.push_str(r#"<section id="accounts"><h2>Accounts</h2>"#);
     if let Some(s) = detail {
         body.push_str(&render_detail(s));
     }
 
     body.push_str(&format!(
         r#"<div class="card">
-<form method="get" action="/user/admin" class="actions" style="margin-bottom:14px">
-<input type="text" name="q" value="{q}" placeholder="0x address prefix">
+<form method="get" action="/user/admin#accounts" class="actions" style="margin-bottom:14px">
+<input type="text" name="q" value="{q}" aria-label="Wallet address prefix" placeholder="Search wallet address">
 <button class="btn" type="submit">Filter</button>
 </form>"#,
         q = html_escape(q)
@@ -537,7 +515,7 @@ fn render_admin(email: &str, q: &str, rows: &[UserRow], detail: Option<&StatusRe
         for r in rows {
             let addr = html_escape(&r.address);
             body.push_str(&format!(
-                r#"<tr><td class="mono"><a href="/user/admin?address={addr}">{addr}</a></td>
+                r#"<tr><td class="mono"><a href="/user/admin?address={addr}#accounts">{addr}</a></td>
 <td>{created}</td><td>{login}</td><td>{plan}</td><td>{badge}</td></tr>"#,
                 created = fmt_ts(r.created_at),
                 login = fmt_ts(r.last_login),
@@ -549,14 +527,18 @@ fn render_admin(email: &str, q: &str, rows: &[UserRow], detail: Option<&StatusRe
     }
     body.push_str("</div>");
 
-    page("User Admin", &body)
+    body.push_str("</section>");
+    include_str!("pages/admin.html")
+        .replace("__STYLE__", STYLE)
+        .replace("__EMAIL__", &html_escape(email))
+        .replace("__CONTENT__", &body)
 }
 
 fn fmt_ts(secs: i64) -> String {
     worker::Date::new(worker::DateInit::Millis((secs.max(0) as u64) * 1000)).to_string()
 }
 
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

@@ -1,6 +1,8 @@
 name = "user-worker"
 main = "build/index.js"
 compatibility_date = "2026-06-01"
+# Preserve existing deposit variables until the first dashboard publication imports them.
+keep_vars = true
 
 [build]
 command = "cargo install -q \"worker-build@^0.9\" && worker-build --profile wasm-release"
@@ -14,16 +16,9 @@ invocation_logs = true
 SIWE_DOMAIN = "lets-embed.louisfly.icu"
 # Ethereum JSON-RPC endpoint used to verify ETH/ERC-20 top-ups + Chainlink prices.
 RPC_URL = "https://cloudflare-eth.com"
-# Deposit address users send ETH/ERC-20 to (MUST be lowercase). Placeholder — set before deploy.
-DEPOSIT_ADDRESS = "0xe441B924145Ee4eE855D7Bd81BE58C8F4d9a7056"
 CHAIN_ID = "1"
 # Solana JSON-RPC endpoint used to verify SOL / SPL top-ups.
 SOL_RPC_URL = "https://api.mainnet-beta.solana.com"
-# Deposit address users send SOL / SPL tokens to (base58). Placeholder — set before deploy.
-SOL_DEPOSIT_ADDRESS = "GjgLaySkPhke5xrgu67uxxmcVoaBwNyjp3LTsZyu79Tx"
-# Cloudflare Access application protecting /user/admin* (new Access app — set its AUD).
-CF_ACCESS_TEAM_DOMAIN = "kingwingfly.cloudflareaccess.com"
-CF_ACCESS_AUD = "5700459f509f888154922a3f93bbf18d7dbd6b4be7fa472716693eb2fefb6ba5"
 
 # Worker secrets; deploy fails until each is set with `wrangler secret put <NAME>`:
 #   JWT_SECRET — HS256 key for `ue_session`; must equal gateway-worker's JWT_SECRET.
@@ -36,11 +31,6 @@ required = ["JWT_SECRET"]
 [[kv_namespaces]]
 binding = "NONCES"
 id = "1d3aa70037834252a25d895d60637774"
-
-# Reuses the gateway's JWKS cache namespace (CF Access RS256 verification for /user/admin).
-[[kv_namespaces]]
-binding = "JWKS_CACHE"
-id = "95b240d71a024088ae4c2c36422e1372"
 
 [[d1_databases]]
 binding = "DB"

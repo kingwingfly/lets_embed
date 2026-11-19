@@ -1,65 +1,20 @@
-# gateway_worker
+# Gallery gateway
 
-Edge gateway in front of the Access-service-token-protected Cloud Run
-upstreams (api / images / videos). Since the SIWE user system landed, this
-worker does **proxy + enforcement only** — all user state lives in
-`user_worker`:
+The gateway applies the visitor policy published at `/user/admin`. New installations require a wallet. In public mode guests can browse the gallery and use the configured free allowances. Personal accounts, payments and favorites still require a wallet session.
 
-- `/user/*` is forwarded to the user-worker via the `USER_WORKER` service
-  binding, before any auth (the login page must be reachable).
-- Every other request needs a valid `ue_session` cookie (HS256, signed with
-  `JWT_SECRET`, `sub` = lowercase 0x eth address). Unauthenticated
-  media GET/HEAD get a plain **401** (an `<img>` tag can't follow a login
-  redirect); everything else is **302**'d to `/user/login?next=...`.
-- Authenticated `GET /images/*` and `GET /videos/*` are charged against the
-  user's `UserAccount` Durable Object (cross-script binding, `script_name =
-  "user-worker"`); the DO dedupes repeat views per 24h. DO `402` renders an
-  "out of points" page, `403` = account suspended, anything else fails closed
-  with 502. HEAD is free.
-- Allowed requests are proxied upstream with the `CF-Access-Client-Id/Secret`
-  service-token headers; gateway cookies are stripped first.
+The gateway meters image views, video views, by-ID similarity searches, uploaded-image searches and description searches through the account Durable Object. Guests receive one allowance per client IP and item type each UTC day. The gateway derives the guest key from Cloudflare's client IP and the shared secret. Clients without an IP share a fallback allowance. Signed-in accounts use their wallet's allowance, then their subscription quota and points balance. Read-only metadata requests do not spend points.
 
-The old apply/admin-approve flow is gone. Admin now lives at `/user/admin` in
-the user-worker, behind a **new** Cloudflare Access application (new AUD).
-Legacy `gw_token` / `gw_app` cookies are dead: they were signed with the same
-secret, but their UUID `sub` fails the eth-address-shape check, so they are
-rejected (and stripped before proxying).
+## Cloudflare Access and deployment
 
-## Usage
+1. Restrict `/user/admin` and its descendants on the public gallery hostname to your administrator group in Cloudflare Access. Set the application's audience in this Worker's `CF_ACCESS_AUD`. Leave the gallery paths public at the Access layer if the dashboard should control guest access. A matching administrator identity must have an email. [Cloudflare Worker identity and path protection](https://developers.cloudflare.com/workers/configuration/cloudflare-access/)
+2. Keep the two service bindings in `wrangler.toml`. Only `ADMIN_WORKER` carries the `gallery_admin` property. The gateway checks the runtime Access audience and identity before using it. The user Worker checks the binding on every admin operation. Browser-submitted settings and account changes also require the gallery's own origin, configured in `SIWE_DOMAIN`. [Service binding properties](https://developers.cloudflare.com/workers/runtime-apis/context/)
+3. Set `JWT_SECRET` to the same secret as the user Worker. Set `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` to the service token authorized for the API and media origins.
+4. Apply the D1 migration and deploy the user Worker first, then deploy this gateway. [User Worker deployment](../user_worker/README.md#setup--deployment)
 
-- Set the worker secrets. `JWT_SECRET` must be the same value as the
-  user-worker's, since the user-worker signs the cookies this worker verifies:
+Administrators can open **View gallery** from the dashboard or **Browse as administrator** on the login page without connecting a wallet. Opening the dashboard grants a 15-minute, host-only browsing cookie for gallery pages, searches and media. Reopen the dashboard to refresh it. Admin actions always require Cloudflare Access. Personal wallet actions require a wallet session.
 
-  ```sh
-  wrangler secret put CF_ACCESS_CLIENT_ID
-  wrangler secret put CF_ACCESS_CLIENT_SECRET
-  wrangler secret put JWT_SECRET
-  ```
+For tunnel-only origins, `cloudflared` can validate the application token with **Protect with Access**. Keep origin validation for Cloud Run or any origin also reachable outside that tunnel. [Cloudflare origin validation](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/)
 
-- Prepare the two bindings onto the user-worker in `wrangler.toml`:
+## Local development
 
-  ```toml
-  [[services]]
-  binding = "USER_WORKER"
-  service = "user-worker"
-
-  [durable_objects]
-  bindings = [{ name = "USER_ACCOUNT", class_name = "UserAccount", script_name = "user-worker" }]
-  ```
-
-- This worker no longer touches D1 (no D1/KV bindings). The user-system
-  schema (`users`, `payments`, `likes`) lives in
-  `user_worker/migrations/0001_users.sql`.
-- Deploy **after** `user_worker` — both bindings above reference the deployed
-  `user-worker` script, so deploying the gateway first fails. Full runbook and
-  cutover steps: `user_worker/README.md`.
-
-## Metering
-
-Besides charging media views (`GET /images/*`, `GET /videos/*`) against the
-user's `UserAccount` Durable Object, the gateway now also meters **similarity
-searches** and **description searches**: `POST /api/search_similar` is charged as `ChargeKind::EmbedSearch`, `POST /api/search_by_image` and `POST /api/search_by_desc` are
-charged as `ChargeKind::Search`, deduped per query per 24h in the DO (so
-paginated re-searches with the same query are free). On insufficient points
-these endpoints return a `402` JSON error (`{"error":"out of points"}`) to the
-fetch caller — not the HTML payment page used for media navigations.
+Use a local-only gateway Wrangler configuration with a matching `[access.dev]` audience and `[access.dev.identity]` email to exercise admin access. Remove the local Access simulation to test a guest. The integration test builds on the same runtime identities, service bindings, SQLite Durable Objects and D1 migrations used by the deployed Workers. From the repository root, after `npm ci` and building both Workers, run `node --test gateway_worker/tests/site-policy.cjs`.
