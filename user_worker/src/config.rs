@@ -1,10 +1,5 @@
-//! FROZEN SCAFFOLD: pricing / limits configuration + payment-token registry.
-//!
-//! Points are anchored to USD: `POINTS_PER_USD` points buy one dollar of usage,
-//! and one image view costs one point. All money-in paths (crypto top-ups)
-//! convert to points at this rate. Subscription plans are bought FROM the points
-//! balance and do NOT auto-renew — they lapse to PAYG at period end and the user
-//! re-subscribes ("Renew") to extend. Values are placeholders the operator tunes.
+//! Default gallery pricing, plan terms and supported on-chain assets.
+//! The dashboard publishes runtime overrides for prices, quotas and deposit addresses.
 
 // ---------------------------------------------------------------------------
 // Pricing

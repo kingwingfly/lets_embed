@@ -118,16 +118,15 @@ structs. Schema lives in `migrations/`.
 - `gateway/` — a **Pingora** reverse proxy. Cloudflare-Access JWT validation lives behind the
   `validate-jwt` feature (`gateway/src/jwt.rs`).
 - `gateway_worker/` — a **Cloudflare Worker** (`axum`), now **proxy + enforcement only** (no D1/KV).
-  Validates the `ue_session` cookie (HS256, `sub` = lowercase eth address): 401s unauthenticated
-  media GET/HEAD, 302s everything else to `/user/login`, forwards `/user/*` to the user-worker via
-  the `USER_WORKER` service binding, and charges media views + similarity searches against the
-  per-user `UserAccount` Durable Object (cross-script binding). `npm run dev` / `npm run deploy`.
+  Verifies wallet sessions and the gallery administrator's runtime Access identity. The dedicated
+  `ADMIN_WORKER` binding gives the user Worker the verified administrator context. Guest allowances
+  and wallet billing for media and searches are enforced by the cross-script `UserAccount` DO.
 - `user_worker/` — a **Cloudflare Worker** (`axum` + D1 + Durable Objects) that owns the whole user
   system: **SIWE** (EIP-4361) wallet login → `ue_session` cookie; a points-based **billing v2** model
   (pay-as-you-go balance + optional per-window subscription plans, no auto-renew) enforced in the
   per-user `UserAccount` DO; **multi-chain crypto top-up** (Ethereum ETH/ERC-20 + Solana SOL/SPL,
   verified on-chain, priced via Chainlink feeds); and likes/favorites. D1 holds
-  `users`/`payments`/`likes` (`user_worker/migrations/0001_users.sql`); balance/plan/dedupe live only
+  `users`/`payments`/`likes` and versioned gallery settings (`user_worker/migrations/`); balance/plan/dedupe live only
   in the DO. **Deploy `user_worker` before `gateway_worker`** — the gateway's `USER_WORKER` service
   and `USER_ACCOUNT` DO bindings reference it. Full model in `user_worker/README.md`.
 

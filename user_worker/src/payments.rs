@@ -1,22 +1,6 @@
-//! UNIT 3: crypto top-up (on-chain verification) + subscription passthrough.
-//!
-//! - POST /user/api/topup Json(TopupReq{chain, token, tx_hash}) -> 200
-//!   Json(TopupResp) | 400 | 401 | 403 (tx sender != claimant) | 409 (already
-//!   submitted) | 425 (not enough confirmations / not finalized yet).
-//!   Points are computed from the on-chain amount via a Chainlink USD price
-//!   (`rates::points_for`); stablecoins price at $1. A credit below
-//!   `MIN_TOPUP_POINTS` is rejected.
-//!   Row lifecycle (unchanged): 'rejected' only for tx-intrinsic failures
-//!   (wrong recipient, dust, reverted) — invalid for any submitter, so the PK
-//!   replay lock then answers 409 forever. Transient / submitter-relative
-//!   failures DELETE the pending row so resubmission works.
-//! - GET  /user/api/payments -> 200 Json(Vec<PaymentRow>) (newest 50) | 401.
-//! - POST /user/api/subscribe Json(SubscribeReq) -> passthrough to DO
-//!   /subscribe; on 200 mirror `users.plan` in D1.
-//!
-//! SCAFFOLD STATE: only the Ethereum-native (ETH) path is wired, and it depends
-//! on `rates::chainlink_price` which UNIT 2 implements. UNIT 3 adds the ERC-20
-//! (USDT/USDC) receipt-log path and dispatches Solana to `crate::solana`.
+//! Ethereum and Solana deposits, payment history and wallet subscriptions.
+//! Confirmed transfers use the receiving address, points rate and minimum at their
+//! block time. The transaction hash is the D1 replay lock and the account credit key.
 
 use axum::{
     Json,
@@ -30,7 +14,7 @@ use wasm_bindgen::JsValue;
 use worker::{Env, Fetch, Method, Request, RequestInit};
 
 use crate::AppState;
-use crate::config::{self, Chain, MIN_CONFIRMATIONS, MIN_TOPUP_POINTS};
+use crate::config::{self, Chain, MIN_CONFIRMATIONS};
 use crate::rates;
 use crate::solana::{self, SolOutcome};
 use crate::types::{ApiError, CreditReq, PaymentRow, SubscribeReq, TopupReq, TopupResp};
@@ -343,7 +327,7 @@ async fn linked_solana(env: &Env, addr: &str) -> worker::Result<Option<String>> 
 }
 
 /// Solana top-up (native SOL + SPL USDT/USDC). Verification lives in
-/// `crate::solana::topup_solana`; this runs the payment-row lifecycle + credit.
+/// `crate::solana`. This handler owns the payment row and account credit.
 async fn topup_solana(
     st: &AppState,
     addr: &str,
@@ -401,15 +385,19 @@ async fn topup_solana(
     }
 
     // 4) fetch + verify on-chain
-    let amount = match solana::topup_solana(
-        &st.sol_rpc_url,
-        spec,
-        &st.sol_deposit_address,
-        &linked,
-        &sig,
-    )
-    .await
-    {
+    let tx = match solana::get_transaction(&st.sol_rpc_url, &sig).await {
+        Ok(tx) if tx.is_null() => return too_early(&st.env, &sig).await,
+        Ok(tx) => tx,
+        Err(e) => return rpc_unavailable(&st.env, &sig, "getTransaction", e).await,
+    };
+    let Some(timestamp) = tx["blockTime"].as_u64() else {
+        return too_early(&st.env, &sig).await;
+    };
+    let policy = match deposit_terms(st, &sig, timestamp).await {
+        Ok(p) => p,
+        Err(response) => return response,
+    };
+    let amount = match solana::verify_solana(&tx, spec, &policy.sol_deposit, &linked) {
         SolOutcome::Credited { amount } => amount,
         SolOutcome::Reject(msg) => return reject(&st.env, &sig, msg).await,
         SolOutcome::WrongSender => {
@@ -419,11 +407,14 @@ async fn topup_solana(
                 "tx sender is not your linked Solana wallet",
             );
         }
-        SolOutcome::TooEarly => return too_early(&st.env, &sig).await,
         SolOutcome::RpcError(e) => {
-            worker::console_error!("solana verify failed for {sig}: {e}");
-            delete_pending(&st.env, &sig).await;
-            return api_err(StatusCode::BAD_GATEWAY, "rpc unavailable, retry later");
+            return rpc_unavailable(
+                &st.env,
+                &sig,
+                "getTransaction decode",
+                worker::Error::RustError(e),
+            )
+            .await;
         }
     };
 
@@ -432,26 +423,39 @@ async fn topup_solana(
         Ok(p) => p,
         Err(resp) => return resp,
     };
-    let points = rates::points_for(amount, spec.decimals, price);
-    if points < MIN_TOPUP_POINTS {
+    let points = rates::points_at_rate(amount, spec.decimals, price, policy.points_per_usd);
+    if points < policy.minimum_topup {
         return reject(&st.env, &sig, "amount below minimum top-up").await;
     }
 
     finalize_credit(st, addr, &sig, amount, points).await
 }
 
-/// Ethereum top-up. SCAFFOLD: native ETH only; UNIT 3 adds the ERC-20 path for
-/// `spec.contract.is_some()` (Transfer-log verification).
+async fn deposit_terms(
+    st: &AppState,
+    hash: &str,
+    timestamp: u64,
+) -> Result<crate::settings::Policy, Response> {
+    match crate::settings::Published::at_block(&st.env, timestamp).await {
+        Ok(policy) => Ok(policy),
+        Err(e) => {
+            worker::console_error!("Could not load payment terms: {e}");
+            delete_pending(&st.env, hash).await;
+            Err(api_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Payment settings unavailable, retry later",
+            ))
+        }
+    }
+}
+
+/// Native ETH and ERC-20 share the same sender, receipt, confirmation and block-time checks.
 async fn topup_ethereum(
     st: &AppState,
     addr: &str,
     spec: &config::TokenSpec,
     tx_hash_in: &str,
 ) -> Response {
-    if let Some(contract) = spec.contract {
-        return topup_erc20(st, addr, spec, contract, tx_hash_in).await;
-    }
-
     // 1) normalize + validate the hash
     let tx_hash = tx_hash_in.trim().to_lowercase();
     if !valid_tx_hash(&tx_hash) {
@@ -504,10 +508,6 @@ async fn topup_ethereum(
             return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionByHash decode", e).await;
         }
     };
-    let amount = match verify_native_tx(&tx, &st.deposit_address) {
-        Ok(w) => w,
-        Err(msg) => return reject(&st.env, &tx_hash, msg).await,
-    };
     if tx.from.to_lowercase() != addr {
         delete_pending(&st.env, &tx_hash).await;
         return api_err(
@@ -539,7 +539,7 @@ async fn topup_ethereum(
             }
         }
     };
-    let block = match receipt {
+    let block = match &receipt {
         Some(RpcReceipt {
             status: Some(s), ..
         }) if s != "0x1" => {
@@ -549,7 +549,7 @@ async fn topup_ethereum(
             status: Some(_),
             block_number: Some(b),
             ..
-        }) => match hex_to_u64(&b) {
+        }) => match hex_to_u64(b) {
             Some(b) => b,
             None => {
                 let e = worker::Error::RustError(format!("bad receipt blockNumber: {b}"));
@@ -570,162 +570,50 @@ async fn topup_ethereum(
     if !confirmed {
         return too_early(&st.env, &tx_hash).await;
     }
+
+    let block_time = match rpc(
+        &st.rpc_url,
+        "eth_getBlockByNumber",
+        serde_json::json!([format!("0x{block:x}"), false]),
+    )
+    .await
+    {
+        Ok(v) => v["timestamp"].as_str().and_then(hex_to_u64),
+        Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_getBlockByNumber", e).await,
+    };
+    let Some(timestamp) = block_time else {
+        return too_early(&st.env, &tx_hash).await;
+    };
+    let policy = match deposit_terms(st, &tx_hash, timestamp).await {
+        Ok(p) => p,
+        Err(response) => return response,
+    };
+    let amount = match spec.contract {
+        Some(contract) => {
+            let deposit = policy.eth_deposit.strip_prefix("0x").unwrap_or("");
+            let sender = addr.strip_prefix("0x").unwrap_or(addr);
+            let logs = &receipt.as_ref().expect("confirmed receipt").logs;
+            if deposit.is_empty() {
+                return reject(&st.env, &tx_hash, "Deposits disabled at transfer time").await;
+            }
+            match match_transfer_log(logs, contract, deposit, sender) {
+                Some(amount) => amount,
+                None => return reject(&st.env, &tx_hash, "no matching token transfer").await,
+            }
+        }
+        None => match verify_native_tx(&tx, &policy.eth_deposit) {
+            Ok(amount) => amount,
+            Err(msg) => return reject(&st.env, &tx_hash, msg).await,
+        },
+    };
 
     // 6) price + points
     let price = match resolve_price(st, spec, &tx_hash).await {
         Ok(p) => p,
         Err(resp) => return resp,
     };
-    let points = rates::points_for(amount, spec.decimals, price);
-    if points < MIN_TOPUP_POINTS {
-        return reject(&st.env, &tx_hash, "amount below minimum top-up").await;
-    }
-
-    finalize_credit(st, addr, &tx_hash, amount, points).await
-}
-
-/// Ethereum ERC-20 top-up (USDT/USDC). Mirrors the native path but verifies a
-/// `Transfer(from=sender, to=deposit)` event log in the receipt instead of
-/// `tx.value`. `contract` is the token's (lowercase) address from the registry.
-async fn topup_erc20(
-    st: &AppState,
-    addr: &str,
-    spec: &config::TokenSpec,
-    contract: &str,
-    tx_hash_in: &str,
-) -> Response {
-    // 1) normalize + validate the hash
-    let tx_hash = tx_hash_in.trim().to_lowercase();
-    if !valid_tx_hash(&tx_hash) {
-        return api_err(StatusCode::BAD_REQUEST, "invalid tx hash");
-    }
-
-    // 2) replay lock: tx_hash is the payments PK.
-    if let Err(e) = d1_exec(
-        &st.env,
-        "INSERT INTO payments (tx_hash, address, chain, token, created_at) VALUES (?, ?, ?, ?, ?)",
-        &[
-            tx_hash.as_str().into(),
-            addr.into(),
-            spec.chain.as_str().into(),
-            spec.symbol.into(),
-            (session::now_secs() as f64).into(),
-        ],
-    )
-    .await
-    {
-        if format!("{e:?}").to_lowercase().contains("constraint") {
-            return api_err(StatusCode::CONFLICT, "tx already submitted");
-        }
-        worker::console_error!("payments insert failed for {tx_hash}: {e:?}");
-        return api_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "database error, retry later",
-        );
-    }
-
-    // 3) the transaction itself: existence + sender. `value` is irrelevant for
-    //    an ERC-20 transfer (the token move lives in the receipt logs).
-    let tx_json = match rpc(
-        &st.rpc_url,
-        "eth_getTransactionByHash",
-        serde_json::json!([tx_hash]),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionByHash", e).await,
-    };
-    if tx_json.is_null() {
-        delete_pending(&st.env, &tx_hash).await;
-        return api_err(StatusCode::BAD_REQUEST, "tx not found");
-    }
-    let tx: RpcTx = match serde_json::from_value(tx_json) {
-        Ok(t) => t,
-        Err(e) => {
-            let e = worker::Error::RustError(e.to_string());
-            return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionByHash decode", e).await;
-        }
-    };
-    if tx.from.to_lowercase() != addr {
-        delete_pending(&st.env, &tx_hash).await;
-        return api_err(
-            StatusCode::FORBIDDEN,
-            "tx sender does not match logged-in address",
-        );
-    }
-
-    // 4) receipt: mined + successful, then the Transfer-log verification.
-    let receipt_json = match rpc(
-        &st.rpc_url,
-        "eth_getTransactionReceipt",
-        serde_json::json!([tx_hash]),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionReceipt", e).await,
-    };
-    if receipt_json.is_null() {
-        return too_early(&st.env, &tx_hash).await;
-    }
-    let receipt: RpcReceipt = match serde_json::from_value(receipt_json) {
-        Ok(r) => r,
-        Err(e) => {
-            let e = worker::Error::RustError(e.to_string());
-            return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionReceipt decode", e).await;
-        }
-    };
-    let block = match receipt {
-        RpcReceipt {
-            status: Some(s), ..
-        } if s != "0x1" => {
-            return reject(&st.env, &tx_hash, "tx failed on-chain").await;
-        }
-        RpcReceipt {
-            status: Some(_),
-            block_number: Some(ref b),
-            ..
-        } => match hex_to_u64(b) {
-            Some(b) => b,
-            None => {
-                let e = worker::Error::RustError(format!("bad receipt blockNumber: {b}"));
-                return rpc_unavailable(&st.env, &tx_hash, "eth_getTransactionReceipt", e).await;
-            }
-        },
-        _ => return too_early(&st.env, &tx_hash).await,
-    };
-
-    // Find the token Transfer into the deposit address from this sender.
-    let deposit_no0x = st
-        .deposit_address
-        .strip_prefix("0x")
-        .unwrap_or(&st.deposit_address);
-    let sender_no0x = addr.strip_prefix("0x").unwrap_or(addr);
-    let amount = match match_transfer_log(&receipt.logs, contract, deposit_no0x, sender_no0x) {
-        Some(a) => a,
-        None => return reject(&st.env, &tx_hash, "no matching token transfer").await,
-    };
-
-    // 5) confirmations
-    let head = match rpc(&st.rpc_url, "eth_blockNumber", serde_json::json!([])).await {
-        Ok(v) => v.as_str().and_then(hex_to_u64),
-        Err(e) => return rpc_unavailable(&st.env, &tx_hash, "eth_blockNumber", e).await,
-    };
-    let confirmed = head
-        .and_then(|h| h.checked_sub(block))
-        .is_some_and(|d| d + 1 >= MIN_CONFIRMATIONS);
-    if !confirmed {
-        return too_early(&st.env, &tx_hash).await;
-    }
-
-    // 6) price + points (stablecoins have no feed -> price None -> $1)
-    let price = match resolve_price(st, spec, &tx_hash).await {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
-    let points = rates::points_for(amount, spec.decimals, price);
-    if points < MIN_TOPUP_POINTS {
+    let points = rates::points_at_rate(amount, spec.decimals, price, policy.points_per_usd);
+    if points < policy.minimum_topup {
         return reject(&st.env, &tx_hash, "amount below minimum top-up").await;
     }
 

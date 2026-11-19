@@ -1,14 +1,4 @@
-//! UNIT 2: Chainlink USD price feeds + amount→points conversion.
-//!
-//! - `chainlink_price` reads a Chainlink aggregator's `latestRoundData` via
-//!   `eth_call` (over the Ethereum `RPC_URL`) and returns the USD price with
-//!   8 decimals, rejecting non-positive or stale answers.
-//! - `points_for` converts a raw on-chain amount into points at
-//!   `POINTS_PER_USD`. Pure and host-tested.
-//! - GET /user/api/rates -> 200 Json(RatesResp) for the account UI.
-//!
-//! SCAFFOLD STATE: `points_for` is fully implemented (pure). `chainlink_price`
-//! and the `rates` handler are stubs — UNIT 2 implements the eth_call decode.
+//! Chainlink USD price feeds and conversion of a transfer to points at the published rate.
 
 use axum::{
     Json,
@@ -19,7 +9,9 @@ use axum::{
 use worker::{Fetch, Method, Request, RequestInit};
 
 use crate::AppState;
-use crate::config::{self, POINTS_PER_USD};
+use crate::config;
+#[cfg(test)]
+use crate::config::POINTS_PER_USD;
 use crate::session;
 use crate::types::{ApiError, RatesResp};
 
@@ -27,7 +19,12 @@ use crate::types::{ApiError, RatesResp};
 /// `decimals` decimals) into points. `price_8dec` is the token's USD price with
 /// 8 decimals, or `None` for a $1 stablecoin. Saturating and ordered so the
 /// intermediate product cannot overflow `u128` for realistic values.
-pub fn points_for(amount_raw: u128, decimals: u32, price_8dec: Option<u128>) -> i64 {
+pub fn points_at_rate(
+    amount_raw: u128,
+    decimals: u32,
+    price_8dec: Option<u128>,
+    points_per_usd: i64,
+) -> i64 {
     // usd_1e8 = amount_raw * price_8dec / 10^decimals   (stable: price = 1e8)
     let price = price_8dec.unwrap_or(100_000_000); // 1.0 with 8 decimals
     let Some(scaled) = amount_raw.checked_mul(price) else {
@@ -35,7 +32,7 @@ pub fn points_for(amount_raw: u128, decimals: u32, price_8dec: Option<u128>) -> 
     };
     let usd_1e8 = scaled / 10u128.pow(decimals);
     // points = usd_1e8 * POINTS_PER_USD / 1e8
-    let Some(num) = usd_1e8.checked_mul(POINTS_PER_USD as u128) else {
+    let Some(num) = usd_1e8.checked_mul(points_per_usd as u128) else {
         return i64::MAX;
     };
     let points = num / 100_000_000;
@@ -162,6 +159,9 @@ pub async fn rates(State(st): State<AppState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn points_for(raw: u128, decimals: u32, price: Option<u128>) -> i64 {
+        points_at_rate(raw, decimals, price, POINTS_PER_USD)
+    }
 
     #[test]
     fn stablecoin_one_to_one_usd() {

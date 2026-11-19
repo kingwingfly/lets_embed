@@ -536,7 +536,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
- "zeroize",
 ]
 
 [[package]]
@@ -1107,11 +1106,9 @@ checksum = "914c195c4d7fbc5ed7f88d14cbf85914d5c664967658d43404b263913a477e82"
 dependencies = [
  "cpubits",
  "ctutils",
- "getrandom 0.4.3",
  "hybrid-array",
  "num-traits",
  "rand_core 0.10.1",
- "serdect",
  "subtle",
  "zeroize",
 ]
@@ -1132,18 +1129,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
- "getrandom 0.4.3",
  "hybrid-array",
- "rand_core 0.10.1",
-]
-
-[[package]]
-name = "crypto-primes"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3633a51a39c69ebbaa4feaa694bd83d241e4093901c84a0963b19d9bb3f0cf8f"
-dependencies = [
- "crypto-bigint",
  "rand_core 0.10.1",
 ]
 
@@ -1500,7 +1486,6 @@ dependencies = [
  "const-oid",
  "crypto-common 0.2.2",
  "ctutils",
- "zeroize",
 ]
 
 [[package]]
@@ -2098,6 +2083,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "site_access",
  "tower-cookies",
  "tower-service",
  "worker",
@@ -4848,16 +4834,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pkcs1"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6250dd7321adbe93d12b750aee0ced159fd13e77f625edcdf1cb6f83cd99f650"
-dependencies = [
- "der",
- "spki",
-]
-
-[[package]]
 name = "pkcs8"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5606,27 +5582,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsa"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23e77fd77e0dea28b3011fd62d15445b7de7959333b0276d930e03be0f755699"
-dependencies = [
- "const-oid",
- "crypto-bigint",
- "crypto-common 0.2.2",
- "crypto-primes",
- "digest 0.11.3",
- "hmac",
- "pkcs1",
- "pkcs8",
- "rand_core 0.10.1",
- "sha2 0.11.1",
- "signature",
- "spki",
- "zeroize",
-]
-
-[[package]]
 name = "rstml"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6285,6 +6240,16 @@ name = "siphasher"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
+
+[[package]]
+name = "site_access"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "hmac",
+ "serde",
+ "sha2 0.11.1",
+]
 
 [[package]]
 name = "slab"
@@ -7484,11 +7449,13 @@ dependencies = [
  "hex",
  "hmac",
  "k256",
- "rsa",
+ "percent-encoding",
  "serde",
+ "serde-wasm-bindgen",
  "serde_json",
  "sha2 0.11.1",
  "sha3",
+ "site_access",
  "tower-cookies",
  "tower-service",
  "uuid",

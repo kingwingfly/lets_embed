@@ -119,6 +119,6 @@ Steps:
 - use `domain mappings` to make service reachable at `xx-api.yourdomain.com`
 - use `cloudflare Access` service token to protect `xx-api.yourdomain.com` service
 - use `cloudflare Access` service token to protect `xx-image.yourdomain.com` service
-- use `cloudflare Access` to bypass everyone `xx.yourdomain.com` service
-- use `cloudflare Access` to protect `xx.yourdomain.com/admin` service
+- leave the public gallery reachable at `xx.yourdomain.com` and protect `/user/admin` and its descendants with a Cloudflare Access policy for administrators
+- publish wallet requirements, guest allowances, pricing, subscriptions and deposit addresses from `/user/admin`. [Gallery controls and deployment](user_worker/README.md)
 - config bindings needed in `gateway_worker/wrangler.toml`,and use `gateway_worker` to control user access and protect contents

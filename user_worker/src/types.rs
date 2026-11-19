@@ -1,9 +1,5 @@
-//! FROZEN SCAFFOLD: wire contracts.
-//!
-//! The "DO internal protocol" section is duplicated verbatim in
-//! `gateway_worker` (deliberate: it is a wire contract between two separately
-//! deployed workers, not shared Rust). Do not change field names or status
-//! codes without updating both sides — they deploy together.
+//! Wire contracts for the wallet API and the account Durable Object.
+//! Gateway metering types are shared through `site_access`.
 
 use serde::{Deserialize, Serialize};
 
@@ -20,26 +16,7 @@ use serde::{Deserialize, Serialize};
 //   POST /ban         BanReq      -> 200 StatusResp
 // ---------------------------------------------------------------------------
 
-/// What is being charged. The gateway sends a synthetic dedupe `path` for the
-/// search kinds (e.g. "search:img:{hash}" / "search:sim:{id}").
-/// - `Search`: upload-image similarity search — runs dinov3 inference (expensive).
-/// - `EmbedSearch`: by-id similarity search — reuses a stored embedding via a
-///   pgvector query (cheap); charged as a view-class action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ChargeKind {
-    Image,
-    Video,
-    Search,
-    EmbedSearch,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ChargeReq {
-    /// Dedupe key — a media path ("/images/abc.webp") or a search key.
-    pub path: String,
-    pub kind: ChargeKind,
-}
+pub use site_access::{ChargeKind, ChargeReq};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChargeResp {
@@ -82,6 +59,15 @@ pub struct InitReq {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SubscribeReq {
     pub plan: String,
+    #[serde(default)]
+    pub expected_price: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdminPlanReq {
+    pub plan: String,
+    pub days: u32,
+    pub token: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

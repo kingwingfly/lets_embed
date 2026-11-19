@@ -3,16 +3,8 @@
 SIWE (Sign-In with Ethereum) user system for lets_embed, running as a Cloudflare
 Worker. Replaces the old apply/approve flow in `gateway_worker`.
 
-- **Auth**: SIWE (EIP-4361) only; EOA wallets via `personal_sign` (EIP-1271
-  contract wallets are not supported). A successful verify sets an HS256 session
-  cookie `ue_session` (signed with the same `JWT_SECRET` as the
-  gateway; `sub` = lowercase address). Nonces are single-use, stored in the
-  `NONCES` KV namespace with a 300s TTL.
-- **Metering**: every image view (1 pt), video view (5 pts), upload-image
-  search (100 pts) and by-id search (10 pts) costs points, deduped per user per
-  resource per 24h.
-  Enforced by `gateway_worker` calling the per-user `UserAccount` Durable
-  Object (bound cross-script).
+- **Auth** supports Ethereum (SIWE) and Solana wallet sign-in. The gateway validates the signed `ue_session` cookie. The dashboard uses a dedicated Cloudflare Access application.
+- **Metering** uses the pricing and free allowances published at `/user/admin`. The gateway asks the account Durable Object to enforce each metered request.
 - **Billing (v2)**: pay-as-you-go points balance + optional subscription plans
   (per-window view/search allowances, bought/renewed **from** the balance, **no
   auto-renew** — they lapse to PAYG at period end). Overage falls back to PAYG.
@@ -24,7 +16,7 @@ Worker. Replaces the old apply/approve flow in `gateway_worker`.
   on the Leptos details page and a `/user/favorites` page.
 - **Storage**: balance/plan/window/dedupe live only in the Durable Object; D1
   holds `users` (incl. linked `solana_address`), `payments` (chain-aware) and
-  `likes` (see `migrations/0001_users.sql`).
+  `likes`. D1 also keeps the published site policy revisions.
 
 ## Routes
 
@@ -45,15 +37,25 @@ Worker. Replaces the old apply/approve flow in `gateway_worker`.
 | `/user/api/like` | GET/POST/DELETE | check / add / remove a like |
 | `/user/api/likes` | GET | list likes (keyset paginated) |
 | `/user/admin` | GET | admin page (Cloudflare Access protected) |
+| `/user/admin/settings` | POST | publish the visitor, pricing, plan and payment settings |
+| `/user/admin/plan` | POST | grant or revoke a customer subscription |
 | `/user/admin/credit` | POST | admin credit/deduct points |
 | `/user/admin/ban` | POST | admin ban/unban |
 
 ## Points & billing model (v2)
 
-Points are the single internal currency. **$1 = 10,000 points.** Numbers live
-in `src/config.rs`.
+Open **Gallery controls** at `/user/admin` on the gateway hostname. Saving checks the revision shown in the form. Reload and reapply edits if another administrator has already published a change.
 
-### Pricing (pay-as-you-go)
+- **Browsing access** switches between wallet-required and public browsing. To show a public image gallery, select **Public browsing** and set **Image views → Free per day** to a positive number or `-1`.
+- **Free media folders** optionally limits daily free media to selected albums or files. Use decoded gallery paths, one per line, such as `/images/Sample album`. An empty list includes all folders. These rules govern access to media bytes. Search results can still list the full catalog.
+- **Prices & free access** sets a point price and a daily free allowance for each of the five metered actions. Guests share an allowance per client IP. Wallet holders get their own allowance. A daily allowance of `0` closes that action to guests, and `-1` grants unlimited access. A zero point price makes the action free for signed-in customers. The gallery listing itself is free in public mode.
+- **Subscriptions** sets each plan's purchase price and five-hour usage limits. Existing purchases retain their original refund basis. An administrator can grant, replace or revoke an individual plan under **Accounts**. Replacing a paid period refunds its unused portion. Complimentary days have zero refund value.
+- **Payments & credits** sets the receiving addresses, points per USD, minimum top-up and welcome grant. Empty receiving addresses close new deposits on that chain. Verification uses the address, minimum and points conversion in effect at the transfer's block time, including when a customer submits the hash later. Native-token market prices still come from the existing spot feeds.
+- **Accounts** also supports balance adjustments with a reason and account suspension. Wallet-specific controls apply to signed-in users. Public quotas identify guests by IP, so people sharing an IP share the quota.
+
+The tables below show the initial billing values from `src/config.rs`. Existing deployments start with wallet-required browsing, their current prices and their configured receiving addresses.
+
+### Initial pay-as-you-go pricing
 
 - Image view: **1 pt**; video view: **5 pts**.
 - Similarity search comes in two tiers by cost-to-serve:
@@ -67,7 +69,7 @@ in `src/config.rs`.
 - New accounts get a **3,000 pt** free grant on first touch
   (`FREE_GRANT_POINTS`).
 
-### Plans
+### Initial plans
 
 Plans are bought/renewed **from the points balance** (there is **no
 auto-renew**): at period end an account simply lapses back to PAYG, and the
@@ -89,14 +91,14 @@ each transaction credits exactly once (`payments` is keyed on the tx hash).
 - **Ethereum** — native **ETH** plus ERC-20 **USDT** / **USDC**. Token
   transfers are verified from the `Transfer` event in the receipt logs.
   Requires **≥ 6 confirmations** (`MIN_CONFIRMATIONS`); deposits must go to
-  `DEPOSIT_ADDRESS`.
+  the active Ethereum receiving address.
 - **Solana** — native **SOL** plus SPL **USDT** / **USDC**. Verified at the
-  **`finalized`** commitment; deposits must go to `SOL_DEPOSIT_ADDRESS` and
+  **`finalized`** commitment; deposits must go to the active Solana receiving address and
   originate from the user's linked Solana address (see below).
 - **USD pricing**: stablecoins (USDT/USDC) are treated as **$1**. Volatile
   assets (ETH, SOL) are priced in USD from **Chainlink on-chain price feeds**
   (an `eth_call` to `latestRoundData` over `RPC_URL`). Credited points =
-  USD value × 10,000.
+  USD value × the published points per USD.
 
 ### Solana wallet linking
 
@@ -115,63 +117,29 @@ transaction's sender matches this linked address.
    wrangler kv namespace create NONCES     # fill id into [[kv_namespaces]] binding = "NONCES"
    ```
 
-2. Fill in `[vars]` in `wrangler.toml`:
-   - `DEPOSIT_ADDRESS` — the ETH address that receives top-ups (**lowercase**
-     `0x`).
-   - `RPC_URL` / `CHAIN_ID` — Ethereum JSON-RPC endpoint and chain
-     (defaults: `https://cloudflare-eth.com`, mainnet `1`). Also used for the
-     Chainlink `latestRoundData` price-feed `eth_call`s.
-   - `SOL_RPC_URL` — Solana JSON-RPC endpoint (default
-     `https://api.mainnet-beta.solana.com`).
-   - `SOL_DEPOSIT_ADDRESS` — the Solana address (base58) that receives SOL/SPL
-     top-ups. **Set it** — Solana top-ups are rejected until it is configured.
-   - `SIWE_DOMAIN` — the public hostname users sign in on (the
-     gateway-worker's domain).
-
-3. Create a **new** Cloudflare Access application covering
-   `/user/admin*` on the public hostname, and put its AUD into
-   `CF_ACCESS_AUD` (`CF_ACCESS_TEAM_DOMAIN` is your team domain).
-
-4. Apply the D1 migration (shared `lets-embed` database). It now adds
-   `users.solana_address` (UNIQUE) and a chain-aware `payments` table with
-   `chain`, `token` and `amount` columns:
+2. Set `SIWE_DOMAIN` to your public gallery hostname. Configure `RPC_URL`, `CHAIN_ID` and `SOL_RPC_URL` for your deployment. Fresh deployments start with deposits closed. Enter your receiving addresses in **Payments & credits**. Upgrades retain existing `DEPOSIT_ADDRESS` and `SOL_DEPOSIT_ADDRESS` variables through Wrangler’s `keep_vars` setting. Verify those addresses on the dashboard before the first save, which records the original recipients for historical payments.
+3. Protect the public gateway's `/user/admin` path and descendants with an administrator-only Access policy. Put its audience in **gateway_worker/wrangler.toml**. The gateway calls this Worker through the dedicated admin service binding. [Gateway Access setup](../gateway_worker/README.md#cloudflare-access-and-deployment)
+4. From the repository root, apply the schema before deploying. These files can also upgrade installations originally provisioned with `wrangler d1 execute`.
 
    ```sh
-   wrangler d1 execute lets-embed --remote --file user_worker/migrations/0001_users.sql
+   npx wrangler d1 execute lets-embed --config user_worker/wrangler.toml --remote --file user_worker/migrations/0001_users.sql
+   npx wrangler d1 execute lets-embed --config user_worker/wrangler.toml --remote --file user_worker/migrations/0002_site_settings.sql
    ```
 
-5. Set the session-signing key, then deploy **user-worker first**. Generate
-   the key once (e.g. `openssl rand -base64 48`) and give the gateway-worker
-   the same value:
+5. New deployments need the same `JWT_SECRET` in both Workers. Upgrades reuse the existing secret. Set the gateway’s upstream service token as described in its README.
+6. Deploy the user Worker first, then the gateway. Run both commands from the repository root.
 
    ```sh
-   npx wrangler secret put JWT_SECRET
-   npx wrangler deploy
+   npx wrangler --cwd user_worker deploy
+   npx wrangler --cwd gateway_worker deploy
    ```
 
-   The gateway's `USER_WORKER` service binding and cross-script
-   `USER_ACCOUNT` DO binding reference this worker — deploying the gateway
-   first fails.
-
-6. Deploy `gateway_worker` (see its README).
-
-7. Cutover: verify a wallet login works and a media view is charged
-   (check `/user/api/me` before/after), then drop the retired table and
-   delete the old `/admin` Access application:
-
-   ```sql
-   DROP TABLE IF EXISTS applications;
-   ```
+7. Visit `/user/admin` via the gateway and choose **View gallery** to browse as an administrator without a wallet. Check the published guest policy in a private browser window.
 
 ## Limitations
 
 - **EOA only.** Signatures are verified by ecrecover; EIP-1271 contract
   wallets (Safe, etc.) cannot sign in.
-- **Native ETH only.** ERC-20 (e.g. USDC) top-ups are phase-2, not
-  implemented.
-- **First submitter owns the tx.** A top-up is credited to whoever submits
-  the hash first (guarded by the `payments.tx_hash` PK); the sender address
-  of the tx is not required to match the logged-in wallet.
 - **KV nonces are eventually consistent.** A nonce issued at one edge
   location may briefly be invisible (or appear unconsumed) at another;
   worst case a login retry, not a security hole — verification still

@@ -37,16 +37,42 @@ type HmacSha256 = Hmac<Sha256>;
 struct AppState {
     env: Arc<Env>,
     jwt_secret: Arc<Vec<u8>>,
+    admin_email: Option<String>,
     client_id: Arc<String>,
     client_secret: Arc<String>,
 }
 
-async fn router(env: Env, _ctx: Context) -> Result<Router> {
+async fn access_admin(ctx: &Context, env: &Env) -> Result<Option<String>> {
+    use worker::{
+        js_sys::{Function, Promise, Reflect, futures::JsFuture},
+        wasm_bindgen::JsCast,
+    };
+    let access = Reflect::get(ctx.as_ref(), &"access".into())?;
+    if !access.is_object() {
+        return Ok(None);
+    }
+    let expected = env.var("CF_ACCESS_AUD")?.to_string();
+    let aud = Reflect::get(&access, &"aud".into())?.as_string();
+    if expected.is_empty() || aud.as_deref() != Some(&expected) {
+        return Ok(None);
+    }
+    let get: Function = Reflect::get(&access, &"getIdentity".into())?.dyn_into()?;
+    let identity = JsFuture::from(Promise::resolve(&get.call0(&access)?)).await?;
+    if !identity.is_object() {
+        return Ok(None);
+    }
+    Ok(Reflect::get(&identity, &"email".into())?
+        .as_string()
+        .filter(|s| !s.trim().is_empty()))
+}
+
+async fn router(env: Env, ctx: Context) -> Result<Router> {
     let client_id = env.secret("CF_ACCESS_CLIENT_ID")?.to_string();
     let client_secret = env.secret("CF_ACCESS_CLIENT_SECRET")?.to_string();
     let jwt_secret = env.secret("JWT_SECRET")?.to_string();
 
     let state = AppState {
+        admin_email: access_admin(&ctx, &env).await?,
         env: Arc::new(env),
         jwt_secret: Arc::new(jwt_secret.into_bytes()),
         client_id: Arc::new(client_id),
@@ -113,44 +139,7 @@ fn is_valid_principal(s: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// UserAccount DO wire contract — duplicated verbatim from
-// `user_worker/src/types.rs` (deliberate: it is a wire contract between two
-// separately deployed workers, not shared Rust)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ChargeKind {
-    Image,
-    Video,
-    /// Upload-image similarity search (runs dinov3 inference — expensive),
-    /// or description search (runs siglip2 text inference — expensive).
-    Search,
-    /// By-id similarity search (reuses a stored embedding — cheap, view-class).
-    EmbedSearch,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ChargeReq {
-    /// Dedupe key — a media path ("/images/abc.webp") or a search key.
-    pub path: String,
-    pub kind: ChargeKind,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ChargeResp {
-    /// false = deduped (seen within the window) or refused; nothing deducted.
-    pub charged: bool,
-    pub cost: i64,
-    /// PAYG points after the charge.
-    pub balance: i64,
-    /// Remaining view-units in the current window; `None` = no plan / unlimited.
-    pub views_remaining: Option<i64>,
-    /// Remaining searches in the current window; `None` = no active plan.
-    pub searches_remaining: Option<i64>,
-    /// Epoch secs when the usage window resets; 0 = no active window.
-    pub window_reset: u64,
-}
+use site_access::{ADMIN_VIEW_COOKIE, ChargeKind, ChargeReq, GuestReq};
 
 // ---------------------------------------------------------------------------
 // gateway：/user/* → user-worker；verify session → charge media → proxy
@@ -167,122 +156,208 @@ async fn gateway(
 ) -> Response {
     let path = uri.path();
 
-    // /user/* reaches the user-worker before any auth: login must be reachable
-    if path == "/user" || path.starts_with("/user/") {
-        return forward_user(&st, &uri, &method, &headers, body).await;
+    if is_segment_prefix(path, "/user/admin") {
+        let Some(email) = st.admin_email.as_deref() else {
+            return (StatusCode::FORBIDDEN, "Administrator access required").into_response();
+        };
+        let browse_entry = method == Method::GET && path == "/user/admin/browse";
+        let mut response = if browse_entry {
+            Redirect::to("/").into_response()
+        } else {
+            forward_user(&st, &uri, &method, &headers, body, Some(email)).await
+        };
+        response
+            .headers_mut()
+            .insert("cache-control", "private, no-store".parse().unwrap());
+        if method == Method::GET && (browse_entry || response.status().is_success()) {
+            let pass =
+                site_access::admin_view_pass(&st.jwt_secret, now_secs() + site_access::VIEW_TTL);
+            let cookie = format!(
+                "{ADMIN_VIEW_COOKIE}={pass}; Path=/; Max-Age={}; Secure; HttpOnly; SameSite=Lax",
+                site_access::VIEW_TTL
+            );
+            response
+                .headers_mut()
+                .append("set-cookie", cookie.parse().expect("ASCII signed pass"));
+        }
+        return response;
+    }
+    if is_segment_prefix(path, "/user") {
+        return forward_user(&st, &uri, &method, &headers, body, None).await;
+    }
+    let browse = browse_route(&method, path);
+    let now = now_secs();
+    let pass = cookies
+        .get(ADMIN_VIEW_COOKIE)
+        .is_some_and(|c| site_access::valid_admin_view(&st.jwt_secret, c.value(), now));
+    if browse && (pass || st.admin_email.is_some()) {
+        return proxy(uri, method, headers, body, &st.client_id, &st.client_secret).await;
     }
 
     let claims = cookies
         .get(SESSION_COOKIE)
-        .and_then(|tok| jwt_verify(tok.value(), &st.jwt_secret, now_secs()));
-    let Some(claims) = claims else {
-        let media = is_segment_prefix(path, "/images") || is_segment_prefix(path, "/videos");
-        if media && matches!(method, Method::GET | Method::HEAD) {
-            // an <img> tag can't follow a login redirect
-            return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-        }
-        let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-        return Redirect::to(&format!("/user/login?next={}", encode_next(pq))).into_response();
+        .and_then(|tok| jwt_verify(tok.value(), &st.jwt_secret, now));
+    if claims.is_none() && !browse {
+        return login_response(&uri, &method);
+    }
+    let item = match metered_item(&method, path, &headers, &body) {
+        Ok(item) => item,
+        Err(()) => return (StatusCode::BAD_REQUEST, "Invalid search request").into_response(),
     };
-
-    // charge GET media views against the user's account DO (HEAD is free)
-    if method == Method::GET {
-        let kind = if is_segment_prefix(path, "/images") {
-            Some(ChargeKind::Image)
-        } else if is_segment_prefix(path, "/videos") {
-            Some(ChargeKind::Video)
-        } else {
-            None
-        };
-        if let Some(kind) = kind {
-            match charge_do(&st, &claims.sub, path, kind).await {
-                Ok(200) => {}
-                Ok(402) => return out_of_points(),
-                Ok(403) => return (StatusCode::FORBIDDEN, "account suspended").into_response(),
-                Ok(status) => {
-                    worker::console_error!("charge returned {status}");
-                    return (StatusCode::BAD_GATEWAY, "charge failed").into_response();
-                }
-                Err(e) => {
-                    // fail closed
-                    worker::console_error!("charge failed: {e:?}");
-                    return (StatusCode::BAD_GATEWAY, "charge failed").into_response();
-                }
-            }
+    let guest = claims.is_none();
+    let decision = match (claims, item) {
+        (Some(claims), Some(item)) if method != Method::HEAD => {
+            account_call(&st, &claims.sub, "charge", &item).await
         }
-    }
-
-    // Meter the two similarity-search server-fn endpoints (POST). These are
-    // XHR/fetch calls from the Leptos app (not browser navigations), so on 402
-    // we return a JSON error the app can surface — never the HTML out_of_points
-    // page. Only these exact paths + POST are intercepted; all else falls
-    // through unchanged. Dedupe (same key within 24h) lives in the DO, so
-    // paginated re-searches with the same `q` are automatically free.
-    if method == Method::POST
-        && matches!(
-            path,
-            "/api/search_similar" | "/api/search_by_image" | "/api/search_by_desc"
+        (Some(_), _) => Ok(200),
+        (None, item) => {
+            let ip = headers
+                .get("cf-connecting-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse().ok());
+            // A missing client address shares a single quota, including local development.
+            let id = ip
+                .map(|ip| site_access::guest_account(&st.jwt_secret, ip))
+                .unwrap_or_else(|| "guest:unknown".into());
+            account_call(
+                &st,
+                &id,
+                "guest",
+                &GuestReq {
+                    item,
+                    head: method == Method::HEAD,
+                },
+            )
+            .await
+        }
+    };
+    match decision {
+        Ok(200) => proxy(uri, method, headers, body, &st.client_id, &st.client_secret).await,
+        Ok(401) => login_response(&uri, &method),
+        Ok(402) if method == Method::POST => {
+            let message = if guest {
+                "Sign in to continue beyond the free allowance"
+            } else {
+                "out of points"
+            };
+            (
+                StatusCode::PAYMENT_REQUIRED,
+                axum::Json(serde_json::json!({"error":message})),
+            )
+                .into_response()
+        }
+        Ok(402) if guest => (
+            StatusCode::PAYMENT_REQUIRED,
+            "Free allowance reached. Sign in to continue.",
         )
-    {
-        let content_type_ok = headers
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| {
-                ct.split(';')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .eq_ignore_ascii_case("application/x-www-form-urlencoded")
-            });
-        let charge = if content_type_ok {
-            match path {
-                // By-id search reuses a stored embedding (cheap) -> view-class EmbedSearch.
-                "/api/search_similar" => form_field(&body, "q")
-                    .map(|q| (format!("search:sim:{q}"), ChargeKind::EmbedSearch)),
-                // Upload-image search runs dinov3 inference (expensive) -> Search.
-                "/api/search_by_image" => form_field(&body, "image").map(|img| {
-                    (
-                        format!("search:img:{}", &sha256_hex(&img)[..32]),
-                        ChargeKind::Search,
-                    )
-                }),
-                "/api/search_by_desc" => form_field(&body, "q")
-                    .map(|q| (format!("search:desc:{q}"), ChargeKind::Search)),
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        let Some((charge_key, kind)) = charge else {
-            worker::console_warn!("search rejected: invalid or unmeterable form body on {path}");
-            return (StatusCode::BAD_REQUEST, "invalid search payload").into_response();
-        };
-
-        match charge_do(&st, &claims.sub, &charge_key, kind).await {
-            Ok(200) => {}
-            Ok(402) => {
-                return (
-                    StatusCode::PAYMENT_REQUIRED,
-                    [(CONTENT_TYPE, "application/json")],
-                    r#"{"error":"out of points"}"#,
-                )
-                    .into_response();
-            }
-            Ok(403) => return (StatusCode::FORBIDDEN, "account suspended").into_response(),
-            Ok(status) => {
-                worker::console_error!("search charge returned {status}");
-                return (StatusCode::BAD_GATEWAY, "charge failed").into_response();
-            }
-            Err(e) => {
-                // fail closed, mirroring the media path
-                worker::console_error!("search charge failed: {e:?}");
-                return (StatusCode::BAD_GATEWAY, "charge failed").into_response();
-            }
+            .into_response(),
+        Ok(402) => out_of_points(),
+        Ok(403) => (StatusCode::FORBIDDEN, "Account suspended").into_response(),
+        other => {
+            worker::console_error!("access decision failed: {other:?}");
+            (StatusCode::BAD_GATEWAY, "Access service unavailable").into_response()
         }
     }
+}
 
-    proxy(uri, method, headers, body, &st.client_id, &st.client_secret).await
+fn login_response(uri: &Uri, method: &Method) -> Response {
+    let path = uri.path();
+    if is_segment_prefix(path, "/api")
+        || is_segment_prefix(path, "/images")
+        || is_segment_prefix(path, "/videos")
+        || !matches!(*method, Method::GET | Method::HEAD)
+    {
+        return (StatusCode::UNAUTHORIZED, "Login required").into_response();
+    }
+    let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    Redirect::to(&format!("/user/login?next={}", encode_next(pq))).into_response()
+}
+
+fn browse_route(method: &Method, path: &str) -> bool {
+    if matches!(*method, Method::GET | Method::HEAD) {
+        return matches!(path, "/" | "/favicon.ico" | "/api/like_previews")
+            || ["/pkg", "/images", "/videos", "/details"]
+                .iter()
+                .any(|p| is_segment_prefix(path, p));
+    }
+    if method != Method::POST {
+        return false;
+    }
+    if matches!(
+        path,
+        "/api/search_similar" | "/api/search_by_image" | "/api/search_by_desc"
+    ) {
+        return true;
+    }
+    // Leptos appends a decimal u64 build hash to its unnamed server functions.
+    let Some(name) = path.strip_prefix("/api/") else {
+        return false;
+    };
+    [
+        "search_query",
+        "list_post_images",
+        "list_post_videos",
+        "fetch_image_details",
+    ]
+    .iter()
+    .any(|p| {
+        name.strip_prefix(p).is_some_and(|suffix| {
+            suffix.is_empty() || (suffix.len() <= 20 && suffix.bytes().all(|b| b.is_ascii_digit()))
+        })
+    })
+}
+
+fn metered_item(
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> std::result::Result<Option<ChargeReq>, ()> {
+    if matches!(*method, Method::GET | Method::HEAD) {
+        let kind = if is_segment_prefix(path, "/images") {
+            ChargeKind::Image
+        } else if is_segment_prefix(path, "/videos") {
+            ChargeKind::Video
+        } else {
+            return Ok(None);
+        };
+        return Ok(Some(ChargeReq {
+            path: path.to_owned(),
+            kind,
+        }));
+    }
+    if method != Method::POST {
+        return Ok(None);
+    }
+    let (kind, field, prefix) = match path {
+        "/api/search_similar" => (ChargeKind::EmbedSearch, "q", "search:sim:"),
+        "/api/search_by_image" => (ChargeKind::Search, "image", "search:img:"),
+        "/api/search_by_desc" => (ChargeKind::Description, "q", "search:desc:"),
+        _ => return Ok(None),
+    };
+    let ok = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        });
+    if !ok {
+        return Err(());
+    }
+    let value = form_field(body, field).ok_or(())?;
+    let key = if kind == ChargeKind::Search {
+        sha256_hex(&value)[..32].to_owned()
+    } else {
+        value
+    };
+    Ok(Some(ChargeReq {
+        kind,
+        path: format!("{prefix}{key}"),
+    }))
 }
 
 /// Minimal percent-encoding for the `next` query value.
@@ -300,19 +375,18 @@ fn encode_next(s: &str) -> String {
     out
 }
 
-/// POST /charge to the user's UserAccount durable object; returns the DO status.
-async fn charge_do(st: &AppState, sub: &str, path: &str, kind: ChargeKind) -> Result<u16> {
-    let body = serde_json::to_string(&ChargeReq {
-        path: path.to_string(),
-        kind,
-    })
-    .unwrap();
-
+async fn account_call(
+    st: &AppState,
+    sub: &str,
+    operation: &str,
+    payload: &impl Serialize,
+) -> Result<u16> {
+    let body = serde_json::to_string(payload)?;
     let mut init = RequestInit::new();
     init.with_method(worker::Method::Post);
     init.with_body(Some(JsValue::from_str(&body)));
     init.headers.set("content-type", "application/json")?;
-    let req = Request::new_with_init("https://do/charge", &init)?;
+    let req = Request::new_with_init(&format!("https://do/{operation}"), &init)?;
 
     let stub = st
         .env
@@ -412,12 +486,14 @@ async fn forward_user(
     method: &Method,
     headers: &HeaderMap,
     body: Bytes,
+    admin_email: Option<&str>,
 ) -> Response {
     let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
     let target = format!("https://user-worker{pq}");
 
     let mut init = RequestInit::new();
     init.with_method(method.to_string().into());
+    init.with_redirect(worker::RequestRedirect::Manual);
 
     if !matches!(*method, Method::GET | Method::HEAD) && !body.is_empty() {
         init.with_body(Some(Uint8Array::from(&body[..]).into()));
@@ -426,7 +502,10 @@ async fn forward_user(
     // forward all headers — cookie included, the user-worker needs `ue_session`
     for (k, v) in headers {
         let name = k.as_str();
-        if is_hop_by_hop(name) {
+        if is_hop_by_hop(name)
+            || name.eq_ignore_ascii_case(site_access::ADMIN_HEADER)
+            || name.eq_ignore_ascii_case("cf-access-jwt-assertion")
+        {
             continue;
         }
         if let Ok(v) = v.to_str() {
@@ -435,13 +514,27 @@ async fn forward_user(
     }
 
     let sent = async {
+        if let Some(email) = admin_email {
+            init.headers.set(site_access::ADMIN_HEADER, email)?;
+        }
+        let binding = if admin_email.is_some() {
+            "ADMIN_WORKER"
+        } else {
+            "USER_WORKER"
+        };
         let req = Request::new_with_init(&target, &init)?;
-        st.env.service("USER_WORKER")?.fetch_request(req).await
+        st.env.service(binding)?.fetch_request(req).await
     }
     .await;
 
     match sent {
-        Ok(resp) => resp.map(axum::body::Body::new),
+        Ok(resp) => {
+            let mut response = resp.map(axum::body::Body::new);
+            response
+                .headers_mut()
+                .insert("cache-control", "private, no-store".parse().unwrap());
+            response
+        }
         Err(e) => {
             worker::console_error!("user-worker fetch failed: {e:?}");
             (StatusCode::BAD_GATEWAY, "user service unavailable").into_response()
@@ -476,7 +569,14 @@ fn sanitize_cookie(headers: &HeaderMap) -> Option<String> {
         .map(str::trim)
         .filter(|c| {
             let name = c.split('=').next().unwrap_or("");
-            name != SESSION_COOKIE && name != LEGACY_TOKEN_COOKIE && name != LEGACY_APP_COOKIE
+            !matches!(
+                name,
+                SESSION_COOKIE
+                    | ADMIN_VIEW_COOKIE
+                    | "CF_Authorization"
+                    | LEGACY_TOKEN_COOKIE
+                    | LEGACY_APP_COOKIE
+            )
         })
         .collect();
     (!kept.is_empty()).then(|| kept.join("; "))
@@ -538,6 +638,9 @@ async fn proxy(
         let name = k.as_str();
         if is_hop_by_hop(name)
             || name == "cookie"
+            || name.eq_ignore_ascii_case(site_access::ADMIN_HEADER)
+            || name.eq_ignore_ascii_case("cf-access-jwt-assertion")
+            || name.eq_ignore_ascii_case("cf-access-authenticated-user-email")
             || name.eq_ignore_ascii_case("cf-access-client-id")
             || name.eq_ignore_ascii_case("cf-access-client-secret")
         {
@@ -569,7 +672,15 @@ async fn proxy(
     };
 
     match Fetch::Request(request).send().await {
-        Ok(resp) => Response::from(resp),
+        Ok(resp) => {
+            let mut response = Response::from(resp);
+            if !is_segment_prefix(uri.path(), "/pkg") {
+                response
+                    .headers_mut()
+                    .insert("cache-control", "private, no-store".parse().unwrap());
+            }
+            response
+        }
         Err(e) => {
             worker::console_error!("fetch to {target} failed: {e:?}");
             (

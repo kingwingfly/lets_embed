@@ -12,6 +12,7 @@ documentation.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+site_access = { path = "../site_access" }
 worker = { version = "0.9", features = ["http", "axum", "d1"] }
 # required by the code #[durable_object] generates
 wasm-bindgen = "0.2"
@@ -22,9 +23,10 @@ uuid = { version = "1", features = ["v4", "js"] }
 getrandom = { version = "0.4", features = ["wasm_js"] }
 serde.workspace = true
 serde_json.workspace = true
+serde-wasm-bindgen = "0.6"
+percent-encoding = "2"
 hmac = "0.13"
 sha2 = "0.11"
-rsa = { version = "0.10", features = ["pkcs1v15"] }
 base64 = "0.23"
 k256 = { version = "0.14", default-features = false, features = ["ecdsa", "alloc"] }
 sha3 = "0.12"
