@@ -9,7 +9,7 @@ When an allowance or balance runs out, browser navigation goes to `/user/upgrade
 ## Cloudflare Access and deployment
 
 1. Restrict `/user/admin` and its descendants on the public gallery hostname to your administrator group in Cloudflare Access. Set the application's audience in this Worker's `CF_ACCESS_AUD`. Leave the gallery paths public at the Access layer if the dashboard should control guest access. A matching administrator identity must have an email. [Cloudflare Worker identity and path protection](https://developers.cloudflare.com/workers/configuration/cloudflare-access/)
-2. Keep the two service bindings in the root `wrangler.toml`. Only `ADMIN_WORKER` carries the `gallery_admin` property. The gateway checks the runtime Access audience and identity before using it. The user Worker checks the binding on every admin operation. Browser-submitted settings and account changes also require the gallery's own origin, configured in `SIWE_DOMAIN`. [Service binding properties](https://developers.cloudflare.com/workers/runtime-apis/context/)
+2. Keep the two service bindings in `wrangler.toml`. Only `ADMIN_WORKER` carries the `gallery_admin` property. The gateway checks the runtime Access audience and identity before using it. The user Worker checks the binding on every admin operation. Browser-submitted settings and account changes also require the gallery's own origin, configured in `SIWE_DOMAIN`. [Service binding properties](https://developers.cloudflare.com/workers/runtime-apis/context/)
 3. Set `JWT_SECRET` to the same secret as the user Worker. Set `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` to the service token authorized for the API and media origins.
 4. Apply the D1 migration and deploy the user Worker first, then deploy this gateway. [User Worker deployment](../user_worker/README.md#setup--deployment)
 
@@ -18,7 +18,5 @@ Administrators can open **View gallery** from the dashboard or **Browse as admin
 For tunnel-only origins, `cloudflared` can validate the application token with **Protect with Access**. Keep origin validation for Cloud Run or any origin also reachable outside that tunnel. [Cloudflare origin validation](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/)
 
 ## Local development
-
-From the project root, `npm run dev` starts both Workers and serves the gateway at `http://localhost:8787`. Wrangler reads local secrets from a root `.dev.vars` file. An existing local D1 or Durable Object store under `user_worker/.wrangler/state` can be reused with `npm run dev -- --persist-to user_worker/.wrangler/state`. Use the same `--persist-to` path with local D1 commands for that store.
 
 Use a local-only gateway Wrangler configuration with a matching `[access.dev]` audience and `[access.dev.identity]` email to exercise admin access. Remove the local Access simulation to test a guest. The integration test builds on the same runtime identities, service bindings, SQLite Durable Objects and D1 migrations used by the deployed Workers. From the repository root, after `npm ci` and building both Workers, run `node --test gateway_worker/tests/site-policy.cjs`.

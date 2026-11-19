@@ -1,10 +1,8 @@
 name = "user-worker"
-main = "user_worker/build/index.js"
+main = "build/index.js"
 compatibility_date = "2026-06-01"
 
 [build]
-cwd = "user_worker"
-watch_dir = ["user_worker/src", "site_access/src", "assets/gallery-allowance.js"]
 command = "cargo install -q \"worker-build@^0.9\" && worker-build --profile wasm-release"
 
 [observability.logs]
@@ -20,14 +18,14 @@ CHAIN_ID = "1"
 # Solana JSON-RPC endpoint used to verify SOL / SPL top-ups.
 SOL_RPC_URL = "https://api.mainnet-beta.solana.com"
 
-# Set the user Worker's secrets with `npx wrangler secret put <NAME> -c wrangler.user.toml`.
+# Worker secrets; deploy fails until each is set with `wrangler secret put <NAME>`:
 #   JWT_SECRET — HS256 key for `ue_session`; must equal gateway-worker's JWT_SECRET.
 #     Generate it once with `openssl rand -base64 48` and put the same value into both workers.
 [secrets]
 required = ["JWT_SECRET"]
 
 # SIWE nonces, single-use, TTL-expired. Create the namespace and fill in the id:
-#   npx wrangler kv namespace create NONCES -c wrangler.user.toml
+#   wrangler kv namespace create NONCES
 [[kv_namespaces]]
 binding = "NONCES"
 id = "1d3aa70037834252a25d895d60637774"
@@ -35,7 +33,6 @@ id = "1d3aa70037834252a25d895d60637774"
 [[d1_databases]]
 binding = "DB"
 database_name = "lets-embed"
-migrations_dir = "user_worker/migrations"
 database_id = "ee6985fc-ed13-414f-8f85-8727c86f3b48"
 
 [durable_objects]

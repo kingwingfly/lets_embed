@@ -1,5 +1,5 @@
 -- user_worker D1 schema (database: lets-embed, binding: DB)
--- From the project root: npx wrangler d1 execute lets-embed -c wrangler.user.toml --remote --file user_worker/migrations/0001_users.sql
+-- Apply with: wrangler d1 execute lets-embed --remote --file migrations/0001_users.sql
 --
 -- Note: balance / subscription quota / view-dedupe live ONLY in the UserAccount
 -- Durable Object (single source of truth). `users.plan` and `users.banned` are

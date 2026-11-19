@@ -121,14 +121,14 @@ Steps:
 - use `cloudflare Access` service token to protect `xx-image.yourdomain.com` service
 - leave the public gallery reachable at `xx.yourdomain.com` and protect `/user/admin` and its descendants with a Cloudflare Access policy for administrators
 - publish wallet requirements, guest allowances, pricing, subscriptions and deposit addresses from `/user/admin`. [Gallery controls and deployment](user_worker/README.md)
-- Configure the public gateway and the wallet service in the project root. [Gateway config](wrangler.toml) · [User Worker config](wrangler.user.toml)
+- Configure each Worker in its own directory. [Gateway config](gateway_worker/wrangler.toml) · [User Worker config](user_worker/wrangler.toml)
 
 From the project root, deploy the user Worker first so its service and Durable Object are available to the gateway.
 
 ```sh
 npm ci
-npx wrangler deploy -c wrangler.user.toml
-npx wrangler deploy
+npx wrangler deploy --cwd user_worker
+npx wrangler deploy --cwd gateway_worker
 ```
 
-`npm run dev` runs both Workers locally with the gateway as the entry point. For a first deployment or a site moving payments into the dashboard, follow the [user Worker setup](user_worker/README.md#setup--deployment).
+For a first deployment or a site moving payments into the dashboard, follow the [user Worker setup](user_worker/README.md#setup--deployment).
