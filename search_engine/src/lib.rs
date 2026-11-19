@@ -134,6 +134,18 @@ impl LazyModel {
     }
 }
 
+fn ort_env() -> ort::Result<ort::environment::Environment> {
+    static ENV: std::sync::Mutex<Option<ort::environment::Environment>> =
+        std::sync::Mutex::new(None);
+    let mut guard = ENV.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(env) = guard.as_ref() {
+        return Ok(env.clone());
+    }
+    let env = ort::init().with_name("search_engine").build()?;
+    *guard = Some(env.clone());
+    Ok(env)
+}
+
 #[derive(Debug)]
 pub struct Engine {
     pool: PgPool,
@@ -179,7 +191,10 @@ impl Engine {
             let clip_text_model_path = clip_text_model_path.as_ref().to_owned();
             LazyModel::new(
                 "clip_text",
-                move || siglip2::model(&clip_text_model_path),
+                move || {
+                    let env = ort_env()?;
+                    siglip2::model_with_env(&env, &clip_text_model_path)
+                },
                 idle_timeout,
             )
         });
@@ -187,7 +202,10 @@ impl Engine {
             let dinov3_model_path = dinov3_model_path.as_ref().to_owned();
             LazyModel::new(
                 "dinov3",
-                move || dinov3::model(&dinov3_model_path),
+                move || {
+                    let env = ort_env()?;
+                    dinov3::model_with_env(&env, &dinov3_model_path)
+                },
                 idle_timeout,
             )
         });

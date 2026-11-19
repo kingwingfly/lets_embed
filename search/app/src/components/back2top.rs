@@ -1,5 +1,6 @@
 use leptos::prelude::*;
-use leptos_use::{use_window, use_window_scroll};
+use leptos_use_window::use_window;
+use leptos_use_window_scroll::use_window_scroll;
 use web_sys::{ScrollBehavior, ScrollToOptions};
 
 #[component]

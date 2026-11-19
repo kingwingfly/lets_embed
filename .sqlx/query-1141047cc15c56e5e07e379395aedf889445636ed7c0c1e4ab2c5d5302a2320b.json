@@ -1,0 +1,72 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH input AS (\n                SELECT * FROM unnest($1::meta[]) WITH ORDINALITY\n                AS _(title, authors, tags, images, meta_ord)\n            ),\n            ins_posts AS (\n                INSERT INTO posts (title)\n                SELECT DISTINCT title FROM input\n                WHERE trim(title) != ''\n                ORDER BY title\n                ON CONFLICT (title) DO NOTHING\n            ),\n            ins_images AS (\n                INSERT INTO images (name, width, height)\n                SELECT DISTINCT ON (img.name) img.name, img.width, img.height\n                FROM input i\n                CROSS JOIN LATERAL unnest(i.images::image[]) WITH ORDINALITY\n                    AS img(name, width, height, img_ord)\n                WHERE trim(img.name) != ''\n                ORDER BY img.name, i.meta_ord DESC, img.img_ord DESC\n                ON CONFLICT (name) DO UPDATE\n                SET width = EXCLUDED.width,\n                    height = EXCLUDED.height\n                WHERE images.width IS DISTINCT FROM EXCLUDED.width\n                   OR images.height IS DISTINCT FROM EXCLUDED.height\n            ),\n            ins_authors AS (\n                INSERT INTO authors (name)\n                SELECT DISTINCT name\n                FROM input i\n                CROSS JOIN LATERAL unnest(i.authors::VARCHAR[]) AS _(name)\n                WHERE trim(name) != ''\n                ORDER BY name\n                ON CONFLICT (name) DO NOTHING\n            )\n            INSERT INTO tags (name)\n            SELECT DISTINCT name\n            FROM input i\n            CROSS JOIN LATERAL unnest(i.tags::VARCHAR[]) AS _(name)\n            WHERE trim(name) != ''\n            ORDER BY name\n            ON CONFLICT (name) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "meta[]",
+            "kind": {
+              "Array": {
+                "Custom": {
+                  "name": "meta",
+                  "kind": {
+                    "Composite": [
+                      [
+                        "title",
+                        "Text"
+                      ],
+                      [
+                        "authors",
+                        "TextArray"
+                      ],
+                      [
+                        "tags",
+                        "TextArray"
+                      ],
+                      [
+                        "images",
+                        {
+                          "Custom": {
+                            "name": "image[]",
+                            "kind": {
+                              "Array": {
+                                "Custom": {
+                                  "name": "image",
+                                  "kind": {
+                                    "Composite": [
+                                      [
+                                        "name",
+                                        "Text"
+                                      ],
+                                      [
+                                        "width",
+                                        "Int4"
+                                      ],
+                                      [
+                                        "height",
+                                        "Int4"
+                                      ]
+                                    ]
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1141047cc15c56e5e07e379395aedf889445636ed7c0c1e4ab2c5d5302a2320b"
+}

@@ -11,9 +11,12 @@ documentation.workspace = true
 leptos = { version = "0.8", features = ["nightly"] }
 leptos_meta = { version = "0.8", features = [] }
 leptos_router = { version = "0.8", features = ["nightly"] }
-leptos-use = { version = "0.18", default-features = false, features = [
-    "use_intersection_observer", "use_element_size", "signal_debounced", "use_window_scroll"
-] }
+leptos-use-element-size = "0.20"
+leptos-use-event-listener = "0.20"
+leptos-use-intersection-observer = "0.20"
+leptos-use-signal-debounce-throttle = "0.20"
+leptos-use-window = "0.20"
+leptos-use-window-scroll = "0.20"
 
 search_types = { path = "../../search_types", features = ["serde"] }
 
@@ -37,9 +40,25 @@ search_engine = { path = "../../search_engine", optional = true, features = ["se
 axum = { workspace = true, optional = true, features = ["macros"] }
 leptos_axum = { version = "0.8", optional = true }
 futures = { workspace = true, optional = true }
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 
 [features]
 default = []
 hydrate = ["leptos/hydrate", "dep:wasm-bindgen-futures"]
-ssr = ["leptos/ssr", "leptos_meta/ssr", "leptos_router/ssr", "leptos-use/ssr", "dep:tokio", "dep:search_engine", "dep:axum", "dep:leptos_axum", "dep:futures", "dep:base64"]
+ssr = [
+    "leptos/ssr",
+    "leptos_meta/ssr",
+    "leptos_router/ssr",
+    "leptos-use-element-size/ssr",
+    "leptos-use-event-listener/ssr",
+    "leptos-use-intersection-observer/ssr",
+    "leptos-use-signal-debounce-throttle/ssr",
+    "leptos-use-window/ssr",
+    "leptos-use-window-scroll/ssr",
+    "dep:tokio",
+    "dep:search_engine",
+    "dep:axum",
+    "dep:leptos_axum",
+    "dep:futures",
+    "dep:base64",
+]

@@ -182,7 +182,8 @@ pub fn recover_address(message: &str, signature_hex: &str) -> Result<String, Siw
     };
 
     let mut sig = Signature::from_slice(&sig_bytes[..64]).map_err(|_| SiweError::BadSignature)?;
-    if let Some(normalized) = sig.normalize_s() {
+    let normalized = sig.normalize_s();
+    if normalized != sig {
         sig = normalized;
         v ^= 1;
     }
@@ -202,7 +203,7 @@ pub fn recover_address(message: &str, signature_hex: &str) -> Result<String, Siw
 }
 
 fn pubkey_to_address(key: &VerifyingKey) -> String {
-    let point = key.to_encoded_point(false);
+    let point = key.to_sec1_point(false);
     let hash = keccak256(&point.as_bytes()[1..65]);
     format!("0x{}", hex::encode(&hash[12..32]))
 }
@@ -336,7 +337,7 @@ Expiration Time: 2026-07-04T00:10:00Z";
         let sk = SigningKey::from_slice(&[0x11; 32]).unwrap();
         let expected = pubkey_to_address(sk.verifying_key());
 
-        let (sig, rec_id) = sk.sign_prehash_recoverable(&eip191_digest(MSG)).unwrap();
+        let (sig, rec_id) = sk.sign_prehash_recoverable(&eip191_digest(MSG));
         let mut bytes = sig.to_bytes().to_vec();
         bytes.push(rec_id.to_byte());
         let sig_hex = format!("0x{}", hex::encode(&bytes));
@@ -361,6 +362,28 @@ Expiration Time: 2026-07-04T00:10:00Z";
         ok.push(rec_id.to_byte());
         let other = recover_address("other message", &hex::encode(&ok)).unwrap();
         assert_ne!(other, expected);
+    }
+
+    #[test]
+    fn ecrecover_high_s_normalizes() {
+        use k256::{NonZeroScalar, Scalar, elliptic_curve::scalar::IsHigh};
+
+        let sk = SigningKey::from_slice(&[0x22; 32]).unwrap();
+        let expected = pubkey_to_address(sk.verifying_key());
+        let (sig, rec_id) = sk.sign_prehash_recoverable(&eip191_digest(MSG));
+
+        let (r, s) = sig.split_scalars();
+        let neg_s = NonZeroScalar::new(-Scalar::from(s)).unwrap();
+        assert!(bool::from(neg_s.is_high()));
+        let high_sig = Signature::from_scalars(r, neg_s).unwrap();
+        let flipped_v = rec_id.to_byte() ^ 1;
+
+        let mut raw = high_sig.to_bytes().to_vec();
+        raw.push(flipped_v);
+        assert_eq!(
+            recover_address(MSG, &format!("0x{}", hex::encode(&raw))).unwrap(),
+            expected
+        );
     }
 
     #[test]

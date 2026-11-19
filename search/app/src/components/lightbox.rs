@@ -1,6 +1,6 @@
 use crate::{components::Viewer, types::PostItem, util::encode_path};
 use leptos::prelude::*;
-use leptos_use::use_intersection_observer;
+use leptos_use_intersection_observer::use_intersection_observer;
 
 const PAGE: usize = 20;
 

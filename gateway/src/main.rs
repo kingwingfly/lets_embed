@@ -6,6 +6,8 @@
 #[cfg(feature = "validate-jwt")]
 mod jwt;
 
+use std::process::ExitCode;
+
 use async_trait::async_trait;
 use pingora::prelude::*;
 use tracing_subscriber::EnvFilter;
@@ -119,7 +121,7 @@ fn is_content_hashed(path: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-fn main() {
+fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -130,13 +132,13 @@ fn main() {
     #[cfg(feature = "validate-jwt")]
     if jwt::keys().is_none() {
         tracing::error!("Failed to get pub keys");
-        return;
+        return ExitCode::FAILURE;
     }
 
     #[cfg(feature = "validate-jwt")]
     let Ok(policy_aud) = std::env::var("POLICY_AUD") else {
         tracing::error!(env_var = "POLICY_AUD", "Not presented");
-        return;
+        return ExitCode::FAILURE;
     };
 
     let mut my_server = Server::new(None).unwrap();
