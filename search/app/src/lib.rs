@@ -58,7 +58,7 @@ pub fn App() -> impl IntoView {
                 <Routes fallback=|| "Page not found.".into_view()>
                     <ParentRoute path=path!("") view=SearchBar>
                         <Route path=path!("/details/:id") view=ImageDetails/>
-                        <Route path=path!("") view=Results/>
+                        <Route path=path!("") view=|| view! { <Results /> }/>
                     </ParentRoute>
                 </Routes>
             </main>
