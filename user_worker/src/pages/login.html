@@ -201,7 +201,10 @@ async function getSolanaSigner() {
     if (!account) throw new Error("No Solana account in this wallet — enable one (e.g. in MetaMask) and try again.");
     return {
       address: account.address,
-      sign: async function (m) { return (await w.features["solana:signMessage"].signMessage({ account: account, message: m }))[0].signature; },
+      sign: async function (m) {
+        var out = await w.features["solana:signMessage"].signMessage({ account: account, message: m });
+        return { signature: out[0].signature, signedMessage: out[0].signedMessage };
+      },
     };
   }
   var provider = window.solana || (window.phantom && window.phantom.solana);
@@ -211,10 +214,19 @@ async function getSolanaSigner() {
     if (!pk) throw new Error("wallet did not return a public key");
     return {
       address: pk.toString(),
-      sign: async function (m) { var s = await provider.signMessage(m, "utf8"); return s && s.signature ? s.signature : s; },
+      sign: async function (m) {
+        var s = await provider.signMessage(m, "utf8");
+        return { signature: s && s.signature ? s.signature : s, signedMessage: null };
+      },
     };
   }
   return null;
+}
+function bytesToBase64(bytes) {
+  if (!bytes || typeof bytes.length !== "number") return null;
+  var bin = "";
+  for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
 }
 var sbtn = document.getElementById("siws-btn");
 function hasSolanaWallet() {
@@ -241,12 +253,16 @@ sbtn.addEventListener("click", async function () {
     var nonce = (await nr.json()).nonce;
     // MUST match auth::siws_challenge byte for byte.
     var message = "Sign in to lets_embed with Solana\nDomain: " + SIWE_DOMAIN + "\nNonce: " + nonce;
-    var sigBytes = await signer.sign(new TextEncoder().encode(message));
+    var signed = await signer.sign(new TextEncoder().encode(message));
+    var sigBytes = signed.signature;
     var sigB58 = typeof sigBytes === "string" ? sigBytes : bs58encode(sigBytes);
+    var body = { solana_address: signer.address, signature: sigB58, nonce: nonce };
+    var signedMsgB64 = bytesToBase64(signed.signedMessage);
+    if (signedMsgB64) body.signed_message = signedMsgB64;
     var vr = await fetch("/user/api/verify_solana", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ solana_address: signer.address, signature: sigB58, nonce: nonce }),
+      body: JSON.stringify(body),
     });
     if (vr.ok) {
       showMsg("Signed in. Redirecting…", "ok");

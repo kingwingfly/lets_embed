@@ -590,6 +590,9 @@ impl UserAccount {
     /// days — and switching (upgrade/downgrade/renew) only charges the
     /// difference net of the refund. A pure renew (same plan) costs ~0 net.
     async fn subscribe(&self, req: SubscribeReq, policy: &Policy) -> Result<Response> {
+        if self.get_or("banned", false).await? {
+            return Response::error("account banned", 403);
+        }
         let Some(target) = policy.plan(&req.plan) else {
             return Response::error("unknown plan", 400);
         };

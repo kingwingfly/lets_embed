@@ -34,3 +34,9 @@ hex = "0.4"
 # Solana wallet-link signature verification (ed25519) + base58 addr/sig codec
 ed25519-dalek = { version = "3", default-features = false, features = ["alloc"] }
 bs58 = "0.5"
+# Build unsigned Solana transfers for the user's wallet.
+solana-transaction = { version = "3", features = ["serde"] }
+solana-system-interface = { version = "3", features = ["bincode"] }
+spl-associated-token-account-interface = "2"
+spl-token-interface = "2"
+bincode = "1.3"

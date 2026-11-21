@@ -111,6 +111,10 @@ pub struct SiwsReq {
     pub signature: String,
     /// The nonce embedded in the signed challenge (single-use, from /api/nonce).
     pub nonce: String,
+    /// Optional base64-encoded bytes actually signed by a Wallet Standard wallet
+    /// (e.g. a Solana off-chain message envelope wrapping the exact challenge).
+    #[serde(default)]
+    pub signed_message: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -126,6 +130,9 @@ pub struct NonceResp {
 
 #[derive(Debug, Deserialize)]
 pub struct TopupReq {
+    /// The account page includes its principal so a different session in
+    /// another tab cannot take over a pending checkout.
+    pub account: Option<String>,
     /// "ethereum" | "solana".
     pub chain: String,
     /// Token symbol, lowercase: "eth" | "sol" | "usdt" | "usdc".
@@ -147,7 +154,8 @@ pub struct PaymentRow {
     pub token: String,
     /// Raw base units (wei / lamports / token minor units), decimal string.
     pub amount: String,
-    pub points: i64,
+    /// Exact decimal string so credits above `2^53 - 1` survive D1/JS conversion.
+    pub points: String,
     pub status: String,
     pub created_at: i64,
 }
@@ -168,6 +176,9 @@ pub struct LinkSolReq {
     pub signature: String,
     /// The nonce embedded in the signed challenge (single-use, from /api/nonce).
     pub nonce: String,
+    /// Optional base64-encoded bytes actually signed by a Wallet Standard wallet.
+    #[serde(default)]
+    pub signed_message: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

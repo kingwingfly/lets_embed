@@ -22,9 +22,14 @@ pub(crate) enum SolOutcome {
     RpcError(String),
 }
 
-/// A base58 Solana tx signature decodes to 64 bytes.
+/// A base58 Solana tx signature decodes to exactly 64 bytes.
 pub fn valid_signature(sig: &str) -> bool {
-    matches!(bs58::decode(sig).into_vec(), Ok(v) if v.len() == 64)
+    // 64 bytes in base58 is always 64..=88 characters; bound before decoding.
+    if !(64..=88).contains(&sig.len()) {
+        return false;
+    }
+    let mut buf = [0u8; 64];
+    matches!(bs58::decode(sig).onto(&mut buf), Ok(64))
 }
 
 // ---------------------------------------------------------------------------
@@ -32,7 +37,7 @@ pub fn valid_signature(sig: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// `getTransaction(signature, {encoding:"jsonParsed", commitment:"finalized",
-/// maxSupportedTransactionVersion:0})`. Returns the `result` field (which may be
+/// maxSupportedTransactionVersion:1})`. Returns the `result` field (which may be
 /// JSON `null`). A non-2xx HTTP response, a JSON-RPC-level `error`, or a decode
 /// failure is turned into `Err`.
 pub(crate) async fn get_transaction(url: &str, signature: &str) -> worker::Result<Value> {
@@ -45,7 +50,7 @@ pub(crate) async fn get_transaction(url: &str, signature: &str) -> worker::Resul
             {
                 "encoding": "jsonParsed",
                 "commitment": "finalized",
-                "maxSupportedTransactionVersion": 0,
+                "maxSupportedTransactionVersion": 1,
             },
         ],
     });
@@ -74,14 +79,49 @@ pub(crate) async fn get_transaction(url: &str, signature: &str) -> worker::Resul
 // Pure verifier (host-tested)
 // ---------------------------------------------------------------------------
 
-/// The pubkey of the `i`-th account key. jsonParsed renders each entry as an
-/// object `{pubkey, signer, writable, source}`; legacy/base64 encodings render
-/// it as a plain base58 string. Both are handled.
-fn pubkey_at(keys: &[Value], i: usize) -> Option<&str> {
-    match keys.get(i)? {
+/// The pubkey of an accountKeys / loadedAddresses entry. jsonParsed renders
+/// static account keys as `{pubkey, signer, writable, source}`; legacy/base64
+/// encodings and `meta.loadedAddresses.{writable,readonly}` render plain base58
+/// strings. Both are handled.
+fn key_pubkey(entry: &Value) -> Option<&str> {
+    match entry {
         Value::String(s) => Some(s.as_str()),
         other => other.get("pubkey").and_then(Value::as_str),
     }
+}
+
+/// Build the full account-key table for legacy, v0 (with Address Lookup Tables),
+/// and v1 transactions: static `accountKeys` followed by `loadedAddresses.writable`
+/// and `loadedAddresses.readonly`.
+fn effective_keys(result: &Value) -> Result<Vec<&str>, &'static str> {
+    let static_keys = result["transaction"]["message"]["accountKeys"]
+        .as_array()
+        .ok_or("malformed transaction: missing accountKeys")?;
+    let mut keys = Vec::with_capacity(static_keys.len());
+    for entry in static_keys {
+        keys.push(key_pubkey(entry).ok_or("malformed transaction: bad account key")?);
+    }
+    let loaded = &result["meta"]["loadedAddresses"];
+    if !loaded.is_null() {
+        for section in ["writable", "readonly"] {
+            if let Some(arr) = loaded.get(section).and_then(Value::as_array) {
+                for entry in arr {
+                    keys.push(
+                        key_pubkey(entry).ok_or("malformed transaction: bad loaded address")?,
+                    );
+                }
+            }
+        }
+    }
+    Ok(keys)
+}
+
+/// Extract the fee payer (account key 0) from a `getTransaction` result.
+pub(crate) fn tx_sender(result: &Value) -> Option<&str> {
+    result["transaction"]["message"]["accountKeys"]
+        .as_array()
+        .and_then(|keys| keys.first())
+        .and_then(key_pubkey)
 }
 
 const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
@@ -128,19 +168,14 @@ pub(crate) fn verify_solana(
 ) -> SolOutcome {
     let meta = &result["meta"];
 
-    // A non-null `meta.err` means the transaction failed on-chain: no transfer
-    // took effect, permanent for any submitter.
-    match meta.get("err") {
-        Some(Value::Null) => {}
-        Some(_) => return SolOutcome::Reject("tx failed on-chain"),
-        None => return SolOutcome::RpcError("missing transaction status".into()),
-    }
-
-    let Some(keys) = result["transaction"]["message"]["accountKeys"].as_array() else {
-        return SolOutcome::RpcError("malformed transaction: missing accountKeys".into());
+    let keys = match effective_keys(result) {
+        Ok(k) => k,
+        Err(e) => return SolOutcome::RpcError(e.into()),
     };
-    // Fee payer / sender is always the first account key.
-    let Some(sender) = pubkey_at(keys, 0) else {
+    // Fee payer / sender is always the first account key. Check ownership before
+    // recording permanent rejections so an unrelated caller cannot stuff failed
+    // transactions into `payments`.
+    let Some(&sender) = keys.first() else {
         return SolOutcome::RpcError("malformed transaction: missing fee payer".into());
     };
     // Both the native and SPL paths require the linked wallet to be the fee
@@ -149,14 +184,21 @@ pub(crate) fn verify_solana(
         return SolOutcome::WrongSender;
     }
 
+    // A non-null `meta.err` means the transaction failed on-chain: no transfer
+    // took effect, permanent for any submitter.
+    match meta.get("err") {
+        Some(Value::Null) => {}
+        Some(_) => return SolOutcome::Reject("tx failed on-chain"),
+        None => return SolOutcome::RpcError("missing transaction status".into()),
+    }
+
     if sender == deposit_address || deposit_address.is_empty() {
         return SolOutcome::Reject("no deposit received");
     }
 
     let (received, funded) = match spec.contract {
         None => {
-            let Some(i) = (0..keys.len()).find(|&i| pubkey_at(keys, i) == Some(deposit_address))
-            else {
+            let Some(i) = keys.iter().position(|&k| k == deposit_address) else {
                 return SolOutcome::Reject("deposit address not in transaction");
             };
             let (Some(pre), Some(post)) = (
@@ -195,7 +237,7 @@ pub(crate) fn verify_solana(
                     let Some(key) = entry["accountIndex"]
                         .as_u64()
                         .and_then(|i| usize::try_from(i).ok())
-                        .and_then(|i| pubkey_at(keys, i))
+                        .and_then(|i| keys.get(i).copied())
                     else {
                         return SolOutcome::RpcError("missing token account key".into());
                     };
@@ -288,9 +330,15 @@ mod tests {
         // 64 zero bytes -> valid length
         let sig = bs58::encode([0u8; 64]).into_string();
         assert!(valid_signature(&sig));
+        // 64 max bytes -> 88 chars, valid length
+        let max_sig = bs58::encode([0xffu8; 64]).into_string();
+        assert_eq!(max_sig.len(), 88);
+        assert!(valid_signature(&max_sig));
         // 63 bytes -> invalid
         let short = bs58::encode([0u8; 63]).into_string();
         assert!(!valid_signature(&short));
+        // oversized valid-alphabet string rejected immediately without quadratic work
+        assert!(!valid_signature(&"1".repeat(10_000)));
         // non-base58 garbage
         assert!(!valid_signature("not a signature 0OIl"));
     }
@@ -518,6 +566,57 @@ mod tests {
             SolOutcome::Credited {
                 amount: 1_000_000_000
             }
+        );
+    }
+
+    #[test]
+    fn v0_loaded_addresses_resolve_token_accounts() {
+        let mint = usdc_spec().contract.expect("usdc mint");
+        let result = serde_json::json!({
+            "version": 0,
+            "meta": {
+                "err": null,
+                "loadedAddresses": {
+                    "writable": ["source-token-account", "deposit-token-account"],
+                    "readonly": [mint],
+                },
+                "preTokenBalances": [{
+                    "accountIndex": 2,
+                    "mint": mint,
+                    "owner": LINKED,
+                    "uiTokenAmount": { "amount": "1500000" },
+                }],
+                "postTokenBalances": [{
+                    "accountIndex": 3,
+                    "mint": mint,
+                    "owner": DEPOSIT,
+                    "uiTokenAmount": { "amount": "1500000" },
+                }],
+            },
+            "transaction": {
+                "message": {
+                    "accountKeys": [key(LINKED, true), key(DEPOSIT, false)],
+                    "instructions": [spl_transfer("1500000")],
+                }
+            }
+        });
+        assert_eq!(
+            verify_solana(&result, usdc_spec(), DEPOSIT, LINKED),
+            SolOutcome::Credited { amount: 1_500_000 }
+        );
+    }
+
+    #[test]
+    fn wrong_sender_checked_before_meta_err() {
+        let result = serde_json::json!({
+            "meta": { "err": { "InstructionError": [0, "Custom"] } },
+            "transaction": {
+                "message": { "accountKeys": [key(OTHER, true), key(DEPOSIT, false)] }
+            }
+        });
+        assert_eq!(
+            verify_solana(&result, sol_spec(), DEPOSIT, LINKED),
+            SolOutcome::WrongSender
         );
     }
 }

@@ -10,8 +10,10 @@ const root = path.resolve(__dirname, '../..');
 const wallet = '0x' + '1'.repeat(40);
 const originalDeposit = '0x' + '2'.repeat(40);
 const updatedDeposit = '0x' + '3'.repeat(40);
-const linkedSolana = '11111111111111111111111111111112';
-const originalSolanaDeposit = 'So11111111111111111111111111111111111111112';
+const linkedSolana = 'sZzUKaVhJLKv1KmyyaCBc39Dv3dwgtS3HmTPrtLZzqe';
+const originalSolanaDeposit = '5tE57EgXH3HTpbtiEQxVzdJeg2NZgGaH2KSSwc7e63DR';
+const latestBlockhash = '8WWuKFCuQAi1MFmq5kR3WxWb8WrgzDZ4aNrzMw3vuxpD';
+const receiptBlockHash = '0x' + 'a'.repeat(64);
 const secret = 'local-integration-fixture';
 const adminHost = 'staff.gallery.test';
 const appHost = 'gallery.test';
@@ -32,9 +34,9 @@ function builtWorker(crate) {
   };
 }
 
-function signedWalletSession() {
+function signedWalletSession(principal = wallet) {
   const now = Math.floor(Date.now() / 1000);
-  const payload = Buffer.from(JSON.stringify({ sub: wallet, iat: now, exp: now + 3600 })).toString(
+  const payload = Buffer.from(JSON.stringify({ sub: principal, iat: now, exp: now + 3600 })).toString(
     'base64url'
   );
   const signature = createHmac('sha256', secret).update(payload).digest('base64url');
@@ -134,6 +136,9 @@ test('gallery access, billing and administrator controls use the published polic
   const solanaUsdc = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
   const topic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
   const rpcReplies = {
+    eth_chainId: '0x1',
+    getGenesisHash: '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d',
+    getLatestBlockhash: { value: { blockhash: latestBlockhash, lastValidBlockHeight: 123456 } },
     getTransaction: {
       blockTime: oldBlockTime,
       transaction: { message: {
@@ -162,14 +167,22 @@ test('gallery access, billing and administrator controls use the published polic
         ],
       },
     },
-    eth_getTransactionByHash: { from: wallet, to: usdc, value: '0x0' },
+    eth_getTransactionByHash: { from: wallet, to: usdc, value: '0x0', blockHash: receiptBlockHash },
     eth_getTransactionReceipt: {
       status: '0x1',
       blockNumber: '0x10',
-      logs: [{ address: usdc, topics: [topic, wallet, originalDeposit], data: '0xf4240' }],
+      blockHash: receiptBlockHash,
+      logs: [{ address: usdc, topics: [topic, '0x' + '0'.repeat(24) + wallet.slice(2), '0x' + '0'.repeat(24) + originalDeposit.slice(2)], data: '0xf4240' }],
     },
     eth_blockNumber: '0x20',
-    eth_getBlockByNumber: { timestamp: '0x' + oldBlockTime.toString(16) },
+    eth_getBlockByNumber: { hash: receiptBlockHash, timestamp: '0x' + oldBlockTime.toString(16) },
+    eth_call: '0x' + [
+      1n,
+      2000n * 100000000n,
+      BigInt(oldBlockTime),
+      BigInt(Math.floor(Date.now() / 1000)),
+      1n,
+    ].map((n) => n.toString(16).padStart(64, '0')).join(''),
   };
   const mf = new Miniflare(
     convertV4MiniflareOptions({
@@ -225,6 +238,12 @@ test('gallery access, billing and administrator controls use the published polic
   const visit = (host, url, options) =>
     mf.dispatchFetch('https://' + host + url, { ...options, redirect: 'manual' });
   const site = (url, options) => visit(appHost, url, options);
+  const command = (route, body, principal = wallet) =>
+    site('/user/api/' + route, {
+      method: 'POST',
+      headers: { cookie: signedWalletSession(principal), 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
   const admin = (url, options) => visit(adminHost, '/user/admin' + url, options);
   const post = (url, body, origin = 'https://' + adminHost) =>
     admin(url, {
@@ -261,6 +280,39 @@ test('gallery access, billing and administrator controls use the published polic
   const fields = policyForm(html);
   assert.equal(fields.get('eth_deposit'), originalDeposit);
   assert.equal(fields.get('login_required'), 'yes');
+  const checkout = { account: wallet, chain: 'ethereum', token: 'usdc', amount: '1.000001' };
+  const prepared = await command('topup/prepare', checkout);
+  assert.equal(prepared.status, 200);
+  const quote = await prepared.json();
+  assert.equal(quote.recipient, originalDeposit);
+  assert.equal(quote.transaction.to, usdc);
+  assert.equal(quote.estimated_points, 10000);
+  await check(command('topup/prepare', { ...checkout, amount: '0.001' }), 400);
+  await check(command('topup/prepare', { ...checkout, account: linkedSolana }), 409);
+  rpcReplies.eth_chainId = '0x5';
+  await check(command('topup/prepare', checkout), 503);
+  rpcReplies.eth_chainId = '0x1';
+  const solCheckout = { ...checkout, account: linkedSolana, chain: 'solana' };
+  const standalone = await command('topup/prepare', solCheckout, linkedSolana);
+  assert.equal(standalone.status, 200);
+  const solQuote = await standalone.json();
+  assert.equal(solQuote.sender, linkedSolana);
+  assert.equal(solQuote.recipient, originalSolanaDeposit);
+  assert.equal(solQuote.network, 'solana:mainnet');
+  assert.equal(solQuote.last_valid_block_height, 123456);
+  assert.equal(Buffer.from(solQuote.transaction, 'base64')[0], 1);
+  // Two consecutive Solana checkouts on the same blockhash must produce distinct wire txs.
+  const standalone2 = await command('topup/prepare', solCheckout, linkedSolana);
+  assert.equal(standalone2.status, 200);
+  assert.notEqual((await standalone2.json()).transaction, solQuote.transaction);
+  // Devnet Solana RPC must be rejected even for native SOL.
+  rpcReplies.getGenesisHash = 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG';
+  await check(command('topup/prepare', { ...solCheckout, token: 'sol' }, linkedSolana), 503);
+  rpcReplies.getGenesisHash = '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';
+  // Standalone Solana account cannot link another Solana wallet.
+  await check(command('link_solana', { solana_address: originalSolanaDeposit, signature: '1'.repeat(64), nonce: 'n' }, linkedSolana), 400);
+  await check(command('topup/prepare', { ...solCheckout, account: wallet }), 400);
+  assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM payments').first()).n, 0);
   await check(site('/images/one.webp', { headers: { cookie: view } }), 200);
   await check(site('/user/admin', { headers: { cookie: view } }), 403);
   await check(site('/user/api/me', { headers: { cookie: view } }), 401);
@@ -278,6 +330,9 @@ test('gallery access, billing and administrator controls use the published polic
   const invalid = new URLSearchParams(fields);
   invalid.set('eth_deposit', 'invalid');
   await check(post('/settings', invalid), 400);
+  const badMint = new URLSearchParams(fields);
+  badMint.set('sol_deposit', 'So11111111111111111111111111111111111111112');
+  await check(post('/settings', badMint), 400);
   await check(post('/settings', fields), 303);
   await check(post('/settings', fields), 409);
   const listing = await site('/');
@@ -385,12 +440,6 @@ test('gallery access, billing and administrator controls use the published polic
   await check(post('/credit', adjustment), 303);
   await check(post('/credit', adjustment), 303);
   assert.equal((await status()).balance, 53);
-  const command = (route, body) =>
-    site('/user/api/' + route, {
-      method: 'POST',
-      headers: { ...walletHeaders, 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
   await check(command('subscribe', { plan: 'basic', expected_price: 100 }), 409);
   await check(command('subscribe', { plan: 'basic', expected_price: 12 }), 200);
   assert.equal((await status()).balance, 41);
@@ -414,21 +463,82 @@ test('gallery access, billing and administrator controls use the published polic
   assert.equal((await status()).balance, granted.balance);
   await check(post('/ban', { address: wallet, banned: '1' }), 303);
   await check(site('/images/suspended.webp', { headers: walletHeaders }), 403);
+  await check(command('topup/prepare', checkout), 403);
+  await check(command('subscribe', { plan: 'basic', expected_price: 1000 }), 403);
   await check(post('/ban', { address: wallet, banned: '0' }), 303);
   const tx = { chain: 'ethereum', token: 'usdc', tx_hash: '0x' + '4'.repeat(64) };
+  const updated = await command('topup/prepare', checkout);
+  assert.equal((await updated.json()).recipient, updatedDeposit);
+  await check(command('topup/prepare', { ...solCheckout, account: wallet }), 409);
+  // Account binding mismatch on /topup returns 401.
+  await check(command('topup', { ...tx, account: linkedSolana }), 401);
+  // Network mismatch on /topup returns 503.
+  rpcReplies.eth_chainId = '0x5';
+  await check(command('topup', tx), 503);
+  rpcReplies.eth_chainId = '0x1';
+  // Displaced receipt blockHash across a reorg returns 425 Too Early.
+  rpcReplies.eth_getBlockByNumber.hash = '0x' + 'b'.repeat(64);
+  await check(command('topup', tx), 425);
+  rpcReplies.eth_getBlockByNumber.hash = receiptBlockHash;
+  // Unconfirmed reverted receipt returns 425 Too Early (not permanent 400).
+  const origStatus = rpcReplies.eth_getTransactionReceipt.status;
+  const origHead = rpcReplies.eth_blockNumber;
+  rpcReplies.eth_getTransactionReceipt.status = '0x0';
+  rpcReplies.eth_blockNumber = '0x11';
+  await check(command('topup', tx), 425);
+  rpcReplies.eth_getTransactionReceipt.status = origStatus;
+  rpcReplies.eth_blockNumber = origHead;
+  const broadcast = rpcReplies.eth_getTransactionByHash;
+  rpcReplies.eth_getTransactionByHash = null;
+  await check(command('topup', tx), 425);
+  rpcReplies.eth_getTransactionByHash = broadcast;
   await check(command('topup', { ...tx, token: 'usdt' }), 400);
   await check(command('topup', tx), 200);
   assert.equal((await status()).balance, granted.balance + 10000);
-  await check(command('topup', tx), 409);
+  const duplicate = await command('topup', tx);
+  assert.equal(duplicate.status, 409);
+  assert.equal((await duplicate.json()).status, 'credited');
+  const otherAccount = await command('topup', tx, linkedSolana);
+  assert.equal(otherAccount.status, 409);
+  assert.equal((await otherAccount.json()).status, undefined);
+  rpcReplies.getGenesisHash = 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG';
+  await check(command('topup', { chain: 'solana', token: 'usdc', tx_hash: '1'.repeat(64) }), 503);
+  rpcReplies.getGenesisHash = '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';
   await check(command('topup', { chain: 'solana', token: 'usdc', tx_hash: '1'.repeat(64) }), 200);
   assert.equal((await status()).balance, granted.balance + 20000);
+  // Grace window: a transfer prepared to originalDeposit that lands right after rotation still credits.
+  const rotatedGrace = { ...tx, tx_hash: '0x' + 'c'.repeat(64) };
   rpcReplies.eth_getBlockByNumber.timestamp = '0x' + Math.floor(Date.now() / 1000).toString(16);
-  rpcReplies.eth_getTransactionReceipt.logs[0].topics[2] = updatedDeposit;
+  await check(command('topup', rotatedGrace), 200);
+  assert.equal((await status()).balance, granted.balance + 30000);
+  // Volatile ETH prepared at $2,000 for minimum 100 points (0.005 ETH at 100 pts/USD)
+  // still credits when ETH dips slightly to $1,999 before finality.
+  const ethNow = Math.floor(Date.now() / 1000);
+  const ethPrep = await command('topup/prepare', { account: wallet, chain: 'ethereum', token: 'eth', amount: '0.005' });
+  assert.equal(ethPrep.status, 200);
+  assert.equal((await ethPrep.json()).estimated_points, 1000);
+  const savedEthTx = rpcReplies.eth_getTransactionByHash;
+  const savedCall = rpcReplies.eth_call;
+  rpcReplies.eth_getTransactionByHash = { from: wallet, to: updatedDeposit, value: '0x' + (5n * 10n ** 15n).toString(16), blockHash: receiptBlockHash };
+  rpcReplies.eth_call = '0x' + [1n, 1999n * 100000000n, BigInt(oldBlockTime), BigInt(ethNow), 1n]
+    .map((n) => n.toString(16).padStart(64, '0')).join('');
+  await check(command('topup', { chain: 'ethereum', token: 'eth', tx_hash: '0x' + 'd'.repeat(64) }), 200);
+  assert.equal((await status()).balance, granted.balance + 30999);
+  rpcReplies.eth_getTransactionByHash = savedEthTx;
+  rpcReplies.eth_call = savedCall;
+  // Linked Solana wallet on ETH account prepares Solana checkout when Solana deposits are re-opened.
+  fields.set('revision', '2');
+  fields.set('sol_deposit', originalSolanaDeposit);
+  await check(post('/settings', fields), 303);
+  const linkedSolPrep = await command('topup/prepare', { account: wallet, chain: 'solana', token: 'usdc', amount: '1' });
+  assert.equal(linkedSolPrep.status, 200);
+  assert.equal((await linkedSolPrep.json()).sender, linkedSolana);
+  rpcReplies.eth_getTransactionReceipt.logs[0].topics[2] = '0x' + '0'.repeat(24) + updatedDeposit.slice(2);
   const interrupted = { ...tx, tx_hash: '0x' + '5'.repeat(64) };
   await db.prepare(`CREATE TRIGGER interrupt_finalization BEFORE UPDATE OF status ON payments
     WHEN NEW.status='credited' BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END`).run();
   await check(command('topup', interrupted), 503);
-  assert.equal((await status()).balance, granted.balance + 20100);
+  assert.equal((await status()).balance, granted.balance + 31099);
   const payment = () => db.prepare('SELECT status, points, amount FROM payments WHERE tx_hash=?')
     .bind(interrupted.tx_hash).first();
   assert.deepEqual(await payment(), { status: 'pending', points: 100, amount: '1000000' });
@@ -438,14 +548,14 @@ test('gallery access, billing and administrator controls use the published polic
   const retried = await Promise.all([command('topup', interrupted), command('topup', interrupted)]);
   assert.ok(retried.some(r => r.status === 200));
   assert.ok(retried.every(r => [200, 409].includes(r.status)));
-  assert.equal((await status()).balance, granted.balance + 20100);
+  assert.equal((await status()).balance, granted.balance + 31099);
   assert.deepEqual(await payment(), { status: 'credited', points: 100, amount: '1000000' });
   rpcReplies.eth_getTransactionReceipt = receipt;
   const legacy = { ...tx, tx_hash: '0x' + '6'.repeat(64) };
   await db.prepare('INSERT INTO payments(tx_hash,address,chain,token,created_at) VALUES(?,?,?,?,1)')
     .bind(legacy.tx_hash, wallet, legacy.chain, legacy.token).run();
   await check(command('topup', legacy), 200);
-  assert.equal((await status()).balance, granted.balance + 20200);
+  assert.equal((await status()).balance, granted.balance + 31199);
   const legacyPaid = { ...tx, tx_hash: '0x' + '8'.repeat(64) };
   await db.prepare('INSERT INTO payments(tx_hash,address,chain,token,created_at) VALUES(?,?,?,?,1)')
     .bind(legacyPaid.tx_hash, wallet, legacyPaid.chain, legacyPaid.token).run();
@@ -455,16 +565,271 @@ test('gallery access, billing and administrator controls use the published polic
   const reconcile = await command('topup', legacyPaid);
   assert.equal(reconcile.status, 409);
   assert.match((await reconcile.json()).error, /reconcile the original receipt/);
-  assert.equal((await status()).balance, granted.balance + 20273);
+  assert.equal((await status()).balance, granted.balance + 31272);
   const abandoned = { ...tx, tx_hash: '0x' + '9'.repeat(64) };
   await db.prepare('INSERT INTO payments(tx_hash,address,chain,token,created_at) VALUES(?,?,?,?,1)')
     .bind(abandoned.tx_hash, subscriberAddress, abandoned.chain, abandoned.token).run();
   await check(command('topup', abandoned), 200);
-  assert.equal((await status()).balance, granted.balance + 20373);
+  assert.equal((await status()).balance, granted.balance + 31372);
+  // Payment history handles credits above Number.MAX_SAFE_INTEGER cleanly.
+  await db.prepare("INSERT INTO payments(tx_hash,address,chain,token,amount,points,status,created_at) VALUES(?,?,?,?,?,?,?,?)")
+    .bind('0x' + 'f'.repeat(64), wallet, 'ethereum', 'usdc', '900719925474099300', '9007199254740993', 'credited', ethNow + 10).run();
+  const history = await site('/user/api/payments', { headers: walletHeaders });
+  assert.equal(history.status, 200);
+  const historyRows = await history.json();
+  assert.equal(historyRows[0].points, '9007199254740993');
   const page = await site('/user/account', { headers: walletHeaders });
   const accountHtml = await page.text();
   assert.match(accountHtml, /id="topup"/);
   assert.match(accountHtml, new RegExp(updatedDeposit));
   const selected = await admin('?address=' + wallet);
   assert.match(await selected.text(), /Apply subscription/);
+});
+
+test('checkout script handles wallet send, multi-wallet Solana, reload recovery, and dismissal', async () => {
+  const topupSource = fs.readFileSync(path.join(root, 'user_worker/src/pages/topup.js'), 'utf8');
+  function makeEl(tag, id = '') {
+    const el = {
+      tagName: tag.toUpperCase(),
+      id,
+      className: '',
+      dataset: {},
+      hidden: false,
+      disabled: false,
+      value: '',
+      placeholder: '',
+      textContent: '',
+      children: [],
+      options: [],
+      selectedIndex: 0,
+      listeners: {},
+      get selectedOptions() { return [this.options[this.selectedIndex] || this.options[0] || { textContent: '' }]; },
+      addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); },
+      async dispatch(type, ev = {}) {
+        ev.preventDefault ||= () => {};
+        for (const fn of this.listeners[type] || []) await fn(ev);
+      },
+      append(...nodes) { for (const n of nodes) this.appendChild(n); },
+      prepend(...nodes) {
+        for (const n of nodes.reverse()) {
+          if (typeof n === 'object') n.parent = this;
+          this.children.unshift(n);
+        }
+      },
+      appendChild(n) {
+        if (typeof n === 'object') n.parent = this;
+        this.children.push(n);
+        if (this.tagName === 'SELECT' && n.tagName === 'OPTION') {
+          this.options.push(n);
+          if (this.options.length === 1) this.value = n.value;
+        }
+      },
+      replaceChildren(...nodes) { this.children = nodes; this.textContent = nodes.map(n => typeof n === 'string' ? n : n.textContent).join(''); },
+      remove() {
+        if (this.parent) this.parent.children = this.parent.children.filter(c => c !== this);
+      },
+    };
+    Object.defineProperty(el, 'value', {
+      get() { return el._value ?? ''; },
+      set(v) {
+        el._value = String(v);
+        if (el.tagName === 'SELECT') {
+          const idx = el.options.findIndex(o => o.value === el._value);
+          if (idx >= 0) el.selectedIndex = idx;
+        }
+      },
+    });
+    return el;
+  }
+
+  function runTopupEnv({ accountAddr, ethDeposit = originalDeposit, solDeposit = originalSolanaDeposit, storage = {}, ethereum = null, fetchImpl, currentMe = null }) {
+    const ids = new Map();
+    const reg = (el) => { if (el.id) ids.set(el.id, el); return el; };
+    const topupEl = reg(makeEl('section', 'topup'));
+    topupEl.dataset = { account: accountAddr, ethereum: ethDeposit, solana: solDeposit };
+    const chainSel = reg(makeEl('select', 'topup-chain'));
+    for (const [v, label] of [['ethereum', 'Ethereum'], ['solana', 'Solana']]) {
+      const o = makeEl('option'); o.value = v; o.textContent = label; chainSel.appendChild(o);
+    }
+    const tokenSel = reg(makeEl('select', 'topup-token'));
+    for (const [c, v, dec] of [['ethereum', 'eth', 18], ['ethereum', 'usdc', 6], ['solana', 'sol', 9], ['solana', 'usdc', 6]]) {
+      const o = makeEl('option'); o.value = v; o.textContent = v.toUpperCase(); o.dataset = { chain: c, decimals: String(dec) }; tokenSel.appendChild(o);
+    }
+    for (const [tag, id] of [
+      ['div', 'sol-wallet-wrap'], ['select', 'sol-wallet'], ['input', 'topup-amount'],
+      ['input', 'tx-hash'], ['button', 'topup-btn'], ['button', 'sol-link-btn'],
+      ['div', 'claim-msg'], ['p', 'topup-help'], ['label', 'amount-label'],
+      ['span', 'sol-token-rent'], ['p', 'manual-sender'], ['div', 'sol-link'],
+      ['p', 'deposit-address'], ['label', 'tx-label'], ['div', 'topup-msg'],
+      ['p', 'sol-linked-state'], ['div', 'sol-link-msg'], ['form', 'topup-form'],
+      ['div', 'topup-receipts'], ['form', 'claim-form'],
+    ]) reg(makeEl(tag, id));
+
+    const winListeners = {};
+    let registerApi;
+    const localStorageObj = new Proxy(storage, {
+      get(target, prop) {
+        if (prop === 'getItem') return (k) => (Object.hasOwn(target, k) ? target[k] : null);
+        if (prop === 'setItem') return (k, v) => { target[k] = String(v); };
+        if (prop === 'removeItem') return (k) => { delete target[k]; };
+        return target[prop];
+      },
+      ownKeys(target) { return Object.keys(target); },
+      getOwnPropertyDescriptor(target, prop) { return Object.getOwnPropertyDescriptor(target, prop); },
+    });
+    let loadMeCount = 0;
+    let loadPaymentsCount = 0;
+    const ctx = {
+      document: {
+        getElementById: (id) => ids.get(id) || null,
+        createElement: (tag) => makeEl(tag),
+      },
+      window: {
+        ethereum,
+        addEventListener(type, fn) { (winListeners[type] ||= []).push(fn); },
+        dispatchEvent(ev) {
+          if (ev.type === 'wallet-standard:app-ready') registerApi = ev.detail;
+          for (const fn of winListeners[ev.type] || []) fn(ev);
+        },
+      },
+      CustomEvent: class CustomEvent { constructor(type, init) { this.type = type; this.detail = init?.detail; } },
+      localStorage: localStorageObj,
+      fetch: fetchImpl,
+      TextEncoder,
+      Uint8Array,
+      BigInt,
+      atob: (s) => Buffer.from(s, 'base64').toString('binary'),
+      btoa: (s) => Buffer.from(s, 'binary').toString('base64'),
+      setTimeout: (fn) => { fn(); return 1; },
+      currentMe,
+      setText(id, text) { ids.get(id).textContent = text; },
+      setMsg(id, text, cls) { const e = ids.get(id); e.hidden = false; e.className = 'msg' + (cls ? ' ' + cls : ''); e.textContent = text; },
+      loadMe() { loadMeCount++; },
+      loadPayments() { loadPaymentsCount++; },
+    };
+    require('node:vm').runInNewContext(topupSource, ctx);
+    return { ctx, ids, storage, registerWallet: (w) => registerApi.register(w), counts: () => ({ loadMeCount, loadPaymentsCount }) };
+  }
+
+  // 1) Ethereum checkout where signed-in account is second in eth_requestAccounts
+  const txHash = '0x' + 'e'.repeat(64);
+  let broadcasts = 0;
+  let topupCalls = 0;
+  const ethEnv = runTopupEnv({
+    accountAddr: wallet,
+    ethereum: {
+      async request({ method }) {
+        if (method === 'eth_chainId') return '0x1';
+        if (method === 'eth_requestAccounts') return ['0x' + '9'.repeat(40), wallet.toUpperCase()];
+        if (method === 'eth_sendTransaction') { broadcasts++; return txHash; }
+        throw new Error('unexpected ' + method);
+      },
+    },
+    fetchImpl: async (url, init) => {
+      if (url === '/user/api/link_solana') return Response.json({ solana_address: linkedSolana });
+      if (url === '/user/api/topup/prepare') {
+        return Response.json({
+          sender: wallet, recipient: originalDeposit, network: '0x1',
+          transaction: { from: wallet, to: originalDeposit, chainId: '0x1', value: '0x1' },
+          estimated_points: 10000,
+        });
+      }
+      if (url === '/user/api/topup') {
+        topupCalls++;
+        const body = JSON.parse(init.body);
+        assert.equal(body.account, wallet);
+        return Response.json({ credited_points: 10000, balance: 10000 });
+      }
+      throw new Error('unexpected url ' + url);
+    },
+  });
+  ethEnv.ids.get('topup-amount').value = '1';
+  await ethEnv.ids.get('topup-form').dispatch('submit');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(broadcasts, 1);
+  assert.equal(topupCalls, 1);
+  assert.equal(Object.keys(ethEnv.storage).length, 0);
+  assert.equal(ethEnv.counts().loadMeCount, 1);
+  assert.equal(ethEnv.counts().loadPaymentsCount, 1);
+
+  // 2) Reload pending receipt: 401 keeps receipt & prompts sign-in; 403 keeps receipt & Dismiss removes it
+  const pendingKey = `lets-embed:topup:${wallet}:ethereum/usdc/${txHash}`;
+  const persisted = { [pendingKey]: JSON.stringify({ ts: Date.now() }) };
+  let replyCode = 401;
+  const reloadEnv = runTopupEnv({
+    accountAddr: wallet,
+    storage: persisted,
+    fetchImpl: async (url) => {
+      if (url === '/user/api/link_solana') return Response.json({ solana_address: null });
+      if (url === '/user/api/topup') {
+        return new Response(JSON.stringify({ error: replyCode === 401 ? 'Sign back in' : 'Wrong sender' }), { status: replyCode });
+      }
+      throw new Error('unexpected ' + url);
+    },
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.ok(Object.hasOwn(persisted, pendingKey), '401 must retain pending receipt');
+  const receiptRow = reloadEnv.ids.get('topup-receipts').children[0];
+  const [retryBtn, dismissBtn] = receiptRow.children[2].children;
+  assert.equal(retryBtn.hidden, false);
+  assert.equal(dismissBtn.hidden, false);
+  replyCode = 403;
+  await retryBtn.dispatch('click');
+  await new Promise((r) => setImmediate(r));
+  assert.ok(Object.hasOwn(persisted, pendingKey), '403 must retain pending receipt for wallet restore');
+  await dismissBtn.dispatch('click');
+  assert.equal(Object.hasOwn(persisted, pendingKey), false, 'Dismiss removes pending receipt');
+
+  // 3) Multi-wallet Solana selection + standalone Solana hides #sol-link + banned disables payBtn
+  let solBroadcasts = 0;
+  const solSigBytes = new Uint8Array(64).fill(7);
+  const solEnv = runTopupEnv({
+    accountAddr: linkedSolana,
+    fetchImpl: async (url) => {
+      if (url === '/user/api/topup/prepare') {
+        return Response.json({
+          sender: linkedSolana, recipient: originalSolanaDeposit, network: 'solana:mainnet',
+          transaction: Buffer.from([1, 2, 3]).toString('base64'), estimated_points: 10000,
+        });
+      }
+      if (url === '/user/api/topup') return Response.json({ credited_points: 10000, balance: 10000 });
+      throw new Error('unexpected ' + url);
+    },
+  });
+  assert.equal(solEnv.ids.get('sol-link').hidden, true, 'standalone Solana hides #sol-link');
+  const walletA = {
+    name: 'Wallet A',
+    accounts: [],
+    features: {
+      'standard:connect': { connect: async () => ({ accounts: [{ address: originalSolanaDeposit }] }) },
+      'solana:signAndSendTransaction': { signAndSendTransaction: async () => { throw new Error('wrong wallet'); } },
+    },
+  };
+  const walletB = {
+    name: 'Wallet B',
+    accounts: [],
+    features: {
+      'standard:connect': { connect: async () => ({ accounts: [{ address: linkedSolana }] }) },
+      // Deliberately omit account.features, account.chains, and supportedTransactionVersions.
+      'solana:signAndSendTransaction': { signAndSendTransaction: async () => { solBroadcasts++; return [{ signature: solSigBytes }]; } },
+    },
+  };
+  solEnv.registerWallet(walletA);
+  solEnv.registerWallet(walletB);
+  assert.equal(solEnv.ids.get('sol-wallet-wrap').hidden, false);
+  solEnv.ids.get('sol-wallet').value = '1';
+  await solEnv.ids.get('sol-wallet').dispatch('change');
+  solEnv.ids.get('topup-amount').value = '1';
+  await solEnv.ids.get('topup-form').dispatch('submit');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(solBroadcasts, 1);
+
+  const bannedEnv = runTopupEnv({
+    accountAddr: wallet,
+    currentMe: { banned: true },
+    ethereum: { request: async () => '0x1' },
+    fetchImpl: async () => Response.json({ solana_address: null }),
+  });
+  assert.equal(bannedEnv.ids.get('topup-btn').disabled, true);
+  assert.match(bannedEnv.ids.get('topup-help').textContent, /suspended/i);
 });

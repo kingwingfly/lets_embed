@@ -9,9 +9,7 @@ Worker. Replaces the old apply/approve flow in `gateway_worker`.
   (per-window view/search allowances, bought/renewed **from** the balance, **no
   auto-renew** — they lapse to PAYG at period end). Overage falls back to PAYG.
   New users get a free grant.
-- **Top-up**: crypto only, **multi-chain**. Ethereum (native ETH + ERC-20
-  USDT/USDC) and Solana (native SOL + SPL USDT/USDC). Submit the tx
-  hash/signature; the worker verifies it on-chain and credits points.
+- **Top-ups** support ETH, SOL, USDT and USDC. The account page opens the transfer in the customer's wallet and automatically checks the receipt for points.
 - **Likes**: post/image/video favorites stored in D1, surfaced as like buttons
   on the Leptos details page and a `/user/favorites` page.
 - **Storage**: balance/plan/window/dedupe live only in the Durable Object; D1
@@ -24,17 +22,20 @@ Worker. Replaces the old apply/approve flow in `gateway_worker`.
 | --- | --- | --- |
 | `/user/login` | GET | wallet login page (`?next=` redirect target) |
 | `/user/upgrade` | GET | sign in after reaching a free limit, then open the account top-up form. Signed-in visitors go directly to top-up. |
-| `/user/account` | GET | balance, plan, top-up (submit tx hash), payment history |
+| `/user/account` | GET | balance, plan, wallet payments, transfer recovery and payment history |
 | `/user/favorites` | GET | liked posts/images/videos |
-| `/user/api/nonce` | GET | issue a SIWE / link nonce (KV, 300s, single-use) |
+| `/user/api/nonce` | GET | issue a SIWE / SIWS / link nonce (KV, 300s, single-use) |
 | `/user/api/verify` | POST | verify SIWE message + signature, set `ue_session` |
+| `/user/api/verify_solana` | POST | verify SIWS message + ed25519 signature, set `ue_session` |
 | `/user/api/logout` | POST | clear the session cookie |
 | `/user/api/me` | GET | current address + balance / plan / window status |
-| `/user/api/topup` | POST | submit a `{chain, token, tx_hash}` top-up for verification + credit |
+| `/user/api/topup/prepare` | POST | prepare an unsigned mainnet wallet transfer and point estimate for `{account, chain, token, amount}`. Supply the amount as a decimal string in asset units. |
+| `/user/api/topup` | POST | submit a `{chain, token, tx_hash, account?}` top-up for verification + credit |
 | `/user/api/payments` | GET | payment history |
 | `/user/api/subscribe` | POST | buy/renew a plan from the balance (no auto-renew) |
+| `/user/api/unsubscribe` | POST | cancel the active plan and refund prorated unused paid time |
 | `/user/api/rates` | GET | spot USD prices for ETH/SOL (Chainlink feeds) |
-| `/user/api/link_solana` | POST | link a Solana wallet by signing a challenge |
+| `/user/api/link_solana` | GET/POST/DELETE | read, link (by signing a challenge), or unlink a Solana wallet for an Ethereum session |
 | `/user/api/like` | GET/POST/DELETE | check / add / remove a like |
 | `/user/api/likes` | GET | list likes (keyset paginated) |
 | `/user/admin` | GET | admin page (Cloudflare Access protected) |
@@ -60,7 +61,7 @@ The tables below show the initial billing values from `src/config.rs`. Existing 
 
 - Image view: **1 pt**; video view: **5 pts**.
 - Similarity search comes in two tiers by cost-to-serve:
-  - **upload-image search: 100 pts** — runs dinov3 ONNX inference (expensive).
+  - **upload-image / text description search: 100 pts** — runs neural inference (expensive).
     For subscribers it draws from the per-window search allowance.
   - **by-id search: 10 pts** — reuses a stored embedding (a pgvector query, no
     inference — cheap), so it is a view-class charge: for subscribers it draws
@@ -86,16 +87,15 @@ plan-only, or plan+PAYG.
 
 ## Payment rails
 
-Top-ups are crypto only. Submit `{chain, token, tx_hash}` on `/user/account`;
-each transaction credits exactly once (`payments` is keyed on the tx hash).
+On `/user/account`, choose the chain and asset, enter an amount, and select **Pay with wallet**. The Worker checks the current receiving address, network and minimum top-up. The customer approves the transfer in their Ethereum provider or Solana Wallet Standard wallet. The page submits the returned receipt to the on-chain verifier and refreshes the balance once credited.
 
-- **Ethereum** — native **ETH** plus ERC-20 **USDT** / **USDC**. Token
+Pending receipts are saved under the signed-in account in browser storage. Reopening the account page in that browser resumes verification. **Check again** retries a delayed receipt, and **Dismiss** clears a canceled or replaced one. **Pay manually or recover a transfer** accepts a hash or signature for a payment sent directly from the account's own wallet (as the transaction sender / fee payer) outside checkout, from another browser, or with an older wallet. Each transaction credits once through the payment ledger and the account's idempotent credit key.
+
+- **Ethereum** — mainnet native **ETH** plus ERC-20 **USDT** / **USDC**. Token
   transfers are verified from the `Transfer` event in the receipt logs.
-  Requires **≥ 6 confirmations** (`MIN_CONFIRMATIONS`); deposits must go to
-  the active Ethereum receiving address.
-- **Solana** — native **SOL** plus SPL **USDT** / **USDC**. Verified at the
-  **`finalized`** commitment; deposits must go to the active Solana receiving address and
-  originate from the user's linked Solana address (see below).
+  Requires **≥ 6 confirmations** (`MIN_CONFIRMATIONS`) on the canonical block;
+  deposits must go to the active Ethereum receiving address.
+- **Solana** — mainnet native **SOL** plus SPL **USDT** / **USDC**. The wallet pays from its associated token account for SPL assets. The transfer creates the recipient's associated token account if needed and attaches a unique checkout memo. Verification requires **`finalized`** commitment and matches the fee payer/sender and active receiving address.
 - **USD pricing**: stablecoins (USDT/USDC) are treated as **$1**. Volatile
   assets (ETH, SOL) are priced in USD from **Chainlink on-chain price feeds**
   (an `eth_call` to `latestRoundData` over `RPC_URL`). Credited points =
@@ -103,12 +103,10 @@ each transaction credits exactly once (`payments` is keyed on the tx hash).
 
 ### Solana wallet linking
 
-A Solana transaction carries no on-chain link to the SIWE (Ethereum) session,
-so a user links a Solana wallet **once**: they sign a challenge with the wallet
+A customer who signed in with Solana can pay directly from that wallet. To pay from Solana while signed in with Ethereum, the customer links a Solana wallet once. They sign a challenge with the wallet
 (`ed25519` `signMessage`, e.g. Phantom) and POST it to
 `/user/api/link_solana`. The verified address is stored on
-`users.solana_address` (UNIQUE). SOL/SPL top-ups are only accepted when the
-transaction's sender matches this linked address.
+`users.solana_address` (UNIQUE). Verification matches the sender to the linked wallet when present, or to the customer's Solana sign-in address.
 
 ## Setup & deployment
 

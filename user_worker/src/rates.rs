@@ -15,28 +15,80 @@ use crate::config::POINTS_PER_USD;
 use crate::session;
 use crate::types::{ApiError, RatesResp};
 
+/// Compute `floor(a * b / d)` without overflowing `u128`, returning `None` if
+/// the quotient does not fit in `u128`.
+fn mul_div_u128(a: u128, b: u128, d: u128) -> Option<u128> {
+    debug_assert!(d > 0);
+    if let Some(prod) = a.checked_mul(b) {
+        return Some(prod / d);
+    }
+    // 128 x 128 -> 256-bit product (hi, lo)
+    let a_lo = a as u64 as u128;
+    let a_hi = a >> 64;
+    let b_lo = b as u64 as u128;
+    let b_hi = b >> 64;
+
+    let ll = a_lo * b_lo;
+    let lh = a_lo * b_hi;
+    let hl = a_hi * b_lo;
+    let hh = a_hi * b_hi;
+
+    let mid1 = (ll >> 64) + (lh as u64 as u128) + (hl as u64 as u128);
+    let lo = (ll as u64 as u128) | ((mid1 as u64 as u128) << 64);
+    let hi = hh + (lh >> 64) + (hl >> 64) + (mid1 >> 64);
+
+    if hi >= d {
+        return None;
+    }
+    // Binary long division of 256-bit (hi, lo) by 128-bit d.
+    let mut rem = hi;
+    let mut quot = 0u128;
+    for bit in (0..128).rev() {
+        let carry = rem >> 127;
+        rem = (rem << 1) | ((lo >> bit) & 1);
+        if carry != 0 || rem >= d {
+            rem = rem.wrapping_sub(d);
+            quot |= 1u128 << bit;
+        }
+    }
+    Some(quot)
+}
+
 /// Convert a raw on-chain amount (`amount_raw`, in the token's base units with
 /// `decimals` decimals) into points. `price_8dec` is the token's USD price with
-/// 8 decimals, or `None` for a $1 stablecoin. Saturating and ordered so the
-/// intermediate product cannot overflow `u128` for realistic values.
+/// 8 decimals, or `None` for a $1 stablecoin. Uses exact 256-bit intermediate
+/// arithmetic so rounding happens only once at the final point boundary,
+/// saturating at `i64::MAX`.
 pub fn points_at_rate(
     amount_raw: u128,
     decimals: u32,
     price_8dec: Option<u128>,
     points_per_usd: i64,
 ) -> i64 {
-    // usd_1e8 = amount_raw * price_8dec / 10^decimals   (stable: price = 1e8)
+    if points_per_usd <= 0 || amount_raw == 0 {
+        return 0;
+    }
+    // points = floor(amount_raw * price_8dec * points_per_usd / (10^decimals * 1e8))
     let price = price_8dec.unwrap_or(100_000_000); // 1.0 with 8 decimals
-    let Some(scaled) = amount_raw.checked_mul(price) else {
-        return i64::MAX;
+    let Some(denom) = 10u128
+        .checked_pow(decimals)
+        .and_then(|p| p.checked_mul(100_000_000))
+    else {
+        return 0;
     };
-    let usd_1e8 = scaled / 10u128.pow(decimals);
-    // points = usd_1e8 * POINTS_PER_USD / 1e8
-    let Some(num) = usd_1e8.checked_mul(points_per_usd as u128) else {
-        return i64::MAX;
+    let Some(rate) = price.checked_mul(points_per_usd as u128) else {
+        // price * points_per_usd overflowed u128; divide price first as fallback
+        let Some(usd) = mul_div_u128(amount_raw, price, denom) else {
+            return i64::MAX;
+        };
+        return usd
+            .checked_mul(points_per_usd as u128)
+            .and_then(|p| i64::try_from(p).ok())
+            .unwrap_or(i64::MAX);
     };
-    let points = num / 100_000_000;
-    i64::try_from(points).unwrap_or(i64::MAX)
+    mul_div_u128(amount_raw, rate, denom)
+        .and_then(|points| i64::try_from(points).ok())
+        .unwrap_or(i64::MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +243,17 @@ mod tests {
     fn absurd_amount_saturates_not_wraps() {
         assert_eq!(points_for(u128::MAX, 0, Some(u128::MAX)), i64::MAX);
         assert!(points_for(u128::MAX / 2, 18, Some(100_000_000)) >= 0);
+        assert_eq!(points_at_rate(1_000_000, 6, None, 0), 0);
+        assert_eq!(points_at_rate(1_000_000, 6, None, -5), 0);
+    }
+
+    #[test]
+    fn single_final_floor_for_high_points_per_usd() {
+        // 1,000,000 wei at $3,000/ETH and 1,000,000,000 points/USD = exactly 3 points.
+        let price = 3000u128 * 100_000_000;
+        assert_eq!(points_at_rate(1_000_000, 18, Some(price), 1_000_000_000), 3);
+        // 999,999 wei floors to 2 points.
+        assert_eq!(points_at_rate(999_999, 18, Some(price), 1_000_000_000), 2);
     }
 
     // --- decode_latest_round_data --------------------------------------------

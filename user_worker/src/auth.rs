@@ -250,7 +250,12 @@ pub async fn verify_solana(
 
     // 3) Verify the ed25519 signature over the SIWS challenge.
     let msg = siws_challenge(st.siwe_domain.as_str(), &req.nonce);
-    if !solana_link::verify_ed25519_b58(&req.solana_address, &req.signature, &msg) {
+    if !solana_link::verify_ed25519_challenge(
+        &req.solana_address,
+        &req.signature,
+        &msg,
+        req.signed_message.as_deref(),
+    ) {
         return api_error(StatusCode::UNAUTHORIZED, "signature verification failed");
     }
 

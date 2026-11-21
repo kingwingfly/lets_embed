@@ -112,8 +112,15 @@ pub async fn upgrade_page(State(st): State<AppState>, cookies: Cookies) -> Respo
         return Redirect::to("/user/account#topup").into_response();
     }
     let terms = match crate::settings::load(&st.env).await {
-        Ok(p) if p.eth_deposit.is_empty() && p.sol_deposit.is_empty() =>
-            "<p class=\"hint\">New deposits are currently closed. You can still use existing points.</p>".to_owned(),
+        Ok(p)
+            if !crate::settings::valid_deposit_address(config::Chain::Ethereum, &p.eth_deposit)
+                && !crate::settings::valid_deposit_address(
+                    config::Chain::Solana,
+                    &p.sol_deposit,
+                ) =>
+        {
+            "<p class=\"hint\">New deposits are currently closed. You can still use existing points.</p>".to_owned()
+        }
         Ok(p) => format!(
             r#"<dl class="wallet-terms"><div><dt>Points per USD</dt><dd>{}</dd></div><div><dt>Minimum top-up</dt><dd>{}</dd></div></dl>"#,
             p.points_per_usd, points(p.minimum_topup)
@@ -201,15 +208,13 @@ fn pricing_table(policy: &crate::settings::Policy) -> String {
     )
 }
 
-/// `__DEPOSIT_ADDRESS__` (HTML-escaped), `__SOL_DEPOSIT_ADDRESS__`, `__PRICING__`
-/// and `__PLANS_TABLE__` are substituted server-side.
 const ACCOUNT_BODY: &str = include_str!("pages/account.html");
 
 #[worker::send]
 pub async fn account_page(State(st): State<AppState>, cookies: Cookies) -> Response {
-    if session_address(&cookies, &st.jwt_secret).is_none() {
+    let Some(account) = session_address(&cookies, &st.jwt_secret) else {
         return redirect_to_login("/user/account");
-    }
+    };
     let policy = match crate::settings::load(&st.env).await {
         Ok(p) => p,
         Err(_) => {
@@ -220,11 +225,40 @@ pub async fn account_page(State(st): State<AppState>, cookies: Cookies) -> Respo
                 .into_response();
         }
     };
+    let options: String = config::TOKENS
+        .iter()
+        .map(|spec| {
+            format!(
+                r#"<option data-chain="{}" data-decimals="{}" value="{}">{}</option>"#,
+                spec.chain.as_str(),
+                spec.decimals,
+                spec.symbol,
+                spec.symbol.to_ascii_uppercase()
+            )
+        })
+        .collect();
+    let eth_deposit =
+        if crate::settings::valid_deposit_address(config::Chain::Ethereum, &policy.eth_deposit) {
+            policy.eth_deposit.as_str()
+        } else {
+            ""
+        };
+    let sol_deposit =
+        if crate::settings::valid_deposit_address(config::Chain::Solana, &policy.sol_deposit) {
+            policy.sol_deposit.as_str()
+        } else {
+            ""
+        };
     let body = ACCOUNT_BODY
-        .replace("__DEPOSIT_ADDRESS__", &html_escape(&policy.eth_deposit))
-        .replace("__SOL_DEPOSIT_ADDRESS__", &html_escape(&policy.sol_deposit))
+        .replace("__ACCOUNT__", &html_escape(&account))
+        .replace("__ASSET_OPTIONS__", &options)
+        .replace("__POINTS_PER_USD__", &policy.points_per_usd.to_string())
+        .replace("__MINIMUM__", &points(policy.minimum_topup))
+        .replace("__DEPOSIT_ADDRESS__", &html_escape(eth_deposit))
+        .replace("__SOL_DEPOSIT_ADDRESS__", &html_escape(sol_deposit))
         .replace("__PRICING__", &pricing_table(&policy))
-        .replace("__PLANS_TABLE__", &plans_table(&policy));
+        .replace("__PLANS_TABLE__", &plans_table(&policy))
+        .replace("__TOPUP_SCRIPT__", include_str!("pages/topup.js"));
     Html(Page::Account.render(&body)).into_response()
 }
 

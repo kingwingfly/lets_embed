@@ -20,6 +20,9 @@ use crate::solana::{self, SolOutcome};
 use crate::types::{ApiError, CreditReq, PaymentRow, SubscribeReq, TopupReq, TopupResp};
 use crate::{do_client, session};
 
+mod checkout;
+pub use checkout::prepare;
+
 // ---------------------------------------------------------------------------
 // JSON-RPC over worker::Fetch (no alloy/ethers)
 // ---------------------------------------------------------------------------
@@ -82,6 +85,8 @@ struct RpcTx {
     /// None for contract-creation transactions.
     to: Option<String>,
     value: String,
+    #[serde(rename = "blockHash", default)]
+    block_hash: Option<String>,
 }
 
 /// `eth_getTransactionReceipt` result (fields we care about).
@@ -91,6 +96,8 @@ struct RpcReceipt {
     status: Option<String>,
     #[serde(rename = "blockNumber")]
     block_number: Option<String>,
+    #[serde(rename = "blockHash", default)]
+    block_hash: Option<String>,
     /// Event logs emitted by the tx (used to verify ERC-20 `Transfer`s). The
     /// native-ETH path ignores these, so default to empty when absent.
     #[serde(default)]
@@ -215,6 +222,15 @@ impl Deposit<'_> {
         if row.status == "rejected" {
             return Ok(None);
         }
+        let same_payment = row.address == self.address
+            && row.token == self.token.symbol
+            && row.chain == self.token.chain.as_str();
+        if row.status == "credited" && same_payment {
+            return Ok(Some((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"status": "credited", "error": "Payment already credited"})),
+            ).into_response()));
+        }
         if row.status == "pending" {
             if row.points == "0" {
                 // Older Workers saved only a boolean in the account. A new quote
@@ -228,10 +244,7 @@ impl Deposit<'_> {
                         "This payment was already credited. If it still shows as pending, contact support to reconcile the original receipt.",
                     )));
                 }
-            } else if row.address == self.address
-                && row.token == self.token.symbol
-                && row.chain == self.token.chain.as_str()
-            {
+            } else if same_payment {
                 let points = row
                     .points
                     .parse::<i64>()
@@ -245,9 +258,14 @@ impl Deposit<'_> {
     }
 
     async fn reject(&self, env: &Env, msg: &str) -> Response {
+        self.reject_with_amount(env, None, msg).await
+    }
+
+    async fn reject_with_amount(&self, env: &Env, amount: Option<u128>, msg: &str) -> Response {
+        let raw_amount = amount.map_or_else(|| "0".to_string(), |a| a.to_string());
         if let Err(e) = d1_exec(env,
-            "INSERT INTO payments(tx_hash,address,chain,token,created_at,status) VALUES(?,?,?,?,unixepoch(),'rejected') ON CONFLICT(tx_hash) DO NOTHING",
-            &[self.hash.into(), self.address.into(), self.token.chain.as_str().into(), self.token.symbol.into()],
+            "INSERT INTO payments(tx_hash,address,chain,token,amount,created_at,status) VALUES(?,?,?,?,?,unixepoch(),'rejected') ON CONFLICT(tx_hash) DO NOTHING",
+            &[self.hash.into(), self.address.into(), self.token.chain.as_str().into(), self.token.symbol.into(), raw_amount.into()],
         ).await {
             worker::console_error!("recording rejected payment failed: {e:?}");
         }
@@ -362,6 +380,16 @@ pub async fn topup(
     let Some(addr) = session::session_address(&cookies, &st.jwt_secret) else {
         return api_err(StatusCode::UNAUTHORIZED, "login required");
     };
+    if req
+        .account
+        .as_ref()
+        .is_some_and(|expected| *expected != addr)
+    {
+        return api_err(
+            StatusCode::UNAUTHORIZED,
+            "Sign back in to the account that started this payment.",
+        );
+    }
 
     // Resolve the requested asset from the registry.
     let Some(chain) = Chain::parse(&req.chain) else {
@@ -404,6 +432,53 @@ pub async fn topup(
     }
 }
 
+const SOLANA_MAINNET_GENESIS: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+
+/// Verify that Ethereum payments target mainnet and that `RPC_URL` serves it.
+pub(super) async fn verify_ethereum_network(st: &AppState) -> Result<String, Response> {
+    if st.chain_id != 1 {
+        return Err(api_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Ethereum payments require mainnet.",
+        ));
+    }
+    let network = rpc(&st.rpc_url, "eth_chainId", serde_json::json!([]))
+        .await
+        .map_err(|e| rpc_unavailable("eth_chainId", e))?;
+    if network.as_str().and_then(hex_to_u64) != Some(st.chain_id) {
+        return Err(api_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The payment network does not match the configured Ethereum network.",
+        ));
+    }
+    Ok(format!("0x{:x}", st.chain_id))
+}
+
+/// Verify that `SOL_RPC_URL` serves Solana mainnet before preparing or crediting.
+pub(super) async fn verify_solana_network(st: &AppState) -> Result<&'static str, Response> {
+    let genesis = rpc(&st.sol_rpc_url, "getGenesisHash", serde_json::json!([]))
+        .await
+        .map_err(|e| rpc_unavailable("getGenesisHash", e))?;
+    if genesis.as_str() != Some(SOLANA_MAINNET_GENESIS) {
+        return Err(api_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Solana payments require mainnet.",
+        ));
+    }
+    Ok("solana:mainnet")
+}
+
+/// Allow a small 5% spot-price tolerance at settlement for volatile feed-priced
+/// assets (ETH/SOL) so a payment approved at the minimum during checkout is not
+/// rejected if the price ticks down while waiting for finality.
+fn settlement_minimum_points(minimum_topup: i64, spec: &config::TokenSpec) -> i64 {
+    if spec.feed.is_some() {
+        (((minimum_topup as i128) * 95) / 100).max(1) as i64
+    } else {
+        minimum_topup
+    }
+}
+
 /// The token's USD price with 8 decimals, or `None` for a $1 stablecoin.
 /// Chainlink feeds live on Ethereum mainnet, so this always uses `rpc_url`
 /// (even to price SOL). On RPC failure returns a ready retry-later response.
@@ -417,90 +492,125 @@ async fn resolve_price(st: &AppState, spec: &config::TokenSpec) -> Result<Option
     }
 }
 
-/// The user's linked Solana wallet (base58), if any.
-async fn linked_solana(env: &Env, addr: &str) -> worker::Result<Option<String>> {
-    #[derive(Deserialize)]
-    struct Row {
-        solana_address: Option<String>,
+async fn solana_sender(st: &AppState, addr: &str) -> Result<String, Response> {
+    if session::is_sol_principal(addr) {
+        return Ok(addr.to_string());
     }
-    let row = env
-        .d1(crate::D1_BINDING)?
-        .prepare("SELECT solana_address FROM users WHERE address = ?")
-        .bind(&[addr.into()])?
-        .first::<Row>(None)
-        .await?;
-    Ok(row.and_then(|r| r.solana_address))
+    crate::solana_link::linked_address(&st.env, addr)
+        .await
+        .map_err(payment_db_error)?
+        .ok_or_else(|| {
+            api_err(
+                StatusCode::BAD_REQUEST,
+                "Link a Solana wallet before topping up with SOL or SPL tokens.",
+            )
+        })
 }
 
 /// Solana top-up (native SOL + SPL USDT/USDC). Verification lives in
 /// `crate::solana`. This handler owns the payment row and account credit.
 async fn topup_solana(st: &AppState, deposit: &Deposit<'_>) -> Response {
     let (addr, sig, spec) = (deposit.address, deposit.hash, deposit.token);
-    // Standalone Solana accounts can deposit from their own principal.
-    let linked = match linked_solana(&st.env, addr).await {
-        Ok(Some(l)) => l,
-        Ok(None) if session::is_sol_principal(addr) => addr.to_string(),
-        Ok(None) => {
-            return api_err(
-                StatusCode::BAD_REQUEST,
-                "link a Solana wallet before topping up with SOL/SPL",
-            );
-        }
-        Err(e) => {
-            worker::console_error!("linked_solana lookup failed: {e:?}");
-            return api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "database error, retry later",
-            );
-        }
+    let linked = match solana_sender(st, addr).await {
+        Ok(address) => address,
+        Err(response) => return response,
     };
+    if let Err(response) = verify_solana_network(st).await {
+        return response;
+    }
 
     let tx = match solana::get_transaction(&st.sol_rpc_url, sig).await {
         Ok(tx) if tx.is_null() => return too_early(),
         Ok(tx) => tx,
         Err(e) => return rpc_unavailable("getTransaction", e),
     };
+    // Verify fee-payer ownership before consulting policy or writing any
+    // rejected row to `payments`.
+    if solana::tx_sender(&tx).is_some_and(|s| s != linked) {
+        return api_err(
+            StatusCode::FORBIDDEN,
+            "tx sender is not your linked Solana wallet",
+        );
+    }
     let Some(timestamp) = tx["blockTime"].as_u64() else {
         return too_early();
     };
-    let policy = match deposit_terms(st, timestamp).await {
+    let policies = match deposit_terms_candidates(st, timestamp).await {
         Ok(p) => p,
         Err(response) => return response,
     };
-    if policy.sol_deposit.is_empty() {
-        return deposit
-            .reject(&st.env, "Deposits disabled at transfer time")
-            .await;
+
+    let mut first_reject: Option<&'static str> = None;
+    let mut saw_wrong_sender = false;
+    let mut matched = None;
+    for (i, policy) in policies.iter().enumerate() {
+        if !crate::settings::valid_deposit_address(Chain::Solana, &policy.sol_deposit) {
+            if i == 0 {
+                first_reject = Some("Deposits disabled at transfer time");
+            }
+            continue;
+        }
+        match solana::verify_solana(&tx, spec, &policy.sol_deposit, &linked) {
+            SolOutcome::Credited { amount } => {
+                matched = Some((policy, amount));
+                break;
+            }
+            SolOutcome::Reject("tx failed on-chain") => {
+                return deposit.reject(&st.env, "tx failed on-chain").await;
+            }
+            SolOutcome::Reject(msg) => {
+                if i == 0 {
+                    first_reject = Some(msg);
+                }
+            }
+            SolOutcome::WrongSender => {
+                saw_wrong_sender = true;
+            }
+            SolOutcome::RpcError(e) => {
+                return rpc_unavailable("getTransaction decode", worker::Error::RustError(e));
+            }
+        }
     }
-    let amount = match solana::verify_solana(&tx, spec, &policy.sol_deposit, &linked) {
-        SolOutcome::Credited { amount } => amount,
-        SolOutcome::Reject(msg) => return deposit.reject(&st.env, msg).await,
-        SolOutcome::WrongSender => {
+    let Some((policy, amount)) = matched else {
+        if saw_wrong_sender && first_reject.is_none() {
             return api_err(
                 StatusCode::FORBIDDEN,
                 "tx sender is not your linked Solana wallet",
             );
         }
-        SolOutcome::RpcError(e) => {
-            return rpc_unavailable("getTransaction decode", worker::Error::RustError(e));
-        }
+        return deposit
+            .reject(
+                &st.env,
+                first_reject.unwrap_or("Deposits disabled at transfer time"),
+            )
+            .await;
     };
 
+    if spec.feed.is_some()
+        && let Err(response) = verify_ethereum_network(st).await
+    {
+        return response;
+    }
     let price = match resolve_price(st, spec).await {
         Ok(p) => p,
         Err(resp) => return resp,
     };
     let points = rates::points_at_rate(amount, spec.decimals, price, policy.points_per_usd);
-    if points < policy.minimum_topup {
-        return deposit.reject(&st.env, "amount below minimum top-up").await;
+    if points < settlement_minimum_points(policy.minimum_topup, spec) {
+        return deposit
+            .reject_with_amount(&st.env, Some(amount), "amount below minimum top-up")
+            .await;
     }
 
     deposit.credit_verified(st, amount, points).await
 }
 
-async fn deposit_terms(st: &AppState, timestamp: u64) -> Result<crate::settings::Policy, Response> {
-    match crate::settings::Published::at_block(&st.env, timestamp).await {
-        Ok(policy) => Ok(policy),
+async fn deposit_terms_candidates(
+    st: &AppState,
+    timestamp: u64,
+) -> Result<Vec<crate::settings::Policy>, Response> {
+    match crate::settings::Published::at_block_candidates(&st.env, timestamp).await {
+        Ok(policies) => Ok(policies),
         Err(e) => {
             worker::console_error!("Could not load payment terms: {e}");
             Err(api_err(
@@ -514,6 +624,15 @@ async fn deposit_terms(st: &AppState, timestamp: u64) -> Result<crate::settings:
 /// Native ETH and ERC-20 share the same sender, receipt, confirmation and block-time checks.
 async fn topup_ethereum(st: &AppState, deposit: &Deposit<'_>) -> Response {
     let (addr, tx_hash, spec) = (deposit.address, deposit.hash, deposit.token);
+    if !session::is_eth_address(addr) {
+        return api_err(
+            StatusCode::BAD_REQUEST,
+            "Choose Solana for this gallery account.",
+        );
+    }
+    if let Err(response) = verify_ethereum_network(st).await {
+        return response;
+    }
     let tx_json = match rpc(
         &st.rpc_url,
         "eth_getTransactionByHash",
@@ -525,7 +644,8 @@ async fn topup_ethereum(st: &AppState, deposit: &Deposit<'_>) -> Response {
         Err(e) => return rpc_unavailable("eth_getTransactionByHash", e),
     };
     if tx_json.is_null() {
-        return api_err(StatusCode::BAD_REQUEST, "tx not found");
+        // The wallet can return the hash before our RPC node sees the broadcast.
+        return too_early();
     }
     let tx: RpcTx = match serde_json::from_value(tx_json) {
         Ok(t) => t,
@@ -551,35 +671,26 @@ async fn topup_ethereum(st: &AppState, deposit: &Deposit<'_>) -> Response {
         Ok(v) => v,
         Err(e) => return rpc_unavailable("eth_getTransactionReceipt", e),
     };
-    let receipt: Option<RpcReceipt> = if receipt_json.is_null() {
-        None
-    } else {
-        match serde_json::from_value(receipt_json) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                let e = worker::Error::RustError(e.to_string());
-                return rpc_unavailable("eth_getTransactionReceipt decode", e);
-            }
+    if receipt_json.is_null() {
+        return too_early();
+    }
+    let receipt: RpcReceipt = match serde_json::from_value(receipt_json) {
+        Ok(r) => r,
+        Err(e) => {
+            let e = worker::Error::RustError(e.to_string());
+            return rpc_unavailable("eth_getTransactionReceipt decode", e);
         }
     };
-    let block = match &receipt {
-        Some(RpcReceipt {
-            status: Some(s), ..
-        }) if s != "0x1" => {
-            return deposit.reject(&st.env, "tx failed on-chain").await;
-        }
-        Some(RpcReceipt {
-            status: Some(_),
-            block_number: Some(b),
-            ..
-        }) => match hex_to_u64(b) {
-            Some(b) => b,
-            None => {
-                let e = worker::Error::RustError(format!("bad receipt blockNumber: {b}"));
-                return rpc_unavailable("eth_getTransactionReceipt", e);
-            }
-        },
-        _ => return too_early(),
+    let (Some(status), Some(block_hex), Some(receipt_block_hash)) = (
+        receipt.status.as_deref(),
+        receipt.block_number.as_deref(),
+        receipt.block_hash.as_deref(),
+    ) else {
+        return too_early();
+    };
+    let Some(block) = hex_to_u64(block_hex) else {
+        let e = worker::Error::RustError(format!("bad receipt blockNumber: {block_hex}"));
+        return rpc_unavailable("eth_getTransactionReceipt", e);
     };
 
     let head = match rpc(&st.rpc_url, "eth_blockNumber", serde_json::json!([])).await {
@@ -593,42 +704,68 @@ async fn topup_ethereum(st: &AppState, deposit: &Deposit<'_>) -> Response {
         return too_early();
     }
 
-    let block_time = match rpc(
+    let block_obj = match rpc(
         &st.rpc_url,
         "eth_getBlockByNumber",
         serde_json::json!([format!("0x{block:x}"), false]),
     )
     .await
     {
-        Ok(v) => v["timestamp"].as_str().and_then(hex_to_u64),
+        Ok(v) => v,
         Err(e) => return rpc_unavailable("eth_getBlockByNumber", e),
     };
-    let Some(timestamp) = block_time else {
+    let (Some(timestamp), Some(canonical_hash)) = (
+        block_obj["timestamp"].as_str().and_then(hex_to_u64),
+        block_obj["hash"].as_str(),
+    ) else {
         return too_early();
     };
-    let policy = match deposit_terms(st, timestamp).await {
+    // Verify the receipt (and tx, if mined) belongs to the canonical block at
+    // this height so an RPC split across a reorg cannot mix two blocks.
+    if !canonical_hash.eq_ignore_ascii_case(receipt_block_hash)
+        || tx
+            .block_hash
+            .as_deref()
+            .is_some_and(|h| !h.eq_ignore_ascii_case(receipt_block_hash))
+    {
+        return too_early();
+    }
+    if status != "0x1" {
+        return deposit.reject(&st.env, "tx failed on-chain").await;
+    }
+
+    let policies = match deposit_terms_candidates(st, timestamp).await {
         Ok(p) => p,
         Err(response) => return response,
     };
-    let amount = match spec.contract {
-        Some(contract) => {
-            let recipient = policy.eth_deposit.strip_prefix("0x").unwrap_or("");
-            let sender = addr.strip_prefix("0x").unwrap_or(addr);
-            let logs = &receipt.as_ref().expect("confirmed receipt").logs;
-            if recipient.is_empty() {
-                return deposit
-                    .reject(&st.env, "Deposits disabled at transfer time")
-                    .await;
-            }
-            match match_transfer_log(logs, contract, recipient, sender) {
-                Some(amount) => amount,
-                None => return deposit.reject(&st.env, "no matching token transfer").await,
-            }
+    let match_eth = |policy: &crate::settings::Policy| -> Result<u128, &'static str> {
+        if !crate::settings::valid_deposit_address(Chain::Ethereum, &policy.eth_deposit) {
+            return Err("Deposits disabled at transfer time");
         }
-        None => match verify_native_tx(&tx, &policy.eth_deposit) {
-            Ok(amount) => amount,
-            Err(msg) => return deposit.reject(&st.env, msg).await,
-        },
+        match spec.contract {
+            Some(contract) => {
+                let recipient = policy.eth_deposit.strip_prefix("0x").unwrap_or("");
+                let sender = addr.strip_prefix("0x").unwrap_or(addr);
+                match_transfer_log(&receipt.logs, contract, recipient, sender)
+                    .ok_or("no matching token transfer")
+            }
+            None => verify_native_tx(&tx, &policy.eth_deposit),
+        }
+    };
+    let mut first_err = "Deposits disabled at transfer time";
+    let mut matched = None;
+    for (i, policy) in policies.iter().enumerate() {
+        match match_eth(policy) {
+            Ok(amount) => {
+                matched = Some((policy, amount));
+                break;
+            }
+            Err(msg) if i == 0 => first_err = msg,
+            Err(_) => {}
+        }
+    }
+    let Some((policy, amount)) = matched else {
+        return deposit.reject(&st.env, first_err).await;
     };
 
     let price = match resolve_price(st, spec).await {
@@ -636,8 +773,10 @@ async fn topup_ethereum(st: &AppState, deposit: &Deposit<'_>) -> Response {
         Err(resp) => return resp,
     };
     let points = rates::points_at_rate(amount, spec.decimals, price, policy.points_per_usd);
-    if points < policy.minimum_topup {
-        return deposit.reject(&st.env, "amount below minimum top-up").await;
+    if points < settlement_minimum_points(policy.minimum_topup, spec) {
+        return deposit
+            .reject_with_amount(&st.env, Some(amount), "amount below minimum top-up")
+            .await;
     }
 
     deposit.credit_verified(st, amount, points).await
@@ -687,7 +826,7 @@ pub async fn list_payments(State(st): State<AppState>, cookies: Cookies) -> Resp
 
     let stmt = st.env.d1(crate::D1_BINDING).and_then(|db| {
         db.prepare(
-            "SELECT tx_hash, chain, token, amount, points, status, created_at \
+            "SELECT tx_hash, chain, token, amount, CAST(points AS TEXT) AS points, status, created_at \
              FROM payments WHERE address = ? ORDER BY created_at DESC LIMIT 50",
         )
         .bind(&[addr.as_str().into()])
@@ -743,6 +882,7 @@ mod tests {
             from: SENDER.into(),
             to: to.map(Into::into),
             value: value.into(),
+            block_hash: None,
         }
     }
 
@@ -785,6 +925,32 @@ mod tests {
         assert_eq!(verify_native_tx(&mixed, DEPOSIT), Ok(10u128.pow(18)));
         // contract creation (no `to`) rejected
         assert!(verify_native_tx(&tx(None, "0x1"), DEPOSIT).is_err());
+        // self-transfer (sender == deposit) rejected
+        assert!(verify_native_tx(&tx(Some(SENDER), "0x1"), SENDER).is_err());
+    }
+
+    #[test]
+    fn self_transfer_erc20_rejected() {
+        let logs = vec![log(
+            USDC,
+            TRANSFER_TOPIC0,
+            &DEPOSIT[2..],
+            &DEPOSIT[2..],
+            &format!("0x{:064x}", 1_000_000u128),
+        )];
+        assert_eq!(
+            match_transfer_log(&logs, USDC, &DEPOSIT[2..], &DEPOSIT[2..]),
+            None
+        );
+    }
+
+    #[test]
+    fn settlement_minimum_allows_small_volatility_for_feed_assets_only() {
+        let eth = config::token(Chain::Ethereum, "eth").unwrap();
+        let usdc = config::token(Chain::Ethereum, "usdc").unwrap();
+        assert_eq!(settlement_minimum_points(1_000, eth), 950);
+        assert_eq!(settlement_minimum_points(1_000, usdc), 1_000);
+        assert_eq!(settlement_minimum_points(1, eth), 1);
     }
 
     // USDC on Ethereum mainnet.

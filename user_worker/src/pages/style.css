@@ -525,6 +525,23 @@ td.meta {
   grid-template-columns: 1fr 1fr;
   gap: 12px;
 }
+#topup-form,
+#manual-topup {
+  margin-top: 16px;
+}
+#sol-wallet-wrap {
+  margin-top: 12px;
+}
+.receipt-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+#sol-linked-state,
+#manual-sender {
+  overflow-wrap: anywhere;
+}
 .deposit {
   margin: 15px 0;
   padding: 12px 14px;
