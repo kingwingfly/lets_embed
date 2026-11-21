@@ -58,10 +58,10 @@ impl Page {
         } else if self == Self::Admin {
             nav.push_str(r#"<a href="/user/admin" aria-current="page">Admin</a>"#);
         }
-        let extra_css = if self == Self::Admin {
-            include_str!("pages/admin.css")
-        } else {
-            ""
+        let extra_css = match self {
+            Self::Admin => include_str!("pages/admin.css"),
+            Self::Favorites => include_str!("pages/favorites.css"),
+            _ => "",
         };
         let media_script = if self == Self::Favorites {
             include_str!("../../assets/gallery-allowance.js")
@@ -276,5 +276,6 @@ pub async fn favorites_page(State(st): State<AppState>, cookies: Cookies) -> Res
     if session_address(&cookies, &st.jwt_secret).is_none() {
         return redirect_to_login("/user/favorites");
     }
-    Html(Page::Favorites.render(FAVORITES_BODY)).into_response()
+    let body = FAVORITES_BODY.replace("__FAVORITES_SCRIPT__", include_str!("pages/favorites.js"));
+    Html(Page::Favorites.render(&body)).into_response()
 }

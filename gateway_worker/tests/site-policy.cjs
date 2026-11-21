@@ -582,6 +582,12 @@ test('gallery access, billing and administrator controls use the published polic
   const accountHtml = await page.text();
   assert.match(accountHtml, /id="topup"/);
   assert.match(accountHtml, new RegExp(updatedDeposit));
+  const favPage = await site('/user/favorites', { headers: walletHeaders });
+  assert.equal(favPage.status, 200);
+  const favHtml = await favPage.text();
+  assert.match(favHtml, /id="tab-image"/);
+  assert.match(favHtml, /id="tab-post"/);
+  assert.match(favHtml, /id="fav-viewer"/);
   const selected = await admin('?address=' + wallet);
   assert.match(await selected.text(), /Apply subscription/);
 });
@@ -832,4 +838,213 @@ test('checkout script handles wallet send, multi-wallet Solana, reload recovery,
   });
   assert.equal(bannedEnv.ids.get('topup-btn').disabled, true);
   assert.match(bannedEnv.ids.get('topup-help').textContent, /suspended/i);
+});
+
+test('favorites gallery splits images and posts, supports masonry viewer, unfavorite and undo', async () => {
+  const favSource = fs.readFileSync(path.join(root, 'user_worker/src/pages/favorites.js'), 'utf8');
+  function makeNode(tag, id = '', cls = '') {
+    const attrs = {};
+    const node = {
+      tagName: tag.toUpperCase(),
+      id,
+      className: cls,
+      dataset: {},
+      style: {},
+      hidden: false,
+      disabled: false,
+      clientWidth: 1000,
+      textContent: '',
+      href: '',
+      src: '',
+      alt: '',
+      children: [],
+      listeners: {},
+      setAttribute(k, v) { attrs[k] = String(v); },
+      getAttribute(k) { return attrs[k] ?? null; },
+      addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); },
+      async dispatch(type, ev = {}) {
+        ev.preventDefault ||= () => {};
+        ev.stopPropagation ||= () => {};
+        ev.target ||= this;
+        for (const fn of this.listeners[type] || []) await fn(ev);
+      },
+      append(...items) { for (const x of items) this.appendChild(x); },
+      appendChild(child) {
+        if (typeof child === 'object' && child) child.parent = this;
+        this.children.push(child);
+      },
+      focus() {},
+    };
+    Object.defineProperty(node, 'textContent', {
+      get() { return node._text ?? ''; },
+      set(v) {
+        node._text = String(v);
+        if (v === '') node.children = [];
+      },
+    });
+    return node;
+  }
+
+  function findAll(rootNode, pred, out = []) {
+    if (!rootNode || typeof rootNode !== 'object') return out;
+    if (pred(rootNode)) out.push(rootNode);
+    for (const c of rootNode.children || []) findAll(c, pred, out);
+    return out;
+  }
+
+  function runFavoritesEnv({ fetchImpl, hash = '' }) {
+    const ids = new Map();
+    const reg = (el) => { if (el.id) ids.set(el.id, el); return el; };
+    for (const [tag, id] of [
+      ['div', 'fav-grid'], ['div', 'fav-panel'], ['div', 'likes-empty'],
+      ['p', 'likes-empty-text'], ['button', 'empty-switch-btn'], ['div', 'likes-msg'],
+      ['div', 'fav-loading'], ['button', 'more-btn'], ['div', 'fav-end'],
+      ['div', 'fav-viewer'], ['div', 'viewer-stage'], ['img', 'viewer-img'],
+      ['span', 'viewer-title'], ['span', 'viewer-counter'], ['a', 'viewer-details'],
+      ['button', 'viewer-unfav'], ['button', 'viewer-close'], ['button', 'viewer-prev'],
+      ['button', 'viewer-next'], ['div', 'fav-toast'], ['span', 'fav-toast-text'],
+      ['button', 'fav-undo-btn'], ['button', 'tab-image'], ['button', 'tab-post'],
+      ['button', 'tab-video'], ['span', 'count-image'], ['span', 'count-post'],
+      ['span', 'count-video'],
+    ]) reg(makeNode(tag, id));
+    ids.get('fav-viewer').hidden = true;
+    ids.get('fav-toast').hidden = true;
+    ids.get('tab-video').hidden = true;
+
+    const densityBtns = ['compact', 'medium', 'large'].map((sz) => {
+      const b = makeNode('button', '', 'density-btn');
+      b.dataset.size = sz;
+      return b;
+    });
+    const winListeners = {};
+    const storage = {};
+    const body = { style: {} };
+    const ctx = {
+      document: {
+        body,
+        getElementById: (id) => ids.get(id) || null,
+        querySelectorAll: (sel) => (sel === '.density-btn' ? densityBtns : []),
+        createElement: (tag) => makeNode(tag),
+      },
+      window: {
+        innerWidth: 1028,
+        addEventListener(type, fn) { (winListeners[type] ||= []).push(fn); },
+        async dispatch(type, ev = {}) {
+          ev.preventDefault ||= () => {};
+          for (const fn of winListeners[type] || []) await fn(ev);
+        },
+      },
+      location: { hash },
+      history: { replaceState() {} },
+      localStorage: {
+        getItem: (k) => (Object.hasOwn(storage, k) ? storage[k] : null),
+        setItem: (k, v) => { storage[k] = String(v); },
+      },
+      fetch: fetchImpl,
+      setTimeout: () => 1,
+      clearTimeout: () => {},
+    };
+    require('node:vm').runInNewContext(favSource, ctx);
+    return { ctx, ids, densityBtns, storage, findAll };
+  }
+
+  const calls = [];
+  const env = runFavoritesEnv({
+    fetchImpl: async (url, init = {}) => {
+      calls.push([init.method || 'GET', url, init.body ? JSON.parse(init.body) : null]);
+      if (url.startsWith('/user/api/likes?kind=image')) {
+        return Response.json({
+          items: [
+            { kind: 'image', target_id: 10, created_at: 1700000200 },
+            { kind: 'image', target_id: 11, created_at: 1700000100 },
+          ],
+          next_cursor: null,
+        });
+      }
+      if (url.startsWith('/user/api/likes?kind=post')) {
+        return Response.json({
+          items: [{ kind: 'post', target_id: 77, created_at: 1700000300 }],
+          next_cursor: null,
+        });
+      }
+      if (url.startsWith('/user/api/likes?kind=video')) {
+        return Response.json({ items: [], next_cursor: null });
+      }
+      if (url.startsWith('/api/like_previews?items=')) {
+        const items = decodeURIComponent(url.split('items=')[1]);
+        if (items.includes('image:10')) {
+          return Response.json([
+            { kind: 'image', target_id: 10, image_id: 10, name: 'album/a b', width: 800, height: 1200 },
+            { kind: 'image', target_id: 11, image_id: 11, name: 'solo', width: 1200, height: 800 },
+          ]);
+        }
+        return Response.json([
+          { kind: 'post', target_id: 77, image_id: 501, name: 'set/cover', width: 1000, height: 1000, image_count: 9 },
+        ]);
+      }
+      if (url === '/user/api/like') {
+        return Response.json({ liked: init.method === 'POST' });
+      }
+      throw new Error('unexpected ' + url);
+    },
+  });
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+
+  // Images tab loads first with aspect-preserved tiles and segment-encoded paths.
+  assert.equal(env.ids.get('tab-video').hidden, true);
+  assert.equal(env.ids.get('count-image').textContent, '2');
+  const imgs = env.findAll(env.ids.get('fav-grid'), (n) => n.tagName === 'IMG');
+  assert.equal(imgs.length, 2);
+  assert.equal(imgs[0].src, '/images/album/a%20b.webp');
+  assert.equal(imgs[0].style.aspectRatio, '800 / 1200');
+
+  // Clicking first image opens full-screen viewer; ArrowRight advances; Escape closes.
+  const triggers = env.findAll(env.ids.get('fav-grid'), (n) => n.className === 'fav-media-trigger');
+  await triggers[0].dispatch('click');
+  assert.equal(env.ids.get('fav-viewer').hidden, false);
+  assert.equal(env.ids.get('viewer-counter').textContent, '1 / 2');
+  await env.ctx.window.dispatch('keydown', { key: 'ArrowRight' });
+  assert.equal(env.ids.get('viewer-counter').textContent, '2 / 2');
+  assert.equal(env.ids.get('viewer-img').src, '/images/solo.webp');
+  await env.ctx.window.dispatch('keydown', { key: 'Escape' });
+  assert.equal(env.ids.get('fav-viewer').hidden, true);
+
+  // Unfavoriting removes the card and shows Undo toast; Undo restores it via POST.
+  const unfavs = env.findAll(env.ids.get('fav-grid'), (n) => n.className.includes('unfav'));
+  await unfavs[0].dispatch('click');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(env.ids.get('count-image').textContent, '1');
+  assert.equal(env.ids.get('fav-toast').hidden, false);
+  await env.ids.get('fav-undo-btn').dispatch('click');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(env.ids.get('count-image').textContent, '2');
+  assert.ok(calls.some(([m, u, b]) => m === 'DELETE' && u === '/user/api/like' && b.target_id === 10));
+  assert.ok(calls.some(([m, u, b]) => m === 'POST' && u === '/user/api/like' && b.target_id === 10));
+
+  // Switching to Posts tab loads posts separately with post badge and direct /details link.
+  await env.ids.get('tab-post').dispatch('click');
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(env.ids.get('count-post').textContent, '1');
+  const postTriggers = env.findAll(env.ids.get('fav-grid'), (n) => n.className === 'fav-media-trigger');
+  assert.equal(postTriggers[0].tagName, 'A');
+  assert.equal(postTriggers[0].href, '/details/501?mode=similar&q=501&limit=50');
+  const postPills = env.findAll(env.ids.get('fav-grid'), (n) => n.className === 'fav-post-pill');
+  assert.match(postPills[0].children.join(''), /9p/);
+
+  // Auto-switch: when user has 0 single images and >=1 post, lands on Posts automatically.
+  const postsOnly = runFavoritesEnv({
+    fetchImpl: async (url) => {
+      if (url.startsWith('/user/api/likes?kind=image')) return Response.json({ items: [], next_cursor: null });
+      if (url.startsWith('/user/api/likes?kind=post')) {
+        return Response.json({ items: [{ kind: 'post', target_id: 99, created_at: 1700000400 }], next_cursor: null });
+      }
+      if (url.startsWith('/user/api/likes?kind=video')) return Response.json({ items: [], next_cursor: null });
+      return Response.json([{ kind: 'post', target_id: 99, image_id: 600, name: 'p/1', width: 600, height: 800 }]);
+    },
+  });
+  for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(postsOnly.ids.get('tab-post').getAttribute('aria-selected'), 'true');
+  assert.equal(postsOnly.ids.get('count-post').textContent, '1');
 });

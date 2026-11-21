@@ -37,6 +37,9 @@ pub struct Preview {
     name: String,
     width: i32,
     height: i32,
+    /// Total image count for a post preview (omitted for single images).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_count: Option<usize>,
 }
 
 /// `GET /api/like_previews?items=post:12,image:34`
@@ -74,11 +77,14 @@ pub async fn like_previews(
                         name: img.name,
                         width: img.width,
                         height: img.height,
+                        image_count: None,
                     })
                 }
                 // "post": cover = first image of the post.
                 _ => {
-                    let cover = engine.list_post_images(id).await.ok()?.into_iter().next()?;
+                    let images = engine.list_post_images(id).await.ok()?;
+                    let image_count = Some(images.len());
+                    let cover = images.into_iter().next()?;
                     Some(Preview {
                         kind: "post",
                         target_id: id,
@@ -86,6 +92,7 @@ pub async fn like_previews(
                         name: cover.name,
                         width: cover.width,
                         height: cover.height,
+                        image_count,
                     })
                 }
             }
