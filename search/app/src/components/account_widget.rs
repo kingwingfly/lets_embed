@@ -1,4 +1,9 @@
-use leptos::{prelude::*, task::spawn_local};
+use crate::components::LikeStore;
+#[cfg(feature = "hydrate")]
+use leptos::ev;
+use leptos::{html, prelude::*, task::spawn_local};
+#[cfg(feature = "hydrate")]
+use leptos_use_event_listener::use_event_listener;
 
 /// Parsed subset of the user worker's `StatusResp` (`GET /user/api/me`).
 ///
@@ -6,6 +11,8 @@ use leptos::{prelude::*, task::spawn_local};
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
 struct Account {
+    /// Authenticated wallet principal (lowercase eth address or Solana pubkey).
+    address: Option<String>,
     /// Pay-as-you-go points balance.
     balance: String,
     /// Active plan name, or `None` when the user has no plan.
@@ -73,6 +80,10 @@ async fn call_me_api() -> Result<AccountState, String> {
         .unwrap_or_default();
     let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
 
+    let address = json
+        .get("address")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let balance = json
         .get("balance")
         .map(fmt_num)
@@ -85,6 +96,7 @@ async fn call_me_api() -> Result<AccountState, String> {
     let searches_remaining = json.get("searches_remaining").and_then(|v| v.as_i64());
 
     Ok(AccountState::Loaded(Account {
+        address,
         balance,
         plan,
         views_remaining,
@@ -113,22 +125,26 @@ fn fmt_usage(remaining: Option<i64>, has_plan: bool) -> String {
 }
 
 /// Account entry for the site header: a compact points chip linking to
-/// `/user/account`, with a hover-revealed float card showing points, plan and
+/// `/user/account`, with a click/tap-revealed float card showing points, plan and
 /// remaining usage.
 ///
 /// SSR renders a neutral placeholder; the browser resolves the real state
-/// (signed-in stats or a sign-in link).
+/// (signed-in stats or a sign-in link) and keeps [`LikeStore`] synced across
+/// wallet switches or sign-in in another tab.
 #[component]
 pub fn AccountWidget() -> impl IntoView {
-    // None = SSR placeholder / still loading in the browser.
     let state: RwSignal<Option<AccountState>> = RwSignal::new(None);
-    // Whether the detail panel is expanded via click/tap. Hover still reveals
-    // the panel on desktop (pointer devices); `open` is the touch-friendly path
-    // since mobile browsers can't hover.
     let open = RwSignal::new(false);
+    let root_ref: NodeRef<html::Div> = NodeRef::new();
+    let like_store = use_context::<LikeStore>();
+    let last_refresh: StoredValue<f64> = StoredValue::new(0.0);
 
-    // Effects only run in the browser, so this never fires on the server.
-    Effect::new(move |_| {
+    let refresh = move |force: bool| {
+        let now = js_sys::Date::now();
+        if !force && now - last_refresh.get_value() < 2000.0 {
+            return;
+        }
+        last_refresh.set_value(now);
         spawn_local(async move {
             let next = match call_me_api().await {
                 Ok(s) => s,
@@ -137,56 +153,99 @@ pub fn AccountWidget() -> impl IntoView {
                     AccountState::SignedOut
                 }
             };
-            // try_set: the component may have been disposed mid-flight.
+            if let Some(store) = like_store {
+                match &next {
+                    AccountState::Loaded(acc) => store.sync_principal(acc.address.clone()),
+                    AccountState::SignedOut => store.sync_principal(None),
+                }
+            }
             let _ = state.try_set(Some(next));
         });
+    };
+
+    // Initial account resolve in browser.
+    Effect::new(move |_| {
+        refresh(true);
     });
 
-    // Shared card idiom for the float panel. Visibility is driven solely by the
-    // `open` signal (click/tap toggle) so behaviour is identical on desktop and
-    // touch: a CSS `:hover` reveal was removed because it fought the toggle —
-    // on desktop the lingering hover kept the panel open after a close-click,
-    // and on touch the sticky emulated `:hover` made tap-to-close impossible.
+    // Revalidate wallet session on tab focus / bfcache restore, and close the
+    // dropdown when clicking/tapping anywhere outside `root_ref` or pressing Esc.
+    // (Avoids a `fixed inset-0` backdrop, which would be trapped inside SearchBar's
+    // `backdrop-blur-md` containing block.)
+    #[cfg(feature = "hydrate")]
+    {
+        let _ = use_event_listener(window(), ev::focus, move |_| refresh(false));
+        let _ = use_event_listener(window(), ev::pageshow, move |_| refresh(false));
+        let _ = use_event_listener(window(), ev::pointerdown, move |ev: ev::PointerEvent| {
+            if !open.get_untracked() {
+                return;
+            }
+            use wasm_bindgen::JsCast;
+            let inside = root_ref.get().is_some_and(|root| {
+                ev.target()
+                    .and_then(|t| t.dyn_into::<web_sys::Node>().ok())
+                    .is_some_and(|node| root.contains(Some(&node)))
+            });
+            if !inside {
+                open.set(false);
+            }
+        });
+        let _ = use_event_listener(window(), ev::keydown, move |ev: ev::KeyboardEvent| {
+            if open.get_untracked() && ev.key() == "Escape" {
+                open.set(false);
+            }
+        });
+    }
+
     let panel_cls = move || {
         let base = "absolute right-0 top-full pt-2 w-56 max-w-[calc(100vw-2rem)] z-50 \
             origin-top-right transition-all duration-150";
         if open.get() {
-            format!("{base} opacity-100 scale-100 pointer-events-auto")
+            format!("{base} opacity-100 scale-100 pointer-events-auto visible")
         } else {
-            format!("{base} opacity-0 scale-95 pointer-events-none")
+            format!("{base} opacity-0 scale-95 pointer-events-none invisible")
         }
     };
-    let card_cls = "bg-white/90 backdrop-blur-md rounded-2xl ring-1 ring-sky-200 \
+    let card_cls = "bg-white/95 backdrop-blur-md rounded-2xl ring-1 ring-sky-200 \
         shadow-lg shadow-sky-200/50 p-4 text-sm text-slate-700";
 
     view! {
-        <div class="relative shrink-0">
-            // Tap-outside backdrop: only rendered while expanded so a tap
-            // anywhere (including the chip) collapses the panel on touch.
-            {move || open.get().then(|| view! {
-                <div
-                    class="fixed inset-0 z-40 cursor-default"
-                    on:click=move |_| open.set(false)
-                />
+        <div node_ref=root_ref class="relative flex items-center gap-1.5 shrink-0">
+            {move || matches!(state.get(), Some(AccountState::Loaded(_))).then(|| view! {
+                <a
+                    href="/user/favorites"
+                    rel="external"
+                    class="hidden sm:flex items-center gap-1 rounded-full py-2 px-3 bg-white/80 backdrop-blur-md
+                        ring-1 ring-sky-200 shadow-sm shadow-sky-200/50 text-sky-600 font-medium
+                        hover:ring-sky-300 hover:text-amber-500 hover:scale-105 transition-all whitespace-nowrap"
+                    title="Favorites"
+                    aria-label="Favorites"
+                >
+                    <span class="text-amber-500 leading-none select-none">"\u{2605}"</span>
+                    <span class="text-sm">"Favorites"</span>
+                </a>
             })}
             <button
                 type="button"
+                aria-haspopup="true"
+                aria-expanded=move || open.get().to_string()
+                aria-controls="account-menu-panel"
                 on:click=move |_| open.update(|o| *o = !*o)
-                class="flex items-center gap-1.5 rounded-full py-2 px-3 bg-white/80 backdrop-blur-md
+                class="flex items-center gap-1.5 rounded-full py-1.5 sm:py-2 px-2.5 sm:px-3 bg-white/80 backdrop-blur-md
                     ring-1 ring-sky-200 shadow-sm shadow-sky-200/50 text-sky-600 font-medium
                     hover:ring-sky-300 hover:scale-105 transition-all cursor-pointer whitespace-nowrap"
-                title="account"
+                title="Account"
             >
-                <span class="text-lg leading-none select-none">"\u{1F464}"</span>
+                <span class="text-base sm:text-lg leading-none select-none">"\u{1F464}"</span>
                 {move || match state.get() {
                     Some(AccountState::Loaded(acc)) => view! {
-                        <span class="tabular-nums">
+                        <span class="tabular-nums text-sm">
                             <span class="select-none">"\u{1FA99} "</span>
                             {acc.balance.clone()}
                         </span>
                     }.into_any(),
                     Some(AccountState::SignedOut) => view! {
-                        <span class="text-sky-500">"Sign in"</span>
+                        <span class="text-sky-500 text-sm">"Sign in"</span>
                     }.into_any(),
                     None => view! {
                         <span class="text-sky-300 select-none">"\u{2026}"</span>
@@ -194,7 +253,12 @@ pub fn AccountWidget() -> impl IntoView {
                 }}
             </button>
 
-            <div class=panel_cls>
+            <div
+                id="account-menu-panel"
+                class=panel_cls
+                aria-hidden=move || (!open.get()).to_string()
+                inert=move || !open.get()
+            >
                 <div class=card_cls>
                 {move || match state.get() {
                     Some(AccountState::Loaded(acc)) => {
@@ -225,9 +289,18 @@ pub fn AccountWidget() -> impl IntoView {
                                 <span class="tabular-nums text-slate-800">{searches}</span>
                             </div>
                             <a
+                                href="/user/favorites"
+                                rel="external"
+                                class="block text-center mt-3 bg-sky-50 ring-1 ring-sky-200
+                                    text-sky-700 font-medium rounded-full py-1.5 px-4
+                                    hover:bg-sky-100 transition-all"
+                            >
+                                "\u{2605} Favorites"
+                            </a>
+                            <a
                                 href="/user/account"
                                 rel="external"
-                                class="block text-center mt-3 bg-gradient-to-r from-sky-400 to-blue-500
+                                class="block text-center mt-2 bg-gradient-to-r from-sky-400 to-blue-500
                                     text-white font-medium rounded-full py-1.5 px-4 shadow-sm shadow-sky-300/60
                                     hover:from-sky-500 hover:to-blue-600 transition-all"
                             >

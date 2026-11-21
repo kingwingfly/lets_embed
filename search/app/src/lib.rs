@@ -8,7 +8,7 @@ mod util;
 #[cfg(feature = "ssr")]
 pub mod state;
 
-use crate::components::{ImageDetails, Results, SearchBar};
+use crate::components::{ImageDetails, LikeStore, Results, SearchBar};
 use leptos::prelude::*;
 use leptos_meta::{HashedStylesheet, Link, MetaTags, Title, provide_meta_context};
 use leptos_router::{
@@ -50,8 +50,9 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 pub fn App() -> impl IntoView {
     provide_meta_context();
     provide_context(crate::types::ImageQuery(RwSignal::new(None)));
+    provide_context(LikeStore::new());
     view! {
-        <Title formatter=|text| format!("{text} - Let's Embed")/>
+        <Title text="Let's Embed"/>
         <Router>
             <main class="min-h-screen w-screen max-w-screen bg-gradient-to-b from-sky-50 via-white to-sky-100">
                 <Routes fallback=|| "Page not found.".into_view()>
@@ -85,5 +86,25 @@ mod tests {
         let html = std::str::from_utf8(&bytes).unwrap();
         let (head, _) = html.split_once("</head>").expect("gallery document");
         assert!(head.contains(include_str!("../../../assets/gallery-allowance.js")));
+    }
+
+    #[tokio::test]
+    async fn ssr_title_never_interpolates_untrusted_query_parameters() {
+        leptos_axum::generate_route_list(App);
+        let render = leptos_axum::render_app_to_stream(|| {
+            shell(LeptosOptions::builder().output_name("search").build())
+        });
+        let response = render(
+            Request::builder()
+                .uri("/?mode=tag&q=%3C%2Ftitle%3E%3Cscript%3Ealert(1)%3C%2Fscript%3E")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let bytes = to_bytes(response.into_body(), 1_000_000).await.unwrap();
+        let html = std::str::from_utf8(&bytes).unwrap();
+        let (head, _) = html.split_once("</head>").expect("gallery document");
+        assert!(head.contains("<title>Let's Embed</title>"));
+        assert!(!head.contains("<script>alert(1)</script>"));
     }
 }

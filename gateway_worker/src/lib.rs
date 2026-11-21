@@ -214,6 +214,9 @@ async fn gateway(
             };
             account_call(&st, &claims.sub, operation, &item).await
         }
+        (Some(claims), None) if is_segment_prefix(path, "/api") => {
+            account_call(&st, &claims.sub, "check-active", &serde_json::json!({})).await
+        }
         (Some(_), _) => Ok(200),
         (None, item) => {
             let ip = headers
@@ -263,7 +266,7 @@ fn login_response(uri: &Uri, method: &Method) -> Response {
 
 fn browse_route(method: &Method, path: &str) -> bool {
     if matches!(*method, Method::GET | Method::HEAD) {
-        return matches!(path, "/" | "/favicon.ico" | "/api/like_previews")
+        return matches!(path, "/" | "/favicon.ico")
             || ["/pkg", "/images", "/videos", "/details"]
                 .iter()
                 .any(|p| is_segment_prefix(path, p));
@@ -273,7 +276,11 @@ fn browse_route(method: &Method, path: &str) -> bool {
     }
     if matches!(
         path,
-        "/api/search_similar" | "/api/search_by_image" | "/api/search_by_desc"
+        "/api/search_similar"
+            | "/api/search_by_image"
+            | "/api/search_by_desc"
+            | "/api/fetch_post_meta"
+            | "/api/suggest_search"
     ) {
         return true;
     }
@@ -733,7 +740,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         for (accept, expected) in [
             ("application/json, text/html;q=0.8", StatusCode::SEE_OTHER),
-            ("text/html; q=0, application/json", StatusCode::PAYMENT_REQUIRED),
+            (
+                "text/html; q=0, application/json",
+                StatusCode::PAYMENT_REQUIRED,
+            ),
         ] {
             headers.insert("accept", accept.parse().unwrap());
             assert_eq!(payment_required(&headers, true).status(), expected);
@@ -760,5 +770,14 @@ mod tests {
 
         let missing = Bytes::from_static(b"limit=20");
         assert_eq!(form_field(&missing, "q"), None);
+    }
+
+    #[test]
+    fn browse_route_allows_pinned_metadata_and_blocks_guest_like_previews() {
+        assert!(browse_route(&Method::POST, "/api/fetch_post_meta"));
+        assert!(browse_route(&Method::POST, "/api/suggest_search"));
+        assert!(!browse_route(&Method::POST, "/api/suggest_search123456"));
+        assert!(!browse_route(&Method::POST, "/api/suggest_search_evil"));
+        assert!(!browse_route(&Method::GET, "/api/like_previews"));
     }
 }

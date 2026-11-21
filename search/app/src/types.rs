@@ -2,13 +2,21 @@ use leptos::prelude::RwSignal;
 use search_types::{Image, Video};
 use serde::{Deserialize, Serialize};
 
+/// Pending client-side image-search payload bound to the URL nonce that triggered it,
+/// so navigating Back to an older crop/upload nonce never silently runs with newer bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageQueryPayload {
+    pub nonce: String,
+    pub b64: String,
+}
+
 /// Client-side holder for a pending image-search payload (URL-safe base64, no pad).
 ///
 /// The bytes are kept out of the URL to avoid the request-line length limit that
 /// caused 400s; only a short nonce travels in the query string. Provided as a
 /// context at the app root and read by the search entry points + `Results`.
 #[derive(Clone, Copy)]
-pub struct ImageQuery(pub RwSignal<Option<String>>);
+pub struct ImageQuery(pub RwSignal<Option<ImageQueryPayload>>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]

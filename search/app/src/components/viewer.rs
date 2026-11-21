@@ -1,21 +1,72 @@
-use leptos::ev;
-use leptos::prelude::*;
+use leptos::{ev, html, prelude::*};
+use leptos_router::{NavigateOptions, hooks::use_navigate};
 use leptos_use_event_listener::use_event_listener;
 use search_types::Image;
+use wasm_bindgen::JsCast;
 use web_sys::TouchEvent;
 
-use crate::util::encode_path;
+use crate::{
+    components::{LikeButton, LikeVariant},
+    util::{encode_path, lock_body_scroll},
+};
 
 const SWIPE_RATIO: f64 = 0.05;
 
+fn details_href(id: i64) -> String {
+    format!("/details/{id}?mode=similar&q={id}&limit=50")
+}
+
+/// True when `target` is inside an editable form field (`INPUT`/`TEXTAREA`/`SELECT`/contenteditable).
+fn is_editable_target(target: Option<web_sys::EventTarget>) -> bool {
+    let Some(el) = target.and_then(|t| t.dyn_into::<web_sys::Element>().ok()) else {
+        return false;
+    };
+    el.closest("input, textarea, select, [contenteditable='true'], [contenteditable='']")
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// True when `target` is (or is inside) an interactive button or link that consumes `Space`.
+fn is_interactive_target(target: Option<web_sys::EventTarget>) -> bool {
+    let Some(el) = target.and_then(|t| t.dyn_into::<web_sys::Element>().ok()) else {
+        return false;
+    };
+    el.closest("button, a, [role='button']")
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 #[component]
-pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -> impl IntoView {
+pub fn Viewer(
+    images: StoredValue<Vec<Image>>,
+    index: RwSignal<Option<usize>>,
+    #[prop(optional)] post_id: Option<i64>,
+    #[prop(optional)] on_navigate: Option<Callback<()>>,
+) -> impl IntoView {
     let total = images.with_value(|v| v.len());
     let dragging = RwSignal::new(false);
     let drag = RwSignal::new(0.0_f64);
+    let navigate = use_navigate();
+    let dialog_ref: NodeRef<html::Div> = NodeRef::new();
+    lock_body_scroll();
+
+    // Move keyboard focus into the dialog on mount so shortcuts and Tab stay inside.
+    #[cfg(feature = "hydrate")]
+    Effect::new(move |_| {
+        if let Some(el) = dialog_ref.get() {
+            let _ = el.focus();
+        }
+    });
 
     let has_prev = move || matches!(index.get(), Some(i) if i > 0);
     let has_next = move || matches!(index.get(), Some(i) if i + 1 < total);
+    let current_image = Memo::new(move |_| {
+        index
+            .get()
+            .and_then(|i| images.with_value(|v| v.get(i).cloned()))
+    });
 
     let slide = move |offset: isize| {
         if let Some(next) = index
@@ -27,22 +78,50 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
         }
     };
 
+    let nav_key = navigate.clone();
     let _ = use_event_listener(window(), ev::keydown, move |e| {
         if e.alt_key() || e.ctrl_key() || e.meta_key() {
             return;
         }
-        match e.key().as_str() {
-            "ArrowLeft" => slide(-1),
-            "ArrowRight" => slide(1),
-            "Escape" | " " => index.set(None),
+        let key = e.key();
+        if key != "Escape" && is_editable_target(e.target()) {
+            return;
+        }
+        match key.as_str() {
+            "ArrowLeft" | "k" | "K" => slide(-1),
+            "ArrowRight" | "j" | "J" => slide(1),
+            "Escape" => index.set(None),
+            " " => {
+                if is_interactive_target(e.target()) {
+                    return;
+                }
+                index.set(None);
+            }
+            "d" | "D" => {
+                if let Some(im) = current_image.get_untracked() {
+                    let href = details_href(im.id);
+                    index.set(None);
+                    if let Some(cb) = on_navigate {
+                        cb.run(());
+                    }
+                    nav_key(&href, NavigateOptions::default());
+                }
+            }
             _ => return,
         }
         e.prevent_default();
+        e.stop_immediate_propagation();
     });
 
     let start_x = StoredValue::new(0.0_f64);
     let width = StoredValue::new(1.0_f64);
     let on_touch_start = move |ev: TouchEvent| {
+        // Ignore multi-touch (e.g. pinch-zoom gestures).
+        if ev.touches().length() != 1 {
+            dragging.set(false);
+            drag.set(0.0);
+            return;
+        }
         if let Some(t) = ev.touches().get(0) {
             start_x.set_value(t.client_x() as f64);
             let w = window()
@@ -57,6 +136,11 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
     };
     let on_touch_move = move |ev: TouchEvent| {
         if !dragging.get_untracked() {
+            return;
+        }
+        if ev.touches().length() != 1 {
+            dragging.set(false);
+            drag.set(0.0);
             return;
         }
         if let Some(t) = ev.changed_touches().get(0) {
@@ -98,20 +182,42 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
         )
     };
 
+    let nav_slide = navigate.clone();
     let slides = images.with_value(|v| {
         v.iter()
-            .map(|im| {
+            .enumerate()
+            .map(|(slide_idx, im)| {
                 let src = format!("/images/{}.webp", encode_path(&im.name));
-                let href = format!("/details/{id}?mode=similar&q={id}&limit=50", id = im.id);
+                let href = details_href(im.id);
+                let click_href = href.clone();
+                let nav = nav_slide.clone();
                 let alt = im.name.clone();
                 view! {
-                    <div class="flex-none w-screen h-full grid place-items-center p-2">
-                        <a href=href>
+                    <div
+                        class="flex-none w-screen h-full grid place-items-center px-2 py-2"
+                        inert=move || index.get() != Some(slide_idx)
+                    >
+                        <a
+                            href=href
+                            title="Open image details & similar"
+                            class="max-h-full max-w-full flex items-center justify-center"
+                            on:click=move |ev: ev::MouseEvent| {
+                                ev.stop_propagation();
+                                if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
+                                    ev.prevent_default();
+                                    index.set(None);
+                                    if let Some(cb) = on_navigate {
+                                        cb.run(());
+                                    }
+                                    nav(&click_href, NavigateOptions::default());
+                                }
+                            }
+                        >
                             <img
                                 src=src
                                 alt=alt
                                 loading="lazy"
-                                class="max-h-screen max-w-screen object-contain select-none cursor-cell"
+                                class="max-h-[calc(100dvh-6.5rem)] max-w-[96vw] object-contain select-none cursor-pointer"
                             />
                         </a>
                     </div>
@@ -120,9 +226,17 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
             .collect_view()
     });
 
+    let nav_bar = navigate.clone();
+
     view! {
         <div
-            class="fixed inset-0 bg-black/95 z-[60] overflow-hidden cursor-zoom-out select-none touch-none"
+            node_ref=dialog_ref
+            role="dialog"
+            aria-modal="true"
+            aria-label="Image viewer"
+            tabindex="-1"
+            class="fixed inset-0 h-dvh bg-black/95 z-[60] overflow-hidden cursor-zoom-out select-none touch-none
+                   flex flex-col outline-none"
             on:click=move |ev| {
                 if !(ev.alt_key() || ev.ctrl_key() || ev.meta_key() || ev.shift_key()) {
                     index.set(None);
@@ -136,33 +250,112 @@ pub fn Viewer(images: StoredValue<Vec<Image>>, index: RwSignal<Option<usize>>) -
                 drag.set(0.0);
             }
         >
-            <div class="flex h-full will-change-transform" style=track_style>
-                {slides}
-            </div>
-
-            <button
-                class="absolute left-2 top-1/2 -translate-y-1/2 text-white bg-black/50 hover:bg-sky-500/70 transition-colors rounded-full w-12 h-12 text-3xl disabled:opacity-30 disabled:cursor-default"
-                prop:disabled=move || !has_prev()
+            // Non-overlapping flex header bar: counter, dimensions, favorite buttons, Details CTA, Close
+            <div
+                class="shrink-0 z-20 flex items-center justify-between gap-1.5 sm:gap-2
+                       px-2.5 sm:px-3 py-2 bg-black/85 border-b border-white/10 cursor-default"
+                on:click=|ev| ev.stop_propagation()
                 on:touchstart=|ev: TouchEvent| ev.stop_propagation()
                 on:touchend=|ev: TouchEvent| ev.stop_propagation()
-                on:click=move |ev| { ev.stop_propagation(); slide(-1); }
-            >"‹"</button>
-            <button
-                class="absolute right-2 top-1/2 -translate-y-1/2 text-white bg-black/50 hover:bg-sky-500/70 transition-colors rounded-full w-12 h-12 text-3xl disabled:opacity-30 disabled:cursor-default"
-                prop:disabled=move || !has_next()
-                on:touchstart=|ev: TouchEvent| ev.stop_propagation()
-                on:touchend=|ev: TouchEvent| ev.stop_propagation()
-                on:click=move |ev| { ev.stop_propagation(); slide(1); }
-            >"›"</button>
+            >
+                <div class="flex items-center gap-1.5 min-w-0">
+                    <div class="text-xs sm:text-sm font-medium text-sky-100 bg-white/10 px-2.5 sm:px-3 py-1 rounded-full shrink-0 tabular-nums">
+                        {move || index.get().map(|i| format!("{} / {}", i + 1, total)).unwrap_or_default()}
+                    </div>
+                    {move || current_image.get().and_then(|im| {
+                        (im.width > 0 && im.height > 0).then(|| view! {
+                            <span class="hidden sm:inline-block text-xs text-sky-200/75 bg-white/5 px-2.5 py-1 rounded-full tabular-nums">
+                                {format!("{} × {}", im.width, im.height)}
+                            </span>
+                        })
+                    })}
+                </div>
 
-            <div class="absolute bottom-3 left-1/2 -translate-x-1/2 text-sm text-sky-100 bg-black/55 px-3 py-1 rounded-full">
-                {move || index.get().map(|i| format!("{} / {}", i + 1, total)).unwrap_or_default()}
+                <div class="flex items-center gap-1.5 sm:gap-2 justify-end shrink-0">
+                    {post_id.map(|pid| view! {
+                        <LikeButton
+                            kind="post"
+                            target_id=pid
+                            variant=LikeVariant::Overlay
+                            show_label=true
+                            hide_label_mobile=true
+                        />
+                    })}
+                    {move || current_image.get().map(|im| {
+                        let href = details_href(im.id);
+                        let click_href = href.clone();
+                        let nav = nav_bar.clone();
+                        view! {
+                            <LikeButton
+                                kind="image"
+                                target_id=im.id
+                                variant=LikeVariant::Overlay
+                                show_label=true
+                                hide_label_mobile=true
+                            />
+                            <a
+                                href=href
+                                class="inline-flex items-center gap-1 px-2.5 sm:px-3 py-1.5 rounded-full
+                                       bg-sky-500 hover:bg-sky-400 text-white text-xs sm:text-sm
+                                       font-semibold shadow-sm transition-colors whitespace-nowrap"
+                                on:click=move |ev: ev::MouseEvent| {
+                                    ev.stop_propagation();
+                                    if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
+                                        ev.prevent_default();
+                                        index.set(None);
+                                        if let Some(cb) = on_navigate {
+                                            cb.run(());
+                                        }
+                                        nav(&click_href, NavigateOptions::default());
+                                    }
+                                }
+                            >
+                                <span class="sm:hidden">"Details \u{2197}"</span>
+                                <span class="hidden sm:inline">"Details & similar \u{2197}"</span>
+                            </a>
+                        }
+                    })}
+                    <button
+                        type="button"
+                        aria-label="Close viewer"
+                        title="Close (Esc)"
+                        class="text-white bg-white/10 hover:bg-sky-500/70 transition-colors rounded-full w-8 h-8 sm:w-9 sm:h-9 text-xl flex items-center justify-center cursor-pointer shrink-0"
+                        on:click=move |ev| { ev.stop_propagation(); index.set(None); }
+                    >"×"</button>
+                </div>
             </div>
 
-            <button
-                class="absolute top-2 right-2 text-white bg-black/50 hover:bg-sky-500/70 transition-colors rounded-full w-10 h-10 text-2xl"
-                on:click=move |ev| { ev.stop_propagation(); index.set(None); }
-            >"×"</button>
+            // Flex stage so images never collide with top toolbar or bottom hint
+            <div class="relative flex-1 min-h-0 overflow-hidden">
+                <div class="flex h-full will-change-transform" style=track_style>
+                    {slides}
+                </div>
+
+                <button
+                    type="button"
+                    aria-label="Previous image"
+                    class="absolute left-2 top-1/2 -translate-y-1/2 text-white bg-black/50 hover:bg-sky-500/70 transition-colors rounded-full w-11 h-11 sm:w-12 sm:h-12 text-3xl disabled:opacity-30 disabled:cursor-default cursor-pointer"
+                    prop:disabled=move || !has_prev()
+                    on:touchstart=|ev: TouchEvent| ev.stop_propagation()
+                    on:touchend=|ev: TouchEvent| ev.stop_propagation()
+                    on:click=move |ev| { ev.stop_propagation(); slide(-1); }
+                >"‹"</button>
+                <button
+                    type="button"
+                    aria-label="Next image"
+                    class="absolute right-2 top-1/2 -translate-y-1/2 text-white bg-black/50 hover:bg-sky-500/70 transition-colors rounded-full w-11 h-11 sm:w-12 sm:h-12 text-3xl disabled:opacity-30 disabled:cursor-default cursor-pointer"
+                    prop:disabled=move || !has_next()
+                    on:touchstart=|ev: TouchEvent| ev.stop_propagation()
+                    on:touchend=|ev: TouchEvent| ev.stop_propagation()
+                    on:click=move |ev| { ev.stop_propagation(); slide(1); }
+                >"›"</button>
+            </div>
+
+            <div class="hidden sm:flex shrink-0 justify-center pb-2.5 pt-0.5 pointer-events-none">
+                <span class="text-xs text-sky-100/75 bg-white/5 px-3 py-1 rounded-full whitespace-nowrap">
+                    "Click image or press D for details & similar · ← / → browse · Esc close"
+                </span>
+            </div>
         </div>
     }
 }

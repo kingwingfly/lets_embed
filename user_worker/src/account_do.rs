@@ -174,6 +174,13 @@ impl DurableObject for UserAccount {
                 json(&applied, 200)
             }
             (Method::Get, "/status") => json(&self.status_resp(&policy).await?, 200),
+            (Method::Post, "/check-active") => {
+                if self.get_or("banned", false).await? {
+                    Response::error("banned", 403)
+                } else {
+                    Response::ok("")
+                }
+            }
             (Method::Post, "/subscribe") => self.subscribe(req.json().await?, &policy).await,
             (Method::Post, "/unsubscribe") => self.unsubscribe(&policy).await,
             (Method::Post, "/ban") => self.ban(req.json().await?, &policy).await,
