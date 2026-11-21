@@ -514,15 +514,15 @@ pub fn SearchBar() -> impl IntoView {
     };
 
     view! {
-        <div class="relative flex flex-col w-full h-fit sticky top-0 z-40 bg-white/80 backdrop-blur-md shadow-sm shadow-sky-200/50">
-            <div class="flex flex-wrap w-full items-center gap-2 py-2 px-3 sm:px-4 justify-between lg:justify-start">
-                <a href="/" class="order-1 font-display text-xl sm:text-3xl font-bold text-left shrink-0
+        <div class="relative flex flex-col w-full h-fit sticky top-0 z-40 bg-white/85 backdrop-blur-md shadow-sm shadow-sky-200/50">
+            <div class="flex flex-wrap w-full items-center gap-2.5 py-2.5 px-4 justify-center lg:justify-start">
+                <a href="/" class="font-display text-2xl sm:text-3xl font-bold text-left shrink-0
                     bg-gradient-to-r from-sky-500 via-blue-500 to-cyan-400 bg-clip-text text-transparent
                     drop-shadow-sm hover:scale-105 transition-transform">
                     "Let\u{2019}s Embed \u{2728}"
                 </a>
                 <form class="contents" on:submit=submit>
-                    <div class="order-3 md:order-2 flex w-full md:w-auto min-w-0 justify-center md:justify-start">
+                    <div class="flex w-full md:w-auto min-w-0 justify-center md:justify-start">
                         <div
                             class="flex gap-1 bg-sky-100/80 rounded-full p-1 max-w-full
                                    overflow-x-auto scrollbar-none overscroll-contain"
@@ -558,7 +558,7 @@ pub fn SearchBar() -> impl IntoView {
                         </div>
                     </div>
 
-                    <div class="order-4 lg:order-3 flex w-full lg:w-auto lg:flex-1 items-center gap-2 min-w-0">
+                    <div class="flex w-full lg:w-auto lg:flex-1 lg:min-w-[16rem] items-center gap-2 min-w-0">
                         {
                             let go_suggest = go.clone();
                             move || if mode.get() == Mode::SearchImage {
@@ -584,7 +584,7 @@ pub fn SearchBar() -> impl IntoView {
                                 }.into_any()
                             } else if mode.get() == Mode::Random {
                                 view! {
-                                    <div class="flex grow justify-center min-w-0">
+                                    <div class="flex grow justify-center lg:justify-start min-w-0">
                                         <div class="flex flex-wrap justify-center gap-1 bg-sky-100/80 rounded-full p-1 max-w-full">
                                             <button type="submit" class=move || random_cls("posts")
                                                 on:click=move |_| drafts.update(|d| d.set(Mode::Random, "posts".to_string()))>"Posts"</button>
@@ -752,20 +752,6 @@ pub fn SearchBar() -> impl IntoView {
                             }
                         }
 
-                        <input type="number" min="1"
-                            title="Results per page"
-                            aria-label="Results per page"
-                            class="w-16 sm:w-20 shrink-0 bg-white border border-sky-200 rounded-full py-2 px-3 outline-none
-                                text-slate-700 focus:border-sky-400 focus:ring-2 focus:ring-sky-200 transition"
-                            value=move || limit.get().to_string()
-                            prop:value=move || limit.get().to_string()
-                            on:change=move |ev| {
-                                if let Ok(v) = event_target_value(&ev).parse::<usize>() && v >= 1 {
-                                    limit.set(v);
-                                }
-                            }
-                        />
-
                         {
                             move || (mode() != Mode::Random).then(|| view! {
                                 <button type="submit"
@@ -778,9 +764,11 @@ pub fn SearchBar() -> impl IntoView {
                         }
                     </div>
                 </form>
-                <div class="order-2 md:order-3 lg:order-4 shrink-0 md:ml-auto lg:ml-0">
-                    <AccountWidget />
-                </div>
+            </div>
+            // Floats just below the sticky bar at the top-right corner so the
+            // search bar always keeps generous breathing room at every width.
+            <div class="absolute top-full right-4 mt-2 z-40">
+                <AccountWidget />
             </div>
             <div class="w-full h-px bg-gradient-to-r from-transparent via-sky-300 to-transparent" />
         </div>

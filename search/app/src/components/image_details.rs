@@ -14,13 +14,11 @@ use search_types::{Image, ImageDetails as ImageDetailsData, Tag, Video};
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement};
 
-/// Maximum number of alias chips rendered inside the floating tag tooltip.
-const MAX_TOOLTIP_ALIASES: usize = 12;
 /// Maximum number of aliases joined inline when "Show aliases" is toggled on.
 const MAX_INLINE_ALIASES: usize = 6;
 
-/// Floating hover/focus tooltip state for a tag pill, rendered with `position: fixed`
-/// so it is never clipped by the scrollable tag box.
+/// Interactive hover/focus popover state for a tag pill, rendered with `position: fixed`
+/// so it is never clipped by the scrollable tag box and stays open when moving into it.
 #[derive(Clone, Debug, PartialEq)]
 struct TagTooltip {
     tag_id: i64,
@@ -29,7 +27,7 @@ struct TagTooltip {
     score_pct: Option<u8>,
     /// Horizontal center in viewport pixels (clamped safely on render).
     x: f64,
-    /// Anchor Y in viewport pixels.
+    /// Anchor Y in viewport pixels (flush with pill edge; outer padding bridges the hover gap).
     y: f64,
     /// When true, anchor below the pill instead of above it.
     below: bool,
@@ -41,14 +39,10 @@ fn build_tag_tooltip(tag: &Tag, el: &web_sys::Element) -> TagTooltip {
         .and_then(|w| w.inner_width().ok())
         .and_then(|v| v.as_f64())
         .unwrap_or(1024.0);
-    let x = (rect.left() + rect.width() / 2.0).clamp(144.0, (vw - 144.0).max(144.0));
-    // Account for the sticky header height + multi-alias tooltip height before flipping.
-    let below = rect.top() < 220.0;
-    let y = if below {
-        rect.bottom() + 8.0
-    } else {
-        rect.top() - 8.0
-    };
+    let x = (rect.left() + rect.width() / 2.0).clamp(156.0, (vw - 156.0).max(156.0));
+    // Account for the sticky header height + scrollable popover height before flipping.
+    let below = rect.top() < 260.0;
+    let y = if below { rect.bottom() } else { rect.top() };
     let score_pct = tag.score.map(|s| (s.clamp(0.0, 1.0) * 100.0).round() as u8);
     TagTooltip {
         tag_id: tag.id,
@@ -125,7 +119,7 @@ pub fn ImageDetails() -> impl IntoView {
             </For>
             <div class="w-full px-3 md:px-4 pb-4 mt-2">
                 <h2 class="text-sky-700 text-lg md:text-xl font-semibold mb-3">"Similar \u{1f49e}"</h2>
-                <Results />
+                <Results embedded=true />
             </div>
         </div>
     }
@@ -199,22 +193,53 @@ fn ImageDetailPage(id: String) -> impl IntoView {
     let pathname = use_location().pathname;
 
     let hovered_tag: RwSignal<Option<TagTooltip>> = RwSignal::new(None);
+    let tip_close_gen: StoredValue<u64> = StoredValue::new(0);
+    let pointer_in_tip: StoredValue<bool> = StoredValue::new(false);
+    let focus_in_tip: StoredValue<bool> = StoredValue::new(false);
     let show_inline_aliases = RwSignal::new(false);
     let copied_id = RwSignal::new(false);
     #[cfg(feature = "hydrate")]
     let copy_gen: StoredValue<u64> = StoredValue::new(0);
 
-    // Dismiss the fixed tag tooltip on window scroll or Escape (WCAG 1.4.13).
+    let cancel_tip_close = move || {
+        tip_close_gen.set_value(tip_close_gen.get_value().wrapping_add(1));
+    };
+
+    let close_tip_now = move || {
+        cancel_tip_close();
+        pointer_in_tip.set_value(false);
+        focus_in_tip.set_value(false);
+        hovered_tag.set(None);
+    };
+
+    let schedule_tip_close = move || {
+        let close_id = tip_close_gen.get_value().wrapping_add(1);
+        tip_close_gen.set_value(close_id);
+        #[cfg(feature = "hydrate")]
+        set_timeout(
+            move || {
+                if tip_close_gen.try_get_value() == Some(close_id)
+                    && !pointer_in_tip.try_get_value().unwrap_or(false)
+                    && !focus_in_tip.try_get_value().unwrap_or(false)
+                {
+                    let _ = hovered_tag.try_set(None);
+                }
+            },
+            std::time::Duration::from_millis(180),
+        );
+    };
+
+    // Dismiss the interactive tag popover on window scroll or Escape (WCAG 1.4.13).
     #[cfg(feature = "hydrate")]
     {
         let _ = use_event_listener(window(), ev::scroll, move |_| {
             if hovered_tag.with_untracked(Option::is_some) {
-                hovered_tag.set(None);
+                close_tip_now();
             }
         });
         let _ = use_event_listener(window(), ev::keydown, move |e: ev::KeyboardEvent| {
             if e.key() == "Escape" && hovered_tag.with_untracked(Option::is_some) {
-                hovered_tag.set(None);
+                close_tip_now();
             }
         });
     }
@@ -238,7 +263,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
     };
 
     let render_author_pill = |name: String| {
-        let href = format!("/?mode=author&q={}&limit=50", encode_path(name.as_str()));
+        let href = format!("/?mode=author&q={}&limit=50", urlencoding::encode(&name));
         let tip = format!("Search posts by {name}");
         view! {
             <a href=href title=tip>
@@ -253,7 +278,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
     };
 
     let render_tag_pill = move |tag: Tag| {
-        let href = format!("/?mode=tag&q={}&limit=50", encode_path(tag.name.as_str()));
+        let href = format!("/?mode=tag&q={}&limit=50", urlencoding::encode(&tag.name));
         let tag_id = tag.id;
         let has_aliases = !tag.aliases.is_empty();
         let inline_summary = if tag.aliases.is_empty() {
@@ -276,6 +301,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
         let tag_enter = tag.clone();
         let tag_focus = tag;
         let show_tip = move |target: Option<web_sys::EventTarget>, tag_data: &Tag| {
+            cancel_tip_close();
             if let Some(el) = target.and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
                 hovered_tag.set(Some(build_tag_tooltip(tag_data, &el)));
             }
@@ -295,12 +321,12 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                 on:mouseenter=move |ev: leptos::ev::MouseEvent| {
                     show_tip(ev.current_target(), &tag_enter);
                 }
-                on:mouseleave=move |_| hovered_tag.set(None)
+                on:mouseleave=move |_| schedule_tip_close()
                 on:focus=move |ev: leptos::ev::FocusEvent| {
                     show_tip_focus(ev.current_target(), &tag_focus);
                 }
-                on:blur=move |_| hovered_tag.set(None)
-                on:click=move |_| hovered_tag.set(None)
+                on:blur=move |_| schedule_tip_close()
+                on:click=move |_| close_tip_now()
             >
                 <span class="whitespace-nowrap">{ name }</span>
                 {move || {
@@ -720,7 +746,11 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                         })}
                         <div
                             class="max-h-24 md:max-h-32 overflow-y-auto flex flex-wrap content-start gap-1.5"
-                            on:scroll=move |_| hovered_tag.set(None)
+                            on:scroll=move |_| {
+                                if !pointer_in_tip.get_value() && !focus_in_tip.get_value() {
+                                    close_tip_now();
+                                }
+                            }
                         >
                             {
                                 authors.into_iter().map(|author| {
@@ -743,42 +773,41 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                     let open_thumb = open_thumb.clone();
                                     post_images.get().map(|images| match images {
                                         Ok(images) => view! {
-                                            <div class="flex-[2] min-w-0 grid grid-cols-2 sm:grid-cols-3 md:grid-cols-2 lg:grid-cols-3
-                                                    gap-2 pr-1
-                                                    max-h-[40vh] overflow-y-auto
-                                                    md:max-h-none md:min-h-0">
-                                                {
-                                                    images.into_iter().enumerate().map(|(i, image)| {
-                                                        let open_thumb = open_thumb.clone();
-                                                        let is_current = image.id == image_id;
-                                                        let cls = if is_current {
-                                                            "w-full aspect-square p-0 border-0 rounded-md overflow-hidden \
-                                                             cursor-zoom-in ring-2 ring-sky-400 hover:opacity-80 \
-                                                             hover:scale-[1.02] transition-all focus-visible:outline-2 focus-visible:outline-sky-500"
-                                                        } else {
-                                                            "w-full aspect-square p-0 border-0 rounded-md overflow-hidden \
-                                                             cursor-zoom-in hover:opacity-80 hover:scale-[1.02] \
-                                                             transition-all focus-visible:outline-2 focus-visible:outline-sky-500"
-                                                        };
-                                                        view! {
-                                                            <button
-                                                                type="button"
-                                                                aria-label=format!("Zoom album image {}", i + 1)
-                                                                class=cls
-                                                                on:click=move |_| open_thumb(Some(i))
-                                                            >
-                                                                <img
-                                                                    loading="lazy"
-                                                                    decoding="async"
-                                                                    class="w-full h-full object-cover select-none"
-                                                                    src=format!("/images/{}.webp", encode_path(&image.name))
-                                                                    alt=image.name.clone()
-                                                                />
-                                                            </button>
-                                                        }
-                                                    })
-                                                    .collect_view()
-                                                }
+                                            <div class="flex-[2] min-w-0 max-h-[40vh] overflow-y-auto md:max-h-none md:min-h-0 p-0.5 pr-1.5">
+                                                <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-2 lg:grid-cols-3 gap-2 content-start">
+                                                    {
+                                                        images.into_iter().enumerate().map(|(i, image)| {
+                                                            let open_thumb = open_thumb.clone();
+                                                            let is_current = image.id == image_id;
+                                                            let cls = if is_current {
+                                                                "relative block w-full aspect-square p-0 border-0 rounded-lg overflow-hidden bg-sky-100 \
+                                                                 cursor-zoom-in ring-2 ring-sky-400 hover:opacity-85 \
+                                                                 hover:scale-[1.02] transition-all focus-visible:outline-2 focus-visible:outline-sky-500"
+                                                            } else {
+                                                                "relative block w-full aspect-square p-0 border-0 rounded-lg overflow-hidden bg-sky-100 \
+                                                                 cursor-zoom-in hover:opacity-85 hover:scale-[1.02] \
+                                                                 transition-all focus-visible:outline-2 focus-visible:outline-sky-500"
+                                                            };
+                                                            view! {
+                                                                <button
+                                                                    type="button"
+                                                                    aria-label=format!("Zoom album image {}", i + 1)
+                                                                    class=cls
+                                                                    on:click=move |_| open_thumb(Some(i))
+                                                                >
+                                                                    <img
+                                                                        loading="lazy"
+                                                                        decoding="async"
+                                                                        class="absolute inset-0 w-full h-full object-cover select-none"
+                                                                        src=format!("/images/{}.webp", encode_path(&image.name))
+                                                                        alt=image.name.clone()
+                                                                    />
+                                                                </button>
+                                                            }
+                                                        })
+                                                        .collect_view()
+                                                    }
+                                                </div>
                                             </div>
                                         }.into_any(),
                                         Err(e) => e.to_string().into_any(),
@@ -792,46 +821,45 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                 move || {
                                     post_videos.get().and_then(|videos| match videos {
                                         Ok(videos) if !videos.is_empty() => Some(view! {
-                                            <div class="flex-1 min-w-0 grid grid-cols-1
-                                                    gap-2 pr-1
-                                                    max-h-[40vh] overflow-y-auto
-                                                    md:max-h-none md:min-h-0">
-                                                {
-                                                    videos.into_iter().map(|v| {
-                                                        let vid_id = v.id;
-                                                        let aspect = if v.width > 0 && v.height > 0 {
-                                                            format!("aspect-ratio:{}/{};", v.width, v.height)
-                                                        } else {
-                                                            "aspect-ratio:16/9;".to_string()
-                                                        };
-                                                        let dur = (v.duration > 0).then(|| format_duration(v.duration));
-                                                        view! {
-                                                            <div class="relative group rounded-md overflow-hidden bg-black">
-                                                                <video
-                                                                    class="w-full block bg-black object-contain select-none"
-                                                                    style=aspect
-                                                                    controls
-                                                                    playsinline
-                                                                    preload="metadata"
-                                                                    src=format!("/videos/{}", encode_path(&v.name))
-                                                                />
-                                                                <div class="absolute top-1.5 right-1.5 z-10">
-                                                                    <LikeButton
-                                                                        kind="video"
-                                                                        target_id=vid_id
-                                                                        variant=LikeVariant::Card
+                                            <div class="flex-1 min-w-0 max-h-[40vh] overflow-y-auto md:max-h-none md:min-h-0 pr-1">
+                                                <div class="flex flex-col gap-2">
+                                                    {
+                                                        videos.into_iter().map(|v| {
+                                                            let vid_id = v.id;
+                                                            let aspect = if v.width > 0 && v.height > 0 {
+                                                                format!("aspect-ratio:{}/{};", v.width, v.height)
+                                                            } else {
+                                                                "aspect-ratio:16/9;".to_string()
+                                                            };
+                                                            let dur = (v.duration > 0).then(|| format_duration(v.duration));
+                                                            view! {
+                                                                <div class="relative group rounded-lg overflow-hidden bg-black">
+                                                                    <video
+                                                                        class="w-full block bg-black object-contain select-none"
+                                                                        style=aspect
+                                                                        controls
+                                                                        playsinline
+                                                                        preload="metadata"
+                                                                        src=format!("/videos/{}", encode_path(&v.name))
                                                                     />
+                                                                    <div class="absolute top-1.5 right-1.5 z-10">
+                                                                        <LikeButton
+                                                                            kind="video"
+                                                                            target_id=vid_id
+                                                                            variant=LikeVariant::Card
+                                                                        />
+                                                                    </div>
+                                                                    {dur.map(|d| view! {
+                                                                        <span class="absolute top-1.5 left-1.5 z-10 pointer-events-none px-2 py-0.5 rounded-full bg-black/70 text-white text-[11px] font-medium tabular-nums">
+                                                                            {d}
+                                                                        </span>
+                                                                    })}
                                                                 </div>
-                                                                {dur.map(|d| view! {
-                                                                    <span class="absolute top-1.5 left-1.5 z-10 pointer-events-none px-2 py-0.5 rounded-full bg-black/70 text-white text-[11px] font-medium tabular-nums">
-                                                                        {d}
-                                                                    </span>
-                                                                })}
-                                                            </div>
-                                                        }
-                                                    })
-                                                    .collect_view()
-                                                }
+                                                            }
+                                                        })
+                                                        .collect_view()
+                                                    }
+                                                </div>
                                             </div>
                                         }.into_any()),
                                         Ok(_) => None,
@@ -853,52 +881,92 @@ fn ImageDetailPage(id: String) -> impl IntoView {
             } else {
                 "translate(-50%, -100%)"
             };
+            // Invisible outer padding bridges the gap between the tag pill and card
+            // so moving the cursor into the popover never dismisses it.
+            let bridge_cls = if tip.below { "fixed z-[45] pt-2" } else { "fixed z-[45] pb-2" };
             let style = format!("left:{:.1}px;top:{:.1}px;transform:{transform};", tip.x, tip.y);
-            let total_aliases = tip.aliases.len();
-            let shown_aliases: Vec<String> = tip
-                .aliases
-                .into_iter()
-                .take(MAX_TOOLTIP_ALIASES)
-                .collect();
-            let remaining = total_aliases.saturating_sub(shown_aliases.len());
+            let canonical_href = format!("/?mode=tag&q={}&limit=50", urlencoding::encode(&tip.name));
+            let dialog_label = format!("Aliases for {}", tip.name);
+            let alias_count = tip.aliases.len();
+            let alias_count_label = if alias_count == 1 {
+                "1 alias".to_string()
+            } else {
+                format!("{alias_count} aliases")
+            };
             view! {
                 <div
                     id="tag-alias-tooltip"
-                    role="tooltip"
+                    role="dialog"
+                    aria-label=dialog_label
                     style=style
-                    class="fixed z-[45] pointer-events-none max-w-68 px-3 py-2 rounded-xl
-                           bg-slate-900/95 text-white shadow-xl ring-1 ring-white/15 backdrop-blur-md"
+                    class=bridge_cls
+                    on:mouseenter=move |_| {
+                        pointer_in_tip.set_value(true);
+                        cancel_tip_close();
+                    }
+                    on:mouseleave=move |_| {
+                        pointer_in_tip.set_value(false);
+                        schedule_tip_close();
+                    }
+                    on:focusin=move |_| {
+                        focus_in_tip.set_value(true);
+                        cancel_tip_close();
+                    }
+                    on:focusout=move |_| {
+                        focus_in_tip.set_value(false);
+                        schedule_tip_close();
+                    }
                 >
-                    <div class="flex items-center justify-between gap-2 text-xs">
-                        <span class="font-semibold text-sky-200 truncate">{tip.name}</span>
-                        {tip.score_pct.map(|pct| view! {
-                            <span class="shrink-0 px-1.5 py-0.5 rounded-full bg-indigo-500/35 text-indigo-100 text-[10px] font-semibold tabular-nums">
-                                {format!("{pct}%")}
-                            </span>
-                        })}
-                    </div>
-                    {if !shown_aliases.is_empty() {
-                        view! {
-                            <div class="flex flex-wrap gap-1 mt-1.5">
-                                {shown_aliases.into_iter().map(|a| view! {
-                                    <span class="px-1.5 py-0.5 rounded-md bg-white/10 text-slate-100 text-[11px] leading-tight">
-                                        {a}
+                    <div class="w-72 max-w-[calc(100vw-1.5rem)] px-3 py-2.5 rounded-xl
+                                bg-slate-900/95 text-white shadow-xl ring-1 ring-white/15 backdrop-blur-md">
+                        <div class="flex items-center justify-between gap-2 text-xs">
+                            <a
+                                href=canonical_href
+                                class="font-semibold text-sky-200 hover:text-white hover:underline truncate"
+                                on:click=move |_| close_tip_now()
+                            >
+                                {tip.name}
+                            </a>
+                            <div class="flex items-center gap-1.5 shrink-0">
+                                {(alias_count > 0).then(|| view! {
+                                    <span class="text-[10px] text-slate-300/80 tabular-nums">
+                                        {alias_count_label}
                                     </span>
-                                }).collect_view()}
-                                {(remaining > 0).then(|| view! {
-                                    <span class="px-1.5 py-0.5 rounded-md bg-sky-500/25 text-sky-200 text-[11px] leading-tight">
-                                        {format!("+{remaining} more")}
+                                })}
+                                {tip.score_pct.map(|pct| view! {
+                                    <span class="px-1.5 py-0.5 rounded-full bg-indigo-500/35 text-indigo-100 text-[10px] font-semibold tabular-nums">
+                                        {format!("{pct}%")}
                                     </span>
                                 })}
                             </div>
-                        }.into_any()
-                    } else {
-                        view! {
-                            <div class="text-[11px] text-slate-400 mt-0.5">
-                                "Click to search this tag"
-                            </div>
-                        }.into_any()
-                    }}
+                        </div>
+                        {if alias_count > 0 {
+                            view! {
+                                <div class="flex flex-wrap gap-1 mt-2 max-h-52 overflow-y-auto overscroll-contain pr-0.5">
+                                    {tip.aliases.into_iter().map(|a| {
+                                        let href = format!("/?mode=tag&q={}&limit=50", urlencoding::encode(&a));
+                                        view! {
+                                            <a
+                                                href=href
+                                                class="px-2 py-0.5 rounded-md bg-white/10 hover:bg-sky-500/80
+                                                       text-slate-100 hover:text-white text-[11px] leading-snug
+                                                       transition-colors cursor-pointer"
+                                                on:click=move |_| close_tip_now()
+                                            >
+                                                {a}
+                                            </a>
+                                        }
+                                    }).collect_view()}
+                                </div>
+                            }.into_any()
+                        } else {
+                            view! {
+                                <div class="text-[11px] text-slate-400 mt-1">
+                                    "Click to search this tag"
+                                </div>
+                            }.into_any()
+                        }}
+                    </div>
                 </div>
             }
         })

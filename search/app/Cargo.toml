@@ -32,7 +32,7 @@ web-sys = { version = "0.3", features = [
     "IntersectionObserver", "IntersectionObserverEntry", "IntersectionObserverInit",
     "ScrollToOptions", "ScrollBehavior", "Window", "DomRect", "CanvasRenderingContext2d",
     "ImageBitmap", "FileList", "File", "Touch", "TouchEvent", "TouchList",
-    "Request", "RequestInit", "Response", "Headers"
+    "Request", "RequestInit", "Response", "Headers", "Storage"
 ] }
 
 tokio = { workspace = true, optional = true }

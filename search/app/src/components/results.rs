@@ -16,8 +16,99 @@ use leptos_use_intersection_observer::use_intersection_observer;
 use leptos_use_signal_debounce_throttle::signal_debounced;
 use search_types::Image;
 
-const COLUMN_WIDTH: u32 = 360;
-const COLUMN_PAD: u32 = 2;
+const COLUMN_GAP: u32 = 12;
+#[cfg(feature = "hydrate")]
+const GALLERY_DENSITY_KEY: &str = "lets-embed:gallery-density";
+#[cfg(feature = "hydrate")]
+const FAV_DENSITY_KEY: &str = "lets-embed:fav-density";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Density {
+    Compact,
+    Medium,
+    Large,
+}
+
+impl Density {
+    const fn target_width(self) -> f64 {
+        match self {
+            Self::Compact => 220.0,
+            Self::Medium => 320.0,
+            Self::Large => 440.0,
+        }
+    }
+
+    #[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+
+    #[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "compact" => Some(Self::Compact),
+            "medium" => Some(Self::Medium),
+            "large" => Some(Self::Large),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "hydrate")]
+fn load_density() -> Option<Density> {
+    let storage = web_sys::window()?.local_storage().ok()??;
+    storage
+        .get_item(GALLERY_DENSITY_KEY)
+        .ok()
+        .flatten()
+        .and_then(|s| Density::parse(&s))
+        .or_else(|| {
+            storage
+                .get_item(FAV_DENSITY_KEY)
+                .ok()
+                .flatten()
+                .and_then(|s| Density::parse(&s))
+        })
+}
+
+#[cfg(feature = "hydrate")]
+fn save_density(density: Density) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(GALLERY_DENSITY_KEY, density.as_str());
+    }
+}
+
+#[cfg(not(feature = "hydrate"))]
+fn save_density(_density: Density) {}
+
+fn target_column_count(width: f64, density: Density) -> usize {
+    if width <= 0.0 {
+        return 1;
+    }
+    if width <= 540.0 {
+        return if density == Density::Large { 1 } else { 2 };
+    }
+    ((width / density.target_width()).round() as usize).clamp(1, 6)
+}
+
+fn initial_viewport_width() -> f64 {
+    #[cfg(feature = "hydrate")]
+    {
+        web_sys::window()
+            .and_then(|w| w.inner_width().ok())
+            .and_then(|v| v.as_f64())
+            .map(|w| (w - 28.0).clamp(320.0, 1600.0))
+            .unwrap_or(1120.0)
+    }
+    #[cfg(not(feature = "hydrate"))]
+    {
+        1120.0
+    }
+}
 
 #[derive(Debug, Clone)]
 enum Item {
@@ -46,6 +137,7 @@ struct Placed {
     item: Item,
     w: u32,
     h: u32,
+    order: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +148,7 @@ struct Column {
 }
 
 #[component]
-pub fn Results() -> impl IntoView {
+pub fn Results(#[prop(default = false)] embedded: bool) -> impl IntoView {
     let qmap = use_query_map();
     let pathname = use_location().pathname;
 
@@ -100,17 +192,62 @@ pub fn Results() -> impl IntoView {
         set_document_title(&text);
     });
 
+    let density = RwSignal::new(Density::Medium);
+
+    // Restore saved density strictly on the client after hydration so SSR and
+    // initial hydrate markup stay identical.
+    #[cfg(feature = "hydrate")]
+    Effect::new(move |_| {
+        if let Some(saved) = load_density() {
+            density.set(saved);
+        }
+    });
+
     let size_el = NodeRef::<leptos::html::Div>::new();
     let UseElementSizeReturn { width, .. } = use_element_size(size_el);
-    let width: Signal<f64> = signal_debounced(width, 250.0);
-    let width = Memo::new(move |_| width());
+    let debounced_width: Signal<f64> = signal_debounced(width, 160.0);
 
-    let columns: RwSignal<Vec<Column>> = RwSignal::new(vec![]);
+    let init_w = initial_viewport_width();
+    let init_cols = target_column_count(init_w, Density::Medium);
+    let init_col_w = ((init_w - COLUMN_GAP as f64 * (init_cols.saturating_sub(1) as f64))
+        / init_cols as f64)
+        .round()
+        .max(120.0) as u32;
+    let columns: RwSignal<Vec<Column>> = RwSignal::new(
+        repeat_with(|| Column {
+            items: vec![],
+            width: init_col_w,
+            height: 0,
+        })
+        .take(init_cols)
+        .collect(),
+    );
 
+    // Reflow existing columns only when column count changes (from viewport
+    // breakpoint changes or switching Compact / Medium / Large), never on
+    // scrollbar appearance or lazy-loaded page appends.
     Effect::new(move || {
-        let width = width();
-        let column_count = ((width / COLUMN_WIDTH as f64).round() as usize).max(1);
-        let column_width = (width / column_count as f64).round() as u32;
+        let cur_density = density.get();
+        let measured = debounced_width();
+        let width = if measured > 0.0 {
+            measured
+        } else {
+            initial_viewport_width()
+        };
+        let column_count = target_column_count(width, cur_density);
+        let column_width = ((width - COLUMN_GAP as f64 * (column_count.saturating_sub(1) as f64))
+            / column_count as f64)
+            .round()
+            .max(120.0) as u32;
+        let current_count = columns.with_untracked(Vec::len);
+        if current_count == column_count {
+            columns.update_untracked(|cs| {
+                for c in cs {
+                    c.width = column_width;
+                }
+            });
+            return;
+        }
         let mut new = repeat_with(|| Column {
             items: vec![],
             width: column_width,
@@ -118,12 +255,14 @@ pub fn Results() -> impl IntoView {
         })
         .take(column_count)
         .collect::<Vec<_>>();
-        let old = columns.get_untracked();
-        let max_row = old.iter().map(|c| c.items.len()).max().unwrap_or_default();
-        for placed in
-            (0..max_row).flat_map(|row| old.iter().filter_map(move |c| c.items.get(row).cloned()))
-        {
-            place_item(&mut new, placed.item);
+        let mut existing: Vec<Placed> = columns
+            .get_untracked()
+            .into_iter()
+            .flat_map(|c| c.items)
+            .collect();
+        existing.sort_by_key(|p| p.order);
+        for placed in existing {
+            place_item(&mut new, placed.item, placed.order);
         }
         columns.set(new);
     });
@@ -135,6 +274,7 @@ pub fn Results() -> impl IntoView {
     let lightbox: RwSignal<Option<PostItem>> = RwSignal::new(None);
     let viewer: RwSignal<Option<usize>> = RwSignal::new(None);
     let images: StoredValue<Vec<Image>> = StoredValue::new(Vec::new());
+    let next_order: StoredValue<usize> = StoredValue::new(0);
 
     let viewer_open = Memo::new(move |_| viewer.get().is_some());
 
@@ -154,11 +294,12 @@ pub fn Results() -> impl IntoView {
             })
         });
         images.update_value(|v| v.clear());
+        next_order.set_value(0);
         offset.set(0);
         has_more.set(true);
         error.set(None);
         load_page(
-            0, params, img_query, columns, images, has_more, loading, error, req_id,
+            0, params, img_query, columns, images, next_order, has_more, loading, error, req_id,
         );
     });
 
@@ -177,13 +318,16 @@ pub fn Results() -> impl IntoView {
             offset.update(|old| *old += limit);
             let next = offset.get_untracked();
             load_page(
-                next, params, img_query, columns, images, has_more, loading, error, req_id,
+                next, params, img_query, columns, images, next_order, has_more, loading, error,
+                req_id,
             );
         }
     });
 
     let render_item = move |placed: Placed| -> AnyView {
-        // Off-screen items skip render/decode; the reserved box keeps scroll stable.
+        // Off-screen items skip render/decode; put `content-visibility:auto` on
+        // `.gallery-frame` (which already clips via `overflow:hidden`) so
+        // `contain:paint` never clips `.gallery-post::before` or tile shadows.
         let cv = format!(
             "content-visibility:auto;contain-intrinsic-size:{}px {}px;",
             placed.w, placed.h
@@ -208,8 +352,8 @@ pub fn Results() -> impl IntoView {
                     (false, false) => None,
                 };
                 view! {
-                    <div class="mb-2 break-inside-avoid" style=cv>
-                        <div class="relative group rounded-xl overflow-hidden bg-sky-100 ring-1 ring-sky-200/70 shadow-sm shadow-sky-200/50 hover:shadow-md hover:shadow-sky-300/50 transition-shadow">
+                    <article class="gallery-tile gallery-post group">
+                        <div class="gallery-frame" style=cv>
                             <button
                                 type="button"
                                 aria-label=open_label
@@ -222,33 +366,36 @@ pub fn Results() -> impl IntoView {
                                         decoding="async"
                                         alt=title.clone()
                                         style=aspect.clone()
-                                        class="w-full h-auto block bg-sky-100 select-none group-hover:scale-[1.03] transition-transform duration-300"
+                                        class="gallery-img"
                                         src=format!("/images/{}.webp", encode_path(&c.name))
                                     />
                                 }.into_any()).unwrap_or_else(|| view! {
-                                    <div class="w-full grid place-items-center text-sky-700 text-3xl"
+                                    <div class="w-full grid place-items-center text-sky-700 text-3xl bg-[#e4f3fc]"
                                         style=aspect>
                                         <span aria-hidden="true">"▶"</span>
                                     </div>
                                 }.into_any())}
-                                {media_badge.map(|badge| view! {
-                                    <div class="absolute top-1.5 right-1.5 pointer-events-none bg-sky-500/85 text-white text-xs font-medium px-2 py-0.5 rounded-full shadow-sm">
-                                        {badge}
-                                    </div>
-                                })}
-                                <div class="absolute bottom-0 left-0 right-0 pointer-events-none bg-gradient-to-t from-black/70 to-transparent text-white text-xs p-1.5 truncate">
-                                    {title}
-                                </div>
                             </button>
-                            <div class="absolute top-1.5 left-1.5 z-10">
+                            {media_badge.map(|badge| view! {
+                                <div class="gallery-top-left">
+                                    <span class="gallery-post-pill">
+                                        <span class="star" aria-hidden="true">"\u{2605}"</span>
+                                        <span>{badge}</span>
+                                    </span>
+                                </div>
+                            })}
+                            <div class="gallery-top-right">
                                 <LikeButton
                                     kind="post"
                                     target_id=post_id
                                     variant=LikeVariant::Card
                                 />
                             </div>
+                            <div class="gallery-overlay">
+                                <span class="gallery-overlay-meta">{title}</span>
+                            </div>
                         </div>
-                    </div>
+                    </article>
                 }
                 .into_any()
             }
@@ -260,8 +407,8 @@ pub fn Results() -> impl IntoView {
                 let click_href = href.clone();
                 let nav = use_navigate();
                 view! {
-                    <div class="m-1" style=cv>
-                        <div class="relative group rounded-xl overflow-hidden bg-sky-100 ring-1 ring-sky-200/70 shadow-sm shadow-sky-200/50 hover:shadow-md hover:shadow-sky-300/50 transition-shadow">
+                    <article class="gallery-tile group">
+                        <div class="gallery-frame" style=cv>
                             <button
                                 type="button"
                                 aria-label=format!("Zoom image #{id}")
@@ -277,36 +424,36 @@ pub fn Results() -> impl IntoView {
                                     decoding="async"
                                     alt=alt
                                     style=aspect
-                                    class="w-full h-auto block bg-sky-100 select-none group-hover:scale-[1.02] transition-transform duration-300"
+                                    class="gallery-img"
                                     src=url
                                 />
                             </button>
-                            <div class="absolute top-1.5 right-1.5 z-10">
+                            <div class="gallery-top-right">
                                 <LikeButton
                                     kind="image"
                                     target_id=id
                                     variant=LikeVariant::Card
                                 />
                             </div>
-                            <a
-                                href=href
-                                title="Open image details & similar"
-                                class="absolute bottom-1.5 right-1.5 z-10 px-2.5 py-1 rounded-full
-                                       text-xs font-semibold bg-slate-900/75 hover:bg-sky-500
-                                       text-white backdrop-blur-xs opacity-0 group-hover:opacity-100
-                                       group-focus-within:opacity-100 touch-visible transition-opacity"
-                                on:click=move |ev: ev::MouseEvent| {
-                                    ev.stop_propagation();
-                                    if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
-                                        ev.prevent_default();
-                                        nav(&click_href, NavigateOptions::default());
+                            <div class="gallery-overlay">
+                                <span class="gallery-overlay-meta">{format!("#{id}")}</span>
+                                <a
+                                    href=href
+                                    title="Open image details & similar"
+                                    class="gallery-overlay-link"
+                                    on:click=move |ev: ev::MouseEvent| {
+                                        ev.stop_propagation();
+                                        if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
+                                            ev.prevent_default();
+                                            nav(&click_href, NavigateOptions::default());
+                                        }
                                     }
-                                }
-                            >
-                                "Details \u{2197}"
-                            </a>
+                                >
+                                    "Details \u{2197}"
+                                </a>
+                            </div>
                         </div>
-                    </div>
+                    </article>
                 }
                 .into_any()
             }
@@ -414,16 +561,47 @@ pub fn Results() -> impl IntoView {
         })
     };
 
+    let wrap_cls = if embedded {
+        "gallery-wrap gallery-embedded flex flex-col"
+    } else {
+        "gallery-wrap flex flex-col"
+    };
+
+    let render_density_btn = move |d: Density, label: &'static str| {
+        view! {
+            <button
+                type="button"
+                class="gallery-density-btn"
+                aria-pressed=move || (density.get() == d).to_string()
+                on:click=move |_| {
+                    density.set(d);
+                    save_density(d);
+                }
+            >
+                {label}
+            </button>
+        }
+    };
+
     view! {
-        <div node_ref=size_el class="w-full flex flex-col">
+        <div node_ref=size_el class=wrap_cls>
+            {(!embedded).then(|| view! {
+                <div class="gallery-toolbar">
+                    <div class="gallery-density" role="group" aria-label="Grid size">
+                        {render_density_btn(Density::Compact, "Compact")}
+                        {render_density_btn(Density::Medium, "Medium")}
+                        {render_density_btn(Density::Large, "Large")}
+                    </div>
+                </div>
+            })}
             {error_view}
-            <div class="flex w-full h-fit">
+            <div class="gallery-masonry">
                 <For
                     each=move || columns.get().into_iter().enumerate()
                     key=|(i, _)| *i
                     let((i, _))
                 >
-                    <div class="flex-1 columns-1 gap-2">
+                    <div class="gallery-col">
                         <For
                             each=move || {
                                 columns
@@ -455,7 +633,7 @@ pub fn Results() -> impl IntoView {
 }
 
 /// Use the same cover and aspect ratio when loading a page and when reflowing it.
-fn place_item(columns: &mut [Column], item: Item) {
+fn place_item(columns: &mut [Column], item: Item, order: usize) {
     let Some((width, height)) = item.cover_dimensions() else {
         return;
     };
@@ -465,8 +643,9 @@ fn place_item(columns: &mut [Column], item: Item) {
     let ratio = f64::from(height) / f64::from(width);
     let w = column.width;
     let h = (ratio * f64::from(w)).round().max(1.0) as u32;
-    column.height += u64::from(h) + u64::from(COLUMN_PAD);
-    column.items.push(Placed { item, w, h });
+    let extra = if matches!(item, Item::Post(_)) { 6 } else { 0 };
+    column.height += u64::from(h) + u64::from(COLUMN_GAP) + extra;
+    column.items.push(Placed { item, w, h, order });
 }
 
 /// Fetch one page of results through the REST search endpoints and merge it into
@@ -479,6 +658,7 @@ fn load_page(
     img_query: ImageQuery,
     columns: RwSignal<Vec<Column>>,
     images: StoredValue<Vec<Image>>,
+    next_order: StoredValue<usize>,
     has_more: RwSignal<bool>,
     loading: RwSignal<bool>,
     error: RwSignal<Option<String>>,
@@ -528,12 +708,16 @@ fn load_page(
             Ok(resp) => {
                 images.update_value(|v| v.extend(resp.images.iter().cloned()));
                 columns.update(|cs| {
+                    let mut order = next_order.get_value();
                     for post in resp.posts {
-                        place_item(cs, Item::Post(post));
+                        place_item(cs, Item::Post(post), order);
+                        order += 1;
                     }
                     for image in resp.images {
-                        place_item(cs, Item::Image(image));
+                        place_item(cs, Item::Image(image), order);
+                        order += 1;
                     }
+                    next_order.set_value(order);
                 });
                 has_more.set(resp.has_more);
             }
@@ -852,8 +1036,26 @@ fn video_only_post_keeps_its_place_at_different_widths() {
             width,
             height: 0,
         }];
-        place_item(&mut columns, post.clone());
+        place_item(&mut columns, post.clone(), 0);
         assert_eq!(columns[0].items.len(), 1);
         assert_eq!(columns[0].items[0].h, width * 9 / 16);
     }
+}
+
+#[test]
+fn masonry_column_count_matches_favorites_breakpoints() {
+    assert_eq!(target_column_count(0.0, Density::Medium), 1);
+    assert_eq!(target_column_count(375.0, Density::Compact), 2);
+    assert_eq!(target_column_count(375.0, Density::Medium), 2);
+    assert_eq!(target_column_count(375.0, Density::Large), 1);
+    assert_eq!(target_column_count(540.0, Density::Medium), 2);
+    assert_eq!(target_column_count(540.0, Density::Large), 1);
+    assert_eq!(target_column_count(1120.0, Density::Compact), 5);
+    assert_eq!(target_column_count(1120.0, Density::Medium), 4);
+    assert_eq!(target_column_count(1120.0, Density::Large), 3);
+    assert_eq!(target_column_count(1280.0, Density::Compact), 6);
+    assert_eq!(target_column_count(1280.0, Density::Medium), 4);
+    assert_eq!(target_column_count(1280.0, Density::Large), 3);
+    assert_eq!(target_column_count(2400.0, Density::Compact), 6);
+    assert_eq!(target_column_count(2400.0, Density::Large), 5);
 }

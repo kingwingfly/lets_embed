@@ -215,14 +215,14 @@ pub fn AccountWidget() -> impl IntoView {
                 <a
                     href="/user/favorites"
                     rel="external"
-                    class="hidden sm:flex items-center gap-1 rounded-full py-2 px-3 bg-white/80 backdrop-blur-md
+                    class="flex items-center gap-1 rounded-full py-1.5 sm:py-2 px-2.5 sm:px-3 bg-white/85 backdrop-blur-md
                         ring-1 ring-sky-200 shadow-sm shadow-sky-200/50 text-sky-600 font-medium
                         hover:ring-sky-300 hover:text-amber-500 hover:scale-105 transition-all whitespace-nowrap"
                     title="Favorites"
                     aria-label="Favorites"
                 >
                     <span class="text-amber-500 leading-none select-none">"\u{2605}"</span>
-                    <span class="text-sm">"Favorites"</span>
+                    <span class="hidden sm:inline text-sm">"Favorites"</span>
                 </a>
             })}
             <button
