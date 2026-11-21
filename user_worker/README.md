@@ -38,6 +38,7 @@ Worker. Replaces the old apply/approve flow in `gateway_worker`.
 | `/user/api/link_solana` | GET/POST/DELETE | read, link (by signing a challenge), or unlink a Solana wallet for an Ethereum session |
 | `/user/api/like` | GET/POST/DELETE | check / add / remove a like |
 | `/user/api/likes` | GET | list likes (keyset paginated) |
+| `/user/api/likes/status` | GET | batch check liked status for comma-separated `kind:target_id` pairs |
 | `/user/admin` | GET | admin page (Cloudflare Access protected) |
 | `/user/admin/settings` | POST | publish the visitor, pricing, plan and payment settings |
 | `/user/admin/plan` | POST | grant or revoke a customer subscription |

@@ -111,15 +111,25 @@ function formatShortDate(epochSecs) {
 
 function itemLabel(item) {
   if (item.kind === "post") {
-    return (item.preview && item.preview.title) ? item.preview.title : ("Post #" + item.target_id);
+    const t = item.preview && typeof item.preview.title === "string" ? item.preview.title.trim() : "";
+    return t || ("Post #" + item.target_id);
   }
   if (item.kind === "image") return "Image #" + item.target_id;
   return "Video #" + item.target_id;
 }
 
+function formatPostCounts(preview) {
+  if (!preview) return "";
+  const counts = [];
+  if (preview.image_count) counts.push(preview.image_count + "p");
+  if (preview.video_count) counts.push(preview.video_count + "v");
+  return counts.join(" ");
+}
+
 function itemDetailsUrl(item) {
   if (item.kind === "image") {
-    return detailsHref(item.preview ? item.preview.image_id : item.target_id);
+    const id = (item.preview && item.preview.image_id != null) ? item.preview.image_id : item.target_id;
+    return detailsHref(id);
   }
   if (item.kind === "post" && item.preview && item.preview.image_id != null) {
     return detailsHref(item.preview.image_id);
@@ -239,19 +249,30 @@ function buildTile(item) {
       const star = document.createElement("span");
       star.className = "star";
       star.textContent = "★";
-      const text = item.preview.image_count
-        ? ("Post · " + item.preview.image_count + "p")
-        : "Post";
+      const countsText = formatPostCounts(item.preview);
+      const text = countsText ? ("Post · " + countsText) : "Post";
       pill.append(star, " " + text);
       topLeft.appendChild(pill);
       frame.appendChild(topLeft);
 
-      const link = document.createElement("a");
-      link.className = "fav-media-trigger";
-      link.href = href || "#";
-      link.setAttribute("aria-label", "Open " + label);
-      link.appendChild(img);
-      frame.appendChild(link);
+      if (href) {
+        const link = document.createElement("a");
+        link.className = "fav-media-trigger";
+        link.href = href;
+        link.setAttribute("aria-label", "Open " + label);
+        link.appendChild(img);
+        frame.appendChild(link);
+      } else {
+        const trigger = document.createElement("button");
+        trigger.type = "button";
+        trigger.className = "fav-media-trigger";
+        trigger.setAttribute("aria-label", "Inspect cover of " + label);
+        trigger.appendChild(img);
+        trigger.addEventListener("click", function () {
+          openViewerForItem(item, trigger);
+        });
+        frame.appendChild(trigger);
+      }
     } else {
       const trigger = document.createElement("button");
       trigger.type = "button";
@@ -287,7 +308,8 @@ function buildTile(item) {
     body.className = "fav-fallback-body";
     const badge = document.createElement("span");
     badge.className = "badge " + (item.kind === "video" ? "warn" : "ok");
-    badge.textContent = item.kind;
+    const countsText = isPost ? formatPostCounts(item.preview) : "";
+    badge.textContent = countsText ? ("post · " + countsText) : item.kind;
     body.appendChild(badge);
     if (href) {
       const a = document.createElement("a");

@@ -463,6 +463,8 @@ test('gallery access, billing and administrator controls use the published polic
   assert.equal((await status()).balance, granted.balance);
   await check(post('/ban', { address: wallet, banned: '1' }), 303);
   await check(site('/images/suspended.webp', { headers: walletHeaders }), 403);
+  await check(site('/api/suggest_search', { method: 'POST', headers: walletHeaders }), 403);
+  await check(site('/user/api/likes/status?items=post:1', { headers: walletHeaders }), 403);
   await check(command('topup/prepare', checkout), 403);
   await check(command('subscribe', { plan: 'basic', expected_price: 1000 }), 403);
   await check(post('/ban', { address: wallet, banned: '0' }), 303);
@@ -588,6 +590,29 @@ test('gallery access, billing and administrator controls use the published polic
   assert.match(favHtml, /id="tab-image"/);
   assert.match(favHtml, /id="tab-post"/);
   assert.match(favHtml, /id="fav-viewer"/);
+  // Unauthenticated guests cannot call /api/like_previews even when login_required=no.
+  await check(site('/api/like_previews?items=post:42'), 401);
+  // Batch like status endpoint checks multiple items in one round-trip,
+  // rejects >100 items with 400, and preserves full i64 precision above 2^53.
+  await check(command('like', { kind: 'post', target_id: 42 }), 200);
+  await check(command('like', { kind: 'image', target_id: 77 }), 200);
+  await check(
+    site('/user/api/like', {
+      method: 'POST',
+      headers: { cookie: signedWalletSession(wallet), 'content-type': 'application/json' },
+      body: '{"kind":"image","target_id":9007199254740993}',
+    }),
+    200
+  );
+  const batchLikes = await site(
+    '/user/api/likes/status?items=post:42,post:99,image:77,image:88,image:9007199254740993,image:9007199254740992',
+    { headers: walletHeaders }
+  );
+  assert.equal(batchLikes.status, 200);
+  const batchJson = await batchLikes.json();
+  assert.deepEqual(batchJson.liked.sort(), ['image:77', 'image:9007199254740993', 'post:42']);
+  const tooMany = Array.from({ length: 101 }, (_, i) => `image:${i}`).join(',');
+  await check(site('/user/api/likes/status?items=' + tooMany, { headers: walletHeaders }), 400);
   const selected = await admin('?address=' + wallet);
   assert.match(await selected.text(), /Apply subscription/);
 });
@@ -1033,18 +1058,32 @@ test('favorites gallery splits images and posts, supports masonry viewer, unfavo
   const postPills = env.findAll(env.ids.get('fav-grid'), (n) => n.className === 'fav-post-pill');
   assert.match(postPills[0].children.join(''), /9p/);
 
-  // Auto-switch: when user has 0 single images and >=1 post, lands on Posts automatically.
+  // Auto-switch: when user has 0 single images and >=1 post, lands on Posts automatically,
+  // and video-only posts render their title and video count badge in the fallback tile.
   const postsOnly = runFavoritesEnv({
     fetchImpl: async (url) => {
       if (url.startsWith('/user/api/likes?kind=image')) return Response.json({ items: [], next_cursor: null });
       if (url.startsWith('/user/api/likes?kind=post')) {
-        return Response.json({ items: [{ kind: 'post', target_id: 99, created_at: 1700000400 }], next_cursor: null });
+        return Response.json({
+          items: [
+            { kind: 'post', target_id: 99, created_at: 1700000400 },
+            { kind: 'post', target_id: 100, created_at: 1700000300 },
+          ],
+          next_cursor: null,
+        });
       }
       if (url.startsWith('/user/api/likes?kind=video')) return Response.json({ items: [], next_cursor: null });
-      return Response.json([{ kind: 'post', target_id: 99, image_id: 600, name: 'p/1', width: 600, height: 800 }]);
+      return Response.json([
+        { kind: 'post', target_id: 99, image_id: 600, name: 'p/1', width: 600, height: 800, title: '  ', image_count: 5 },
+        { kind: 'post', target_id: 100, width: 0, height: 0, title: 'Clip Reel', video_count: 3 },
+      ]);
     },
   });
   for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
   assert.equal(postsOnly.ids.get('tab-post').getAttribute('aria-selected'), 'true');
-  assert.equal(postsOnly.ids.get('count-post').textContent, '1');
+  assert.equal(postsOnly.ids.get('count-post').textContent, '2');
+  const fallbackBadges = postsOnly.findAll(postsOnly.ids.get('fav-grid'), (n) => n.className.startsWith('badge '));
+  assert.equal(fallbackBadges[0].textContent, 'post · 3v');
+  const fallbackTitles = postsOnly.findAll(postsOnly.ids.get('fav-grid'), (n) => n.className === 'fav-fallback-title');
+  assert.equal(fallbackTitles[0].textContent, 'Clip Reel');
 });

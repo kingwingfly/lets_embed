@@ -1,13 +1,16 @@
 use std::iter::repeat_with;
 
 use crate::{
-    components::{lightbox::Lightbox, viewer::Viewer},
+    components::{LikeButton, LikeVariant, lightbox::Lightbox, viewer::Viewer},
     types::{ImageQuery, Mode, PostItem, SearchResponse},
-    util::encode_path,
+    util::{encode_path, set_document_title},
 };
 
-use leptos::{prelude::*, task::spawn_local};
-use leptos_router::hooks::use_query_map;
+use leptos::{ev, prelude::*, task::spawn_local};
+use leptos_router::{
+    NavigateOptions,
+    hooks::{use_location, use_navigate, use_query_map},
+};
 use leptos_use_element_size::{UseElementSizeReturn, use_element_size};
 use leptos_use_intersection_observer::use_intersection_observer;
 use leptos_use_signal_debounce_throttle::signal_debounced;
@@ -55,6 +58,7 @@ struct Column {
 #[component]
 pub fn Results() -> impl IntoView {
     let qmap = use_query_map();
+    let pathname = use_location().pathname;
 
     let params = Memo::new(move |_| {
         qmap.with(|m| {
@@ -67,9 +71,33 @@ pub fn Results() -> impl IntoView {
                     .max(1),
                 // Random state: the seed lives in the URL so pagination + reload
                 // reproduce the same shuffle. Absent (non-random) modes ignore it.
-                m.get("seed").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
+                m.get("seed")
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0),
             )
         })
+    });
+
+    // Update browser tab title strictly on the client (never via SSR `<Title>`).
+    Effect::new(move |_| {
+        if pathname.with(|p| p != "/") {
+            return;
+        }
+        let (mode, q, _, _) = params.get();
+        let text = if q.is_empty() {
+            "Gallery".to_string()
+        } else {
+            match mode {
+                Mode::Tag => format!("Tag: {q}"),
+                Mode::Author => format!("Author: {q}"),
+                Mode::Title => format!("Title: {q}"),
+                Mode::Clip => format!("CLIP: {q}"),
+                Mode::Similar => format!("Similar to #{q}"),
+                Mode::SearchImage => "Image search".to_string(),
+                Mode::Random => format!("Random {q}"),
+            }
+        };
+        set_document_title(&text);
     });
 
     let size_el = NodeRef::<leptos::html::Div>::new();
@@ -167,34 +195,57 @@ pub fn Results() -> impl IntoView {
         let aspect = format!("aspect-ratio: {width} / {height}");
         match placed.item {
             Item::Post(p) => {
+                let post_id = p.id;
+                let title = p.title.clone();
+                let open_label = format!("Open post: {title}");
                 let cover = p.images.first().cloned();
                 let img_count = p.images.len();
                 let video_count = p.videos.len();
+                let media_badge = match (img_count > 0, video_count > 0) {
+                    (true, true) => Some(format!("{img_count}p {video_count}v")),
+                    (true, false) => Some(format!("{img_count}p")),
+                    (false, true) => Some(format!("{video_count}v")),
+                    (false, false) => None,
+                };
                 view! {
                     <div class="mb-2 break-inside-avoid" style=cv>
-                        <div
-                            class="relative cursor-pointer group rounded-xl overflow-hidden bg-sky-100 ring-1 ring-sky-200/70 shadow-sm shadow-sky-200/50 hover:shadow-md hover:shadow-sky-300/50 transition-shadow"
-                            on:click=move |_| lightbox.set(Some(p.clone()))
-                        >
-                            {cover.map(|c| view! {
-                                <img
-                                    loading="lazy"
-                                    decoding="async"
-                                    style=aspect.clone()
-                                    class="w-full h-auto block bg-sky-100 select-none group-hover:scale-[1.03] transition-transform duration-300"
-                                    src=format!("/images/{}.webp", encode_path(&c.name))
-                                />
-                            }.into_any()).unwrap_or_else(|| view! {
-                                <div class="w-full grid place-items-center text-sky-700 text-3xl"
-                                    style=aspect>
-                                    <span aria-label="Video">"▶"</span>
+                        <div class="relative group rounded-xl overflow-hidden bg-sky-100 ring-1 ring-sky-200/70 shadow-sm shadow-sky-200/50 hover:shadow-md hover:shadow-sky-300/50 transition-shadow">
+                            <button
+                                type="button"
+                                aria-label=open_label
+                                class="block w-full p-0 border-0 bg-transparent text-left cursor-pointer focus-visible:outline-2 focus-visible:outline-sky-500"
+                                on:click=move |_| lightbox.set(Some(p.clone()))
+                            >
+                                {cover.map(|c| view! {
+                                    <img
+                                        loading="lazy"
+                                        decoding="async"
+                                        alt=title.clone()
+                                        style=aspect.clone()
+                                        class="w-full h-auto block bg-sky-100 select-none group-hover:scale-[1.03] transition-transform duration-300"
+                                        src=format!("/images/{}.webp", encode_path(&c.name))
+                                    />
+                                }.into_any()).unwrap_or_else(|| view! {
+                                    <div class="w-full grid place-items-center text-sky-700 text-3xl"
+                                        style=aspect>
+                                        <span aria-hidden="true">"▶"</span>
+                                    </div>
+                                }.into_any())}
+                                {media_badge.map(|badge| view! {
+                                    <div class="absolute top-1.5 right-1.5 pointer-events-none bg-sky-500/85 text-white text-xs font-medium px-2 py-0.5 rounded-full shadow-sm">
+                                        {badge}
+                                    </div>
+                                })}
+                                <div class="absolute bottom-0 left-0 right-0 pointer-events-none bg-gradient-to-t from-black/70 to-transparent text-white text-xs p-1.5 truncate">
+                                    {title}
                                 </div>
-                            }.into_any())}
-                            <div class="absolute top-1.5 right-1.5 bg-sky-500/85 text-white text-xs font-medium px-2 py-0.5 rounded-full shadow-sm">
-                                {img_count}"p "{video_count}"v"
-                            </div>
-                            <div class="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/70 to-transparent text-white text-xs p-1.5 truncate">
-                                {p.title.clone()}
+                            </button>
+                            <div class="absolute top-1.5 left-1.5 z-10">
+                                <LikeButton
+                                    kind="post"
+                                    target_id=post_id
+                                    variant=LikeVariant::Card
+                                />
                             </div>
                         </div>
                     </div>
@@ -203,22 +254,58 @@ pub fn Results() -> impl IntoView {
             }
             Item::Image(im) => {
                 let url = format!("/images/{}.webp", encode_path(&im.name));
+                let alt = im.name.clone();
                 let id = im.id;
+                let href = format!("/details/{id}?mode=similar&q={id}&limit=50");
+                let click_href = href.clone();
+                let nav = use_navigate();
                 view! {
                     <div class="m-1" style=cv>
-                        <img
-                            loading="lazy"
-                            decoding="async"
-                            style=aspect
-                            class="w-full h-auto block rounded-xl bg-sky-100 ring-1 ring-sky-200/70 shadow-sm shadow-sky-200/50
-                                cursor-zoom-in select-none hover:shadow-md hover:shadow-sky-300/50 hover:scale-[1.02] transition-all"
-                            src=url
-                            on:click=move |_| {
-                                if let Some(i) = images.with_value(|v| v.iter().position(|x| x.id == id)) {
-                                    viewer.set(Some(i));
+                        <div class="relative group rounded-xl overflow-hidden bg-sky-100 ring-1 ring-sky-200/70 shadow-sm shadow-sky-200/50 hover:shadow-md hover:shadow-sky-300/50 transition-shadow">
+                            <button
+                                type="button"
+                                aria-label=format!("Zoom image #{id}")
+                                class="block w-full p-0 border-0 bg-transparent cursor-zoom-in focus-visible:outline-2 focus-visible:outline-sky-500"
+                                on:click=move |_| {
+                                    if let Some(i) = images.with_value(|v| v.iter().position(|x| x.id == id)) {
+                                        viewer.set(Some(i));
+                                    }
                                 }
-                            }
-                        />
+                            >
+                                <img
+                                    loading="lazy"
+                                    decoding="async"
+                                    alt=alt
+                                    style=aspect
+                                    class="w-full h-auto block bg-sky-100 select-none group-hover:scale-[1.02] transition-transform duration-300"
+                                    src=url
+                                />
+                            </button>
+                            <div class="absolute top-1.5 right-1.5 z-10">
+                                <LikeButton
+                                    kind="image"
+                                    target_id=id
+                                    variant=LikeVariant::Card
+                                />
+                            </div>
+                            <a
+                                href=href
+                                title="Open image details & similar"
+                                class="absolute bottom-1.5 right-1.5 z-10 px-2.5 py-1 rounded-full
+                                       text-xs font-semibold bg-slate-900/75 hover:bg-sky-500
+                                       text-white backdrop-blur-xs opacity-0 group-hover:opacity-100
+                                       group-focus-within:opacity-100 touch-visible transition-opacity"
+                                on:click=move |ev: ev::MouseEvent| {
+                                    ev.stop_propagation();
+                                    if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
+                                        ev.prevent_default();
+                                        nav(&click_href, NavigateOptions::default());
+                                    }
+                                }
+                            >
+                                "Details \u{2197}"
+                            </a>
+                        </div>
                     </div>
                 }
                 .into_any()
@@ -241,6 +328,68 @@ pub fn Results() -> impl IntoView {
             view! {
                 <div class="w-full text-sky-500 p-4 text-center animate-pulse">"Loading\u{2026} \u{1f4ab}"</div>
             }
+        })
+    };
+
+    let empty_view = move || {
+        let is_empty = !loading.get()
+            && !has_more.get()
+            && error.get().is_none()
+            && columns.read().iter().all(|c| c.items.is_empty());
+        is_empty.then(|| {
+            let (mode, q, limit, _) = params.get();
+            let missing_image_payload = mode == Mode::SearchImage
+                && img_query
+                    .0
+                    .with(|p| p.as_ref().is_none_or(|x| x.nonce != q));
+            if missing_image_payload {
+                return view! {
+                    <div class="w-full max-w-md mx-auto my-10 p-6 rounded-2xl bg-white/80 ring-1 ring-sky-200
+                                text-center text-slate-600 shadow-sm shadow-sky-200/40">
+                        <div class="text-2xl mb-1">"\u{1F5BC}\u{FE0F}"</div>
+                        <p class="font-medium text-sky-800">"Image search isn\u{2019}t stored in the URL"</p>
+                        <p class="text-sm text-slate-500 mt-1">
+                            "Pick an image from the search bar above (or drag to crop on a details page) to search again."
+                        </p>
+                    </div>
+                }.into_any();
+            }
+            let clip_href = (mode == Mode::Tag && !q.is_empty()).then(|| {
+                format!(
+                    "/?mode=clip&q={}&limit={}",
+                    urlencoding::encode(&q),
+                    limit
+                )
+            });
+            let heading = if q.is_empty() {
+                "No items found.".to_string()
+            } else {
+                format!("No matches for \u{201c}{q}\u{201d}")
+            };
+            let hint = match mode {
+                Mode::Tag => "Try a shorter keyword, a tag alias (EN / 中文 / 日本語), or describe the scene with CLIP.",
+                Mode::Author => "Try part of the author\u{2019}s name — suggestions appear as you type.",
+                Mode::Title => "Try fewer keywords from the post title.",
+                _ => "Try a different query or switch search modes above.",
+            };
+            view! {
+                <div class="w-full max-w-md mx-auto my-10 p-6 rounded-2xl bg-white/80 ring-1 ring-sky-200
+                            text-center text-slate-600 shadow-sm shadow-sky-200/40">
+                    <div class="text-2xl mb-1">"\u{1F50D}"</div>
+                    <p class="font-semibold text-sky-800">{heading}</p>
+                    <p class="text-sm text-slate-500 mt-1">{hint}</p>
+                    {clip_href.map(|href| view! {
+                        <a
+                            href=href
+                            class="inline-flex items-center gap-1 mt-4 px-4 py-1.5 rounded-full text-sm font-medium
+                                   bg-gradient-to-r from-sky-400 to-blue-500 text-white shadow-sm
+                                   hover:from-sky-500 hover:to-blue-600 transition-all"
+                        >
+                            "Try CLIP search instead \u{2728}"
+                        </a>
+                    })}
+                </div>
+            }.into_any()
         })
     };
 
@@ -297,6 +446,7 @@ pub fn Results() -> impl IntoView {
             <div node_ref=sentinel class="w-full min-h-10"></div>
 
             {loading_view}
+            {empty_view}
             {end_view}
             {lightbox_view}
             {viewer_view}
@@ -345,10 +495,13 @@ fn load_page(
 
     spawn_local(async move {
         let result = if mode == Mode::SearchImage {
-            match img_query.0.get_untracked() {
-                // The image bytes live only in client memory, so a reloaded or
-                // shared `search_image` URL has none. Degrade to an empty result
-                // instead of sending an empty body that would fail to decode.
+            let matching_b64 = img_query
+                .0
+                .with_untracked(|p| p.as_ref().filter(|x| x.nonce == q).map(|x| x.b64.clone()));
+            match matching_b64 {
+                // The image bytes live only in client memory and are bound to their
+                // navigation nonce, so a reloaded or Back-navigated `search_image` URL
+                // degrades cleanly instead of running with stale bytes.
                 None => {
                     if req_id.try_get_value() == Some(this_id) {
                         has_more.set(false);
@@ -444,9 +597,12 @@ async fn search_query(
                         .await
                         .map_err(to_err)?,
                 ),
-                Mode::Random => {
-                    Box::pin(engine.random_posts(seed, limit, offset).await.map_err(to_err)?)
-                }
+                Mode::Random => Box::pin(
+                    engine
+                        .random_posts(seed, limit, offset)
+                        .await
+                        .map_err(to_err)?,
+                ),
                 _ => unreachable!(),
             }
         };
@@ -486,9 +642,12 @@ async fn search_query(
                 .await
                 .map_err(to_err)?,
         ),
-        Mode::Random => {
-            Box::pin(engine.random_images(seed, limit, offset).await.map_err(to_err)?)
-        }
+        Mode::Random => Box::pin(
+            engine
+                .random_images(seed, limit, offset)
+                .await
+                .map_err(to_err)?,
+        ),
         Mode::Similar => return Err(ServerFnError::Args("similar search moved".into())),
         _ => return Ok(SearchResponse::default()),
     };

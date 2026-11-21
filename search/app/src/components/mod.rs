@@ -11,7 +11,7 @@ pub use account_widget::AccountWidget;
 pub use back2top::BackToTop;
 pub use image_details::ImageDetails;
 pub use lightbox::Lightbox;
-pub use like_button::LikeButton;
+pub use like_button::{LikeButton, LikeStore, LikeVariant};
 pub use results::Results;
 pub use search_bar::SearchBar;
 pub use viewer::Viewer;

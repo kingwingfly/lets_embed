@@ -105,6 +105,7 @@ async fn router(env: Env, ctx: Context) -> Result<Router> {
             get(likes::liked).post(likes::like).delete(likes::unlike),
         )
         .route("/user/api/likes", get(likes::list))
+        .route("/user/api/likes/status", get(likes::status_batch))
         // Admin (Cloudflare Access protected)
         .route("/user/admin", get(admin::admin_page))
         .route("/user/admin/settings", post(admin::save_settings))
