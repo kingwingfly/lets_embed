@@ -300,7 +300,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                         .then_some("tag-alias-tooltip")
                 }
                 class="inline-flex items-center gap-1.5 px-3 py-1 text-xs md:text-sm font-medium text-white
-                       bg-gradient-to-r from-indigo-500 to-purple-500 rounded-full shadow-sm whitespace-nowrap
+                       bg-gradient-to-r from-indigo-500 to-purple-500 rounded-full shadow-sm max-w-full
                        hover:scale-105 hover:brightness-110 transition-all cursor-pointer"
                 on:mouseenter=move |ev: leptos::ev::MouseEvent| {
                     show_tip(ev.current_target(), &tag_enter);
@@ -312,7 +312,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                 on:blur=move |_| schedule_tip_close()
                 on:click=move |_| close_tip_now()
             >
-                <span>{ name }</span>
+                <span class="truncate">{ name }</span>
                 {has_aliases.then(|| view! {
                     <span class="w-1.5 h-1.5 rounded-full bg-white/75 shrink-0" aria-hidden="true" />
                 })}
@@ -325,20 +325,26 @@ fn ImageDetailPage(id: String) -> impl IntoView {
         let score_pct = tag.score.map(|s| (s.clamp(0.0, 1.0) * 100.0).round() as u8);
         let aliases = StoredValue::new(tag.aliases);
         let total_aliases = aliases.with_value(Vec::len);
+        let alias_count_label = if total_aliases == 1 {
+            "1 alias".to_string()
+        } else {
+            format!("{total_aliases} aliases")
+        };
+        let extra = total_aliases.saturating_sub(MAX_INLINE_ALIASES);
         let expanded = RwSignal::new(false);
         view! {
-            <div class="rounded-xl bg-white/90 ring-1 ring-indigo-200/75 px-2.5 py-1.5 flex flex-col gap-1">
+            <div class="min-w-0 rounded-xl bg-white/90 ring-1 ring-indigo-200/75 px-2.5 py-1.5 flex flex-col gap-1">
                 <div class="flex items-center justify-between gap-2 min-w-0">
                     <a
                         href=href
-                        class="text-xs md:text-sm font-semibold text-indigo-700 hover:text-sky-600 hover:underline truncate"
+                        class="text-xs md:text-sm font-semibold text-indigo-700 hover:text-sky-600 hover:underline truncate min-w-0"
                     >
                         {tag.name}
                     </a>
-                    <div class="flex items-center gap-1 shrink-0">
+                    <div class="flex items-center gap-1.5 shrink-0">
                         {(total_aliases > 0).then(|| view! {
-                            <span class="text-[10px] text-slate-400 tabular-nums">
-                                {total_aliases}
+                            <span class="text-[10px] text-slate-400 tabular-nums whitespace-nowrap">
+                                {alias_count_label}
                             </span>
                         })}
                         {score_pct.map(|pct| view! {
@@ -349,44 +355,41 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                     </div>
                 </div>
                 {(total_aliases > 0).then(|| view! {
-                    <div class="flex flex-wrap items-center gap-1">
+                    <div class="flex flex-wrap items-center gap-1 min-w-0">
                         {move || {
-                            let is_open = expanded.get();
-                            let limit = if is_open { total_aliases } else { MAX_INLINE_ALIASES };
-                            let extra = total_aliases.saturating_sub(MAX_INLINE_ALIASES);
+                            let limit = if expanded.get() { total_aliases } else { MAX_INLINE_ALIASES };
                             let items: Vec<String> = aliases.with_value(|v| {
                                 v.iter().take(limit).cloned().collect()
                             });
-                            view! {
-                                {items.into_iter().map(|a| {
-                                    let alias_href = format!("/?mode=tag&q={}&limit=50", urlencoding::encode(&a));
-                                    view! {
-                                        <a
-                                            href=alias_href
-                                            class="px-1.5 py-0.5 rounded-md bg-sky-50 hover:bg-sky-500 text-slate-700
-                                                   hover:text-white ring-1 ring-sky-200/70 text-[11px] leading-snug
-                                                   transition-colors"
-                                        >
-                                            {a}
-                                        </a>
-                                    }
-                                }).collect_view()}
-                                {(extra > 0).then(|| view! {
-                                    <button
-                                        type="button"
-                                        class="px-1.5 py-0.5 rounded-md bg-indigo-50 hover:bg-indigo-100 text-indigo-600
-                                               text-[11px] font-medium leading-snug transition-colors cursor-pointer"
-                                        on:click=move |_| expanded.update(|v| *v = !*v)
+                            items.into_iter().map(|a| {
+                                let alias_href = format!("/?mode=tag&q={}&limit=50", urlencoding::encode(&a));
+                                view! {
+                                    <a
+                                        href=alias_href
+                                        class="max-w-full break-words px-1.5 py-0.5 rounded-md bg-sky-50 hover:bg-sky-500 text-slate-700
+                                               hover:text-white ring-1 ring-sky-200/70 text-[11px] leading-snug
+                                               transition-colors"
                                     >
-                                        {if is_open {
-                                            "Show less".to_string()
-                                        } else {
-                                            format!("+{extra} more")
-                                        }}
-                                    </button>
-                                })}
-                            }
+                                        {a}
+                                    </a>
+                                }
+                            }).collect_view()
                         }}
+                        {(extra > 0).then(|| view! {
+                            <button
+                                type="button"
+                                aria-expanded=move || expanded.get().to_string()
+                                class="px-1.5 py-0.5 rounded-md bg-indigo-50 hover:bg-indigo-100 text-indigo-600
+                                       text-[11px] font-medium leading-snug transition-colors cursor-pointer"
+                                on:click=move |_| expanded.update(|v| *v = !*v)
+                            >
+                                {move || if expanded.get() {
+                                    "Show less".to_string()
+                                } else {
+                                    format!("+{extra} more")
+                                }}
+                            </button>
+                        })}
                     </div>
                 })}
             </div>
@@ -766,7 +769,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                         </div>
                     </div>
 
-                    <div class="shrink-0 flex flex-col gap-1.5 p-2.5 bg-white/75 ring-1 ring-sky-100 rounded-2xl">
+                    <div class="min-h-0 shrink flex flex-col gap-1.5 p-2.5 bg-white/75 ring-1 ring-sky-100 rounded-2xl">
                         {(tag_count > 0).then(|| view! {
                             <div class="flex items-center justify-between gap-2 px-0.5 text-[11px] text-sky-600/80">
                                 <span>
@@ -797,7 +800,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                             let tags_store = StoredValue::new(tags);
                             move || if show_inline_aliases.get() {
                                 view! {
-                                    <div class="max-h-48 md:max-h-56 overflow-y-auto overscroll-contain flex flex-col gap-1.5 pr-0.5">
+                                    <div class="max-h-40 md:max-h-44 lg:max-h-48 min-h-0 overflow-y-auto overscroll-contain flex flex-col gap-1.5 pr-0.5">
                                         {authors_store.with_value(|list| {
                                             (!list.is_empty()).then(|| view! {
                                                 <div class="flex flex-wrap gap-1.5">
@@ -832,7 +835,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                         }
                     </div>
 
-                    <div class="flex-1 min-h-0 flex flex-row gap-2">
+                    <div class="flex-1 min-h-0 md:min-h-[8.5rem] flex flex-row gap-2">
                         <Transition fallback=move || view! { <div class="flex-1 min-h-0" /> }>
                             {
                                 let open_thumb = open_zoom_thumb.clone();

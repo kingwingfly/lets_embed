@@ -33,7 +33,7 @@ web-sys = { version = "0.3", features = [
     "ScrollToOptions", "ScrollBehavior", "Window", "DomRect", "CanvasRenderingContext2d",
     "ImageBitmap", "FileList", "File", "Touch", "TouchEvent", "TouchList",
     "Request", "RequestInit", "Response", "Headers", "Storage",
-    "History", "PopStateEvent"
+    "History", "PopStateEvent", "NodeList"
 ] }
 
 tokio = { workspace = true, optional = true }

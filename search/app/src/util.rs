@@ -89,11 +89,9 @@ pub fn lock_body_scroll() {
 /// `Viewer`) is mounted so pressing Back on mobile closes the topmost modal
 /// instead of navigating away from the page.
 ///
-/// Supports stacked modals (e.g. `Lightbox` -> `Viewer`): Back pops only the top
-/// layer first, then the lower layer on the next Back press. Manual dismissal
-/// (Close button / Esc / backdrop) cleans up its own synthetic entry via
-/// `history.back()`. Call [`prepare_modal_navigation`] before navigating from
-/// inside a modal so the route transition replaces the modal entry cleanly.
+/// Supports stacked modals (e.g. `Lightbox` -> `Viewer`), multi-step Back
+/// (`history.go(-k)`), rapid close+reopen serialization, and restoring focus
+/// to the previously focused trigger element when the modal closes.
 pub fn push_modal_history(on_back: impl Fn() + 'static) {
     #[cfg(feature = "hydrate")]
     {
@@ -105,18 +103,89 @@ pub fn push_modal_history(on_back: impl Fn() + 'static) {
     }
 }
 
-/// Detach any active modal history entries right before navigating to another
-/// route from inside a modal. Returns `true` when the caller should pass
-/// `NavigateOptions { replace: true, .. }` so the route navigation overwrites
-/// the top modal's synthetic history entry instead of leaving a dead Back step.
-pub fn prepare_modal_navigation() -> bool {
+/// Navigate away from inside a modal without leaving synthetic modal history
+/// entries behind or racing with queued `history.back()` pops.
+///
+/// - If `dest` equals the current `pathname + search + hash`, simply runs
+///   `close_modals()` without navigating (preventing duplicate history entries).
+/// - Otherwise drains the modal history stack, unwinds any extra stacked entries
+///   (`k > 1`) via `history.go(-(k-1))`, closes modals, and invokes `do_nav`
+///   with `replace = true` so the destination cleanly replaces the modal entry.
+pub fn navigate_from_modal(
+    dest: String,
+    close_modals: impl FnOnce(),
+    do_nav: impl FnOnce(&str, bool) + 'static,
+) {
     #[cfg(feature = "hydrate")]
     {
-        modal_history::prepare_navigation()
+        modal_history::navigate(dest, close_modals, do_nav);
     }
     #[cfg(not(feature = "hydrate"))]
     {
-        false
+        close_modals();
+        do_nav(&dest, false);
+    }
+}
+
+/// Keep `Tab` / `Shift+Tab` keyboard focus trapped inside an open modal dialog
+/// so users cannot accidentally tab into background controls (e.g. `<SearchBar>`).
+pub fn trap_dialog_tab(ev: &leptos::ev::KeyboardEvent, dialog: Option<web_sys::HtmlDivElement>) {
+    #[cfg(feature = "hydrate")]
+    {
+        use wasm_bindgen::JsCast;
+        if ev.key() != "Tab" || ev.alt_key() || ev.ctrl_key() || ev.meta_key() {
+            return;
+        }
+        let Some(dlg) = dialog else {
+            return;
+        };
+        let Ok(nodes) = dlg.query_selector_all(
+            "a[href]:not([tabindex='-1']):not([inert]), button:not([disabled]):not([tabindex='-1']):not([inert]), \
+             input:not([disabled]):not([tabindex='-1']), select:not([disabled]), textarea:not([disabled]), \
+             video[controls], [tabindex]:not([tabindex='-1'])",
+        ) else {
+            return;
+        };
+        let mut focusables: Vec<web_sys::HtmlElement> = Vec::new();
+        for i in 0..nodes.length() {
+            if let Some(el) = nodes
+                .item(i)
+                .and_then(|n| n.dyn_into::<web_sys::HtmlElement>().ok())
+                && el.closest("[inert]").ok().flatten().is_none()
+            {
+                focusables.push(el);
+            }
+        }
+        if focusables.is_empty() {
+            ev.prevent_default();
+            let _ = dlg.focus();
+            return;
+        }
+        let active = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.active_element());
+        let first = &focusables[0];
+        let last = &focusables[focusables.len() - 1];
+        let inside = active
+            .as_ref()
+            .is_some_and(|a| dlg.contains(Some(a.as_ref())));
+        let is_first = active
+            .as_ref()
+            .is_some_and(|a| a.as_ref() as &web_sys::Node == first.as_ref() as &web_sys::Node);
+        let is_last = active
+            .as_ref()
+            .is_some_and(|a| a.as_ref() as &web_sys::Node == last.as_ref() as &web_sys::Node);
+        if ev.shift_key() && (!inside || is_first) {
+            ev.prevent_default();
+            let _ = last.focus();
+        } else if !ev.shift_key() && (!inside || is_last) {
+            ev.prevent_default();
+            let _ = first.focus();
+        }
+    }
+    #[cfg(not(feature = "hydrate"))]
+    {
+        let _ = (ev, dialog);
     }
 }
 
@@ -127,13 +196,20 @@ mod modal_history {
     use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 
     const STATE_KEY: &str = "__le_modal";
-    type ModalEntry = (u64, Rc<dyn Fn()>);
+    type DeferredAction = Box<dyn FnOnce()>;
+
+    struct ModalEntry {
+        token: u64,
+        pushed: bool,
+        close_fn: Rc<dyn Fn()>,
+        prev_focus: Option<web_sys::HtmlElement>,
+    }
 
     thread_local! {
         static NEXT_TOKEN: Cell<u64> = const { Cell::new(1) };
         static STACK: RefCell<Vec<ModalEntry>> = const { RefCell::new(Vec::new()) };
-        static SUPPRESS_POPS: Cell<usize> = const { Cell::new(0) };
-        static ORPHAN_TOKENS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+        static PENDING_BACKS: Cell<usize> = const { Cell::new(0) };
+        static DEFERRED: RefCell<Vec<DeferredAction>> = const { RefCell::new(Vec::new()) };
         static INSTALLED: Cell<bool> = const { Cell::new(false) };
     }
 
@@ -148,6 +224,82 @@ mod modal_history {
             .map(|f| f as u64)
     }
 
+    fn current_relative_url() -> Option<String> {
+        let loc = web_sys::window()?.location();
+        let path = loc.pathname().ok()?;
+        let search = loc.search().ok().unwrap_or_default();
+        let hash = loc.hash().ok().unwrap_or_default();
+        Some(format!("{path}{search}{hash}"))
+    }
+
+    fn restore_focus(prev: Option<web_sys::HtmlElement>) {
+        if let Some(el) = prev
+            && el.is_connected()
+        {
+            let _ = el.focus();
+        }
+    }
+
+    fn flush_deferred() {
+        while PENDING_BACKS.with(|c| c.get() == 0) {
+            let next = DEFERRED.with(|q| {
+                let mut q = q.borrow_mut();
+                if q.is_empty() {
+                    None
+                } else {
+                    Some(q.remove(0))
+                }
+            });
+            match next {
+                Some(action) => action(),
+                None => break,
+            }
+        }
+    }
+
+    fn push_state_for_token(token: u64) {
+        let should_push = STACK.with(|s| {
+            let mut stack = s.borrow_mut();
+            if let Some(entry) = stack.iter_mut().find(|e| e.token == token) {
+                if entry.pushed {
+                    return false;
+                }
+                entry.pushed = true;
+                true
+            } else {
+                false
+            }
+        });
+        if !should_push {
+            return;
+        }
+        let Some(win) = web_sys::window() else {
+            return;
+        };
+        let Ok(history) = win.history() else {
+            return;
+        };
+        let Ok(href) = win.location().href() else {
+            return;
+        };
+        let state = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &state,
+            &JsValue::from_str(STATE_KEY),
+            &JsValue::from_f64(token as f64),
+        );
+        if history
+            .push_state_with_url(&state, "", Some(&href))
+            .is_err()
+        {
+            STACK.with(|s| {
+                if let Some(e) = s.borrow_mut().iter_mut().find(|e| e.token == token) {
+                    e.pushed = false;
+                }
+            });
+        }
+    }
+
     fn ensure_listener() {
         INSTALLED.with(|installed| {
             if installed.get() {
@@ -158,7 +310,7 @@ mod modal_history {
             };
             let cb = Closure::<dyn Fn(web_sys::PopStateEvent)>::new(
                 move |ev: web_sys::PopStateEvent| {
-                    let suppressed = SUPPRESS_POPS.with(|c| {
+                    let suppressed = PENDING_BACKS.with(|c| {
                         let n = c.get();
                         if n > 0 {
                             c.set(n - 1);
@@ -168,29 +320,28 @@ mod modal_history {
                         }
                     });
                     if suppressed {
+                        flush_deferred();
                         return;
                     }
-                    let top = STACK.with(|s| s.borrow_mut().pop());
-                    if let Some((_, close_fn)) = top {
-                        close_fn();
-                        return;
-                    }
-                    if let Some(tok) = state_token(&ev.state()) {
-                        let is_orphan = ORPHAN_TOKENS.with(|o| {
-                            let mut list = o.borrow_mut();
-                            if list.last().copied() == Some(tok) {
-                                list.pop();
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                        if is_orphan
-                            && let Some(hist) = web_sys::window().and_then(|w| w.history().ok())
-                        {
-                            let _ = hist.back();
+                    // Synchronize `STACK` with the history state we actually landed on
+                    // (handles single Back, multi-step `history.go(-k)`, and route exits).
+                    let landed = state_token(&ev.state());
+                    let to_close: Vec<ModalEntry> = STACK.with(|s| {
+                        let mut stack = s.borrow_mut();
+                        if stack.is_empty() {
+                            return Vec::new();
                         }
+                        match landed.and_then(|t| stack.iter().position(|e| e.token == t)) {
+                            Some(idx) => stack.drain((idx + 1)..).rev().collect(),
+                            None => stack.drain(..).rev().collect(),
+                        }
+                    });
+                    let mut restore = None;
+                    for entry in to_close {
+                        (entry.close_fn)();
+                        restore = entry.prev_focus;
                     }
+                    restore_focus(restore);
                 },
             );
             if win
@@ -205,68 +356,114 @@ mod modal_history {
 
     pub fn push(on_back: impl Fn() + 'static) {
         ensure_listener();
-        let Some(win) = web_sys::window() else {
-            return;
-        };
-        let Ok(history) = win.history() else {
-            return;
-        };
-        let Ok(href) = win.location().href() else {
-            return;
-        };
+        let prev_focus = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.active_element())
+            .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok());
 
         let token = NEXT_TOKEN.with(|n| {
             let t = n.get();
             n.set(t.wrapping_add(1).max(1));
             t
         });
-        let state = js_sys::Object::new();
-        let _ = js_sys::Reflect::set(
-            &state,
-            &JsValue::from_str(STATE_KEY),
-            &JsValue::from_f64(token as f64),
-        );
-        if history
-            .push_state_with_url(&state, "", Some(&href))
-            .is_err()
-        {
-            return;
+        STACK.with(|s| {
+            s.borrow_mut().push(ModalEntry {
+                token,
+                pushed: false,
+                close_fn: Rc::new(on_back),
+                prev_focus,
+            });
+        });
+
+        if PENDING_BACKS.with(|c| c.get() > 0) {
+            DEFERRED.with(|q| {
+                q.borrow_mut()
+                    .push(Box::new(move || push_state_for_token(token)));
+            });
+        } else {
+            push_state_for_token(token);
         }
 
-        STACK.with(|s| s.borrow_mut().push((token, Rc::new(on_back))));
-
         leptos::prelude::on_cleanup(move || {
-            let still_active = STACK.with(|s| {
+            let removed = STACK.with(|s| {
                 let mut stack = s.borrow_mut();
-                if let Some(pos) = stack.iter().position(|(t, _)| *t == token) {
-                    stack.remove(pos);
-                    true
-                } else {
-                    false
-                }
+                stack
+                    .iter()
+                    .position(|e| e.token == token)
+                    .map(|pos| stack.remove(pos))
             });
-            if still_active && let Some(hist) = web_sys::window().and_then(|w| w.history().ok()) {
-                SUPPRESS_POPS.with(|c| c.set(c.get().saturating_add(1)));
+            let Some(entry) = removed else {
+                return;
+            };
+            restore_focus(entry.prev_focus);
+            if entry.pushed
+                && let Some(hist) = web_sys::window().and_then(|w| w.history().ok())
+                && state_token(&hist.state().unwrap_or(JsValue::NULL)) == Some(token)
+            {
+                PENDING_BACKS.with(|c| c.set(c.get().saturating_add(1)));
                 let _ = hist.back();
             }
         });
     }
 
-    pub fn prepare_navigation() -> bool {
-        let tokens: Vec<u64> = STACK.with(|s| s.borrow_mut().drain(..).map(|(t, _)| t).collect());
-        if tokens.is_empty() {
-            return false;
+    pub fn navigate(
+        dest: String,
+        close_modals: impl FnOnce(),
+        do_nav: impl FnOnce(&str, bool) + 'static,
+    ) {
+        // Navigating to the exact current URL (e.g. clicking Details while already
+        // on that same `/details/:id` page) simply closes the modal cleanly so
+        // `on_cleanup` pops the synthetic entry without creating duplicates.
+        if current_relative_url().as_deref() == Some(dest.as_str()) {
+            close_modals();
+            return;
         }
-        // The topmost entry is replaced by the upcoming `replace: true` navigation;
-        // any lower stacked entries (e.g. Lightbox beneath Viewer) are recorded so
-        // pressing Back from the destination skips straight over them.
-        if tokens.len() > 1 {
-            ORPHAN_TOKENS.with(|o| {
-                o.borrow_mut()
-                    .extend_from_slice(&tokens[..tokens.len() - 1])
-            });
+
+        let pushed_count = STACK.with(|s| s.borrow_mut().drain(..).filter(|e| e.pushed).count());
+        close_modals();
+
+        if pushed_count == 0 {
+            if PENDING_BACKS.with(|c| c.get() > 0) {
+                DEFERRED.with(|q| {
+                    q.borrow_mut().push(Box::new(move || do_nav(&dest, false)));
+                });
+            } else {
+                do_nav(&dest, false);
+            }
+            return;
         }
-        true
+
+        if pushed_count == 1 {
+            if PENDING_BACKS.with(|c| c.get() > 0) {
+                DEFERRED.with(|q| {
+                    q.borrow_mut().push(Box::new(move || do_nav(&dest, true)));
+                });
+            } else {
+                do_nav(&dest, true);
+            }
+            return;
+        }
+
+        // Stacked modals (`k > 1`, e.g. Lightbox -> Viewer): unwind `k - 1`
+        // entries via a single `history.go(-(k - 1))`, then replace the bottom
+        // modal entry with `dest` so ZERO orphan entries remain in history.
+        let unwind = -((pushed_count - 1) as i32);
+        let run_unwind = move || {
+            if let Some(hist) = web_sys::window().and_then(|w| w.history().ok()) {
+                PENDING_BACKS.with(|c| c.set(c.get().saturating_add(1)));
+                DEFERRED.with(|q| {
+                    q.borrow_mut().push(Box::new(move || do_nav(&dest, true)));
+                });
+                let _ = hist.go_with_delta(unwind);
+            } else {
+                do_nav(&dest, true);
+            }
+        };
+        if PENDING_BACKS.with(|c| c.get() > 0) {
+            DEFERRED.with(|q| q.borrow_mut().push(Box::new(run_unwind)));
+        } else {
+            run_unwind();
+        }
     }
 }
 

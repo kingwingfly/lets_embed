@@ -13,7 +13,7 @@
 use axum::{
     Json,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -118,8 +118,90 @@ pub(crate) fn issue_session(st: &AppState, cookies: &Cookies, addr: &str) -> Ver
     }
 }
 
-/// Verify an EIP-4361 SIWE login payload, consume its single-use nonce, upsert
-/// the user row, enforce the ban check, and ensure the Durable Object exists.
+/// Verify an `Origin` (or `Sec-Fetch-Site: same-origin` when `Origin` is absent)
+/// header against `siwe_domain` to block cross-site / sibling-subdomain POST CSRF.
+pub(crate) fn same_origin(headers: &HeaderMap, domain: &str) -> bool {
+    if let Some(origin) = headers.get("origin").and_then(|h| h.to_str().ok()) {
+        return origin == format!("https://{domain}")
+            || (domain
+                .split(':')
+                .next()
+                .is_some_and(|h| matches!(h, "localhost" | "127.0.0.1"))
+                && origin == format!("http://{domain}"));
+    }
+    headers
+        .get("sec-fetch-site")
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("same-origin"))
+}
+
+pub(crate) fn require_same_origin(st: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    if !same_origin(headers, &st.siwe_domain) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "cross-origin request rejected",
+        ));
+    }
+    Ok(())
+}
+
+/// Ensure a verified principal is upserted in D1, not banned, and initialized in its DO.
+pub(crate) async fn finalize_eth_principal(st: &AppState, addr: &str) -> Result<(), Response> {
+    let now = session::now_secs();
+    touch_user_login(st, addr, now).await?;
+    ensure_not_banned(st, addr).await?;
+    if let Err(e) = do_client::do_init(&st.env, addr).await {
+        worker::console_error!("do init failed: {e:?}");
+        return Err(internal_error());
+    }
+    Ok(())
+}
+
+/// Check linked-wallet coexistence, upsert D1, check ban, and init DO for a Solana principal.
+pub(crate) async fn finalize_sol_principal(st: &AppState, addr: &str) -> Result<(), Response> {
+    let db = st.env.d1(crate::D1_BINDING).map_err(|e| {
+        worker::console_error!("d1 binding failed: {e:?}");
+        internal_error()
+    })?;
+    #[derive(Deserialize)]
+    struct AddrRow {
+        #[allow(dead_code)]
+        address: String,
+    }
+    let linked = match db
+        .prepare("SELECT address FROM users WHERE solana_address = ?")
+        .bind(&[addr.into()])
+    {
+        Ok(stmt) => match stmt.first::<AddrRow>(None).await {
+            Ok(row) => row,
+            Err(e) => {
+                worker::console_error!("linked lookup failed: {e:?}");
+                return Err(internal_error());
+            }
+        },
+        Err(e) => {
+            worker::console_error!("linked lookup bind failed: {e:?}");
+            return Err(internal_error());
+        }
+    };
+    if linked.is_some() {
+        return Err(api_error(
+            StatusCode::CONFLICT,
+            "this wallet is linked to another account — unlink it there first",
+        ));
+    }
+    let now = session::now_secs();
+    touch_user_login(st, addr, now).await?;
+    ensure_not_banned(st, addr).await?;
+    if let Err(e) = do_client::do_init(&st.env, addr).await {
+        worker::console_error!("do init failed: {e:?}");
+        return Err(internal_error());
+    }
+    Ok(())
+}
+
+/// Verify an EIP-4361 SIWE direct-login payload, consume its single-use nonce,
+/// upsert the user row, enforce the ban check, and ensure the Durable Object exists.
 pub(crate) async fn verify_siwe_and_ensure_user(
     st: &AppState,
     req: &VerifyReq,
@@ -128,7 +210,7 @@ pub(crate) async fn verify_siwe_and_ensure_user(
     let msg = siwe::parse_siwe(&req.message)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    // 2) Domain / version / chain binding.
+    // 2) Domain / version / chain / direct-login URI binding (blocks cross-flow replay).
     if msg.domain != *st.siwe_domain {
         return Err(api_error(StatusCode::UNAUTHORIZED, "domain mismatch"));
     }
@@ -137,6 +219,17 @@ pub(crate) async fn verify_siwe_and_ensure_user(
     }
     if msg.chain_id != st.chain_id {
         return Err(api_error(StatusCode::UNAUTHORIZED, "chain id mismatch"));
+    }
+    if msg.uri.contains("/user/login/approve")
+        || msg
+            .statement
+            .as_deref()
+            .is_some_and(|s| s.starts_with("Approve sign-in for another browser"))
+    {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "handoff approval signature cannot be used for direct sign-in",
+        ));
     }
 
     // 3) Timestamps: issued-at freshness + optional expiration.
@@ -199,16 +292,7 @@ pub(crate) async fn verify_siwe_and_ensure_user(
         ));
     }
 
-    // 6) D1: upsert the user row, then check the ban flag.
-    touch_user_login(st, &addr, now).await?;
-    ensure_not_banned(st, &addr).await?;
-
-    // 7) Ensure the Durable Object account exists (free grant on first touch).
-    if let Err(e) = do_client::do_init(&st.env, &addr).await {
-        worker::console_error!("do init failed: {e:?}");
-        return Err(internal_error());
-    }
-
+    finalize_eth_principal(st, &addr).await?;
     Ok(addr)
 }
 
@@ -262,53 +346,7 @@ pub(crate) async fn verify_siws_and_ensure_user(
     }
 
     let addr = req.solana_address.clone();
-    let now = session::now_secs();
-
-    let db = st.env.d1(crate::D1_BINDING).map_err(|e| {
-        worker::console_error!("d1 binding failed: {e:?}");
-        internal_error()
-    })?;
-
-    // 4) Coexistence: a Solana address that is a LINKED wallet of some ETH account
-    // cannot also be a standalone account.
-    #[derive(Deserialize)]
-    struct AddrRow {
-        #[allow(dead_code)]
-        address: String,
-    }
-    let linked = match db
-        .prepare("SELECT address FROM users WHERE solana_address = ?")
-        .bind(&[addr.as_str().into()])
-    {
-        Ok(stmt) => match stmt.first::<AddrRow>(None).await {
-            Ok(row) => row,
-            Err(e) => {
-                worker::console_error!("linked lookup failed: {e:?}");
-                return Err(internal_error());
-            }
-        },
-        Err(e) => {
-            worker::console_error!("linked lookup bind failed: {e:?}");
-            return Err(internal_error());
-        }
-    };
-    if linked.is_some() {
-        return Err(api_error(
-            StatusCode::CONFLICT,
-            "this wallet is linked to another account — unlink it there first",
-        ));
-    }
-
-    // 5) Upsert the user row, then check the ban flag (mirrors `verify`).
-    touch_user_login(st, &addr, now).await?;
-    ensure_not_banned(st, &addr).await?;
-
-    // 6) Ensure the Durable Object account exists (free grant on first touch).
-    if let Err(e) = do_client::do_init(&st.env, &addr).await {
-        worker::console_error!("do init failed: {e:?}");
-        return Err(internal_error());
-    }
-
+    finalize_sol_principal(st, &addr).await?;
     Ok(addr)
 }
 
@@ -372,7 +410,10 @@ pub async fn verify_solana(
 }
 
 #[worker::send]
-pub async fn logout(cookies: Cookies) -> Response {
+pub async fn logout(State(st): State<AppState>, headers: HeaderMap, cookies: Cookies) -> Response {
+    if let Err(r) = require_same_origin(&st, &headers) {
+        return r;
+    }
     cookies.add(session::clear_session_cookie());
     StatusCode::OK.into_response()
 }

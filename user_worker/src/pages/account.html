@@ -300,8 +300,11 @@ function updateDeviceCountdown() {
   var rem = Math.max(0, Math.ceil((devExpiresAt - Date.now()) / 1000));
   if (rem <= 0) {
     stopDeviceCountdown();
-    devCountdownEl.textContent = "Expired — click above to generate a fresh code.";
+    devActiveCode = "";
+    devPanel.hidden = true;
     devRevokeBtn.hidden = true;
+    devGenBtn.textContent = "Show QR & one-time code";
+    setMsg("device-code-msg", "Previous code expired — click above to generate a fresh one.");
     return;
   }
   var m = Math.floor(rem / 60);
@@ -323,7 +326,12 @@ devGenBtn.addEventListener("click", async function () {
     var data = await r.json();
     devActiveCode = data.code || "";
     devOtpEl.textContent = devActiveCode;
-    renderDeviceQr(devQrBox, data.qr);
+    if (data.qr) {
+      renderDeviceQr(devQrBox, data.qr);
+      devQrBox.hidden = false;
+    } else {
+      devQrBox.hidden = true;
+    }
     devPanel.hidden = false;
     devRevokeBtn.hidden = false;
     devGenBtn.textContent = "Generate new code";

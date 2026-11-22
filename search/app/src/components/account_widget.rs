@@ -175,7 +175,10 @@ pub fn AccountWidget() -> impl IntoView {
     #[cfg(feature = "hydrate")]
     {
         let _ = use_event_listener(window(), ev::focus, move |_| refresh(false));
-        let _ = use_event_listener(window(), ev::pageshow, move |_| refresh(false));
+        let _ = use_event_listener(window(), ev::pageshow, move |_| {
+            open.set(false);
+            refresh(false);
+        });
         let _ = use_event_listener(window(), ev::pointerdown, move |ev: ev::PointerEvent| {
             if !open.get_untracked() {
                 return;
@@ -291,6 +294,7 @@ pub fn AccountWidget() -> impl IntoView {
                             <a
                                 href="/user/favorites"
                                 rel="external"
+                                on:click=move |_| open.set(false)
                                 class="block text-center mt-3 bg-sky-50 ring-1 ring-sky-200
                                     text-sky-700 font-medium rounded-full py-1.5 px-4
                                     hover:bg-sky-100 transition-all"
@@ -300,6 +304,7 @@ pub fn AccountWidget() -> impl IntoView {
                             <a
                                 href="/user/account#device-login"
                                 rel="external"
+                                on:click=move |_| open.set(false)
                                 class="block text-center mt-2 bg-sky-50 ring-1 ring-sky-200
                                     text-sky-700 font-medium rounded-full py-1.5 px-4
                                     hover:bg-sky-100 transition-all"
@@ -309,6 +314,7 @@ pub fn AccountWidget() -> impl IntoView {
                             <a
                                 href="/user/account"
                                 rel="external"
+                                on:click=move |_| open.set(false)
                                 class="block text-center mt-2 bg-gradient-to-r from-sky-400 to-blue-500
                                     text-white font-medium rounded-full py-1.5 px-4 shadow-sm shadow-sky-300/60
                                     hover:from-sky-500 hover:to-blue-600 transition-all"
@@ -323,6 +329,7 @@ pub fn AccountWidget() -> impl IntoView {
                             <a
                                 href="/user/login"
                                 rel="external"
+                                on:click=move |_| open.set(false)
                                 class="text-center bg-gradient-to-r from-sky-400 to-blue-500 text-white
                                     font-medium rounded-full py-1.5 px-4 shadow-sm shadow-sky-300/60
                                     hover:from-sky-500 hover:to-blue-600 transition-all"

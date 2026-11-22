@@ -70,16 +70,27 @@ __TERMS__
 "use strict";
 var CHAIN_ID = __CHAIN_ID__;
 var SIWE_DOMAIN = "__SIWE_DOMAIN__";
+var HANDOFF_STORAGE_KEY = "lets-embed:handoff-v1";
 var btn = document.getElementById("siwe-btn");
 var sbtn = document.getElementById("siws-btn");
 var msgEl = document.getElementById("login-msg");
 var methodsEl = document.getElementById("login-methods");
 var isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+var eip6963Provider = null;
 
 function showMsg(text, cls) {
   msgEl.hidden = false;
   msgEl.className = "msg" + (cls ? " " + cls : "");
   msgEl.textContent = text;
+}
+
+function clearMsg() {
+  msgEl.hidden = true;
+  msgEl.textContent = "";
+}
+
+function getEthProvider() {
+  return window.ethereum || eip6963Provider || null;
 }
 
 function nextUrl() {
@@ -148,15 +159,21 @@ function copyText(text, okMsg) {
   }
 }
 
-// ---- Scanned QR transfer token landing (?transfer=...) ---------------------
-var initialParams = new URLSearchParams(location.search);
-var transferToken = initialParams.get("transfer");
+// ---- Scanned QR transfer token landing (#transfer=...) ---------------------
+// Token travels in the URL fragment so it is never sent in HTTP requests/logs.
+function extractTransferToken() {
+  var hash = location.hash || "";
+  if (hash.indexOf("#transfer=") === 0) {
+    var tok = decodeURIComponent(hash.slice("#transfer=".length)).trim();
+    var cleanUrl = location.pathname + location.search;
+    try { history.replaceState(null, "", cleanUrl); } catch (_) {}
+    return tok || null;
+  }
+  return null;
+}
+
+var transferToken = extractTransferToken();
 if (transferToken) {
-  // Strip single-use token from URL bar immediately so it isn't kept in history.
-  initialParams.delete("transfer");
-  var cleanQuery = initialParams.toString();
-  var cleanUrl = location.pathname + (cleanQuery ? "?" + cleanQuery : "") + location.hash;
-  try { history.replaceState(null, "", cleanUrl); } catch (_) {}
   methodsEl.hidden = true;
   var qrClaimBox = document.getElementById("qr-claim-box");
   var qrClaimBtn = document.getElementById("qr-claim-btn");
@@ -185,62 +202,65 @@ if (transferToken) {
     }
   });
   qrCancelBtn.addEventListener("click", function () {
+    transferToken = null;
+    clearMsg();
     qrClaimBox.hidden = true;
     methodsEl.hidden = false;
-    if (isMobile && !window.ethereum && !hasSolanaWallet() && !handoffState) {
-      startHandoff(false);
-    }
+    updateWalletVisibility();
   });
 }
 
 // ---- Direct Ethereum (SIWE) ------------------------------------------------
-if (window.ethereum) {
-  btn.addEventListener("click", async function () {
-    btn.disabled = true;
-    try {
-      var accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
-      var addr = accounts[0];
-      if (!addr) throw new Error("no account returned by the wallet");
-      var nr = await fetch("/user/api/nonce");
-      if (!nr.ok) throw new Error("failed to fetch nonce (" + nr.status + ")");
-      var nonce = (await nr.json()).nonce;
-      var message = `${location.host} wants you to sign in with your Ethereum account:
+// Always attach click handler so delayed wallet injection (slow mobile wallet
+// browsers / EIP-6963) works seamlessly once enabled.
+btn.addEventListener("click", async function () {
+  var eth = getEthProvider();
+  if (!eth) {
+    showMsg("No Ethereum wallet detected in this browser.", "err");
+    return;
+  }
+  btn.disabled = true;
+  try {
+    var accounts = await eth.request({ method: "eth_requestAccounts" });
+    var addr = accounts[0];
+    if (!addr) throw new Error("no account returned by the wallet");
+    var nr = await fetch("/user/api/nonce");
+    if (!nr.ok) throw new Error("failed to fetch nonce (" + nr.status + ")");
+    var nonce = (await nr.json()).nonce;
+    var scheme = location.protocol === "http:" ? "http://" : "https://";
+    var message = `${SIWE_DOMAIN} wants you to sign in with your Ethereum account:
 ${addr}
 
 Sign in to lets_embed
 
-URI: ${location.origin}/user/login
+URI: ${scheme}${SIWE_DOMAIN}/user/login
 Version: 1
 Chain ID: ${CHAIN_ID}
 Nonce: ${nonce}
 Issued At: ${new Date().toISOString()}`;
-      var signature = await window.ethereum.request({
-        method: "personal_sign",
-        params: [message, addr],
-      });
-      var vr = await fetch("/user/api/verify", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ message: message, signature: signature }),
-      });
-      if (vr.ok) {
-        showMsg("Signed in. Redirecting…", "ok");
-        location = nextUrl();
-        return;
-      }
-      var err;
-      try { err = (await vr.json()).error; } catch (_) {}
-      showMsg(err || "sign-in failed (" + vr.status + ")", "err");
-    } catch (e) {
-      showMsg(e && e.message ? e.message : String(e), "err");
-    } finally {
-      btn.disabled = false;
+    var signature = await eth.request({
+      method: "personal_sign",
+      params: [message, addr],
+    });
+    var vr = await fetch("/user/api/verify", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: message, signature: signature }),
+    });
+    if (vr.ok) {
+      showMsg("Signed in. Redirecting…", "ok");
+      location = nextUrl();
+      return;
     }
-  });
-} else {
-  btn.disabled = true;
-  if (isMobile) btn.hidden = true;
-}
+    var err;
+    try { err = (await vr.json()).error; } catch (_) {}
+    showMsg(err || "sign-in failed (" + vr.status + ")", "err");
+  } catch (e) {
+    showMsg(e && e.message ? e.message : String(e), "err");
+  } finally {
+    btn.disabled = !getEthProvider();
+  }
+});
 
 // ---- Direct Solana (SIWS) --------------------------------------------------
 function bs58encode(bytes) {
@@ -274,19 +294,37 @@ var solWallets = [];
   try { window.addEventListener("wallet-standard:register-wallet", function (ev) { ev.detail(api); }); } catch (e) {}
   try { window.dispatchEvent(new CustomEvent("wallet-standard:app-ready", { detail: api })); } catch (e) {}
 })();
+
+function walletSupportsSolana(w) {
+  var f = w && w.features;
+  if (!f || !f["solana:signMessage"] || !f["standard:connect"]) return false;
+  var chains = w.chains || [];
+  if (chains.length === 0) return true;
+  for (var i = 0; i < chains.length; i++) {
+    if (String(chains[i]).indexOf("solana:") === 0) return true;
+  }
+  return false;
+}
 function pickSolanaWallet() {
   for (var i = 0; i < solWallets.length; i++) {
-    var f = solWallets[i] && solWallets[i].features;
-    if (f && f["solana:signMessage"] && f["standard:connect"]) return solWallets[i];
+    if (walletSupportsSolana(solWallets[i])) return solWallets[i];
   }
   return null;
 }
 function pickSolanaAccount(accounts) {
   for (var i = 0; i < accounts.length; i++) {
     var chains = accounts[i].chains || [];
-    for (var j = 0; j < chains.length; j++) if (chains[j].indexOf("solana:") === 0) return accounts[i];
+    for (var j = 0; j < chains.length; j++) {
+      if (String(chains[j]).indexOf("solana:") === 0) return accounts[i];
+    }
   }
-  return accounts.length ? accounts[0] : null;
+  for (var k = 0; k < accounts.length; k++) {
+    var addr = accounts[k] && accounts[k].address;
+    if (addr && addr.indexOf("0x") !== 0 && (!accounts[k].chains || accounts[k].chains.length === 0)) {
+      return accounts[k];
+    }
+  }
+  return null;
 }
 async function getSolanaSigner() {
   var w = pickSolanaWallet();
@@ -299,7 +337,8 @@ async function getSolanaSigner() {
       address: account.address,
       sign: async function (m) {
         var out = await w.features["solana:signMessage"].signMessage({ account: account, message: m });
-        return { signature: out[0].signature, signedMessage: out[0].signedMessage };
+        var first = Array.isArray(out) ? out[0] : out;
+        return { signature: first.signature, signedMessage: first.signedMessage };
       },
     };
   }
@@ -362,7 +401,7 @@ sbtn.addEventListener("click", async function () {
   } catch (e) {
     showMsg(e && e.message ? e.message : String(e), "err");
   } finally {
-    sbtn.disabled = false;
+    sbtn.disabled = !hasSolanaWallet();
   }
 });
 
@@ -383,16 +422,89 @@ var desktopQrWrap = document.getElementById("desktop-qr-toggle-wrap");
 var desktopQrToggle = document.getElementById("desktop-qr-toggle");
 
 var handoffState = null;
+var lastShowQr = !isMobile;
 var pollTimer = null;
-var pollInFlight = false;
+var pollAbort = null;
+var autoStartTimer = null;
+
+function saveHandoffState(st) {
+  try {
+    if (st) sessionStorage.setItem(HANDOFF_STORAGE_KEY, JSON.stringify(st));
+    else sessionStorage.removeItem(HANDOFF_STORAGE_KEY);
+  } catch (_) {}
+}
+
+function loadHandoffState() {
+  try {
+    var raw = sessionStorage.getItem(HANDOFF_STORAGE_KEY);
+    if (!raw) return null;
+    var parsed = JSON.parse(raw);
+    if (parsed && parsed.session_id && parsed.poll_secret && parsed.expires_at > Date.now() + 5000) {
+      return parsed;
+    }
+    sessionStorage.removeItem(HANDOFF_STORAGE_KEY);
+  } catch (_) {}
+  return null;
+}
 
 function stopPolling() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (pollAbort) { try { pollAbort.abort(); } catch (_) {} pollAbort = null; }
+  if (autoStartTimer) { clearTimeout(autoStartTimer); autoStartTimer = null; }
 }
 
-async function pollHandoffOnce() {
-  if (!handoffState || pollInFlight) return;
-  pollInFlight = true;
+function hideActiveHandoffControls() {
+  handoffPairing.hidden = true;
+  handoffQrWrap.hidden = true;
+  mobileLinksEl.hidden = true;
+}
+
+function renderHandoffUi(st) {
+  handoffSection.hidden = false;
+  handoffRefreshBtn.hidden = true;
+  handoffStatus.hidden = false;
+  var approvePath = "/user/login/approve?s=" + encodeURIComponent(st.session_id);
+  var localApproveUrl = location.origin + approvePath;
+  handoffCodeEl.textContent = st.verify_code;
+  handoffPairing.hidden = false;
+  lastShowQr = !!st.show_qr;
+
+  if (st.show_qr) {
+    handoffHeading.textContent = "Scan with your phone wallet";
+    if (st.qr) {
+      handoffHint.textContent = "Scan this QR code in your phone’s wallet app (or camera -> open in MetaMask/Phantom), confirm the code below, and approve.";
+      renderQrSvg(handoffQrWrap, st.qr);
+      handoffQrWrap.hidden = false;
+      mobileLinksEl.hidden = true;
+    } else {
+      handoffHint.textContent = "Copy the approval link below and open it in your phone’s wallet app, confirm the code, and approve.";
+      handoffQrWrap.hidden = true;
+      mmLink.href = "https://link.metamask.io/dapp/" + location.host + approvePath;
+      phLink.href = "https://phantom.app/ul/browse/" + encodeURIComponent(localApproveUrl) + "?ref=" + encodeURIComponent(location.origin);
+      mobileLinksEl.hidden = false;
+    }
+  } else {
+    handoffHeading.textContent = "Sign in with your wallet app";
+    handoffHint.textContent = "Approve once in MetaMask, Phantom, or any wallet app, then switch right back to this browser.";
+    handoffQrWrap.hidden = true;
+    mmLink.href = "https://link.metamask.io/dapp/" + location.host + approvePath;
+    phLink.href = "https://phantom.app/ul/browse/" + encodeURIComponent(localApproveUrl) + "?ref=" + encodeURIComponent(location.origin);
+    mobileLinksEl.hidden = false;
+  }
+  handoffStatus.textContent = "Waiting for wallet approval…";
+}
+
+async function pollHandoffOnce(forceFresh) {
+  if (!handoffState) return;
+  if (pollAbort) {
+    if (!forceFresh) return;
+    try { pollAbort.abort(); } catch (_) {}
+    pollAbort = null;
+  }
+  var ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  pollAbort = ctrl;
+  var timeoutId = ctrl ? setTimeout(function () { try { ctrl.abort(); } catch (_) {} }, 4000) : null;
+  var activeSid = handoffState.session_id;
   try {
     var r = await fetch("/user/api/handoff/poll", {
       method: "POST",
@@ -401,11 +513,27 @@ async function pollHandoffOnce() {
         session_id: handoffState.session_id,
         poll_secret: handoffState.poll_secret,
       }),
+      signal: ctrl ? ctrl.signal : undefined,
     });
+    if (!handoffState || handoffState.session_id !== activeSid) return;
     if (r.status === 410) {
       stopPolling();
       handoffState = null;
+      saveHandoffState(null);
+      hideActiveHandoffControls();
       handoffStatus.textContent = "Sign-in session expired.";
+      handoffRefreshBtn.hidden = false;
+      return;
+    }
+    if (r.status === 401 || r.status === 403) {
+      stopPolling();
+      handoffState = null;
+      saveHandoffState(null);
+      hideActiveHandoffControls();
+      var err;
+      try { err = (await r.json()).error; } catch (_) {}
+      handoffStatus.textContent = err || "Sign-in rejected (" + r.status + ").";
+      showMsg(handoffStatus.textContent, "err");
       handoffRefreshBtn.hidden = false;
       return;
     }
@@ -414,20 +542,25 @@ async function pollHandoffOnce() {
     if (data.status === "approved") {
       stopPolling();
       handoffState = null;
+      saveHandoffState(null);
       showMsg("Approved in wallet! Redirecting…", "ok");
       location = nextUrl();
     }
   } catch (_) {
-    // Transient network error (e.g. waking from background on mobile) — next poll retries.
+    // Transient network abort (e.g. waking from iOS Safari background) — next poll retries.
   } finally {
-    pollInFlight = false;
+    if (timeoutId) clearTimeout(timeoutId);
+    if (pollAbort === ctrl) pollAbort = null;
   }
 }
 
 async function startHandoff(showQr) {
   stopPolling();
+  saveHandoffState(null);
+  lastShowQr = showQr;
   handoffSection.hidden = false;
   handoffRefreshBtn.hidden = true;
+  hideActiveHandoffControls();
   handoffStatus.hidden = false;
   handoffStatus.textContent = "Preparing wallet sign-in link…";
   try {
@@ -443,30 +576,15 @@ async function startHandoff(showQr) {
     handoffState = {
       session_id: data.session_id,
       poll_secret: data.poll_secret,
+      verify_code: data.verify_code,
       approve_url: data.approve_url,
+      qr: data.qr || null,
+      expires_at: Date.now() + (data.expires_in || 300) * 1000,
       show_qr: showQr,
     };
-    var approvePath = "/user/login/approve?s=" + encodeURIComponent(data.session_id);
-    var localApproveUrl = location.origin + approvePath;
-    handoffCodeEl.textContent = data.verify_code;
-    handoffPairing.hidden = false;
-
-    if (showQr) {
-      handoffHeading.textContent = "Scan with your phone wallet";
-      handoffHint.textContent = "Scan this QR code in your phone’s wallet app (or camera -> open in MetaMask/Phantom), confirm the code below, and approve.";
-      renderQrSvg(handoffQrWrap, data.qr);
-      handoffQrWrap.hidden = !data.qr;
-      mobileLinksEl.hidden = true;
-    } else {
-      handoffHeading.textContent = "Sign in with your wallet app";
-      handoffHint.textContent = "Approve once in MetaMask, Phantom, or any wallet app, then switch right back to this browser.";
-      handoffQrWrap.hidden = true;
-      mmLink.href = "https://link.metamask.io/dapp/" + location.host + approvePath;
-      phLink.href = "https://phantom.app/ul/browse/" + encodeURIComponent(localApproveUrl) + "?ref=" + encodeURIComponent(location.origin);
-      mobileLinksEl.hidden = false;
-    }
-    handoffStatus.textContent = "Waiting for wallet approval…";
-    pollTimer = setInterval(pollHandoffOnce, 2000);
+    saveHandoffState(handoffState);
+    renderHandoffUi(handoffState);
+    pollTimer = setInterval(function () { pollHandoffOnce(false); }, 2000);
   } catch (_) {
     handoffStatus.textContent = "Network error preparing sign-in. Try refreshing.";
     handoffRefreshBtn.hidden = false;
@@ -480,7 +598,7 @@ copyLinkBtn.addEventListener("click", function () {
 });
 
 handoffRefreshBtn.addEventListener("click", function () {
-  startHandoff(handoffState ? handoffState.show_qr : !isMobile);
+  startHandoff(lastShowQr);
 });
 
 desktopQrToggle.addEventListener("click", function () {
@@ -488,28 +606,82 @@ desktopQrToggle.addEventListener("click", function () {
   startHandoff(true);
 });
 
-// Immediately check approval the instant the user switches back from MetaMask/Phantom.
+// Immediately abort any background-stalled fetch and re-poll on return from MetaMask/Phantom.
 document.addEventListener("visibilitychange", function () {
-  if (document.visibilityState === "visible") pollHandoffOnce();
+  if (document.visibilityState === "visible") pollHandoffOnce(true);
 });
-window.addEventListener("focus", pollHandoffOnce);
-window.addEventListener("pageshow", pollHandoffOnce);
+window.addEventListener("focus", function () { pollHandoffOnce(true); });
+window.addEventListener("pageshow", function () { pollHandoffOnce(true); });
 
 function updateWalletVisibility() {
+  var hasEth = !!getEthProvider();
   var hasSol = hasSolanaWallet();
-  var hasEth = !!window.ethereum;
+  btn.disabled = !hasEth;
+  btn.hidden = !hasEth && isMobile;
   sbtn.disabled = !hasSol;
   sbtn.hidden = !hasSol && isMobile;
   document.getElementById("wallet-help").hidden = hasSol || hasEth || isMobile;
-  if (isMobile && !hasEth && !hasSol) {
-    desktopQrWrap.hidden = true;
-    if (!transferToken && !handoffState && handoffSection.hidden) {
-      startHandoff(false);
+
+  if (hasEth || hasSol) {
+    // A native injected wallet is available (e.g. delayed injection inside wallet browser):
+    // cancel any pending mobile auto-handoff so we don't loop back into deep links.
+    if (isMobile) {
+      stopPolling();
+      handoffState = null;
+      saveHandoffState(null);
+      handoffSection.hidden = true;
+    } else if (handoffSection.hidden) {
+      desktopQrWrap.hidden = false;
     }
-  } else if (!isMobile) {
-    if (handoffSection.hidden) desktopQrWrap.hidden = false;
+    return;
+  }
+
+  if (isMobile) {
+    desktopQrWrap.hidden = true;
+    if (!transferToken && !handoffState) {
+      // Resume an unexpired session if iOS Safari evicted the background tab while in MetaMask.
+      var saved = loadHandoffState();
+      if (saved) {
+        handoffState = saved;
+        renderHandoffUi(saved);
+        pollTimer = setInterval(function () { pollHandoffOnce(false); }, 2000);
+        pollHandoffOnce(true);
+      } else if (!autoStartTimer && handoffSection.hidden) {
+        // Brief grace period so slow mobile wallet browsers finish injecting `window.ethereum`.
+        autoStartTimer = setTimeout(function () {
+          autoStartTimer = null;
+          if (!getEthProvider() && !hasSolanaWallet() && !transferToken && !handoffState) {
+            startHandoff(false);
+          }
+        }, 300);
+      }
+    }
+  } else if (handoffSection.hidden) {
+    var savedDesktop = loadHandoffState();
+    if (savedDesktop && savedDesktop.show_qr && !transferToken) {
+      desktopQrWrap.hidden = true;
+      handoffState = savedDesktop;
+      renderHandoffUi(savedDesktop);
+      pollTimer = setInterval(function () { pollHandoffOnce(false); }, 2000);
+      pollHandoffOnce(true);
+    } else {
+      desktopQrWrap.hidden = false;
+    }
   }
 }
+
+try {
+  window.addEventListener("ethereum#initialized", updateWalletVisibility, { once: true });
+  window.addEventListener("eip6963:announceProvider", function (ev) {
+    if (!eip6963Provider && ev && ev.detail && ev.detail.provider) {
+      eip6963Provider = ev.detail.provider;
+      updateWalletVisibility();
+    }
+  });
+  window.dispatchEvent(new Event("eip6963:requestProvider"));
+  window.addEventListener("load", updateWalletVisibility);
+} catch (e) {}
+
 updateWalletVisibility();
 
 // ---- One-time code login (from desktop /user/account) ----------------------

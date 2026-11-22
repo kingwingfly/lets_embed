@@ -613,7 +613,7 @@ td.meta {
 }
 .device-login-grid .qr-box {
   margin: 0;
-  width: 196px;
+  width: min(196px, 100%);
   flex: none;
 }
 .device-code-meta {
@@ -623,9 +623,10 @@ td.meta {
 .otp-code {
   margin-top: 6px;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: clamp(24px, 3vw, 32px);
+  font-size: clamp(20px, 5vw, 32px);
   font-weight: 700;
   letter-spacing: 0.14em;
+  white-space: nowrap;
   color: var(--blue);
 }
 .account-grid {

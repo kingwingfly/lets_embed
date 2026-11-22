@@ -618,4 +618,153 @@ mod tests {
         // Over 213 bytes cleanly returns None.
         assert!(encode(&vec![b'x'; 214]).is_none());
     }
+
+    #[test]
+    fn full_decode_roundtrip_across_versions_1_to_10() {
+        // Verify bit unmasking, de-interleaving, Reed-Solomon zero syndromes,
+        // and exact Byte-mode payload recovery across V1, V5, V7, V8 (2-group), and V10.
+        let payloads = [
+            b"hello".to_vec(),
+            b"https://lets-embed.louisfly.icu/user/login#transfer=AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+                .to_vec(),
+            vec![b'A'; 118], // V7 (version info blocks)
+            vec![b'B'; 145], // V8 (2-group block interleaving)
+            vec![b'C'; 210], // V10 (16-bit byte count + 2-group interleaving)
+        ];
+
+        for payload in payloads {
+            let qr = encode(&payload).expect("payload fits in V1-10");
+            let spec = SPECS_M
+                .iter()
+                .find(|s| usize::from(s.version) * 4 + 17 == qr.size)
+                .expect("matching version spec");
+
+            let grid: Vec<bool> = qr.bits.bytes().map(|b| b == b'1').collect();
+            let mut dummy = vec![false; qr.size * qr.size];
+            let mut func = vec![false; qr.size * qr.size];
+            place_function_patterns(spec, qr.size, &mut dummy, &mut func);
+
+            // Recover mask from format copy 1 around top-left finder.
+            let copy1: [(usize, usize); 15] = [
+                (8, 0),
+                (8, 1),
+                (8, 2),
+                (8, 3),
+                (8, 4),
+                (8, 5),
+                (8, 7),
+                (8, 8),
+                (7, 8),
+                (5, 8),
+                (4, 8),
+                (3, 8),
+                (2, 8),
+                (1, 8),
+                (0, 8),
+            ];
+            let mut fmt_bits = 0u16;
+            for &(r, c) in &copy1 {
+                fmt_bits = (fmt_bits << 1) | u16::from(grid[r * qr.size + c]);
+            }
+            let mask = (0..8u8)
+                .find(|&m| format_bits_m(m) == fmt_bits)
+                .expect("valid BCH format info");
+
+            // Extract unmasked zigzag codewords.
+            let total_cw =
+                spec.total_data_codewords() + (spec.g1_blocks + spec.g2_blocks) * spec.ec_per_block;
+            let mut bits = Vec::with_capacity(total_cw * 8);
+            let mut upward = true;
+            let mut col = qr.size as isize - 1;
+            while col > 0 {
+                if col == 6 {
+                    col -= 1;
+                }
+                for step in 0..qr.size {
+                    let row = if upward { qr.size - 1 - step } else { step };
+                    for dx in 0..2 {
+                        let c = (col - dx) as usize;
+                        let idx = row * qr.size + c;
+                        if func[idx] {
+                            continue;
+                        }
+                        if bits.len() < total_cw * 8 {
+                            bits.push(grid[idx] ^ mask_bit(mask, row, c));
+                        }
+                    }
+                }
+                upward = !upward;
+                col -= 2;
+            }
+            let raw_cw: Vec<u8> = bits
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| c.iter().fold(0u8, |acc, &b| (acc << 1) | u8::from(b)))
+                .collect();
+
+            // De-interleave data + EC blocks and check exact RS remainder match.
+            let num_blocks = spec.g1_blocks + spec.g2_blocks;
+            let mut data_blocks: Vec<Vec<u8>> = (0..num_blocks)
+                .map(|b| {
+                    Vec::with_capacity(if b < spec.g1_blocks {
+                        spec.g1_data
+                    } else {
+                        spec.g2_data
+                    })
+                })
+                .collect();
+            let mut ec_blocks: Vec<Vec<u8>> = (0..num_blocks)
+                .map(|_| Vec::with_capacity(spec.ec_per_block))
+                .collect();
+            let mut cursor = 0usize;
+            for i in 0..spec.g1_data.max(spec.g2_data) {
+                for (b, blk) in data_blocks.iter_mut().enumerate() {
+                    let cap = if b < spec.g1_blocks {
+                        spec.g1_data
+                    } else {
+                        spec.g2_data
+                    };
+                    if i < cap {
+                        blk.push(raw_cw[cursor]);
+                        cursor += 1;
+                    }
+                }
+            }
+            for _ in 0..spec.ec_per_block {
+                for ec in &mut ec_blocks {
+                    ec.push(raw_cw[cursor]);
+                    cursor += 1;
+                }
+            }
+            assert_eq!(cursor, raw_cw.len());
+            for (d, ec) in data_blocks.iter().zip(ec_blocks.iter()) {
+                assert_eq!(
+                    rs_remainder(d, spec.ec_per_block),
+                    *ec,
+                    "RS mismatch for V{}",
+                    spec.version
+                );
+            }
+
+            // Reconstruct Byte-mode payload and assert exact equality.
+            let stream: Vec<bool> = data_blocks
+                .into_iter()
+                .flatten()
+                .flat_map(|byte| (0..8).rev().map(move |bit| ((byte >> bit) & 1) != 0))
+                .collect();
+            let read_u32 = |off: usize, n: usize| -> u32 {
+                (0..n).fold(0u32, |acc, i| (acc << 1) | u32::from(stream[off + i]))
+            };
+            assert_eq!(read_u32(0, 4), 0b0100);
+            let len = read_u32(4, spec.cc_bits()) as usize;
+            assert_eq!(len, payload.len());
+            let mut decoded = Vec::with_capacity(len);
+            let base = 4 + spec.cc_bits();
+            for i in 0..len {
+                decoded.push(read_u32(base + i * 8, 8) as u8);
+            }
+            assert_eq!(decoded, payload);
+        }
+    }
 }
