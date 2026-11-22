@@ -1059,8 +1059,78 @@ test('gallery access, billing and administrator controls use the published polic
     402
   );
 
+  // Admin dashboard horizontal tabs, live credits, subscription filters, optional credit reason,
+  // and same-origin Origin:null + Sec-Fetch-Site:same-origin CSRF handling.
   const selected = await admin('?address=' + wallet);
-  assert.match(await selected.text(), /Apply subscription/);
+  assert.equal(selected.status, 200);
+  assert.equal(selected.headers.get('referrer-policy'), 'same-origin');
+  const selectedHtml = await selected.text();
+  assert.match(selectedHtml, /Apply subscription/);
+  assert.match(selectedHtml, /role="tablist"/);
+  assert.match(selectedHtml, /Credits balance/);
+  assert.match(selectedHtml, /pts/);
+
+  // Optional credit reason: empty/omitted reason succeeds with 303 and updates balance.
+  const beforeOptCredit = (await status()).balance;
+  await check(
+    post('/credit', { address: wallet, points: '25', token: randomUUID() }),
+    303
+  );
+  assert.equal((await status()).balance, beforeOptCredit + 25);
+
+  // Origin: null is blocked unless Sec-Fetch-Site: same-origin is present.
+  const nullGrant = new URLSearchParams({
+    address: wallet,
+    plan: 'pro',
+    days: '14',
+    token: randomUUID(),
+  }).toString();
+  await check(
+    admin('/plan', {
+      method: 'POST',
+      headers: { origin: 'null', 'content-type': 'application/x-www-form-urlencoded' },
+      body: nullGrant,
+    }),
+    403
+  );
+  await check(
+    admin('/plan', {
+      method: 'POST',
+      headers: {
+        origin: 'null',
+        'sec-fetch-site': 'cross-site',
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: nullGrant,
+    }),
+    403
+  );
+  await check(
+    admin('/plan', {
+      method: 'POST',
+      headers: {
+        origin: 'null',
+        'sec-fetch-site': 'same-origin',
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: nullGrant,
+    }),
+    303
+  );
+  assert.equal((await status()).plan, 'pro');
+
+  // Subscription filters on Accounts directory reflect the granted Pro plan.
+  const proFiltered = await (await admin('?plan=pro')).text();
+  assert.match(proFiltered, new RegExp(wallet));
+  const noneFiltered = await (await admin('?plan=none')).text();
+  assert.doesNotMatch(noneFiltered, new RegExp('data-copy="' + wallet + '"'));
+
+  // Revoking a plan succeeds without requiring `days`.
+  await check(
+    post('/plan', { address: wallet, plan: 'none', token: randomUUID() }),
+    303
+  );
+  assert.equal((await status()).plan, null);
 });
 
 test('checkout script handles wallet send, multi-wallet Solana, reload recovery, and dismissal', async () => {

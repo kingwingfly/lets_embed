@@ -7925,6 +7925,7 @@ dependencies = [
  "bincode",
  "bs58",
  "ed25519-dalek",
+ "futures",
  "getrandom 0.4.3",
  "hex",
  "hmac",

@@ -118,21 +118,24 @@ pub(crate) fn issue_session(st: &AppState, cookies: &Cookies, addr: &str) -> Ver
     }
 }
 
-/// Verify an `Origin` (or `Sec-Fetch-Site: same-origin` when `Origin` is absent)
-/// header against `siwe_domain` to block cross-site / sibling-subdomain POST CSRF.
+/// Verify an `Origin` (or `Sec-Fetch-Site: same-origin` when `Origin` is absent
+/// or serialized as `"null"`, e.g. under a strict referrer policy) against
+/// `siwe_domain` to block cross-site / sibling-subdomain POST CSRF.
 pub(crate) fn same_origin(headers: &HeaderMap, domain: &str) -> bool {
+    let sec_fetch = headers.get("sec-fetch-site").and_then(|h| h.to_str().ok());
     if let Some(origin) = headers.get("origin").and_then(|h| h.to_str().ok()) {
-        return origin == format!("https://{domain}")
+        if origin.eq_ignore_ascii_case("null") {
+            return sec_fetch.is_some_and(|v| v.eq_ignore_ascii_case("same-origin"));
+        }
+        let origin_ok = origin.eq_ignore_ascii_case(&format!("https://{domain}"))
             || (domain
                 .split(':')
                 .next()
                 .is_some_and(|h| matches!(h, "localhost" | "127.0.0.1"))
-                && origin == format!("http://{domain}"));
+                && origin.eq_ignore_ascii_case(&format!("http://{domain}")));
+        return origin_ok && sec_fetch.is_none_or(|v| v.eq_ignore_ascii_case("same-origin"));
     }
-    headers
-        .get("sec-fetch-site")
-        .and_then(|h| h.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("same-origin"))
+    sec_fetch.is_some_and(|v| v.eq_ignore_ascii_case("same-origin"))
 }
 
 pub(crate) fn require_same_origin(st: &AppState, headers: &HeaderMap) -> Result<(), Response> {

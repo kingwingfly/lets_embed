@@ -90,7 +90,7 @@ fn html_escape(s: &str) -> String {
 fn html_page(html: String) -> Response {
     (
         [
-            (header::REFERRER_POLICY, "no-referrer"),
+            (header::REFERRER_POLICY, "same-origin"),
             (header::X_FRAME_OPTIONS, "DENY"),
             (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
         ],
