@@ -7,7 +7,7 @@ use web_sys::TouchEvent;
 
 use crate::{
     components::{LikeButton, LikeVariant},
-    util::{encode_path, lock_body_scroll},
+    util::{encode_path, lock_body_scroll, prepare_modal_navigation, push_modal_history},
 };
 
 const SWIPE_RATIO: f64 = 0.05;
@@ -51,6 +51,7 @@ pub fn Viewer(
     let navigate = use_navigate();
     let dialog_ref: NodeRef<html::Div> = NodeRef::new();
     lock_body_scroll();
+    push_modal_history(move || index.set(None));
 
     // Move keyboard focus into the dialog on mount so shortcuts and Tab stay inside.
     #[cfg(feature = "hydrate")]
@@ -100,11 +101,18 @@ pub fn Viewer(
             "d" | "D" => {
                 if let Some(im) = current_image.get_untracked() {
                     let href = details_href(im.id);
+                    let replace = prepare_modal_navigation();
                     index.set(None);
                     if let Some(cb) = on_navigate {
                         cb.run(());
                     }
-                    nav_key(&href, NavigateOptions::default());
+                    nav_key(
+                        &href,
+                        NavigateOptions {
+                            replace,
+                            ..Default::default()
+                        },
+                    );
                 }
             }
             _ => return,
@@ -205,11 +213,12 @@ pub fn Viewer(
                                 ev.stop_propagation();
                                 if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
                                     ev.prevent_default();
+                                    let replace = prepare_modal_navigation();
                                     index.set(None);
                                     if let Some(cb) = on_navigate {
                                         cb.run(());
                                     }
-                                    nav(&click_href, NavigateOptions::default());
+                                    nav(&click_href, NavigateOptions { replace, ..Default::default() });
                                 }
                             }
                         >
@@ -302,11 +311,12 @@ pub fn Viewer(
                                     ev.stop_propagation();
                                     if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
                                         ev.prevent_default();
+                                        let replace = prepare_modal_navigation();
                                         index.set(None);
                                         if let Some(cb) = on_navigate {
                                             cb.run(());
                                         }
-                                        nav(&click_href, NavigateOptions::default());
+                                        nav(&click_href, NavigateOptions { replace, ..Default::default() });
                                     }
                                 }
                             >

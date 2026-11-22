@@ -281,22 +281,6 @@ fn ImageDetailPage(id: String) -> impl IntoView {
         let href = format!("/?mode=tag&q={}&limit=50", urlencoding::encode(&tag.name));
         let tag_id = tag.id;
         let has_aliases = !tag.aliases.is_empty();
-        let inline_summary = if tag.aliases.is_empty() {
-            None
-        } else {
-            let shown: Vec<&str> = tag
-                .aliases
-                .iter()
-                .take(MAX_INLINE_ALIASES)
-                .map(String::as_str)
-                .collect();
-            let extra = tag.aliases.len().saturating_sub(shown.len());
-            let mut s = shown.join(" · ");
-            if extra > 0 {
-                s.push_str(&format!(" +{extra}"));
-            }
-            Some(s)
-        };
         let name = tag.name.clone();
         let tag_enter = tag.clone();
         let tag_focus = tag;
@@ -315,8 +299,8 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                         .with(|t| t.as_ref().is_some_and(|tip| tip.tag_id == tag_id))
                         .then_some("tag-alias-tooltip")
                 }
-                class="inline-flex items-center flex-wrap gap-1.5 px-3 py-1 text-xs md:text-sm font-medium text-white
-                       bg-gradient-to-r from-indigo-500 to-purple-500 rounded-full shadow-sm max-w-full
+                class="inline-flex items-center gap-1.5 px-3 py-1 text-xs md:text-sm font-medium text-white
+                       bg-gradient-to-r from-indigo-500 to-purple-500 rounded-full shadow-sm whitespace-nowrap
                        hover:scale-105 hover:brightness-110 transition-all cursor-pointer"
                 on:mouseenter=move |ev: leptos::ev::MouseEvent| {
                     show_tip(ev.current_target(), &tag_enter);
@@ -328,23 +312,84 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                 on:blur=move |_| schedule_tip_close()
                 on:click=move |_| close_tip_now()
             >
-                <span class="whitespace-nowrap">{ name }</span>
-                {move || {
-                    if show_inline_aliases.get() {
-                        inline_summary.clone().map(|a| view! {
-                            <span class="text-[11px] text-indigo-100/95 border-l border-white/30 pl-1.5 leading-snug break-words">
-                                {a}
-                            </span>
-                        }.into_any())
-                    } else if has_aliases {
-                        Some(view! {
-                            <span class="w-1.5 h-1.5 rounded-full bg-white/75 shrink-0" aria-hidden="true" />
-                        }.into_any())
-                    } else {
-                        None
-                    }
-                }}
+                <span>{ name }</span>
+                {has_aliases.then(|| view! {
+                    <span class="w-1.5 h-1.5 rounded-full bg-white/75 shrink-0" aria-hidden="true" />
+                })}
             </a>
+        }
+    };
+
+    let render_tag_alias_card = move |tag: Tag| {
+        let href = format!("/?mode=tag&q={}&limit=50", urlencoding::encode(&tag.name));
+        let score_pct = tag.score.map(|s| (s.clamp(0.0, 1.0) * 100.0).round() as u8);
+        let aliases = StoredValue::new(tag.aliases);
+        let total_aliases = aliases.with_value(Vec::len);
+        let expanded = RwSignal::new(false);
+        view! {
+            <div class="rounded-xl bg-white/90 ring-1 ring-indigo-200/75 px-2.5 py-1.5 flex flex-col gap-1">
+                <div class="flex items-center justify-between gap-2 min-w-0">
+                    <a
+                        href=href
+                        class="text-xs md:text-sm font-semibold text-indigo-700 hover:text-sky-600 hover:underline truncate"
+                    >
+                        {tag.name}
+                    </a>
+                    <div class="flex items-center gap-1 shrink-0">
+                        {(total_aliases > 0).then(|| view! {
+                            <span class="text-[10px] text-slate-400 tabular-nums">
+                                {total_aliases}
+                            </span>
+                        })}
+                        {score_pct.map(|pct| view! {
+                            <span class="px-1.5 py-0.5 rounded-full bg-indigo-50 text-indigo-600 text-[10px] font-semibold tabular-nums">
+                                {format!("{pct}%")}
+                            </span>
+                        })}
+                    </div>
+                </div>
+                {(total_aliases > 0).then(|| view! {
+                    <div class="flex flex-wrap items-center gap-1">
+                        {move || {
+                            let is_open = expanded.get();
+                            let limit = if is_open { total_aliases } else { MAX_INLINE_ALIASES };
+                            let extra = total_aliases.saturating_sub(MAX_INLINE_ALIASES);
+                            let items: Vec<String> = aliases.with_value(|v| {
+                                v.iter().take(limit).cloned().collect()
+                            });
+                            view! {
+                                {items.into_iter().map(|a| {
+                                    let alias_href = format!("/?mode=tag&q={}&limit=50", urlencoding::encode(&a));
+                                    view! {
+                                        <a
+                                            href=alias_href
+                                            class="px-1.5 py-0.5 rounded-md bg-sky-50 hover:bg-sky-500 text-slate-700
+                                                   hover:text-white ring-1 ring-sky-200/70 text-[11px] leading-snug
+                                                   transition-colors"
+                                        >
+                                            {a}
+                                        </a>
+                                    }
+                                }).collect_view()}
+                                {(extra > 0).then(|| view! {
+                                    <button
+                                        type="button"
+                                        class="px-1.5 py-0.5 rounded-md bg-indigo-50 hover:bg-indigo-100 text-indigo-600
+                                               text-[11px] font-medium leading-snug transition-colors cursor-pointer"
+                                        on:click=move |_| expanded.update(|v| *v = !*v)
+                                    >
+                                        {if is_open {
+                                            "Show less".to_string()
+                                        } else {
+                                            format!("+{extra} more")
+                                        }}
+                                    </button>
+                                })}
+                            }
+                        }}
+                    </div>
+                })}
+            </div>
         }
     };
 
@@ -725,7 +770,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                         {(tag_count > 0).then(|| view! {
                             <div class="flex items-center justify-between gap-2 px-0.5 text-[11px] text-sky-600/80">
                                 <span>
-                                    {if any_aliases {
+                                    {move || if any_aliases && !show_inline_aliases.get() {
                                         format!("Tags ({tag_count}) · hover for aliases")
                                     } else {
                                         format!("Tags ({tag_count})")
@@ -737,32 +782,54 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                         aria-pressed=move || show_inline_aliases.get().to_string()
                                         class="px-2 py-0.5 rounded-full bg-sky-100/80 hover:bg-sky-200/80
                                                text-sky-700 font-medium transition-colors cursor-pointer"
-                                        on:click=move |_| show_inline_aliases.update(|v| *v = !*v)
+                                        on:click=move |_| {
+                                            close_tip_now();
+                                            show_inline_aliases.update(|v| *v = !*v);
+                                        }
                                     >
                                         {move || if show_inline_aliases.get() { "Hide aliases" } else { "Show aliases" }}
                                     </button>
                                 })}
                             </div>
                         })}
-                        <div
-                            class="max-h-24 md:max-h-32 overflow-y-auto flex flex-wrap content-start gap-1.5"
-                            on:scroll=move |_| {
-                                if !pointer_in_tip.get_value() && !focus_in_tip.get_value() {
-                                    close_tip_now();
-                                }
+                        {
+                            let authors_store = StoredValue::new(authors);
+                            let tags_store = StoredValue::new(tags);
+                            move || if show_inline_aliases.get() {
+                                view! {
+                                    <div class="max-h-48 md:max-h-56 overflow-y-auto overscroll-contain flex flex-col gap-1.5 pr-0.5">
+                                        {authors_store.with_value(|list| {
+                                            (!list.is_empty()).then(|| view! {
+                                                <div class="flex flex-wrap gap-1.5">
+                                                    {list.iter().map(|a| render_author_pill(a.name.clone())).collect_view()}
+                                                </div>
+                                            })
+                                        })}
+                                        {tags_store.with_value(|list| {
+                                            list.iter().cloned().map(render_tag_alias_card).collect_view()
+                                        })}
+                                    </div>
+                                }.into_any()
+                            } else {
+                                view! {
+                                    <div
+                                        class="max-h-24 md:max-h-32 overflow-y-auto flex flex-wrap content-start gap-1.5"
+                                        on:scroll=move |_| {
+                                            if !pointer_in_tip.get_value() && !focus_in_tip.get_value() {
+                                                close_tip_now();
+                                            }
+                                        }
+                                    >
+                                        {authors_store.with_value(|list| {
+                                            list.iter().map(|a| render_author_pill(a.name.clone())).collect_view()
+                                        })}
+                                        {tags_store.with_value(|list| {
+                                            list.iter().cloned().map(render_tag_pill).collect_view()
+                                        })}
+                                    </div>
+                                }.into_any()
                             }
-                        >
-                            {
-                                authors.into_iter().map(|author| {
-                                    render_author_pill(author.name)
-                                })
-                                .collect_view()
-                            }
-                            {
-                                tags.into_iter().map(render_tag_pill)
-                                .collect_view()
-                            }
-                        </div>
+                        }
                     </div>
 
                     <div class="flex-1 min-h-0 flex flex-row gap-2">

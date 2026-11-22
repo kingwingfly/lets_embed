@@ -1,7 +1,10 @@
 use crate::{
     components::{LikeButton, LikeVariant, Viewer},
     types::PostItem,
-    util::{encode_path, format_duration, lock_body_scroll},
+    util::{
+        encode_path, format_duration, lock_body_scroll, prepare_modal_navigation,
+        push_modal_history,
+    },
 };
 use leptos::{ev, html, prelude::*};
 use leptos_router::{NavigateOptions, hooks::use_navigate};
@@ -22,6 +25,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
     let navigate = use_navigate();
     let dialog_ref: NodeRef<html::Div> = NodeRef::new();
     lock_body_scroll();
+    push_modal_history(move || lightbox.set(None));
 
     // Move keyboard focus into the dialog on mount.
     #[cfg(feature = "hydrate")]
@@ -143,8 +147,9 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                                     ev.stop_propagation();
                                     if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
                                         ev.prevent_default();
+                                        let replace = prepare_modal_navigation();
                                         lightbox.set(None);
-                                        nav(&click_href, NavigateOptions::default());
+                                        nav(&click_href, NavigateOptions { replace, ..Default::default() });
                                     }
                                 }
                             >
@@ -256,8 +261,9 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                                                 ev.stop_propagation();
                                                 if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
                                                     ev.prevent_default();
+                                                    let replace = prepare_modal_navigation();
                                                     lightbox.set(None);
-                                                    nav(&click_href, NavigateOptions::default());
+                                                    nav(&click_href, NavigateOptions { replace, ..Default::default() });
                                                 }
                                             }
                                         >

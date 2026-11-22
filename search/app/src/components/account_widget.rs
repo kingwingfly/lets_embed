@@ -298,6 +298,15 @@ pub fn AccountWidget() -> impl IntoView {
                                 "\u{2605} Favorites"
                             </a>
                             <a
+                                href="/user/account#device-login"
+                                rel="external"
+                                class="block text-center mt-2 bg-sky-50 ring-1 ring-sky-200
+                                    text-sky-700 font-medium rounded-full py-1.5 px-4
+                                    hover:bg-sky-100 transition-all"
+                            >
+                                "QR / Phone sign-in"
+                            </a>
+                            <a
                                 href="/user/account"
                                 rel="external"
                                 class="block text-center mt-2 bg-gradient-to-r from-sky-400 to-blue-500

@@ -53,6 +53,7 @@ const tabs = {
 let activeKind = initialKind();
 let density = loadDensity();
 let viewerIndex = -1;
+let viewerPushedHistory = false;
 let lastFocusedBeforeViewer = null;
 let lastRemoved = null;
 let toastTimer = null;
@@ -591,19 +592,32 @@ function openViewerForItem(item, triggerEl) {
   const list = previewableItems(activeKind);
   const idx = list.findIndex(x => x.kind === item.kind && x.target_id === item.target_id);
   if (idx < 0) return;
+  const wasClosed = viewerEl.hidden;
   lastFocusedBeforeViewer = triggerEl || document.activeElement;
   viewerIndex = idx;
   viewerEl.hidden = false;
   if (document.body) document.body.style.overflow = "hidden";
+  if (wasClosed && typeof history !== "undefined" && history.pushState) {
+    try {
+      history.pushState({ favViewer: true }, "", location.href);
+      viewerPushedHistory = true;
+    } catch (_) {}
+  }
   syncViewer();
   if (viewerClose && viewerClose.focus) viewerClose.focus();
 }
 
-function closeViewer() {
+function closeViewer(fromPop) {
   if (viewerEl.hidden) return;
   viewerEl.hidden = true;
   viewerIndex = -1;
   if (document.body) document.body.style.overflow = "";
+  if (viewerPushedHistory) {
+    viewerPushedHistory = false;
+    if (!fromPop && typeof history !== "undefined" && history.back) {
+      history.back();
+    }
+  }
   if (lastFocusedBeforeViewer && lastFocusedBeforeViewer.focus) {
     try { lastFocusedBeforeViewer.focus(); } catch (_) {}
   }
@@ -665,7 +679,13 @@ emptySwitchBtn.addEventListener("click", function () {
 moreBtn.addEventListener("click", function () { loadTabPage(activeKind); });
 undoBtn.addEventListener("click", undoLastRemoval);
 
-viewerClose.addEventListener("click", closeViewer);
+viewerClose.addEventListener("click", function () { closeViewer(false); });
+viewerDetails.addEventListener("click", function () { viewerPushedHistory = false; });
+window.addEventListener("popstate", function () {
+  if (!viewerEl.hidden) {
+    closeViewer(true);
+  }
+});
 viewerPrev.addEventListener("click", function (ev) { ev.stopPropagation(); stepViewer(-1); });
 viewerNext.addEventListener("click", function (ev) { ev.stopPropagation(); stepViewer(1); });
 viewerUnfav.addEventListener("click", function (ev) {

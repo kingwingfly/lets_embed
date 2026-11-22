@@ -468,17 +468,165 @@ td.meta {
   min-height: 45px;
 }
 .wallet-footer,
-#mobile-wallets {
-  margin-top: 21px;
+#handoff-section,
+.login-section {
+  margin-top: 20px;
   padding-top: 15px;
   border-top: 1px solid var(--line);
 }
 .wallet-footer a {
   font-size: 13px;
 }
-#mobile-host {
-  font-family: ui-monospace, monospace;
-  overflow-wrap: anywhere;
+.login-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 10px;
+}
+.login-divider::before,
+.login-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+.otp-form {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.otp-form input {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-align: center;
+  text-transform: uppercase;
+}
+.otp-form .btn {
+  flex: none;
+  white-space: nowrap;
+}
+.pairing-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px auto 10px;
+  padding: 6px 14px;
+  border-radius: 999px;
+  background: var(--wash);
+  border: 1px solid var(--line);
+  font-size: 13px;
+  color: var(--muted);
+}
+.pairing-inline strong {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 18px;
+  letter-spacing: 0.16em;
+  color: var(--blue);
+}
+.pairing-box {
+  margin: 10px 0 14px;
+  padding: 14px;
+  border-radius: 16px;
+  background: var(--wash);
+  border: 1px solid var(--line);
+}
+.pairing-label {
+  display: block;
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.pairing-code {
+  display: block;
+  margin-top: 6px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 32px;
+  letter-spacing: 0.22em;
+  color: var(--blue);
+}
+.qr-box {
+  width: min(220px, 100%);
+  margin: 10px auto;
+  padding: 10px;
+  border-radius: 16px;
+  background: #ffffff;
+  border: 1px solid var(--line);
+  box-shadow: 0 4px 14px rgba(25, 95, 143, 0.08);
+}
+.qr-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 6px;
+}
+.handoff-status {
+  margin: 12px 0 4px;
+  font-size: 13px;
+  color: var(--blue);
+  font-weight: 600;
+}
+.qr-claim-box {
+  padding: 14px;
+  border-radius: 16px;
+  background: var(--wash);
+  border: 1px solid var(--line);
+  margin-bottom: 10px;
+}
+.approve-done {
+  padding: 18px 12px;
+  border-radius: 16px;
+  background: #e8f8ef;
+  border: 1px solid #b6e6cb;
+  color: #1e5b46;
+}
+.approve-check {
+  width: 48px;
+  height: 48px;
+  margin: 0 auto 10px;
+  border-radius: 999px;
+  background: #22a06b;
+  color: #fff;
+  display: grid;
+  place-items: center;
+  font-size: 26px;
+  font-weight: 700;
+}
+.device-login-grid {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 20px;
+  margin-top: 16px;
+  padding: 16px;
+  border-radius: 16px;
+  background: var(--wash);
+  border: 1px solid var(--line);
+}
+.device-login-grid .qr-box {
+  margin: 0;
+  width: 196px;
+  flex: none;
+}
+.device-code-meta {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+.otp-code {
+  margin-top: 6px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: clamp(24px, 3vw, 32px);
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--blue);
 }
 .account-grid {
   display: grid;

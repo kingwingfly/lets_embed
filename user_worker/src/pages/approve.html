@@ -1,0 +1,273 @@
+<div class="wallet-card card">
+<div class="wallet-sky"><span class="cloud-friend" aria-hidden="true"><i></i></span></div>
+<div class="wallet-body">
+<h1>Approve sign-in</h1>
+<p class="sub" id="approve-intro">Sign once with your wallet, then switch right back to your browser.</p>
+
+<div id="pairing-wrap" class="pairing-box" hidden>
+  <span class="pairing-label">Confirm this code matches your browser</span>
+  <strong class="pairing-code" id="approve-code">----</strong>
+  <p class="hint">Never approve a sign-in link sent to you by someone else.</p>
+</div>
+
+<div id="approve-actions" hidden>
+  <button class="btn full" id="approve-eth-btn" type="button">Approve with Ethereum</button>
+  <button class="btn full secondary" id="approve-sol-btn" type="button">Approve with Solana</button>
+  <p class="hint" id="approve-wallet-help" hidden>Open this link inside a wallet app (MetaMask, Phantom, OKX, Rabby, etc.) to sign.</p>
+</div>
+
+<div id="approve-done" class="approve-done" hidden>
+  <div class="approve-check" aria-hidden="true">✓</div>
+  <h2>Sign-in approved!</h2>
+  <p class="sub">Switch back to your browser now — you’ll be signed in automatically. You can close this tab.</p>
+</div>
+
+<div class="msg" id="approve-msg" role="status" hidden></div>
+</div></div>
+<script>
+"use strict";
+var CHAIN_ID = __CHAIN_ID__;
+var SIWE_DOMAIN = "__SIWE_DOMAIN__";
+var sessionId = new URLSearchParams(location.search).get("s") || "";
+var msgEl = document.getElementById("approve-msg");
+var ethBtn = document.getElementById("approve-eth-btn");
+var solBtn = document.getElementById("approve-sol-btn");
+var actionsEl = document.getElementById("approve-actions");
+var pairingWrap = document.getElementById("pairing-wrap");
+var codeEl = document.getElementById("approve-code");
+var doneEl = document.getElementById("approve-done");
+var helpEl = document.getElementById("approve-wallet-help");
+var activeVerifyCode = "";
+
+function showMsg(text, cls) {
+  msgEl.hidden = false;
+  msgEl.className = "msg" + (cls ? " " + cls : "");
+  msgEl.textContent = text;
+}
+
+function showDone(address) {
+  actionsEl.hidden = true;
+  pairingWrap.hidden = true;
+  doneEl.hidden = false;
+  if (address) {
+    showMsg("Approved for " + address + ". Switch back to your browser.", "ok");
+  }
+}
+
+function bs58encode(bytes) {
+  var ALPH = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  if (bytes.length === 0) return "";
+  var digits = [0];
+  for (var i = 0; i < bytes.length; i++) {
+    var carry = bytes[i];
+    for (var j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) { digits.push(carry % 58); carry = (carry / 58) | 0; }
+  }
+  var out = "";
+  for (var k = 0; k < bytes.length - 1 && bytes[k] === 0; k++) out += "1";
+  for (var q = digits.length - 1; q >= 0; q--) out += ALPH[digits[q]];
+  return out;
+}
+
+function bytesToBase64(bytes) {
+  if (!bytes || typeof bytes.length !== "number") return null;
+  var bin = "";
+  for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+var solWallets = [];
+(function () {
+  function register() {
+    for (var i = 0; i < arguments.length; i++) {
+      if (solWallets.indexOf(arguments[i]) === -1) solWallets.push(arguments[i]);
+    }
+    updateWalletButtons();
+    return function () {};
+  }
+  var api = { register: register, get: function () { return solWallets.slice(); }, on: function () { return function () {}; } };
+  try { window.addEventListener("wallet-standard:register-wallet", function (ev) { ev.detail(api); }); } catch (e) {}
+  try { window.dispatchEvent(new CustomEvent("wallet-standard:app-ready", { detail: api })); } catch (e) {}
+})();
+
+function pickSolanaWallet() {
+  for (var i = 0; i < solWallets.length; i++) {
+    var f = solWallets[i] && solWallets[i].features;
+    if (f && f["solana:signMessage"] && f["standard:connect"]) return solWallets[i];
+  }
+  return null;
+}
+
+function pickSolanaAccount(accounts) {
+  for (var i = 0; i < accounts.length; i++) {
+    var chains = accounts[i].chains || [];
+    for (var j = 0; j < chains.length; j++) if (chains[j].indexOf("solana:") === 0) return accounts[i];
+  }
+  return accounts.length ? accounts[0] : null;
+}
+
+function hasSolanaWallet() {
+  return !!(pickSolanaWallet() || window.solana || (window.phantom && window.phantom.solana));
+}
+
+async function getSolanaSigner() {
+  var w = pickSolanaWallet();
+  if (w) {
+    var res = await w.features["standard:connect"].connect();
+    var accounts = (res && res.accounts && res.accounts.length ? res.accounts : w.accounts) || [];
+    var account = pickSolanaAccount(accounts);
+    if (!account) throw new Error("No Solana account in this wallet.");
+    return {
+      address: account.address,
+      sign: async function (m) {
+        var out = await w.features["solana:signMessage"].signMessage({ account: account, message: m });
+        return { signature: out[0].signature, signedMessage: out[0].signedMessage };
+      },
+    };
+  }
+  var provider = window.solana || (window.phantom && window.phantom.solana);
+  if (provider && provider.connect) {
+    var conn = await provider.connect();
+    var pk = provider.publicKey || (conn && conn.publicKey);
+    if (!pk) throw new Error("Wallet did not return a public key.");
+    return {
+      address: pk.toString(),
+      sign: async function (m) {
+        var s = await provider.signMessage(m, "utf8");
+        return { signature: s && s.signature ? s.signature : s, signedMessage: null };
+      },
+    };
+  }
+  return null;
+}
+
+function updateWalletButtons() {
+  var hasEth = !!window.ethereum;
+  var hasSol = hasSolanaWallet();
+  ethBtn.disabled = !hasEth;
+  ethBtn.hidden = !hasEth && hasSol;
+  solBtn.disabled = !hasSol;
+  solBtn.hidden = !hasSol && hasEth;
+  helpEl.hidden = hasEth || hasSol;
+}
+
+ethBtn.addEventListener("click", async function () {
+  ethBtn.disabled = true;
+  solBtn.disabled = true;
+  try {
+    if (!window.ethereum) throw new Error("No Ethereum wallet detected in this browser.");
+    var accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+    var addr = accounts[0];
+    if (!addr) throw new Error("No account returned by wallet.");
+    var nr = await fetch("/user/api/nonce");
+    if (!nr.ok) throw new Error("Failed to fetch nonce (" + nr.status + ")");
+    var nonce = (await nr.json()).nonce;
+    var message = location.host + " wants you to sign in with your Ethereum account:\n" +
+      addr + "\n\n" +
+      "Approve sign-in for another browser on lets_embed" + (activeVerifyCode ? " (Code: " + activeVerifyCode + ")" : "") + "\n\n" +
+      "URI: " + location.origin + "/user/login/approve\n" +
+      "Version: 1\n" +
+      "Chain ID: " + CHAIN_ID + "\n" +
+      "Nonce: " + nonce + "\n" +
+      "Issued At: " + new Date().toISOString();
+    var signature = await window.ethereum.request({
+      method: "personal_sign",
+      params: [message, addr],
+    });
+    var vr = await fetch("/user/api/handoff/approve_eth", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, message: message, signature: signature }),
+    });
+    if (vr.ok) {
+      var data = await vr.json().catch(function () { return {}; });
+      showDone(data.address);
+      return;
+    }
+    var err;
+    try { err = (await vr.json()).error; } catch (_) {}
+    showMsg(err || "Approval failed (" + vr.status + ")", "err");
+  } catch (e) {
+    showMsg(e && e.message ? e.message : String(e), "err");
+  } finally {
+    updateWalletButtons();
+  }
+});
+
+solBtn.addEventListener("click", async function () {
+  ethBtn.disabled = true;
+  solBtn.disabled = true;
+  try {
+    var signer = await getSolanaSigner();
+    if (!signer) throw new Error("No Solana wallet detected in this browser.");
+    var nr = await fetch("/user/api/nonce");
+    if (!nr.ok) throw new Error("Failed to fetch nonce (" + nr.status + ")");
+    var nonce = (await nr.json()).nonce;
+    var message = "Sign in to lets_embed with Solana\nDomain: " + SIWE_DOMAIN + "\nNonce: " + nonce;
+    var signed = await signer.sign(new TextEncoder().encode(message));
+    var sigB58 = typeof signed.signature === "string" ? signed.signature : bs58encode(signed.signature);
+    var body = {
+      session_id: sessionId,
+      solana_address: signer.address,
+      signature: sigB58,
+      nonce: nonce,
+    };
+    var signedMsgB64 = bytesToBase64(signed.signedMessage);
+    if (signedMsgB64) body.signed_message = signedMsgB64;
+    var vr = await fetch("/user/api/handoff/approve_sol", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (vr.ok) {
+      var data = await vr.json().catch(function () { return {}; });
+      showDone(data.address);
+      return;
+    }
+    var err;
+    try { err = (await vr.json()).error; } catch (_) {}
+    showMsg(err || "Approval failed (" + vr.status + ")", "err");
+  } catch (e) {
+    showMsg(e && e.message ? e.message : String(e), "err");
+  } finally {
+    updateWalletButtons();
+  }
+});
+
+async function init() {
+  if (!sessionId) {
+    showMsg("Missing sign-in session link. Go back to your browser and try again.", "err");
+    return;
+  }
+  try {
+    var r = await fetch("/user/api/handoff/info?s=" + encodeURIComponent(sessionId));
+    if (!r.ok) {
+      var err;
+      try { err = (await r.json()).error; } catch (_) {}
+      showMsg(err || "This sign-in link has expired. Go back to your browser and start a new one.", "err");
+      return;
+    }
+    var info = await r.json();
+    if (info.status === "approved") {
+      showDone("");
+      return;
+    }
+    activeVerifyCode = info.verify_code || "";
+    codeEl.textContent = activeVerifyCode;
+    pairingWrap.hidden = false;
+    actionsEl.hidden = false;
+    updateWalletButtons();
+    // Some mobile wallets inject `window.ethereum` slightly after DOMContentLoaded.
+    setTimeout(updateWalletButtons, 400);
+    setTimeout(updateWalletButtons, 1200);
+  } catch (e) {
+    showMsg("Couldn’t load sign-in request. Reload to try again.", "err");
+  }
+}
+
+init();
+</script>

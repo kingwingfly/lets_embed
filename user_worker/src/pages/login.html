@@ -4,19 +4,65 @@
 <h1>__HEADING__</h1>
 <p class="sub">__INTRO__</p>
 __TERMS__
-<button class="btn full" id="siwe-btn" type="button">Sign in with Ethereum</button>
-<button class="btn full secondary" id="siws-btn" type="button">Sign in with Solana</button>
-<p class="hint" id="wallet-help" hidden>Open this page with an Ethereum or Solana wallet extension to sign in.</p>
-<div id="mobile-wallets" hidden>
-<h2>Sign in on mobile</h2>
-<p class="hint">Open this site in your wallet’s built-in browser.</p>
-<p id="mobile-host"></p>
-<button class="btn full" id="copy-link" type="button">Copy link</button>
-<div id="mobile-deeplinks">
-<a class="btn full ghost-alt" id="mm-link" rel="noopener" href="#">Open in MetaMask</a>
-<a class="btn full ghost-alt" id="ph-link" rel="noopener" href="#">Open in Phantom</a>
+
+<div id="qr-claim-box" class="qr-claim-box" hidden>
+  <h2>Complete sign-in on this device</h2>
+  <p class="hint">Only continue if you just scanned this QR code from your own signed-in account.</p>
+  <button class="btn full" id="qr-claim-btn" type="button">Sign in now</button>
+  <button class="btn full ghost-alt" id="qr-claim-cancel" type="button">Use another sign-in method</button>
 </div>
+
+<div id="login-methods">
+  <button class="btn full" id="siwe-btn" type="button">Sign in with Ethereum</button>
+  <button class="btn full secondary" id="siws-btn" type="button">Sign in with Solana</button>
+  <p class="hint" id="wallet-help" hidden>No wallet extension detected — sign in with a phone wallet or a one-time code below.</p>
+
+  <div id="handoff-section" hidden>
+    <h2 id="handoff-heading">Sign in with your wallet app</h2>
+    <p class="hint" id="handoff-hint">Approve once in MetaMask, Phantom, or any wallet app, then switch right back to this browser.</p>
+
+    <div id="handoff-pairing" class="pairing-inline" hidden>
+      <span>Match code:</span>
+      <strong id="handoff-code">----</strong>
+    </div>
+
+    <div id="handoff-qr-wrap" class="qr-box" hidden></div>
+
+    <div id="mobile-deeplinks" hidden>
+      <a class="btn full" id="mm-link" rel="noopener" href="#">Open in MetaMask</a>
+      <a class="btn full secondary" id="ph-link" rel="noopener" href="#">Open in Phantom</a>
+      <button class="btn full ghost-alt" id="copy-link" type="button">Copy approval link for other wallets</button>
+    </div>
+
+    <p class="handoff-status" id="handoff-status" hidden></p>
+    <button class="btn small secondary" id="handoff-refresh" type="button" hidden>Refresh sign-in link</button>
+  </div>
+
+  <div id="desktop-qr-toggle-wrap" class="login-section" hidden>
+    <button class="btn full ghost-alt" id="desktop-qr-toggle" type="button">Sign in with phone wallet (QR code)</button>
+  </div>
+
+  <div class="login-section" id="otp-section">
+    <div class="login-divider"><span>or use a one-time code</span></div>
+    <p class="hint">Already signed in on another device? Open <strong>Account → Sign in on another device</strong> to get a code or QR.</p>
+    <form id="otp-form" class="otp-form">
+      <input
+        id="otp-input"
+        type="text"
+        inputmode="text"
+        autocomplete="one-time-code"
+        autocapitalize="characters"
+        spellcheck="false"
+        maxlength="12"
+        placeholder="XXXX-XXXX"
+        aria-label="One-time login code"
+        required
+      >
+      <button class="btn secondary" id="otp-btn" type="submit">Sign in</button>
+    </form>
+  </div>
 </div>
+
 <div class="msg" id="login-msg" role="status" hidden></div>
 <div class="wallet-footer"><a href="/user/admin/browse">Browse as administrator</a></div>
 </div></div>
@@ -25,7 +71,10 @@ __TERMS__
 var CHAIN_ID = __CHAIN_ID__;
 var SIWE_DOMAIN = "__SIWE_DOMAIN__";
 var btn = document.getElementById("siwe-btn");
+var sbtn = document.getElementById("siws-btn");
 var msgEl = document.getElementById("login-msg");
+var methodsEl = document.getElementById("login-methods");
+var isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
 function showMsg(text, cls) {
   msgEl.hidden = false;
@@ -36,69 +85,116 @@ function showMsg(text, cls) {
 function nextUrl() {
   if (location.pathname === "/user/upgrade") return "/user/account#topup";
   var next = new URLSearchParams(location.search).get("next") || "/";
-  // Browsers treat "\" as "/" when resolving URLs, so also reject backslashes
-  // to keep "/\evil.com" from becoming a protocol-relative redirect.
   if (!next.startsWith("/") || next.startsWith("//") || next.includes("\\") || /[\x00-\x1f]/.test(next)) next = "/";
   return next;
 }
 
-if (!window.ethereum) {
-  var isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-  if (isMobile) {
-    // Mobile browsers have no injected provider. The reliable path is manual:
-    // the user opens their wallet app's built-in browser and navigates here,
-    // so we show the host prominently and offer a one-tap "copy link".
-    document.getElementById("mobile-host").textContent = location.host;
-    // Full URL to this exact page, built from location with a fixed origin.
-    var siteUrl = location.origin + location.pathname + location.search;
-    var copyBtn = document.getElementById("copy-link");
-    copyBtn.addEventListener("click", function () {
-      function copied() {
-        showMsg("Link copied. Open your wallet app's browser and paste it.", "ok");
+function renderQrSvg(container, qr) {
+  container.textContent = "";
+  if (!qr || !qr.size || !qr.bits) return;
+  var NS = "http://www.w3.org/2000/svg";
+  var q = 4;
+  var dim = qr.size + q * 2;
+  var svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 " + dim + " " + dim);
+  svg.setAttribute("class", "qr-svg");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", "Sign-in QR code");
+  svg.setAttribute("shape-rendering", "crispEdges");
+  var bg = document.createElementNS(NS, "rect");
+  bg.setAttribute("width", String(dim));
+  bg.setAttribute("height", String(dim));
+  bg.setAttribute("fill", "#ffffff");
+  svg.appendChild(bg);
+  var parts = [];
+  for (var r = 0; r < qr.size; r++) {
+    var rowOff = r * qr.size;
+    for (var c = 0; c < qr.size; c++) {
+      if (qr.bits.charCodeAt(rowOff + c) === 49) {
+        parts.push("M" + (c + q) + "," + (r + q) + "h1v1h-1z");
       }
-      function manual() {
-        // Neither clipboard path worked — show the link so it can be copied by hand.
-        showMsg("Couldn't copy automatically. Copy this link manually:\n" + siteUrl);
-      }
-      function legacyCopy() {
-        try {
-          var inp = document.createElement("input");
-          inp.setAttribute("readonly", "");
-          inp.value = siteUrl;
-          inp.style.position = "absolute";
-          inp.style.left = "-9999px";
-          document.body.appendChild(inp);
-          inp.select();
-          inp.setSelectionRange(0, siteUrl.length);
-          var ok = document.execCommand && document.execCommand("copy");
-          document.body.removeChild(inp);
-          if (ok) { copied(); return; }
-        } catch (e) {}
-        manual();
-      }
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(siteUrl).then(copied, legacyCopy);
-      } else {
-        legacyCopy();
-      }
-    });
-    // Best-effort deep links that reopen THIS page inside a wallet app's in-app
-    // browser (which injects a provider). Documented-unreliable, so secondary.
-    // link.metamask.io is MetaMask's current deeplink host: host+path+query, no
-    // scheme (the legacy metamask.app.link Branch link 404s on HTTPS-only sites).
-    var mmUrl = "https://link.metamask.io/dapp/" +
-      location.host + location.pathname + location.search;
-    // Phantom universal link: full https URL, encoded; ref = origin.
-    var phUrl = "https://phantom.app/ul/browse/" +
-      encodeURIComponent(location.href) + "?ref=" + encodeURIComponent(location.origin);
-    document.getElementById("mm-link").href = mmUrl;
-    document.getElementById("ph-link").href = phUrl;
-    btn.hidden = true;
-    document.getElementById("mobile-wallets").hidden = false;
-  } else {
-    btn.disabled = true;
+    }
   }
-} else {
+  var path = document.createElementNS(NS, "path");
+  path.setAttribute("d", parts.join(""));
+  path.setAttribute("fill", "#102a43");
+  svg.appendChild(path);
+  container.appendChild(svg);
+}
+
+function copyText(text, okMsg) {
+  function ok() { showMsg(okMsg, "ok"); }
+  function manual() { showMsg("Couldn’t copy automatically. Copy manually:\n" + text); }
+  function legacy() {
+    try {
+      var inp = document.createElement("input");
+      inp.setAttribute("readonly", "");
+      inp.value = text;
+      inp.style.position = "absolute";
+      inp.style.left = "-9999px";
+      document.body.appendChild(inp);
+      inp.select();
+      inp.setSelectionRange(0, text.length);
+      var res = document.execCommand && document.execCommand("copy");
+      document.body.removeChild(inp);
+      if (res) { ok(); return; }
+    } catch (e) {}
+    manual();
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(ok, legacy);
+  } else {
+    legacy();
+  }
+}
+
+// ---- Scanned QR transfer token landing (?transfer=...) ---------------------
+var initialParams = new URLSearchParams(location.search);
+var transferToken = initialParams.get("transfer");
+if (transferToken) {
+  // Strip single-use token from URL bar immediately so it isn't kept in history.
+  initialParams.delete("transfer");
+  var cleanQuery = initialParams.toString();
+  var cleanUrl = location.pathname + (cleanQuery ? "?" + cleanQuery : "") + location.hash;
+  try { history.replaceState(null, "", cleanUrl); } catch (_) {}
+  methodsEl.hidden = true;
+  var qrClaimBox = document.getElementById("qr-claim-box");
+  var qrClaimBtn = document.getElementById("qr-claim-btn");
+  var qrCancelBtn = document.getElementById("qr-claim-cancel");
+  qrClaimBox.hidden = false;
+  qrClaimBtn.addEventListener("click", async function () {
+    qrClaimBtn.disabled = true;
+    try {
+      var r = await fetch("/user/api/transfer/claim", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: transferToken }),
+      });
+      if (r.ok) {
+        showMsg("Signed in. Redirecting…", "ok");
+        location = nextUrl();
+        return;
+      }
+      var err;
+      try { err = (await r.json()).error; } catch (_) {}
+      showMsg(err || "QR code expired or already used. Generate a new one on your account page.", "err");
+    } catch (e) {
+      showMsg(e && e.message ? e.message : String(e), "err");
+    } finally {
+      qrClaimBtn.disabled = false;
+    }
+  });
+  qrCancelBtn.addEventListener("click", function () {
+    qrClaimBox.hidden = true;
+    methodsEl.hidden = false;
+    if (isMobile && !window.ethereum && !hasSolanaWallet() && !handoffState) {
+      startHandoff(false);
+    }
+  });
+}
+
+// ---- Direct Ethereum (SIWE) ------------------------------------------------
+if (window.ethereum) {
   btn.addEventListener("click", async function () {
     btn.disabled = true;
     try {
@@ -141,12 +237,12 @@ Issued At: ${new Date().toISOString()}`;
       btn.disabled = false;
     }
   });
+} else {
+  btn.disabled = true;
+  if (isMobile) btn.hidden = true;
 }
 
-// ---- Sign in with Solana (SIWS) -------------------------------------------
-// Independent of the Ethereum provider: discovers a Solana wallet via the Wallet
-// Standard (MetaMask multichain, Phantom, Solflare, Backpack), signs the SIWS
-// challenge, and posts to /user/api/verify_solana for a standalone account.
+// ---- Direct Solana (SIWS) --------------------------------------------------
 function bs58encode(bytes) {
   var ALPH = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
   if (bytes.length === 0) return "";
@@ -171,7 +267,7 @@ var solWallets = [];
     for (var i = 0; i < arguments.length; i++) {
       if (solWallets.indexOf(arguments[i]) === -1) solWallets.push(arguments[i]);
     }
-    if (sbtn) updateSolanaButton();
+    if (sbtn) updateWalletVisibility();
     return function () {};
   }
   var api = { register: register, get: function () { return solWallets.slice(); }, on: function () { return function () {}; } };
@@ -228,18 +324,10 @@ function bytesToBase64(bytes) {
   for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
   return btoa(bin);
 }
-var sbtn = document.getElementById("siws-btn");
 function hasSolanaWallet() {
   return !!(pickSolanaWallet() || window.solana || (window.phantom && window.phantom.solana));
 }
-function updateSolanaButton() {
-  var available = hasSolanaWallet();
-  var mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-  sbtn.disabled = !available;
-  sbtn.hidden = !available && mobile;
-  document.getElementById("wallet-help").hidden = available || !!window.ethereum || mobile;
-}
-updateSolanaButton();
+
 sbtn.addEventListener("click", async function () {
   sbtn.disabled = true;
   try {
@@ -251,7 +339,6 @@ sbtn.addEventListener("click", async function () {
     var nr = await fetch("/user/api/nonce");
     if (!nr.ok) throw new Error("failed to fetch nonce (" + nr.status + ")");
     var nonce = (await nr.json()).nonce;
-    // MUST match auth::siws_challenge byte for byte.
     var message = "Sign in to lets_embed with Solana\nDomain: " + SIWE_DOMAIN + "\nNonce: " + nonce;
     var signed = await signer.sign(new TextEncoder().encode(message));
     var sigBytes = signed.signature;
@@ -276,6 +363,188 @@ sbtn.addEventListener("click", async function () {
     showMsg(e && e.message ? e.message : String(e), "err");
   } finally {
     sbtn.disabled = false;
+  }
+});
+
+// ---- Wallet App Handoff (MetaMask / Phantom deep-link or Desktop QR) -------
+var handoffSection = document.getElementById("handoff-section");
+var handoffHeading = document.getElementById("handoff-heading");
+var handoffHint = document.getElementById("handoff-hint");
+var handoffPairing = document.getElementById("handoff-pairing");
+var handoffCodeEl = document.getElementById("handoff-code");
+var handoffQrWrap = document.getElementById("handoff-qr-wrap");
+var mobileLinksEl = document.getElementById("mobile-deeplinks");
+var mmLink = document.getElementById("mm-link");
+var phLink = document.getElementById("ph-link");
+var copyLinkBtn = document.getElementById("copy-link");
+var handoffStatus = document.getElementById("handoff-status");
+var handoffRefreshBtn = document.getElementById("handoff-refresh");
+var desktopQrWrap = document.getElementById("desktop-qr-toggle-wrap");
+var desktopQrToggle = document.getElementById("desktop-qr-toggle");
+
+var handoffState = null;
+var pollTimer = null;
+var pollInFlight = false;
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+async function pollHandoffOnce() {
+  if (!handoffState || pollInFlight) return;
+  pollInFlight = true;
+  try {
+    var r = await fetch("/user/api/handoff/poll", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: handoffState.session_id,
+        poll_secret: handoffState.poll_secret,
+      }),
+    });
+    if (r.status === 410) {
+      stopPolling();
+      handoffState = null;
+      handoffStatus.textContent = "Sign-in session expired.";
+      handoffRefreshBtn.hidden = false;
+      return;
+    }
+    if (!r.ok) return;
+    var data = await r.json();
+    if (data.status === "approved") {
+      stopPolling();
+      handoffState = null;
+      showMsg("Approved in wallet! Redirecting…", "ok");
+      location = nextUrl();
+    }
+  } catch (_) {
+    // Transient network error (e.g. waking from background on mobile) — next poll retries.
+  } finally {
+    pollInFlight = false;
+  }
+}
+
+async function startHandoff(showQr) {
+  stopPolling();
+  handoffSection.hidden = false;
+  handoffRefreshBtn.hidden = true;
+  handoffStatus.hidden = false;
+  handoffStatus.textContent = "Preparing wallet sign-in link…";
+  try {
+    var r = await fetch("/user/api/handoff/start", { method: "POST" });
+    if (!r.ok) {
+      var err;
+      try { err = (await r.json()).error; } catch (_) {}
+      handoffStatus.textContent = err || "Could not start wallet sign-in (" + r.status + ").";
+      handoffRefreshBtn.hidden = false;
+      return;
+    }
+    var data = await r.json();
+    handoffState = {
+      session_id: data.session_id,
+      poll_secret: data.poll_secret,
+      approve_url: data.approve_url,
+      show_qr: showQr,
+    };
+    var approvePath = "/user/login/approve?s=" + encodeURIComponent(data.session_id);
+    var localApproveUrl = location.origin + approvePath;
+    handoffCodeEl.textContent = data.verify_code;
+    handoffPairing.hidden = false;
+
+    if (showQr) {
+      handoffHeading.textContent = "Scan with your phone wallet";
+      handoffHint.textContent = "Scan this QR code in your phone’s wallet app (or camera -> open in MetaMask/Phantom), confirm the code below, and approve.";
+      renderQrSvg(handoffQrWrap, data.qr);
+      handoffQrWrap.hidden = !data.qr;
+      mobileLinksEl.hidden = true;
+    } else {
+      handoffHeading.textContent = "Sign in with your wallet app";
+      handoffHint.textContent = "Approve once in MetaMask, Phantom, or any wallet app, then switch right back to this browser.";
+      handoffQrWrap.hidden = true;
+      mmLink.href = "https://link.metamask.io/dapp/" + location.host + approvePath;
+      phLink.href = "https://phantom.app/ul/browse/" + encodeURIComponent(localApproveUrl) + "?ref=" + encodeURIComponent(location.origin);
+      mobileLinksEl.hidden = false;
+    }
+    handoffStatus.textContent = "Waiting for wallet approval…";
+    pollTimer = setInterval(pollHandoffOnce, 2000);
+  } catch (_) {
+    handoffStatus.textContent = "Network error preparing sign-in. Try refreshing.";
+    handoffRefreshBtn.hidden = false;
+  }
+}
+
+copyLinkBtn.addEventListener("click", function () {
+  if (!handoffState) return;
+  var url = location.origin + "/user/login/approve?s=" + encodeURIComponent(handoffState.session_id);
+  copyText(url, "Approval link copied. Paste it in your wallet app, sign once, then switch back here.");
+});
+
+handoffRefreshBtn.addEventListener("click", function () {
+  startHandoff(handoffState ? handoffState.show_qr : !isMobile);
+});
+
+desktopQrToggle.addEventListener("click", function () {
+  desktopQrWrap.hidden = true;
+  startHandoff(true);
+});
+
+// Immediately check approval the instant the user switches back from MetaMask/Phantom.
+document.addEventListener("visibilitychange", function () {
+  if (document.visibilityState === "visible") pollHandoffOnce();
+});
+window.addEventListener("focus", pollHandoffOnce);
+window.addEventListener("pageshow", pollHandoffOnce);
+
+function updateWalletVisibility() {
+  var hasSol = hasSolanaWallet();
+  var hasEth = !!window.ethereum;
+  sbtn.disabled = !hasSol;
+  sbtn.hidden = !hasSol && isMobile;
+  document.getElementById("wallet-help").hidden = hasSol || hasEth || isMobile;
+  if (isMobile && !hasEth && !hasSol) {
+    desktopQrWrap.hidden = true;
+    if (!transferToken && !handoffState && handoffSection.hidden) {
+      startHandoff(false);
+    }
+  } else if (!isMobile) {
+    if (handoffSection.hidden) desktopQrWrap.hidden = false;
+  }
+}
+updateWalletVisibility();
+
+// ---- One-time code login (from desktop /user/account) ----------------------
+var otpForm = document.getElementById("otp-form");
+var otpInput = document.getElementById("otp-input");
+var otpBtn = document.getElementById("otp-btn");
+
+otpInput.addEventListener("input", function () {
+  var clean = otpInput.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8);
+  otpInput.value = clean.length > 4 ? (clean.slice(0, 4) + "-" + clean.slice(4)) : clean;
+});
+
+otpForm.addEventListener("submit", async function (ev) {
+  ev.preventDefault();
+  var code = otpInput.value.trim();
+  if (!code) return;
+  otpBtn.disabled = true;
+  try {
+    var r = await fetch("/user/api/transfer/claim", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: code }),
+    });
+    if (r.ok) {
+      showMsg("Signed in. Redirecting…", "ok");
+      location = nextUrl();
+      return;
+    }
+    var err;
+    try { err = (await r.json()).error; } catch (_) {}
+    showMsg(err || "Invalid or expired code.", "err");
+  } catch (e) {
+    showMsg(e && e.message ? e.message : String(e), "err");
+  } finally {
+    otpBtn.disabled = false;
   }
 });
 </script>

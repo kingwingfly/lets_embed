@@ -162,6 +162,32 @@ impl DurableObject for UserAccount {
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         let path = req.path();
+        // Singleton auth-handoff routes (`__auth_handoff__` DO instance) use
+        // synchronous DO SQLite directly and do not need site policy loading.
+        match (req.method(), path.as_str()) {
+            (Method::Post, "/handoff-start") => {
+                return self.handoff_start(req.json().await?);
+            }
+            (Method::Post, "/handoff-info") => {
+                return self.handoff_info(req.json().await?);
+            }
+            (Method::Post, "/handoff-approve") => {
+                return self.handoff_approve(req.json().await?);
+            }
+            (Method::Post, "/handoff-poll") => {
+                return self.handoff_poll(req.json().await?);
+            }
+            (Method::Post, "/transfer-create") => {
+                return self.transfer_create(req.json().await?);
+            }
+            (Method::Post, "/transfer-claim") => {
+                return self.transfer_claim(req.json().await?);
+            }
+            (Method::Post, "/transfer-revoke") => {
+                return self.transfer_revoke(req.json().await?);
+            }
+            _ => {}
+        }
         let policy = settings::load(&self.env).await?;
         match (req.method(), path.as_str()) {
             (Method::Post, "/init") => self.init(req.json().await?, &policy).await,
@@ -663,6 +689,316 @@ impl UserAccount {
     async fn ban(&self, req: BanReq, policy: &Policy) -> Result<Response> {
         self.state.storage().put("banned", req.banned).await?;
         json(&self.status_resp(policy).await?, 200)
+    }
+
+    // -----------------------------------------------------------------------
+    // Strongly-consistent auth handoff & cross-device transfer (DO SQLite)
+    // -----------------------------------------------------------------------
+
+    fn ensure_handoff_tables(&self, now: i64) -> Result<worker::SqlStorage> {
+        let db = self.state.storage().sql();
+        db.exec(
+            "CREATE TABLE IF NOT EXISTS handoff_sessions (\
+                session_id TEXT PRIMARY KEY,\
+                poll_secret_hash TEXT NOT NULL,\
+                verify_code TEXT NOT NULL,\
+                status TEXT NOT NULL,\
+                principal TEXT,\
+                created_at INTEGER NOT NULL,\
+                expires_at INTEGER NOT NULL\
+            )",
+            None,
+        )?;
+        db.exec(
+            "CREATE TABLE IF NOT EXISTS transfer_codes (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                principal TEXT NOT NULL,\
+                code_hash TEXT NOT NULL UNIQUE,\
+                token_hash TEXT NOT NULL UNIQUE,\
+                expires_at INTEGER NOT NULL\
+            )",
+            None,
+        )?;
+        db.exec(
+            "CREATE TABLE IF NOT EXISTS auth_rate_limits (\
+                bucket TEXT PRIMARY KEY,\
+                count INTEGER NOT NULL,\
+                window_end INTEGER NOT NULL\
+            )",
+            None,
+        )?;
+        // Opportunistic purge of expired rows keeps DO SQLite tiny.
+        db.exec(
+            "DELETE FROM handoff_sessions WHERE expires_at <= ?",
+            vec![now.into()],
+        )?;
+        db.exec(
+            "DELETE FROM transfer_codes WHERE expires_at <= ?",
+            vec![now.into()],
+        )?;
+        db.exec(
+            "DELETE FROM auth_rate_limits WHERE window_end <= ?",
+            vec![now.into()],
+        )?;
+        Ok(db)
+    }
+
+    fn rate_limit_hit(
+        db: &worker::SqlStorage,
+        bucket: &str,
+        now: i64,
+        window_secs: i64,
+        max_hits: i64,
+    ) -> Result<bool> {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            count: i64,
+        }
+        let existing: Vec<Row> = db
+            .exec(
+                "SELECT count FROM auth_rate_limits WHERE bucket = ?1 AND window_end > ?2",
+                vec![bucket.into(), now.into()],
+            )?
+            .to_array()?;
+        let cur = existing.first().map(|r| r.count).unwrap_or(0);
+        if cur >= max_hits {
+            return Ok(false);
+        }
+        if existing.is_empty() {
+            db.exec(
+                "INSERT OR REPLACE INTO auth_rate_limits (bucket, count, window_end) VALUES (?1, 1, ?2)",
+                vec![bucket.into(), (now + window_secs).into()],
+            )?;
+        } else {
+            db.exec(
+                "UPDATE auth_rate_limits SET count = count + 1 WHERE bucket = ?1",
+                vec![bucket.into()],
+            )?;
+        }
+        Ok(true)
+    }
+
+    fn rate_limit_blocked(
+        db: &worker::SqlStorage,
+        bucket: &str,
+        now: i64,
+        max_hits: i64,
+    ) -> Result<bool> {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            count: i64,
+        }
+        let existing: Vec<Row> = db
+            .exec(
+                "SELECT count FROM auth_rate_limits WHERE bucket = ?1 AND window_end > ?2",
+                vec![bucket.into(), now.into()],
+            )?
+            .to_array()?;
+        Ok(existing.first().is_some_and(|r| r.count >= max_hits))
+    }
+
+    fn handoff_start(&self, req: crate::handoff::DoHandoffStartReq) -> Result<Response> {
+        let now = now_secs() as i64;
+        let db = self.ensure_handoff_tables(now)?;
+        let bucket = format!("hs:{}", req.ip_key);
+        if !Self::rate_limit_hit(&db, &bucket, now, 600, 20)? {
+            return Response::error("too many sign-in attempts — wait a few minutes", 429);
+        }
+        db.exec(
+            "INSERT INTO handoff_sessions (session_id, poll_secret_hash, verify_code, status, principal, created_at, expires_at) \
+             VALUES (?1, ?2, ?3, 'pending', NULL, ?4, ?5)",
+            vec![
+                req.session_id.into(),
+                req.poll_secret_hash.into(),
+                req.verify_code.into(),
+                now.into(),
+                (req.expires_at as i64).into(),
+            ],
+        )?;
+        Response::ok("")
+    }
+
+    fn handoff_info(&self, req: crate::handoff::DoHandoffInfoReq) -> Result<Response> {
+        let now = now_secs() as i64;
+        let db = self.ensure_handoff_tables(now)?;
+        #[derive(serde::Deserialize)]
+        struct Row {
+            status: String,
+            verify_code: String,
+            expires_at: i64,
+        }
+        let rows: Vec<Row> = db
+            .exec(
+                "SELECT status, verify_code, expires_at FROM handoff_sessions WHERE session_id = ?1 AND expires_at > ?2",
+                vec![req.session_id.into(), now.into()],
+            )?
+            .to_array()?;
+        let Some(row) = rows.into_iter().next() else {
+            return Response::error("sign-in session expired or not found", 410);
+        };
+        json(
+            &crate::handoff::DoHandoffInfoResp {
+                status: row.status,
+                verify_code: row.verify_code,
+                expires_at: row.expires_at.max(0) as u64,
+            },
+            200,
+        )
+    }
+
+    fn handoff_approve(&self, req: crate::handoff::DoHandoffApproveReq) -> Result<Response> {
+        let now = now_secs() as i64;
+        let db = self.ensure_handoff_tables(now)?;
+        #[derive(serde::Deserialize)]
+        struct Row {
+            status: String,
+        }
+        let rows: Vec<Row> = db
+            .exec(
+                "SELECT status FROM handoff_sessions WHERE session_id = ?1 AND expires_at > ?2",
+                vec![req.session_id.clone().into(), now.into()],
+            )?
+            .to_array()?;
+        let Some(row) = rows.into_iter().next() else {
+            return Response::error("sign-in session expired or not found", 410);
+        };
+        if row.status != "pending" {
+            return Response::error("sign-in session already approved", 409);
+        }
+        db.exec(
+            "UPDATE handoff_sessions SET status = 'approved', principal = ?1 WHERE session_id = ?2 AND status = 'pending'",
+            vec![req.principal.into(), req.session_id.into()],
+        )?;
+        Response::ok("")
+    }
+
+    fn handoff_poll(&self, req: crate::handoff::DoHandoffPollReq) -> Result<Response> {
+        let now = now_secs() as i64;
+        let db = self.ensure_handoff_tables(now)?;
+        #[derive(serde::Deserialize)]
+        struct Row {
+            poll_secret_hash: String,
+            status: String,
+            principal: Option<String>,
+        }
+        let rows: Vec<Row> = db
+            .exec(
+                "SELECT poll_secret_hash, status, principal FROM handoff_sessions WHERE session_id = ?1 AND expires_at > ?2",
+                vec![req.session_id.clone().into(), now.into()],
+            )?
+            .to_array()?;
+        let Some(row) = rows.into_iter().next() else {
+            return Response::error("sign-in session expired", 410);
+        };
+        if !crate::handoff::ct_eq(
+            row.poll_secret_hash.as_bytes(),
+            req.poll_secret_hash.as_bytes(),
+        ) {
+            return Response::error("invalid poll secret", 401);
+        }
+        if row.status == "approved"
+            && let Some(principal) = row.principal
+        {
+            // Single-use consumption: burn immediately upon delivery.
+            db.exec(
+                "DELETE FROM handoff_sessions WHERE session_id = ?1",
+                vec![req.session_id.into()],
+            )?;
+            return json(
+                &crate::handoff::DoHandoffPollResp {
+                    status: "approved".to_string(),
+                    principal: Some(principal),
+                },
+                200,
+            );
+        }
+        json(
+            &crate::handoff::DoHandoffPollResp {
+                status: "pending".to_string(),
+                principal: None,
+            },
+            200,
+        )
+    }
+
+    fn transfer_create(&self, req: crate::handoff::DoTransferCreateReq) -> Result<Response> {
+        let now = now_secs() as i64;
+        let db = self.ensure_handoff_tables(now)?;
+        let bucket = format!("tc:{}", req.principal);
+        if !Self::rate_limit_hit(&db, &bucket, now, 600, 15)? {
+            return Response::error("too many codes generated — wait a few minutes", 429);
+        }
+        // Keep at most one active code per user so regenerating immediately
+        // revokes the old one.
+        db.exec(
+            "DELETE FROM transfer_codes WHERE principal = ?1",
+            vec![req.principal.clone().into()],
+        )?;
+        db.exec(
+            "INSERT INTO transfer_codes (principal, code_hash, token_hash, expires_at) VALUES (?1, ?2, ?3, ?4)",
+            vec![
+                req.principal.into(),
+                req.code_hash.into(),
+                req.token_hash.into(),
+                (req.expires_at as i64).into(),
+            ],
+        )?;
+        Response::ok("")
+    }
+
+    fn transfer_claim(&self, req: crate::handoff::DoTransferClaimReq) -> Result<Response> {
+        let now = now_secs() as i64;
+        let db = self.ensure_handoff_tables(now)?;
+        let bucket = format!("tf:{}", req.ip_key);
+        if Self::rate_limit_blocked(&db, &bucket, now, 10)? {
+            return Response::error("too many failed code attempts — wait 10 minutes", 429);
+        }
+        #[derive(serde::Deserialize)]
+        struct Row {
+            id: i64,
+            principal: String,
+        }
+        let rows: Vec<Row> = if let Some(code_hash) = req.code_hash {
+            db.exec(
+                "SELECT id, principal FROM transfer_codes WHERE code_hash = ?1 AND expires_at > ?2",
+                vec![code_hash.into(), now.into()],
+            )?
+            .to_array()?
+        } else if let Some(token_hash) = req.token_hash {
+            db.exec(
+                "SELECT id, principal FROM transfer_codes WHERE token_hash = ?1 AND expires_at > ?2",
+                vec![token_hash.into(), now.into()],
+            )?
+            .to_array()?
+        } else {
+            return Response::error("missing code or token", 400);
+        };
+
+        let Some(row) = rows.into_iter().next() else {
+            let _ = Self::rate_limit_hit(&db, &bucket, now, 600, 100);
+            return Response::error("invalid or expired code", 401);
+        };
+        // Atomically consume both the short code and QR token together.
+        db.exec(
+            "DELETE FROM transfer_codes WHERE id = ?1",
+            vec![row.id.into()],
+        )?;
+        json(
+            &crate::handoff::DoTransferClaimResp {
+                principal: row.principal,
+            },
+            200,
+        )
+    }
+
+    fn transfer_revoke(&self, req: crate::handoff::DoTransferRevokeReq) -> Result<Response> {
+        let now = now_secs() as i64;
+        let db = self.ensure_handoff_tables(now)?;
+        db.exec(
+            "DELETE FROM transfer_codes WHERE principal = ?1",
+            vec![req.principal.into()],
+        )?;
+        Response::ok("")
     }
 }
 

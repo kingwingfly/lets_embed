@@ -22,6 +22,7 @@ const STYLE: &str = include_str!("pages/style.css");
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Page {
     Login,
+    Approve,
     Upgrade,
     Account,
     Favorites,
@@ -32,6 +33,7 @@ impl Page {
     pub(crate) fn render(self, body: &str) -> String {
         let title = match self {
             Self::Login => "Sign in",
+            Self::Approve => "Approve sign-in",
             Self::Upgrade => "Continue exploring",
             Self::Account => "Your account",
             Self::Favorites => "Favorites",
@@ -100,10 +102,19 @@ fn redirect_to_login(next: &str) -> Response {
 
 /// `__CHAIN_ID__` and `__SIWE_DOMAIN__` are substituted server-side.
 const LOGIN_BODY: &str = include_str!("pages/login.html");
+const APPROVE_BODY: &str = include_str!("pages/approve.html");
 
 #[worker::send]
 pub async fn login_page(State(st): State<AppState>) -> Response {
     wallet_page(&st, Page::Login, "")
+}
+
+#[worker::send]
+pub async fn approve_page(State(st): State<AppState>) -> Response {
+    let body = APPROVE_BODY
+        .replace("__CHAIN_ID__", &st.chain_id.to_string())
+        .replace("__SIWE_DOMAIN__", &st.siwe_domain);
+    Html(Page::Approve.render(&body)).into_response()
 }
 
 #[worker::send]

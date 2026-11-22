@@ -8,9 +8,11 @@ pub mod auth;
 pub mod config;
 mod dashboard;
 pub mod do_client;
+pub mod handoff;
 pub mod likes;
 pub mod pages;
 pub mod payments;
+pub mod qr;
 pub mod rates;
 pub mod session;
 pub mod settings;
@@ -77,13 +79,22 @@ async fn router(env: Env, ctx: Context) -> Result<Router> {
     Ok(Router::new()
         // Pages
         .route("/user/login", get(pages::login_page))
+        .route("/user/login/approve", get(pages::approve_page))
         .route(site_access::UPGRADE_PATH, get(pages::upgrade_page))
         .route("/user/account", get(pages::account_page))
         .route("/user/favorites", get(pages::favorites_page))
-        // Auth (SIWE)
+        // Auth (SIWE / SIWS / cross-device QR & wallet handoff)
         .route("/user/api/nonce", get(auth::nonce))
         .route("/user/api/verify", post(auth::verify))
         .route("/user/api/verify_solana", post(auth::verify_solana))
+        .route("/user/api/handoff/start", post(handoff::start))
+        .route("/user/api/handoff/info", get(handoff::info))
+        .route("/user/api/handoff/approve_eth", post(handoff::approve_eth))
+        .route("/user/api/handoff/approve_sol", post(handoff::approve_sol))
+        .route("/user/api/handoff/poll", post(handoff::poll))
+        .route("/user/api/transfer/create", post(handoff::transfer_create))
+        .route("/user/api/transfer/claim", post(handoff::transfer_claim))
+        .route("/user/api/transfer/revoke", post(handoff::transfer_revoke))
         .route("/user/api/logout", post(auth::logout))
         .route("/user/api/me", get(auth::me))
         // Payments / subscription
