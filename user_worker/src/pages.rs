@@ -22,6 +22,7 @@ const STYLE: &str = include_str!("pages/style.css");
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Page {
     Login,
+    Approve,
     Upgrade,
     Account,
     Favorites,
@@ -32,6 +33,7 @@ impl Page {
     pub(crate) fn render(self, body: &str) -> String {
         let title = match self {
             Self::Login => "Sign in",
+            Self::Approve => "Approve sign-in",
             Self::Upgrade => "Continue exploring",
             Self::Account => "Your account",
             Self::Favorites => "Favorites",
@@ -85,6 +87,18 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+fn html_page(html: String) -> Response {
+    (
+        [
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+        ],
+        Html(html),
+    )
+        .into_response()
+}
+
 /// 302 to the login page with a `next` back-reference.
 fn redirect_to_login(next: &str) -> Response {
     (
@@ -100,10 +114,19 @@ fn redirect_to_login(next: &str) -> Response {
 
 /// `__CHAIN_ID__` and `__SIWE_DOMAIN__` are substituted server-side.
 const LOGIN_BODY: &str = include_str!("pages/login.html");
+const APPROVE_BODY: &str = include_str!("pages/approve.html");
 
 #[worker::send]
 pub async fn login_page(State(st): State<AppState>) -> Response {
     wallet_page(&st, Page::Login, "")
+}
+
+#[worker::send]
+pub async fn approve_page(State(st): State<AppState>) -> Response {
+    let body = APPROVE_BODY
+        .replace("__CHAIN_ID__", &st.chain_id.to_string())
+        .replace("__SIWE_DOMAIN__", &st.siwe_domain);
+    html_page(Page::Approve.render(&body))
 }
 
 #[worker::send]
@@ -145,7 +168,7 @@ fn wallet_page(st: &AppState, screen: Page, terms: &str) -> Response {
         .replace("__TERMS__", terms)
         .replace("__CHAIN_ID__", &st.chain_id.to_string())
         .replace("__SIWE_DOMAIN__", &st.siwe_domain);
-    Html(screen.render(&body)).into_response()
+    html_page(screen.render(&body))
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +282,7 @@ pub async fn account_page(State(st): State<AppState>, cookies: Cookies) -> Respo
         .replace("__PRICING__", &pricing_table(&policy))
         .replace("__PLANS_TABLE__", &plans_table(&policy))
         .replace("__TOPUP_SCRIPT__", include_str!("pages/topup.js"));
-    Html(Page::Account.render(&body)).into_response()
+    html_page(Page::Account.render(&body))
 }
 
 // ---------------------------------------------------------------------------
@@ -277,5 +300,5 @@ pub async fn favorites_page(State(st): State<AppState>, cookies: Cookies) -> Res
         return redirect_to_login("/user/favorites");
     }
     let body = FAVORITES_BODY.replace("__FAVORITES_SCRIPT__", include_str!("pages/favorites.js"));
-    Html(Page::Favorites.render(&body)).into_response()
+    html_page(Page::Favorites.render(&body))
 }

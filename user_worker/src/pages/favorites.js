@@ -53,6 +53,9 @@ const tabs = {
 let activeKind = initialKind();
 let density = loadDensity();
 let viewerIndex = -1;
+let viewerPushedHistory = false;
+let suppressViewerPops = 0;
+let pendingViewerAfterPop = null;
 let lastFocusedBeforeViewer = null;
 let lastRemoved = null;
 let toastTimer = null;
@@ -481,11 +484,18 @@ async function probeVideosTab() {
 function selectTab(kind, updateHash = true) {
   if (!Object.hasOwn(tabs, kind)) return;
   activeKind = kind;
-  if (updateHash && typeof history !== "undefined" && history.replaceState) {
-    const nextHash = kind === "post" ? "#posts" : kind === "video" ? "#videos" : "#images";
-    try { history.replaceState(null, "", nextHash); } catch (_) {}
+  closeViewer(false);
+  const nextHash = kind === "post" ? "#posts" : kind === "video" ? "#videos" : "#images";
+  const applyHash = function () {
+    if (updateHash && typeof history !== "undefined" && history.replaceState) {
+      try { history.replaceState(null, "", nextHash); } catch (_) {}
+    }
+  };
+  if (suppressViewerPops > 0) {
+    pendingViewerAfterPop = applyHash;
+  } else {
+    applyHash();
   }
-  closeViewer();
   showError("");
   renderActiveTab();
   if (!tabs[kind].loaded && !tabs[kind].loading) {
@@ -587,25 +597,53 @@ async function undoLastRemoval() {
 
 // ---- Full-screen Lightbox Viewer -------------------------------------------
 
+function pushViewerHistoryEntry() {
+  if (viewerEl.hidden || viewerPushedHistory) return;
+  if (typeof history !== "undefined" && history.pushState) {
+    try {
+      history.pushState({ favViewer: true }, "", location.href);
+      viewerPushedHistory = true;
+    } catch (_) {}
+  }
+}
+
 function openViewerForItem(item, triggerEl) {
   const list = previewableItems(activeKind);
   const idx = list.findIndex(x => x.kind === item.kind && x.target_id === item.target_id);
   if (idx < 0) return;
+  const wasClosed = viewerEl.hidden;
   lastFocusedBeforeViewer = triggerEl || document.activeElement;
   viewerIndex = idx;
   viewerEl.hidden = false;
   if (document.body) document.body.style.overflow = "hidden";
+  if (wasClosed) {
+    if (suppressViewerPops > 0) {
+      pendingViewerAfterPop = pushViewerHistoryEntry;
+    } else {
+      pushViewerHistoryEntry();
+    }
+  }
   syncViewer();
   if (viewerClose && viewerClose.focus) viewerClose.focus();
 }
 
-function closeViewer() {
+function closeViewer(fromPop) {
   if (viewerEl.hidden) return;
   viewerEl.hidden = true;
   viewerIndex = -1;
   if (document.body) document.body.style.overflow = "";
-  if (lastFocusedBeforeViewer && lastFocusedBeforeViewer.focus) {
-    try { lastFocusedBeforeViewer.focus(); } catch (_) {}
+  if (viewerPushedHistory) {
+    viewerPushedHistory = false;
+    if (!fromPop && typeof history !== "undefined" && history.back) {
+      suppressViewerPops += 1;
+      history.back();
+    }
+  }
+  const restore = (lastFocusedBeforeViewer && lastFocusedBeforeViewer.isConnected)
+    ? lastFocusedBeforeViewer
+    : (!toastEl.hidden && undoBtn ? undoBtn : tabButtons[activeKind]);
+  if (restore && restore.focus) {
+    try { restore.focus(); } catch (_) {}
   }
   lastFocusedBeforeViewer = null;
 }
@@ -665,7 +703,35 @@ emptySwitchBtn.addEventListener("click", function () {
 moreBtn.addEventListener("click", function () { loadTabPage(activeKind); });
 undoBtn.addEventListener("click", undoLastRemoval);
 
-viewerClose.addEventListener("click", closeViewer);
+viewerClose.addEventListener("click", function () { closeViewer(false); });
+viewerDetails.addEventListener("click", function (ev) {
+  if (ev.ctrlKey || ev.metaKey || ev.shiftKey || ev.altKey || ev.button !== 0) return;
+  ev.preventDefault();
+  const dest = viewerDetails.href;
+  viewerEl.hidden = true;
+  viewerIndex = -1;
+  if (document.body) document.body.style.overflow = "";
+  if (viewerPushedHistory) {
+    viewerPushedHistory = false;
+    location.replace(dest);
+  } else {
+    location.assign(dest);
+  }
+});
+window.addEventListener("popstate", function () {
+  if (suppressViewerPops > 0) {
+    suppressViewerPops -= 1;
+    if (suppressViewerPops === 0 && pendingViewerAfterPop) {
+      const fn = pendingViewerAfterPop;
+      pendingViewerAfterPop = null;
+      fn();
+    }
+    return;
+  }
+  if (!viewerEl.hidden) {
+    closeViewer(true);
+  }
+});
 viewerPrev.addEventListener("click", function (ev) { ev.stopPropagation(); stepViewer(-1); });
 viewerNext.addEventListener("click", function (ev) { ev.stopPropagation(); stepViewer(1); });
 viewerUnfav.addEventListener("click", function (ev) {
@@ -694,9 +760,28 @@ viewerStage.addEventListener("touchend", function (ev) {
 
 window.addEventListener("keydown", function (ev) {
   if (viewerEl.hidden || ev.altKey || ev.ctrlKey || ev.metaKey) return;
-  if (ev.key === "Escape" || ev.key === " ") {
+  if (ev.key === "Tab") {
+    const focusables = Array.from(viewerEl.querySelectorAll("a[href]:not([hidden]), button:not([disabled]):not([hidden])"));
+    if (focusables.length > 0) {
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (ev.shiftKey && (document.activeElement === first || !viewerEl.contains(document.activeElement))) {
+        ev.preventDefault();
+        last.focus();
+      } else if (!ev.shiftKey && (document.activeElement === last || !viewerEl.contains(document.activeElement))) {
+        ev.preventDefault();
+        first.focus();
+      }
+    }
+    return;
+  }
+  if (ev.key === "Escape") {
     ev.preventDefault();
-    closeViewer();
+    closeViewer(false);
+  } else if (ev.key === " ") {
+    if (ev.target && ev.target.closest && ev.target.closest("button, a, [role='button']")) return;
+    ev.preventDefault();
+    closeViewer(false);
   } else if (ev.key === "ArrowLeft" || ev.key === "k") {
     ev.preventDefault();
     stepViewer(-1);

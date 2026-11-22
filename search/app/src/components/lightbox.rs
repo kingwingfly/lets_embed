@@ -1,7 +1,10 @@
 use crate::{
     components::{LikeButton, LikeVariant, Viewer},
     types::PostItem,
-    util::{encode_path, format_duration, lock_body_scroll},
+    util::{
+        encode_path, format_duration, lock_body_scroll, navigate_from_modal, push_modal_history,
+        trap_dialog_tab,
+    },
 };
 use leptos::{ev, html, prelude::*};
 use leptos_router::{NavigateOptions, hooks::use_navigate};
@@ -22,6 +25,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
     let navigate = use_navigate();
     let dialog_ref: NodeRef<html::Div> = NodeRef::new();
     lock_body_scroll();
+    push_modal_history(move || lightbox.set(None));
 
     // Move keyboard focus into the dialog on mount.
     #[cfg(feature = "hydrate")]
@@ -40,14 +44,20 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
     let viewer = RwSignal::new(None::<usize>);
     let viewer_open = Memo::new(move |_| viewer.get().is_some());
 
-    // Close the lightbox on Escape when the nested Viewer is not on top.
+    // Close the lightbox on Escape and trap Tab when the nested Viewer is not on top.
     let _ = use_event_listener(window(), ev::keydown, move |e| {
+        if viewer_open.get_untracked() {
+            return;
+        }
+        if e.key() == "Tab" {
+            trap_dialog_tab(&e, dialog_ref.get_untracked());
+            return;
+        }
         if e.key() == "Escape"
             && !e.default_prevented()
             && !e.alt_key()
             && !e.ctrl_key()
             && !e.meta_key()
-            && !viewer_open.get_untracked()
         {
             e.prevent_default();
             lightbox.set(None);
@@ -143,8 +153,14 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                                     ev.stop_propagation();
                                     if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
                                         ev.prevent_default();
-                                        lightbox.set(None);
-                                        nav(&click_href, NavigateOptions::default());
+                                        let nav = nav.clone();
+                                        navigate_from_modal(
+                                            click_href.clone(),
+                                            move || lightbox.set(None),
+                                            move |dest, replace| {
+                                                nav(dest, NavigateOptions { replace, ..Default::default() });
+                                            },
+                                        );
                                     }
                                 }
                             >
@@ -256,8 +272,14 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                                                 ev.stop_propagation();
                                                 if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
                                                     ev.prevent_default();
-                                                    lightbox.set(None);
-                                                    nav(&click_href, NavigateOptions::default());
+                                                    let nav = nav.clone();
+                                                    navigate_from_modal(
+                                                        click_href.clone(),
+                                                        move || lightbox.set(None),
+                                                        move |dest, replace| {
+                                                            nav(dest, NavigateOptions { replace, ..Default::default() });
+                                                        },
+                                                    );
                                                 }
                                             }
                                         >
