@@ -287,8 +287,9 @@
         gap: 8px;
     }
 }
-@media (max-width: 420px) {
-    .gallery-toolbar {
-        padding-top: 44px;
+@media (max-width: 380px) {
+    .gallery-density-btn {
+        padding: 4px 6.5px;
+        font-size: 11.5px;
     }
 }

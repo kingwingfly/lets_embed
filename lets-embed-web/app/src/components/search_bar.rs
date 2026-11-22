@@ -986,7 +986,7 @@ pub fn SearchBar() -> impl IntoView {
 
             // Floats just below the sticky bar at the top-right corner so the
             // search bar always keeps generous breathing room at every width.
-            <div class="absolute top-full right-4 mt-2 z-40">
+            <div class="absolute top-full right-2 sm:right-4 mt-2 z-40">
                 <AccountWidget />
             </div>
         </div>
