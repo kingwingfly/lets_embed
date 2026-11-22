@@ -34,7 +34,7 @@ props = { gallery_admin = true }
 # Audience of the Access application protecting /user/admin and its descendants.
 CF_ACCESS_AUD = "5700459f509f888154922a3f93bbf18d7dbd6b4be7fa472716693eb2fefb6ba5"
 # Upstream origins proxied by the gateway (trailing slashes are trimmed at runtime).
-API_UPSTREAM = "https://lets-embed-api.louisfly.icu"
+API_UPSTREAM = "https://lets-embed-web.louisfly.icu"
 IMAGE_UPSTREAM = "https://lets-embed-image.louisfly.icu"
 VIDEO_UPSTREAM = "https://lets-embed-video.louisfly.icu"
 
