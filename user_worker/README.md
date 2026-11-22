@@ -1,7 +1,7 @@
-# user_worker
+# user_worker (`lets-embed-user-worker`)
 
-SIWE (Sign-In with Ethereum) user system for lets_embed, running as a Cloudflare
-Worker. Replaces the old apply/approve flow in `gateway_worker`.
+SIWE (Sign-In with Ethereum) user system for lets_embed, running as the Cloudflare
+Worker `lets-embed-user-worker` (called by `lets-embed-gateway-worker`). Replaces the old apply/approve flow in `gateway_worker`.
 
 - **Auth** supports Ethereum (SIWE) and Solana wallet sign-in. The gateway validates the signed `ue_session` cookie. The dashboard uses a dedicated Cloudflare Access application.
 - **Metering** uses the pricing and free allowances published at `/user/admin`. The gateway asks the account Durable Object to enforce each metered request.
@@ -127,13 +127,15 @@ A customer who signed in with Solana can pay directly from that wallet. To pay f
    npx wrangler d1 execute lets-embed --cwd user_worker --remote --command 'SELECT MAX(revision) AS revision FROM site_settings'
    ```
 
-5. New deployments need the same `JWT_SECRET` in both Workers. Run `npx wrangler secret put JWT_SECRET --cwd user_worker` and `npx wrangler secret put JWT_SECRET --cwd gateway_worker`. Upgrades reuse the existing secret. Set the gateway’s upstream service token as described in its README.
-6. Deploy the user Worker first, then the gateway. If the site still uses `DEPOSIT_ADDRESS` or `SOL_DEPOSIT_ADDRESS` and has yet to publish settings from the dashboard, add `--keep-vars` to the user Worker command until the first dashboard save imports those addresses.
+5. New deployments need the same `JWT_SECRET` in both Workers. Run `npx wrangler secret put JWT_SECRET --cwd user_worker` and `npx wrangler secret put JWT_SECRET --cwd gateway_worker`. Upgrades reuse the existing secret. Set the gateway’s upstream variables (`API_UPSTREAM`, `IMAGE_UPSTREAM`, `VIDEO_UPSTREAM`) and upstream service token as described in its README.
+6. Deploy `lets-embed-user-worker` first, then `lets-embed-gateway-worker`. If the site still uses `DEPOSIT_ADDRESS` or `SOL_DEPOSIT_ADDRESS` and has yet to publish settings from the dashboard, add `--keep-vars` to the user Worker command until the first dashboard save imports those addresses.
 
    ```sh
    npx wrangler deploy --cwd user_worker
    npx wrangler deploy --cwd gateway_worker
    ```
+
+   > **Upgrading from the previous `user-worker` / `gateway-worker` script names:** `user_worker/wrangler.toml` keeps `[[migrations]] tag = "v1" new_sqlite_classes = ["UserAccount"]` for fresh installs. Cloudflare scopes Durable Object namespaces to the owning Worker script name, so deploying under the new `lets-embed-user-worker` name creates a separate empty `UserAccount` namespace rather than inheriting state from an existing `user-worker` script. Existing deployments with live Durable Object balances/plans must either keep the old script name until migrating state or run a Cloudflare Durable Objects transfer migration (`transferred_classes` from `user-worker` to `lets-embed-user-worker`) before retiring `user-worker` and switching `lets-embed-gateway-worker`'s bindings.
 
 7. Open `/user/admin` from the public gallery hostname. On an upgrade, verify that each chain accepting payments shows its existing receiving address. If an address is unexpectedly blank or wrong, restore its legacy variable on the user Worker and reload before the first save. The first save snapshots those variables for transfers made before the change.
 8. Leave **Require a wallet** selected for the first save. Choose **View gallery** to check admin browsing without a wallet, then verify a customer account and a signed-out private window. To enable guest browsing, select **Public browsing**, set **Image views → Free per day** to a positive number or `-1` for unlimited, choose any free media folders, and save. To close public browsing again, select **Require a wallet** and save.

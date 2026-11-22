@@ -1,5 +1,9 @@
 #![feature(iterator_try_collect, portable_simd)]
 
+mod advanced;
+
+pub use advanced::{AdvancedSearchRequest, AdvancedSearchResult};
+
 use std::{
     borrow::Borrow,
     fmt,
@@ -27,6 +31,17 @@ pub struct PostPreview {
     pub post_id: i64,
     pub title: String,
     pub cover: Option<Image>,
+    pub image_count: usize,
+    pub video_count: usize,
+}
+
+/// Batch gallery cover summary returned for album cards.
+#[derive(Debug, Clone)]
+pub struct PostGalleryCover {
+    pub post_id: i64,
+    pub title: String,
+    pub cover_image: Option<Image>,
+    pub cover_video: Option<Video>,
     pub image_count: usize,
     pub video_count: usize,
 }
@@ -209,7 +224,7 @@ impl Engine {
                     conn.execute("SET hnsw.ef_search = 1000").await?;
                     conn.execute("SET hnsw.iterative_scan = strict_order")
                         .await?;
-                    conn.execute("SET hnsw.max_scan_tuples = 2000").await?;
+                    conn.execute("SET hnsw.max_scan_tuples = 4000").await?;
                     Ok(())
                 })
             })
@@ -641,15 +656,25 @@ impl Engine {
     where
         R: Read + Seek,
     {
+        static PREPROCESS_SEM: LazyLock<Arc<tokio::sync::Semaphore>> =
+            LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
         let Some(dinov3_lazy) = self.dinov3_session.as_ref() else {
-            bail!("dinov3_session not enblaed")
+            bail!("dinov3_session not enabled")
         };
         let dinov3_session = dinov3_lazy.session().await?;
+        let permit = Arc::clone(&PREPROCESS_SEM)
+            .acquire_owned()
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let converted = images
                 .into_iter()
                 .map(|i| dinov3::convert_image(i))
                 .try_collect::<Vec<_>>()?;
+            if converted.is_empty() {
+                bail!("no images provided");
+            }
             let mut dinov3_session = dinov3_session.blocking_lock();
             let embeddings = dinov3::infer_vision(&mut dinov3_session, converted)?;
             drop(dinov3_session);
@@ -673,7 +698,7 @@ impl Engine {
             anyhow::Ok(embedding)
         })
         .await
-        .unwrap()
+        .map_err(|e| anyhow!("dinov3 task panicked: {e}"))?
     }
 
     async fn search_dinov3_inner<'a>(
@@ -997,6 +1022,424 @@ impl Engine {
             })
             .try_collect()
             .map_err(Into::into)
+    }
+
+    /// Batch-fetch post titles, deterministic cover image (`MIN(image_id)`),
+    /// deterministic cover video (`MIN(video_id)`), and media counts in one query.
+    pub async fn post_gallery_covers_by_ids(
+        &self,
+        ids: &[i64],
+    ) -> anyhow::Result<Vec<PostGalleryCover>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            WITH target_posts AS (
+                SELECT p.id, p.title::TEXT AS title
+                FROM posts p
+                WHERE p.id = ANY($1::BIGINT[])
+            ),
+            img_counts AS (
+                SELECT pi.post_id, COUNT(*)::BIGINT AS cnt
+                FROM post_images pi
+                WHERE pi.post_id = ANY($1::BIGINT[])
+                GROUP BY pi.post_id
+            ),
+            vid_counts AS (
+                SELECT pv.post_id, COUNT(*)::BIGINT AS cnt
+                FROM post_videos pv
+                WHERE pv.post_id = ANY($1::BIGINT[])
+                GROUP BY pv.post_id
+            ),
+            img_covers AS (
+                SELECT DISTINCT ON (pi.post_id)
+                    pi.post_id,
+                    i.id AS image_id,
+                    i.name::TEXT AS image_name,
+                    i.width AS image_width,
+                    i.height AS image_height
+                FROM post_images pi
+                JOIN images i ON i.id = pi.image_id
+                WHERE pi.post_id = ANY($1::BIGINT[])
+                ORDER BY pi.post_id, i.id ASC
+            ),
+            vid_covers AS (
+                SELECT DISTINCT ON (pv.post_id)
+                    pv.post_id,
+                    v.id AS video_id,
+                    v.name::TEXT AS video_name,
+                    v.width AS video_width,
+                    v.height AS video_height,
+                    v.duration AS video_duration
+                FROM post_videos pv
+                JOIN videos v ON v.id = pv.video_id
+                WHERE pv.post_id = ANY($1::BIGINT[])
+                ORDER BY pv.post_id, v.id ASC
+            )
+            SELECT
+                tp.id AS post_id,
+                tp.title,
+                icov.image_id,
+                icov.image_name,
+                icov.image_width,
+                icov.image_height,
+                vcov.video_id,
+                vcov.video_name,
+                vcov.video_width,
+                vcov.video_height,
+                vcov.video_duration,
+                COALESCE(ic.cnt, 0) AS image_count,
+                COALESCE(vc.cnt, 0) AS video_count
+            FROM target_posts tp
+            LEFT JOIN img_covers icov ON icov.post_id = tp.id
+            LEFT JOIN vid_covers vcov ON vcov.post_id = tp.id
+            LEFT JOIN img_counts ic ON ic.post_id = tp.id
+            LEFT JOIN vid_counts vc ON vc.post_id = tp.id
+            "#,
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| -> sqlx::Result<PostGalleryCover> {
+                let image_id: Option<i64> = r.try_get("image_id")?;
+                let cover_image = match image_id {
+                    Some(id) => Some(Image {
+                        id,
+                        name: r.try_get("image_name")?,
+                        width: r.try_get("image_width")?,
+                        height: r.try_get("image_height")?,
+                    }),
+                    None => None,
+                };
+                let video_id: Option<i64> = r.try_get("video_id")?;
+                let cover_video = match video_id {
+                    Some(id) => Some(Video {
+                        id,
+                        name: r.try_get("video_name")?,
+                        width: r.try_get("video_width")?,
+                        height: r.try_get("video_height")?,
+                        duration: r.try_get("video_duration")?,
+                    }),
+                    None => None,
+                };
+                let image_count: i64 = r.try_get("image_count")?;
+                let video_count: i64 = r.try_get("video_count")?;
+                Ok(PostGalleryCover {
+                    post_id: r.try_get("post_id")?,
+                    title: r.try_get("title")?,
+                    cover_image,
+                    cover_video,
+                    image_count: image_count.max(0) as usize,
+                    video_count: video_count.max(0) as usize,
+                })
+            })
+            .try_collect()
+            .map_err(Into::into)
+    }
+
+    pub async fn newest_posts_vec(&self, limit: i64, offset: i64) -> anyhow::Result<Vec<Post>> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT id, title::TEXT AS title
+            FROM posts
+            ORDER BY id DESC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        advanced::map_post_rows(rows)
+    }
+
+    pub async fn random_posts_vec(
+        &self,
+        seed: i64,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<Post>> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
+        let bounds = sqlx::query("SELECT MIN(id) AS min_id, MAX(id) AS max_id FROM posts")
+            .fetch_one(&self.pool)
+            .await?;
+        let min_id: Option<i64> = bounds.try_get("min_id")?;
+        let max_id: Option<i64> = bounds.try_get("max_id")?;
+        let ids = match (min_id, max_id) {
+            (Some(min), Some(max)) => random_ids(seed, min, max, limit, offset),
+            _ => return Ok(Vec::new()),
+        };
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT p.id, p.title::TEXT AS title
+            FROM UNNEST($1::BIGINT[]) WITH ORDINALITY AS c(id, ord)
+            JOIN posts p ON p.id = c.id
+            ORDER BY c.ord
+            "#,
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        advanced::map_post_rows(rows)
+    }
+
+    pub async fn random_images_vec(
+        &self,
+        seed: i64,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<Image>> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
+        let bounds = sqlx::query("SELECT MIN(id) AS min_id, MAX(id) AS max_id FROM images")
+            .fetch_one(&self.pool)
+            .await?;
+        let min_id: Option<i64> = bounds.try_get("min_id")?;
+        let max_id: Option<i64> = bounds.try_get("max_id")?;
+        let ids = match (min_id, max_id) {
+            (Some(min), Some(max)) => random_ids(seed, min, max, limit, offset),
+            _ => return Ok(Vec::new()),
+        };
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT i.id, i.name::TEXT AS name, i.width, i.height
+            FROM UNNEST($1::BIGINT[]) WITH ORDINALITY AS c(id, ord)
+            JOIN images i ON i.id = c.id
+            ORDER BY c.ord
+            "#,
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        advanced::map_image_rows(rows)
+    }
+
+    pub async fn search_posts_by_title_vec(
+        &self,
+        title: impl AsRef<str>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<Post>> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
+        let raw = title.as_ref().trim();
+        if raw.is_empty() {
+            bail!("title should not be empty")
+        }
+        let pat = format!("%{}%", escape_like(raw));
+        let rows = sqlx::query(
+            r#"
+            SELECT p.id, p.title::TEXT AS title
+            FROM posts p
+            WHERE p.title ILIKE $1 ESCAPE '\'
+            ORDER BY p.id DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(&pat)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        advanced::map_post_rows(rows)
+    }
+
+    pub async fn search_posts_by_author_vec(
+        &self,
+        author: impl AsRef<str>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<Post>> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
+        let raw = author.as_ref().trim();
+        if raw.is_empty() {
+            bail!("author name should not be empty")
+        }
+        let pat = format!("%{}%", escape_like(raw));
+        let rows = sqlx::query(
+            r#"
+            SELECT p.id, p.title::TEXT AS title
+            FROM posts p
+            WHERE EXISTS (
+                SELECT 1
+                FROM author_posts ap
+                JOIN authors a ON a.id = ap.author_id
+                WHERE ap.post_id = p.id
+                  AND a.name ILIKE $1 ESCAPE '\'
+            )
+            ORDER BY p.id DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(&pat)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        advanced::map_post_rows(rows)
+    }
+
+    pub async fn search_images_by_tag_vec(
+        &self,
+        tag: impl AsRef<str>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<Image>> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
+        let raw = tag.as_ref().trim();
+        if raw.is_empty() {
+            bail!("tag should not be empty")
+        }
+        let underscored = raw.replace(' ', "_");
+        let pat_raw = format!("%{}%", escape_like(raw));
+        let pat_under = format!("%{}%", escape_like(&underscored));
+
+        let rows = sqlx::query(
+            r#"
+            WITH
+            pos_tags AS (
+                SELECT wt.id AS tag_id
+                FROM wd_tags wt
+                WHERE wt.name ILIKE $1 ESCAPE '\'
+                   OR ($2 <> $1 AND wt.name ILIKE $2 ESCAPE '\')
+                UNION
+                SELECT tt.tag_id
+                FROM wd_tag_translations tt
+                WHERE tt.translation ILIKE $1 ESCAPE '\'
+            ),
+            img_match AS (
+                SELECT wti.image_id, MAX(wti.score) AS max_score
+                FROM wd_tag_images wti
+                JOIN pos_tags pt ON pt.tag_id = wti.wd_tag_id
+                GROUP BY wti.image_id
+            )
+            SELECT i.id, i.name::TEXT AS name, i.width, i.height
+            FROM img_match im
+            JOIN images i ON i.id = im.image_id
+            ORDER BY im.max_score DESC, im.image_id DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(pat_raw)
+        .bind(pat_under)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        advanced::map_image_rows(rows)
+    }
+
+    pub async fn search_clip_cached_vec(
+        &self,
+        describe: &str,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<Image>> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
+        let raw = describe.trim();
+        if raw.is_empty() {
+            bail!("description should not be empty")
+        }
+        let vec = self.clip_text_vec_cached(raw).await?;
+        let hv = advanced::combine_unit_vectors(&[(*vec).clone()], &[], siglip2::EMBED_DIM)?;
+        self.query_images_single_vector(
+            "clip_embedding",
+            hv,
+            None,
+            &std::collections::HashMap::new(),
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_dinov3_upload_vec(
+        &self,
+        bytes: Vec<u8>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<Image>> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
+        if bytes.is_empty() {
+            bail!("uploaded image is empty")
+        }
+        let vec = self.dinov3_upload_vec_cached(bytes).await?;
+        let hv = advanced::combine_unit_vectors(&[(*vec).clone()], &[], dinov3::EMBED_DIM)?;
+        self.query_images_single_vector(
+            "dinov3_embedding",
+            hv,
+            None,
+            &std::collections::HashMap::new(),
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_similar_images(
+        &self,
+        image_id: i64,
+        exclude_post_id: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<Image>> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
+        if image_id <= 0 {
+            bail!("Image #{image_id} not found or has no visual embedding")
+        }
+        let id_vecs = self.fetch_dino_id_vectors(&[image_id]).await?;
+        let seed_vec =
+            advanced::combine_unit_vectors(&[id_vecs[&image_id].clone()], &[], dinov3::EMBED_DIM)?;
+        let mut qb = advanced::build_similar_images_query(
+            seed_vec,
+            image_id,
+            exclude_post_id,
+            limit,
+            offset,
+        );
+        if exclude_post_id.is_some() {
+            let mut tx = self.pool.begin().await?;
+            tx.execute("SET TRANSACTION READ ONLY").await?;
+            tx.execute("SET LOCAL hnsw.max_scan_tuples = 20000").await?;
+            let rows = qb.build().fetch_all(&mut *tx).await?;
+            tx.commit().await?;
+            advanced::map_image_rows(rows)
+        } else {
+            let rows = qb.build().fetch_all(&self.pool).await?;
+            advanced::map_image_rows(rows)
+        }
     }
 
     /// Fetch authors attached to a post (for Lightbox headers).

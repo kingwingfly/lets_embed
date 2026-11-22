@@ -169,13 +169,16 @@ pub fn trap_dialog_tab(ev: &leptos::ev::KeyboardEvent, dialog: Option<web_sys::H
         let inside = active
             .as_ref()
             .is_some_and(|a| dlg.contains(Some(a.as_ref())));
+        let is_dlg = active
+            .as_ref()
+            .is_some_and(|a| a.as_ref() as &web_sys::Node == dlg.as_ref() as &web_sys::Node);
         let is_first = active
             .as_ref()
             .is_some_and(|a| a.as_ref() as &web_sys::Node == first.as_ref() as &web_sys::Node);
         let is_last = active
             .as_ref()
             .is_some_and(|a| a.as_ref() as &web_sys::Node == last.as_ref() as &web_sys::Node);
-        if ev.shift_key() && (!inside || is_first) {
+        if ev.shift_key() && (!inside || is_first || is_dlg) {
             ev.prevent_default();
             let _ = last.focus();
         } else if !ev.shift_key() && (!inside || is_last) {

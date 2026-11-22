@@ -22,17 +22,17 @@ steps:
     name: "gcr.io/cloud-builders/docker"
     args: ["build", "--target=embed-cuda13", "-t=${_REPO}/embed:cuda13", "."]
 
-  - id: search-cpu
+  - id: lets-embed-web-cpu
     name: "gcr.io/cloud-builders/docker"
-    args: ["build", "--target=search-cpu", "-t=${_REPO}/search:cpu", "."]
+    args: ["build", "--target=lets-embed-web-cpu", "-t=${_REPO}/lets-embed-web:cpu", "."]
 
-  - id: search-cuda12
+  - id: lets-embed-web-cuda12
     name: "gcr.io/cloud-builders/docker"
-    args: ["build", "--target=search-cuda12", "-t=${_REPO}/search:cuda12", "."]
+    args: ["build", "--target=lets-embed-web-cuda12", "-t=${_REPO}/lets-embed-web:cuda12", "."]
 
-  - id: search-cuda13
+  - id: lets-embed-web-cuda13
     name: "gcr.io/cloud-builders/docker"
-    args: ["build", "--target=search-cuda13", "-t=${_REPO}/search:cuda13", "."]
+    args: ["build", "--target=lets-embed-web-cuda13", "-t=${_REPO}/lets-embed-web:cuda13", "."]
 
   - id: img2webp
     name: "gcr.io/cloud-builders/docker"
@@ -42,7 +42,7 @@ images:
   - "${_REPO}/embed:cpu"
   - "${_REPO}/embed:cuda12"
   - "${_REPO}/embed:cuda13"
-  - "${_REPO}/search:cpu"
-  - "${_REPO}/search:cuda12"
-  - "${_REPO}/search:cuda13"
+  - "${_REPO}/lets-embed-web:cpu"
+  - "${_REPO}/lets-embed-web:cuda12"
+  - "${_REPO}/lets-embed-web:cuda13"
   - "${_REPO}/img2webp:latest"

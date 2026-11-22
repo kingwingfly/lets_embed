@@ -1,5 +1,8 @@
 use crate::{
-    components::{LikeButton, LikeVariant, Viewer},
+    components::{
+        LikeButton, LikeVariant, Viewer,
+        image_details::{list_post_images, list_post_videos},
+    },
     types::PostItem,
     util::{
         encode_path, format_duration, lock_body_scroll, navigate_from_modal, push_modal_history,
@@ -10,17 +13,24 @@ use leptos::{ev, html, prelude::*};
 use leptos_router::{NavigateOptions, hooks::use_navigate};
 use leptos_use_event_listener::use_event_listener;
 use leptos_use_intersection_observer::use_intersection_observer;
-use search_types::PostMeta;
+use search_types::{Image, PostMeta, Video};
 
 const PAGE: usize = 20;
 
 #[component]
 pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl IntoView {
     let post_id = post.id;
-    let total = post.images.len();
-    let images = StoredValue::new(post.images);
-    let videos = StoredValue::new(post.videos);
-    let has_videos = !videos.with_value(|v| v.is_empty());
+    let initial_img_len = post.images.len();
+    let initial_vid_len = post.videos.len();
+    let expected_img_count = post.image_count.max(initial_img_len);
+    let expected_vid_count = post.video_count.max(initial_vid_len);
+    let need_images = initial_img_len < expected_img_count;
+    let need_videos = initial_vid_len < expected_vid_count;
+
+    let images_sig: RwSignal<Vec<Image>> = RwSignal::new(post.images.clone());
+    let viewer_images: StoredValue<Vec<Image>> = StoredValue::new(post.images);
+    let videos_sig: RwSignal<Vec<Video>> = RwSignal::new(post.videos);
+    let images_err: RwSignal<Option<String>> = RwSignal::new(None);
     let title = post.title;
     let navigate = use_navigate();
     let dialog_ref: NodeRef<html::Div> = NodeRef::new();
@@ -38,8 +48,61 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
     // Lazily load authors so users can pivot straight from a post album.
     let meta = OnceResource::new(async move { fetch_post_meta(post_id).await.ok() });
 
-    let visible = RwSignal::new(PAGE.min(total));
+    // Lazily hydrate full album images/videos only when the PostItem only carries its cover.
+    let full_images = need_images.then(|| {
+        OnceResource::new(async move { list_post_images(post_id).await.map_err(|e| e.to_string()) })
+    });
+    let full_videos = need_videos.then(|| {
+        OnceResource::new(async move { list_post_videos(post_id).await.map_err(|e| e.to_string()) })
+    });
+
+    let visible = RwSignal::new(PAGE.min(initial_img_len));
     let sentinel = NodeRef::<html::Div>::new();
+
+    if let Some(res) = full_images {
+        Effect::new(move |_| {
+            if let Some(result) = res.get() {
+                match result {
+                    Ok(list) => {
+                        let new_len = list.len();
+                        viewer_images.set_value(list.clone());
+                        images_sig.set(list);
+                        images_err.set(None);
+                        visible.update(|v| {
+                            let target = PAGE.min(new_len);
+                            if *v < target || *v > new_len {
+                                *v = target;
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        images_err.set(Some(e));
+                    }
+                }
+            }
+        });
+    }
+    if let Some(res) = full_videos {
+        Effect::new(move |_| {
+            if let Some(Ok(list)) = res.get() {
+                videos_sig.set(list);
+            }
+        });
+    }
+
+    let images_loading = move || full_images.is_some_and(|r| r.get().is_none());
+    let total_images = move || {
+        let loaded = images_sig.with(Vec::len);
+        if images_loading() {
+            expected_img_count.max(loaded)
+        } else {
+            loaded
+        }
+    };
+    let has_videos = move || {
+        !videos_sig.with(Vec::is_empty)
+            || (full_videos.is_some_and(|r| r.get().is_none()) && expected_vid_count > 0)
+    };
 
     let viewer = RwSignal::new(None::<usize>);
     let viewer_open = Memo::new(move |_| viewer.get().is_some());
@@ -69,62 +132,61 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
             return;
         }
         let cur = visible.get_untracked();
-        if cur < total {
-            visible.set((cur + PAGE).min(total));
+        let loaded_len = images_sig.with_untracked(Vec::len);
+        if cur < loaded_len {
+            visible.set((cur + PAGE).min(loaded_len));
         }
     });
 
     let render_videos = move || {
-        has_videos.then(|| {
-            videos.with_value(|vids| {
-                vids.iter()
-                    .map(|v| {
-                        let vid_id = v.id;
-                        let url = format!("/videos/{}", encode_path(&v.name));
-                        let aspect = if v.width > 0 && v.height > 0 {
-                            format!("aspect-ratio:{}/{};", v.width, v.height)
-                        } else {
-                            "aspect-ratio:16/9;".to_string()
-                        };
-                        let dur = (v.duration > 0).then(|| format_duration(v.duration));
-                        let dims = (v.width > 0 && v.height > 0)
-                            .then(|| format!("{}×{}", v.width, v.height));
-                        view! {
-                            <div class="relative group rounded-xl overflow-hidden bg-black ring-1 ring-white/10">
-                                <video
-                                    class="w-full block bg-black object-contain select-none"
-                                    style=aspect
-                                    controls
-                                    playsinline
-                                    preload="metadata"
-                                    src=url
+        videos_sig.with(|vids| {
+            vids.iter()
+                .map(|v| {
+                    let vid_id = v.id;
+                    let url = format!("/videos/{}", encode_path(&v.name));
+                    let aspect = if v.width > 0 && v.height > 0 {
+                        format!("aspect-ratio:{}/{};", v.width, v.height)
+                    } else {
+                        "aspect-ratio:16/9;".to_string()
+                    };
+                    let dur = (v.duration > 0).then(|| format_duration(v.duration));
+                    let dims = (v.width > 0 && v.height > 0)
+                        .then(|| format!("{}×{}", v.width, v.height));
+                    view! {
+                        <div class="relative group rounded-xl overflow-hidden bg-black ring-1 ring-white/10">
+                            <video
+                                class="w-full block bg-black object-contain select-none"
+                                style=aspect
+                                controls
+                                playsinline
+                                preload="metadata"
+                                src=url
+                            />
+                            <div class="absolute top-1.5 right-1.5 z-10">
+                                <LikeButton
+                                    kind="video"
+                                    target_id=vid_id
+                                    variant=LikeVariant::Card
                                 />
-                                <div class="absolute top-1.5 right-1.5 z-10">
-                                    <LikeButton
-                                        kind="video"
-                                        target_id=vid_id
-                                        variant=LikeVariant::Card
-                                    />
-                                </div>
-                                {(dur.is_some() || dims.is_some()).then(|| view! {
-                                    <div class="absolute top-1.5 left-1.5 z-10 pointer-events-none flex items-center gap-1">
-                                        {dur.map(|d| view! {
-                                            <span class="px-2 py-0.5 rounded-full bg-black/70 text-white text-[11px] font-medium tabular-nums">
-                                                {d}
-                                            </span>
-                                        })}
-                                        {dims.map(|dim| view! {
-                                            <span class="px-2 py-0.5 rounded-full bg-black/60 text-sky-100/80 text-[11px] tabular-nums">
-                                                {dim}
-                                            </span>
-                                        })}
-                                    </div>
-                                })}
                             </div>
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
+                            {(dur.is_some() || dims.is_some()).then(|| view! {
+                                <div class="absolute top-1.5 left-1.5 z-10 pointer-events-none flex items-center gap-1">
+                                    {dur.map(|d| view! {
+                                        <span class="px-2 py-0.5 rounded-full bg-black/70 text-white text-[11px] font-medium tabular-nums">
+                                            {d}
+                                        </span>
+                                    })}
+                                    {dims.map(|dim| view! {
+                                        <span class="px-2 py-0.5 rounded-full bg-black/60 text-sky-100/80 text-[11px] tabular-nums">
+                                            {dim}
+                                        </span>
+                                    })}
+                                </div>
+                            })}
+                        </div>
+                    }
+                })
+                .collect::<Vec<_>>()
         })
     };
 
@@ -201,7 +263,10 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                         hide_label_mobile=true
                     />
                     <div class="text-xs sm:text-sm text-sky-200/70 tabular-nums whitespace-nowrap">
-                        {move || format!("{} / {}", visible.get(), total)}
+                        {move || {
+                            let tot = total_images();
+                            format!("{} / {}", visible.get().min(tot), tot)
+                        }}
                     </div>
                     <button
                         type="button"
@@ -221,7 +286,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                         <For
                             each=move || {
                                 let v = visible.get();
-                                images.with_value(|imgs| {
+                                images_sig.with(|imgs| {
                                     imgs.iter().take(v).cloned().enumerate().collect::<Vec<_>>()
                                 })
                             }
@@ -242,9 +307,12 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                                     >
                                         <button
                                             type="button"
-                                            aria-label=format!("Zoom image {} of {}", i + 1, total)
+                                            aria-label=move || format!("Zoom image {} of {}", i + 1, total_images())
                                             class="absolute inset-0 w-full h-full p-0 border-0 bg-transparent cursor-zoom-in focus-visible:outline-2 focus-visible:outline-sky-400"
-                                            on:click=move |_| viewer.set(Some(i))
+                                            on:click=move |_| {
+                                                viewer_images.set_value(images_sig.get_untracked());
+                                                viewer.set(Some(i));
+                                            }
                                         >
                                             <img
                                                 loading="lazy"
@@ -293,12 +361,24 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
 
                     <div node_ref=sentinel class="h-12 w-full"></div>
 
-                    {move || (visible.get() >= total).then(|| view! {
+                    {move || images_loading().then(|| view! {
+                        <div class="text-sky-300/80 text-center text-sm pb-6 animate-pulse">
+                            "Loading album\u{2026}"
+                        </div>
+                    })}
+
+                    {move || images_err.get().map(|err| view! {
+                        <div class="text-rose-300 text-center text-xs pb-4 px-4">
+                            {format!("Could not load full album: {err}")}
+                        </div>
+                    })}
+
+                    {move || (!images_loading() && visible.get() >= images_sig.with(Vec::len)).then(|| view! {
                         <div class="text-sky-300/70 text-center pb-6">"\u{2014} \u{1f33f} \u{2014}"</div>
                     })}
                 </div>
 
-                {has_videos.then(|| view! {
+                {move || has_videos().then(|| view! {
                     <div class="flex-1 min-w-0 overflow-y-auto overscroll-contain">
                         <div class="grid grid-cols-1 gap-2">
                             {render_videos}
@@ -310,7 +390,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
 
         {move || viewer_open.get().then(|| view! {
             <Viewer
-                images=images
+                images=viewer_images
                 index=viewer
                 post_id=post_id
                 on_navigate=Callback::new(move |_| lightbox.set(None))

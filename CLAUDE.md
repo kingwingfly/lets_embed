@@ -102,13 +102,13 @@ large CTE-based upserts that fan a single `meta[]` array into posts/images/autho
 tables in one statement. Postgres composite types (`image`, `meta`, `translation`) mirror the Rust
 structs. Schema lives in `migrations/`.
 
-### Search stack — `search/` + `search_engine/` + `search_types/`
+### Search stack — `lets-embed-web/` + `search_engine/` + `search_types/`
 - `search_engine/` — query engine. `LazyModel` lazily loads ONNX sessions and reaps them after an idle
   timeout (saves GPU memory in serverless). Does text→vision (siglip2) and image→vision (dinov3)
   similarity search over pgvector, with a `moka` result cache.
-- `search/` is a **Leptos 0.8** full-stack app, split into the standard three crates:
-  `app` (shared UI/components, compiles to both SSR and `hydrate`), `server` (axum SSR binary,
-  exposes `/api/search` SSE endpoint, serves `/images` + `/videos` static dirs), `frontend`
+- `lets-embed-web/` is a **Leptos 0.8** full-stack app, split into the standard three crates:
+  `app` (shared UI/components, compiles to both SSR and `hydrate`), `server` (axum SSR binary `lets-embed-web`,
+  exposes Leptos `/api/*` endpoints, serves `/images` + `/videos` static dirs), `frontend`
   (wasm cdylib hydration entry). `cargo-leptos` config is in the root `Cargo.toml`
   (`[[workspace.metadata.leptos]]`), wasm uses the `wasm-release` profile.
 - `search_types/` — plain shared types (Post/Image/Author/Tag/Video), `serde` behind a feature so the
@@ -137,7 +137,7 @@ structs. Schema lives in `migrations/`.
 
 ## Deployment
 
-`Dockerfile` is multi-target (`--target=`): `embed-cpu|cuda12|cuda13`, `search-cpu|cuda12|cuda13`,
+`Dockerfile` is multi-target (`--target=`): `embed-cpu|cuda12|cuda13`, `lets-embed-web-cpu|cuda12|cuda13`,
 `img2webp`. `cloudbuild.yaml` builds and pushes all of them to a GCP Artifact Registry. The full
 serverless topology (Cloudflare Access tokens, R2, Cloud Run, domain mappings) is documented in
 `README.md`.

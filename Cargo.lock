@@ -3504,6 +3504,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "lets-embed-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "app",
+ "axum",
+ "base64 0.23.1",
+ "clap",
+ "futures",
+ "leptos",
+ "leptos_axum",
+ "search_engine",
+ "serde",
+ "tokio",
+ "tower-http 0.7.1",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6167,26 +6187,6 @@ checksum = "66cf8fedced2fcf12406bcb34223dffb92eaf34908ede12fed414c82b7f00b3e"
 dependencies = [
  "base16ct",
  "serde",
-]
-
-[[package]]
-name = "server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "app",
- "axum",
- "base64 0.23.1",
- "clap",
- "futures",
- "leptos",
- "leptos_axum",
- "search_engine",
- "serde",
- "tokio",
- "tower-http 0.7.1",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

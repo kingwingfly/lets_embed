@@ -7,15 +7,28 @@ use crate::{
 #[cfg(feature = "hydrate")]
 use leptos::{ev, task::spawn_local};
 use leptos::{ev::PointerEvent, html, prelude::*};
-use leptos_router::hooks::{use_location, use_navigate, use_params_map};
+use leptos_router::hooks::{use_location, use_navigate, use_params_map, use_query_map};
 #[cfg(feature = "hydrate")]
 use leptos_use_event_listener::use_event_listener;
-use search_types::{Image, ImageDetails as ImageDetailsData, Tag, Video};
+use search_types::{
+    Image, ImageDetails as ImageDetailsData, Tag, Video,
+    query::{QueryExpr, SearchField},
+};
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement};
 
 /// Maximum number of aliases joined inline when "Show aliases" is toggled on.
 const MAX_INLINE_ALIASES: usize = 6;
+
+/// Build an Advanced Search URL targeting a single WD tag or multilingual alias.
+fn tag_search_href(value: &str) -> String {
+    let query = QueryExpr::Term {
+        field: SearchField::Tag,
+        value: value.to_string(),
+    }
+    .format_query();
+    format!("/?mode=advanced&adv={}", urlencoding::encode(&query))
+}
 
 /// Interactive hover/focus popover state for a tag pill, rendered with `position: fixed`
 /// so it is never clipped by the scrollable tag box and stays open when moving into it.
@@ -112,14 +125,15 @@ fn crop_to_base64(img: &HtmlImageElement, region: Region) -> Option<String> {
 #[component]
 pub fn ImageDetails() -> impl IntoView {
     let params = use_params_map();
+    let id_sig: Signal<Option<String>> = Memo::new(move |_| params.with(|p| p.get("id"))).into();
     view! {
-        <div class="w-full min-h-full flex flex-col">
+        <div class="w-full min-h-full flex flex-col pt-12">
             <For each=move || params.with(|p| p.get("id")) key=String::clone let(id)>
                 <ImageDetailPage id />
             </For>
             <div class="w-full px-3 md:px-4 pb-4 mt-2">
                 <h2 class="text-sky-700 text-lg md:text-xl font-semibold mb-3">"Similar \u{1f49e}"</h2>
-                <Results embedded=true />
+                <Results embedded=true default_similar_id=id_sig />
             </div>
         </div>
     }
@@ -136,18 +150,16 @@ fn ImageDetailPage(id: String) -> impl IntoView {
     });
     let post_images = OnceResource::new(async move {
         let details = details.await?;
-        let post_id = details
-            .post
-            .map(|p| p.id)
-            .ok_or("this image belongs to no post".to_string())?;
+        let Some(post_id) = details.post.map(|p| p.id) else {
+            return Ok(Vec::new());
+        };
         list_post_images(post_id).await.map_err(|e| e.to_string())
     });
     let post_videos = OnceResource::new(async move {
         let details = details.await?;
-        let post_id = details
-            .post
-            .map(|p| p.id)
-            .ok_or("this image belongs to no post".to_string())?;
+        let Some(post_id) = details.post.map(|p| p.id) else {
+            return Ok(Vec::new());
+        };
         list_post_videos(post_id).await.map_err(|e| e.to_string())
     });
 
@@ -155,6 +167,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
     let viewer: RwSignal<Option<usize>> = RwSignal::new(None);
     let current_post_id: RwSignal<Option<i64>> = RwSignal::new(None);
     let post_images_store: StoredValue<Vec<Image>> = StoredValue::new(Vec::new());
+    let post_images_count: RwSignal<Option<usize>> = RwSignal::new(None);
     // Dedicated snapshot handed to `<Viewer>` so zooming before `post_images` resolves
     // never overwrites `post_images_store`.
     let viewer_images_store: StoredValue<Vec<Image>> = StoredValue::new(Vec::new());
@@ -171,14 +184,33 @@ fn ImageDetailPage(id: String) -> impl IntoView {
         }
     });
     Effect::new(move |_| {
-        if let Some(Ok(imgs)) = post_images.get() {
-            post_images_store.set_value(imgs);
+        if let Some(res) = post_images.get() {
+            match res {
+                Ok(imgs) => {
+                    let count = imgs.len();
+                    post_images_store.set_value(imgs);
+                    post_images_count.set(Some(count));
+                }
+                Err(_) => {
+                    post_images_count.set(Some(0));
+                }
+            }
         }
     });
     let post_videos_store: StoredValue<Vec<Video>> = StoredValue::new(Vec::new());
+    let post_videos_count: RwSignal<Option<usize>> = RwSignal::new(None);
     Effect::new(move |_| {
-        if let Some(Ok(videos)) = post_videos.get() {
-            post_videos_store.set_value(videos);
+        if let Some(res) = post_videos.get() {
+            match res {
+                Ok(videos) => {
+                    let count = videos.len();
+                    post_videos_store.set_value(videos);
+                    post_videos_count.set(Some(count));
+                }
+                Err(_) => {
+                    post_videos_count.set(Some(0));
+                }
+            }
         }
     });
     let viewer_open = Memo::new(move |_| viewer.get().is_some());
@@ -188,6 +220,15 @@ fn ImageDetailPage(id: String) -> impl IntoView {
     let overlay_ref: NodeRef<html::Div> = NodeRef::new();
     let drag_origin: RwSignal<Option<(f64, f64)>> = RwSignal::new(None);
     let sel_box: RwSignal<Option<(f64, f64, f64, f64)>> = RwSignal::new(None);
+
+    let qmap = use_query_map();
+    Effect::new(move |_| {
+        let is_crop_search = qmap.with(|m| m.get("mode").as_deref() == Some("search_image"));
+        if !is_crop_search {
+            sel_box.set(None);
+            drag_origin.set(None);
+        }
+    });
 
     let navigate = use_navigate();
     let pathname = use_location().pathname;
@@ -278,7 +319,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
     };
 
     let render_tag_pill = move |tag: Tag| {
-        let href = format!("/?mode=tag&q={}&limit=50", urlencoding::encode(&tag.name));
+        let href = tag_search_href(&tag.name);
         let tag_id = tag.id;
         let has_aliases = !tag.aliases.is_empty();
         let name = tag.name.clone();
@@ -321,7 +362,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
     };
 
     let render_tag_alias_card = move |tag: Tag| {
-        let href = format!("/?mode=tag&q={}&limit=50", urlencoding::encode(&tag.name));
+        let href = tag_search_href(&tag.name);
         let score_pct = tag.score.map(|s| (s.clamp(0.0, 1.0) * 100.0).round() as u8);
         let aliases = StoredValue::new(tag.aliases);
         let total_aliases = aliases.with_value(Vec::len);
@@ -362,7 +403,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                 v.iter().take(limit).cloned().collect()
                             });
                             items.into_iter().map(|a| {
-                                let alias_href = format!("/?mode=tag&q={}&limit=50", urlencoding::encode(&a));
+                                let alias_href = tag_search_href(&a);
                                 view! {
                                     <a
                                         href=alias_href
@@ -413,7 +454,8 @@ fn ImageDetailPage(id: String) -> impl IntoView {
         let post_like_id = post_meta.as_ref().map(|(id, _)| *id);
         let post_store = StoredValue::new(post_meta);
 
-        let album_ready = move || post_images.get().is_some() && post_videos.get().is_some();
+        let album_ready =
+            move || post_images_count.get().is_some() && post_videos_count.get().is_some();
 
         let open_lightbox = move || {
             if !album_ready() {
@@ -423,11 +465,15 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                 if let Some((id, title)) = m {
                     let images = post_images_store.with_value(|v| v.clone());
                     let videos = post_videos_store.with_value(|v| v.clone());
+                    let image_count = images.len();
+                    let video_count = videos.len();
                     lightbox.set(Some(PostItem {
                         id: *id,
                         title: title.clone(),
                         images,
                         videos,
+                        image_count,
+                        video_count,
                     }));
                 }
             });
@@ -599,19 +645,9 @@ fn ImageDetailPage(id: String) -> impl IntoView {
         };
 
         let album_badge = move || {
-            if !album_ready() {
+            let (Some(ic), Some(vc)) = (post_images_count.get(), post_videos_count.get()) else {
                 return "Loading\u{2026}".to_string();
-            }
-            let ic = post_images
-                .get()
-                .and_then(|r| r.ok())
-                .map(|v| v.len())
-                .unwrap_or(0);
-            let vc = post_videos
-                .get()
-                .and_then(|r| r.ok())
-                .map(|v| v.len())
-                .unwrap_or(0);
+            };
             match (ic > 0, vc > 0) {
                 (true, true) => format!("Album · {ic}p {vc}v \u{2922}"),
                 (true, false) => format!("Album · {ic}p \u{2922}"),
@@ -687,7 +723,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                 type="button"
                                 aria-label="Clear crop selection"
                                 title="Clear crop selection"
-                                class="absolute top-2 right-2 z-10 w-7 h-7 flex items-center justify-center
+                                class="absolute top-2 left-2 z-10 w-7 h-7 flex items-center justify-center
                                         rounded-full bg-black/60 text-white text-sm
                                         hover:bg-black/80 transition-colors cursor-pointer"
                                 on:click=on_clear.clone()
@@ -841,8 +877,8 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                 let open_thumb = open_zoom_thumb.clone();
                                 move || {
                                     let open_thumb = open_thumb.clone();
-                                    post_images.get().map(|images| match images {
-                                        Ok(images) => view! {
+                                    post_images.get().and_then(|images| match images {
+                                        Ok(images) if !images.is_empty() => Some(view! {
                                             <div class="flex-[2] min-w-0 max-h-[40vh] overflow-y-auto md:max-h-none md:min-h-0 p-0.5 pr-1.5">
                                                 <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-2 lg:grid-cols-3 gap-2 content-start">
                                                     {
@@ -879,8 +915,9 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                                     }
                                                 </div>
                                             </div>
-                                        }.into_any(),
-                                        Err(e) => e.to_string().into_any(),
+                                        }.into_any()),
+                                        Ok(_) => None,
+                                        Err(e) => Some(e.to_string().into_any()),
                                     })
                                 }
                             }
@@ -955,7 +992,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
             // so moving the cursor into the popover never dismisses it.
             let bridge_cls = if tip.below { "fixed z-[45] pt-2" } else { "fixed z-[45] pb-2" };
             let style = format!("left:{:.1}px;top:{:.1}px;transform:{transform};", tip.x, tip.y);
-            let canonical_href = format!("/?mode=tag&q={}&limit=50", urlencoding::encode(&tip.name));
+            let canonical_href = tag_search_href(&tip.name);
             let dialog_label = format!("Aliases for {}", tip.name);
             let alias_count = tip.aliases.len();
             let alias_count_label = if alias_count == 1 {
@@ -1014,7 +1051,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                             view! {
                                 <div class="flex flex-wrap gap-1 mt-2 max-h-52 overflow-y-auto overscroll-contain pr-0.5">
                                     {tip.aliases.into_iter().map(|a| {
-                                        let href = format!("/?mode=tag&q={}&limit=50", urlencoding::encode(&a));
+                                        let href = tag_search_href(&a);
                                         view! {
                                             <a
                                                 href=href
@@ -1061,7 +1098,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
     }
 }
 
-#[server]
+#[server(endpoint = "fetch_image_details")]
 async fn fetch_image_details(id: Option<String>) -> Result<ImageDetailsData, ServerFnError> {
     use crate::state::AppState;
 
@@ -1084,8 +1121,8 @@ async fn fetch_image_details(id: Option<String>) -> Result<ImageDetailsData, Ser
         .map_err(|e| ServerFnError::Response(e.to_string()))
 }
 
-#[server]
-async fn list_post_images(post_id: i64) -> Result<Vec<Image>, ServerFnError> {
+#[server(endpoint = "list_post_images")]
+pub async fn list_post_images(post_id: i64) -> Result<Vec<Image>, ServerFnError> {
     use crate::state::AppState;
 
     use std::sync::Arc;
@@ -1103,8 +1140,8 @@ async fn list_post_images(post_id: i64) -> Result<Vec<Image>, ServerFnError> {
         .map_err(|e| ServerFnError::Response(e.to_string()))
 }
 
-#[server]
-async fn list_post_videos(post_id: i64) -> Result<Vec<Video>, ServerFnError> {
+#[server(endpoint = "list_post_videos")]
+pub async fn list_post_videos(post_id: i64) -> Result<Vec<Video>, ServerFnError> {
     use crate::state::AppState;
 
     use std::sync::Arc;
@@ -1120,4 +1157,28 @@ async fn list_post_videos(post_id: i64) -> Result<Vec<Video>, ServerFnError> {
         .list_post_videos(post_id)
         .await
         .map_err(|e| ServerFnError::Response(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tag_search_href;
+
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn pinned_paths() {
+        use super::{FetchImageDetails, ListPostImages, ListPostVideos};
+        use leptos::server_fn::ServerFn;
+        assert_eq!(FetchImageDetails::PATH, "/api/fetch_image_details");
+        assert_eq!(ListPostImages::PATH, "/api/list_post_images");
+        assert_eq!(ListPostVideos::PATH, "/api/list_post_videos");
+    }
+
+    #[test]
+    fn tag_links_use_advanced_query_syntax() {
+        assert_eq!(tag_search_href("maid"), "/?mode=advanced&adv=tag%3Amaid");
+        assert_eq!(
+            tag_search_href("black hair"),
+            "/?mode=advanced&adv=tag%3A%22black%20hair%22"
+        );
+    }
 }

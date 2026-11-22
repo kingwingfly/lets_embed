@@ -1,6 +1,8 @@
-name = "user-worker"
+name = "lets-embed-user-worker"
 main = "build/index.js"
 compatibility_date = "2026-06-01"
+workers_dev = false
+preview_urls = false
 
 [build]
 command = "cargo install -q \"worker-build@^0.9\" && worker-build --profile wasm-release"
@@ -10,7 +12,7 @@ enabled = true
 invocation_logs = true
 
 [vars]
-# Public hostname the SIWE message must be signed for (the gateway-worker's domain).
+# Public hostname the SIWE message must be signed for (the lets-embed-gateway-worker's domain).
 SIWE_DOMAIN = "lets-embed.louisfly.icu"
 # Ethereum JSON-RPC endpoint used to verify ETH/ERC-20 top-ups + Chainlink prices.
 RPC_URL = "https://cloudflare-eth.com"
@@ -19,7 +21,7 @@ CHAIN_ID = "1"
 SOL_RPC_URL = "https://api.mainnet-beta.solana.com"
 
 # Worker secrets; deploy fails until each is set with `wrangler secret put <NAME>`:
-#   JWT_SECRET — HS256 key for `ue_session`; must equal gateway-worker's JWT_SECRET.
+#   JWT_SECRET — HS256 key for `ue_session`; must equal lets-embed-gateway-worker's JWT_SECRET.
 #     Generate it once with `openssl rand -base64 48` and put the same value into both workers.
 [secrets]
 required = ["JWT_SECRET"]

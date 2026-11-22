@@ -7,16 +7,24 @@ use serde::{Deserialize, Serialize};
 // UserAccount Durable Object internal protocol
 //
 // Routes (dispatched in `account_do::UserAccount::fetch`):
-//   POST /charge      ChargeReq   -> 200 ChargeResp | 402 ChargeResp | 403
-//   POST /credit      CreditReq   -> 200 BalanceResp
+//   POST /charge        ChargeReq -> 200 ChargeResp | 402 ChargeResp | 403
+//   POST /can-charge    ChargeReq -> 200 | 402 ChargeResp | 403
+//   POST /reserve       ChargeReq -> 200 HoldResp | 402 ChargeResp | 403
+//   POST /commit        HoldReq   -> 200
+//   POST /release       HoldReq   -> 200
+//   POST /guest         GuestReq  -> 200 | 401 | 402
+//   POST /reserve-guest GuestReq  -> 200 HoldResp | 401 | 402
+//   POST /commit-guest  HoldReq   -> 200
+//   POST /release-guest HoldReq   -> 200
+//   POST /credit        CreditReq -> 200 BalanceResp
 //   GET  /status                  -> 200 StatusResp
-//   POST /init        InitReq     -> 200 StatusResp
-//   POST /subscribe   SubscribeReq-> 200 StatusResp | 400 | 402
+//   POST /init          InitReq   -> 200 StatusResp
+//   POST /subscribe     SubscribeReq -> 200 StatusResp | 400 | 402
 //   POST /unsubscribe             -> 200 StatusResp
-//   POST /ban         BanReq      -> 200 StatusResp
+//   POST /ban           BanReq    -> 200 StatusResp
 // ---------------------------------------------------------------------------
 
-pub use site_access::{ChargeKind, ChargeReq};
+pub use site_access::{ChargeKind, ChargeReq, HoldReq, HoldResp};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChargeResp {

@@ -18,7 +18,10 @@ use tracing_subscriber::{
 async fn main() -> anyhow::Result<()> {
     Registry::default()
         .with(tracing_subscriber::fmt::layer())
-        .with(EnvFilter::try_from_default_env().unwrap_or("server=info,search_engine=info".into()))
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or("lets_embed_web=info,search_engine=info".into()),
+        )
         .init();
 
     let args = cli::Cli::parse();
@@ -72,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         .fallback(leptos_axum::file_and_error_handler::<state::AppState, _>(
             shell,
         ))
+        .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(app_state);
 

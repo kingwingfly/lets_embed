@@ -17,6 +17,14 @@ const receiptBlockHash = '0x' + 'a'.repeat(64);
 const secret = 'local-integration-fixture';
 const adminHost = 'staff.gallery.test';
 const appHost = 'gallery.test';
+const apiUpstream = 'https://api.gallery.test';
+const imageUpstream = 'https://image.gallery.test';
+const videoUpstream = 'https://video.gallery.test';
+const configuredUpstreamHosts = new Set([
+  new URL(apiUpstream).host,
+  new URL(imageUpstream).host,
+  new URL(videoUpstream).host,
+]);
 
 function builtWorker(crate) {
   const dir = path.join(root, crate, 'build');
@@ -43,7 +51,7 @@ function signedWalletSession(principal = wallet) {
   return 'ue_session=' + payload + '.' + signature;
 }
 
-function gateway(name, hostname, access) {
+function gateway(name, hostname, access, onUpstream) {
   return {
     ...builtWorker('gateway_worker'),
     name,
@@ -54,22 +62,34 @@ function gateway(name, hostname, access) {
       CF_ACCESS_AUD: 'gallery-admin',
       CF_ACCESS_CLIENT_ID: 'local',
       CF_ACCESS_CLIENT_SECRET: 'local',
+      API_UPSTREAM: apiUpstream,
+      IMAGE_UPSTREAM: imageUpstream,
+      VIDEO_UPSTREAM: videoUpstream,
     },
     serviceBindings: {
-      USER_WORKER: 'user-worker',
-      ADMIN_WORKER: { name: 'user-worker', props: { gallery_admin: true } },
+      USER_WORKER: 'lets-embed-user-worker',
+      ADMIN_WORKER: { name: 'lets-embed-user-worker', props: { gallery_admin: true } },
     },
     durableObjects: {
-      USER_ACCOUNT: { className: 'UserAccount', scriptName: 'user-worker', useSQLite: true },
+      USER_ACCOUNT: { className: 'UserAccount', scriptName: 'lets-embed-user-worker', useSQLite: true },
     },
     outboundService: (request) => {
+      const target = new URL(request.url);
+      assert.ok(
+        configuredUpstreamHosts.has(target.host),
+        `unexpected upstream host: ${request.url}`
+      );
       assert.equal(request.headers.get('x-gallery-admin-email'), null);
       assert.equal(request.headers.get('cf-access-jwt-assertion'), null);
       assert.doesNotMatch(
         request.headers.get('cookie') || '',
         /ue_admin_view|ue_session|CF_Authorization/
       );
-      return new Response('Gallery origin');
+      if (onUpstream) {
+        const reply = onUpstream(request, target);
+        if (reply) return reply;
+      }
+      return new Response('Gallery origin', { headers: { 'x-test-upstream': request.url } });
     },
   };
 }
@@ -184,11 +204,24 @@ test('gallery access, billing and administrator controls use the published polic
       1n,
     ].map((n) => n.toString(16).padStart(64, '0')).join(''),
   };
+  let nextUpstreamStatus = null;
+  let upstreamCalls = 0;
   const mf = new Miniflare(
     convertV4MiniflareOptions({
       cf: false,
       workers: [
-        gateway('public-gateway', appHost),
+        gateway('public-gateway', appHost, undefined, (request) => {
+          upstreamCalls += 1;
+          if (nextUpstreamStatus !== null) {
+            const status = nextUpstreamStatus;
+            nextUpstreamStatus = null;
+            return new Response('Upstream error ' + status, {
+              status,
+              headers: { 'x-test-upstream': request.url },
+            });
+          }
+          return null;
+        }),
         gateway('staff-gateway', adminHost, {
           aud: 'gallery-admin',
           identity: { email: 'operator@example.test' },
@@ -199,7 +232,7 @@ test('gallery access, billing and administrator controls use the published polic
         }),
         {
           ...builtWorker('user_worker'),
-          name: 'user-worker',
+          name: 'lets-embed-user-worker',
           routes: ['direct.gallery.test/*'],
           bindings: {
             JWT_SECRET: secret,
@@ -223,7 +256,7 @@ test('gallery access, billing and administrator controls use the published polic
     })
   );
   t.after(() => mf.dispose());
-  const db = await mf.getD1Database('DB', 'user-worker');
+  const db = await mf.getD1Database('DB', 'lets-embed-user-worker');
   for (const file of ['0001_users.sql', '0002_site_settings.sql']) {
     const sql = fs
       .readFileSync(path.join(root, 'user_worker/migrations', file), 'utf8')
@@ -313,7 +346,12 @@ test('gallery access, billing and administrator controls use the published polic
   await check(command('link_solana', { solana_address: originalSolanaDeposit, signature: '1'.repeat(64), nonce: 'n' }, linkedSolana), 400);
   await check(command('topup/prepare', { ...solCheckout, account: wallet }), 400);
   assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM payments').first()).n, 0);
-  await check(site('/images/one.webp', { headers: { cookie: view } }), 200);
+  const adminImg = await site('/images/one.webp', { headers: { cookie: view } });
+  assert.equal(adminImg.status, 200);
+  assert.equal(adminImg.headers.get('x-test-upstream'), imageUpstream + '/one.webp');
+  const adminVid = await site('/videos/a.mp4', { headers: { cookie: view } });
+  assert.equal(adminVid.status, 200);
+  assert.equal(adminVid.headers.get('x-test-upstream'), videoUpstream + '/a.mp4');
   await check(site('/user/admin', { headers: { cookie: view } }), 403);
   await check(site('/user/api/me', { headers: { cookie: view } }), 401);
   fields.set('login_required', 'no');
@@ -338,6 +376,7 @@ test('gallery access, billing and administrator controls use the published polic
   const listing = await site('/');
   assert.equal(listing.status, 200);
   assert.equal(listing.headers.get('cache-control'), 'private, no-store');
+  assert.equal(listing.headers.get('x-test-upstream'), apiUpstream + '/');
   const media = ['/images/a.webp', '/images/b.webp'];
   for (const url of media) await check(site(url, { method: 'HEAD' }), 200);
   const concurrent = await Promise.all(media.map((url) => site(url)));
@@ -365,15 +404,105 @@ test('gallery access, billing and administrator controls use the published polic
   assert.match(guestHtml, /Sign in with Ethereum/);
   assert.match(guestHtml, /Sign in with Solana/);
   assert.match(guestHtml, /Points per USD<\/dt><dd>100<\/dd>/);
+  const appOrigin = 'https://' + appHost;
   const search = await site('/api/search_by_desc', {
     method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    headers: { origin: appOrigin, 'content-type': 'application/x-www-form-urlencoded' },
     body: 'q=fixture',
   });
   assert.equal(search.status, 402);
   assert.equal(search.headers.get('server-timing'), 'gallery-allowance');
   assert.equal((await search.json()).redirect_to, '/user/upgrade');
-  const ns = await mf.getDurableObjectNamespace('USER_ACCOUNT', 'user-worker');
+  // Pinned Advanced Search endpoints: metadata-only is free for guests; vector tiers are strictly metered.
+  const advMeta = await site('/api/search_advanced', {
+    method: 'POST',
+    headers: { origin: appOrigin, 'content-type': 'application/x-www-form-urlencoded' },
+    body: 'q=tag%3Amaid&sort=relevance&limit=50&offset=0',
+  });
+  assert.equal(advMeta.status, 200);
+  assert.equal(advMeta.headers.get('x-test-upstream'), apiUpstream + '/api/search_advanced');
+  await check(
+    site('/api/search_advanced_embed', {
+      method: 'POST',
+      headers: { origin: appOrigin, 'content-type': 'application/json' },
+      body: '{"q":"dino:42"}',
+    }),
+    400
+  );
+  await check(
+    site('/api/search_advanced_embed', {
+      method: 'POST',
+      headers: { origin: appOrigin, 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'q=dino%3A42&limit=50',
+    }),
+    402
+  );
+  await check(
+    site('/api/search_advanced_clip', {
+      method: 'POST',
+      headers: { origin: appOrigin, 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'q=&limit=50',
+    }),
+    400
+  );
+  await check(
+    site('/api/search_advanced_clip', {
+      method: 'POST',
+      headers: { origin: appOrigin, 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'q=clip%3Asunset&limit=50',
+    }),
+    402
+  );
+  await check(
+    site('/api/search_advanced_image', {
+      method: 'POST',
+      headers: { origin: appOrigin, 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'q=img%3A1&images=',
+    }),
+    400
+  );
+  await check(
+    site('/api/search_advanced_image', {
+      method: 'POST',
+      headers: { origin: appOrigin, 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'q=img%3A1&images=AAAA',
+    }),
+    402
+  );
+  // Path-normalization / traversal differentials must never bypass metering, auth, or cache headers.
+  for (const rawBlocked of ['//api/search_advanced_clip', '/api%2fsearch_advanced_clip', '/api%5csearch_advanced_clip']) {
+    await check(
+      site(rawBlocked, {
+        method: 'POST',
+        headers: { origin: appOrigin, 'content-type': 'application/x-www-form-urlencoded' },
+        body: 'q=clip%3Asunset',
+      }),
+      400
+    );
+  }
+  for (const traversal of ['/x/%2e%2e/api/search_advanced_clip', '/api/%2e/search_by_desc']) {
+    const resp = await site(traversal, {
+      method: 'POST',
+      headers: { origin: appOrigin, 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'q=clip%3Asunset',
+    });
+    assert.ok([400, 402].includes(resp.status), `${traversal} got ${resp.status}`);
+  }
+  const pkgTraversal = await site('/pkg/%2e%2e/api/search_query', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: 'q=test',
+  });
+  assert.ok(
+    pkgTraversal.status === 400 || pkgTraversal.headers.get('cache-control') === 'private, no-store',
+    `/pkg traversal leaked cacheable response: ${pkgTraversal.status}`
+  );
+  const imgTraversal = await site('/images/%2e%2e/secret');
+  assert.ok(
+    [303, 400, 401].includes(imgTraversal.status),
+    `/images traversal got ${imgTraversal.status}`
+  );
+  const ns = await mf.getDurableObjectNamespace('USER_ACCOUNT', 'lets-embed-user-worker');
   const subscriberAddress = '0x' + '7'.repeat(40);
   const subscriber = ns.get(ns.idFromName(subscriberAddress));
   const change = async (path, body) => {
@@ -415,7 +544,7 @@ test('gallery access, billing and administrator controls use the published polic
   assert.equal(walletUpgrade.headers.get('location'), '/user/account#topup');
   const walletLimit = await site('/api/search_by_desc', {
     method: 'POST',
-    headers: { ...walletHeaders, 'content-type': 'application/x-www-form-urlencoded' },
+    headers: { ...walletHeaders, origin: appOrigin, 'content-type': 'application/x-www-form-urlencoded' },
     body: 'q=fixture',
   });
   assert.equal(walletLimit.status, 402);
@@ -464,6 +593,20 @@ test('gallery access, billing and administrator controls use the published polic
   await check(post('/ban', { address: wallet, banned: '1' }), 303);
   await check(site('/images/suspended.webp', { headers: walletHeaders }), 403);
   await check(site('/api/suggest_search', { method: 'POST', headers: walletHeaders }), 403);
+  await check(
+    site('//api/search_advanced_clip', {
+      method: 'POST',
+      headers: { ...walletHeaders, 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'q=clip%3Asunset',
+    }),
+    400
+  );
+  const bannedTraversal = await site('/x/%2e%2e/api/search_advanced_clip', {
+    method: 'POST',
+    headers: { ...walletHeaders, origin: appOrigin, 'content-type': 'application/x-www-form-urlencoded' },
+    body: 'q=clip%3Asunset',
+  });
+  assert.ok([400, 403].includes(bannedTraversal.status), `banned traversal got ${bannedTraversal.status}`);
   await check(site('/user/api/likes/status?items=post:1', { headers: walletHeaders }), 403);
   await check(command('topup/prepare', checkout), 403);
   await check(command('subscribe', { plan: 'basic', expected_price: 1000 }), 403);
@@ -613,6 +756,309 @@ test('gallery access, billing and administrator controls use the published polic
   assert.deepEqual(batchJson.liked.sort(), ['image:77', 'image:9007199254740993', 'post:42']);
   const tooMany = Array.from({ length: 101 }, (_, i) => `image:${i}`).join(',');
   await check(site('/user/api/likes/status?items=' + tooMany, { headers: walletHeaders }), 400);
+  // Signed-in wallet metering + 24h deduplication for all 4 pinned Advanced Search endpoints.
+  const advForm = { ...walletHeaders, origin: appOrigin, 'content-type': 'application/x-www-form-urlencoded' };
+  const beforeAdv = (await status()).balance;
+  await check(
+    site('/api/search_advanced', { method: 'POST', headers: advForm, body: 'q=tag%3Amaid&limit=50' }),
+    200
+  );
+  assert.equal((await status()).balance, beforeAdv);
+  await check(
+    site('/api/search_advanced_embed', { method: 'POST', headers: advForm, body: 'q=dino%3A42&offset=0' }),
+    200
+  );
+  assert.equal((await status()).balance, beforeAdv - 10);
+  await check(
+    site('/api/search_advanced_embed', { method: 'POST', headers: advForm, body: 'q=dino%3A42&offset=50' }),
+    200
+  );
+  assert.equal((await status()).balance, beforeAdv - 10);
+  await check(
+    site('/api/search_advanced_clip', { method: 'POST', headers: advForm, body: 'q=clip%3Asunset&offset=0' }),
+    200
+  );
+  assert.equal((await status()).balance, beforeAdv - 110);
+  await check(
+    site('/api/search_advanced_clip', { method: 'POST', headers: advForm, body: 'q=clip%3Asunset&offset=50' }),
+    200
+  );
+  assert.equal((await status()).balance, beforeAdv - 110);
+  await check(
+    site('/api/search_advanced_image', {
+      method: 'POST',
+      headers: advForm,
+      body: 'q=img%3A1&images=AAAA&offset=0',
+    }),
+    200
+  );
+  assert.equal((await status()).balance, beforeAdv - 210);
+  await check(
+    site('/api/search_advanced_image', {
+      method: 'POST',
+      headers: advForm,
+      body: 'q=img%3A1&images=AAAA&offset=50',
+    }),
+    200
+  );
+  assert.equal((await status()).balance, beforeAdv - 210);
+  await check(
+    site('/api/search_advanced_image', {
+      method: 'POST',
+      headers: advForm,
+      body: 'q=img%3A1&images=BBBB&offset=0',
+    }),
+    200
+  );
+  assert.equal((await status()).balance, beforeAdv - 310);
+
+  // Method allowlist: unsupported methods return 405 with explicit Allow header before auth/metering/proxying.
+  const callsBefore405 = upstreamCalls;
+  for (const [m, p] of [
+    ['DELETE', '/images/a.webp'],
+    ['PUT', '/api/search_advanced'],
+    ['PATCH', '/'],
+    ['PURGE', '/images/a.webp'],
+  ]) {
+    const r = await site(p, { method: m, headers: walletHeaders });
+    assert.equal(r.status, 405, `${m} ${p} should return 405`);
+    assert.equal(r.headers.get('allow'), 'GET, HEAD, POST');
+  }
+  const user405 = await site('/user/account', { method: 'PURGE', headers: walletHeaders });
+  assert.equal(user405.status, 405);
+  assert.equal(user405.headers.get('allow'), 'GET, HEAD, POST, DELETE, PUT, PATCH, OPTIONS');
+  assert.equal(upstreamCalls, callsBefore405);
+
+  // Canonical media billing key: /images/a(1).webp and /images/a%281%29.webp bill identically (charge once).
+  const beforeCanon = (await status()).balance;
+  await check(site('/images/a(1).webp', { headers: walletHeaders }), 200);
+  assert.equal((await status()).balance, beforeCanon - 7);
+  await check(site('/images/a%281%29.webp', { headers: walletHeaders }), 200);
+  assert.equal((await status()).balance, beforeCanon - 7);
+
+  // Publish 1 daily free description & similar search to test same-origin & guest/wallet hold refunds.
+  fields.set('revision', '3');
+  fields.set('description_free', '1');
+  fields.set('similar_free', '1');
+  await check(post('/settings', fields), 303);
+
+  // Cross-origin / missing-origin metered POST searches return 403 with zero wallet or guest charge.
+  const beforeOriginBal = (await status()).balance;
+  const callsBeforeOrigin = upstreamCalls;
+  const csrfGuestIp = '198.51.100.7';
+  for (const badHeaders of [
+    { origin: 'https://evil.gallery.test' },
+    { origin: 'https://unrelated.test' },
+    { origin: appOrigin, 'sec-fetch-site': 'same-site' },
+    { 'sec-fetch-site': 'same-site' },
+    {},
+  ]) {
+    await check(
+      site('/api/search_by_desc', {
+        method: 'POST',
+        headers: { ...walletHeaders, ...badHeaders, 'content-type': 'application/x-www-form-urlencoded' },
+        body: 'q=csrf-wallet-probe',
+      }),
+      403
+    );
+    await check(
+      site('/api/search_by_desc', {
+        method: 'POST',
+        headers: { 'cf-connecting-ip': csrfGuestIp, ...badHeaders, 'content-type': 'application/x-www-form-urlencoded' },
+        body: 'q=csrf-guest-probe',
+      }),
+      403
+    );
+  }
+  assert.equal((await status()).balance, beforeOriginBal);
+  assert.equal(upstreamCalls, callsBeforeOrigin);
+  // Same-origin via Sec-Fetch-Site alone succeeds for the untouched guest allowance.
+  await check(
+    site('/api/search_by_desc', {
+      method: 'POST',
+      headers: {
+        'cf-connecting-ip': csrfGuestIp,
+        'sec-fetch-site': 'same-origin',
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: 'q=sec-fetch-only-ok',
+    }),
+    200
+  );
+
+  // Per-route body limits (413) & query/slot validation (400) execute before billing, while >2 MiB image uploads succeed.
+  const beforeLimitsBal = (await status()).balance;
+  const callsBeforeLimits = upstreamCalls;
+  await check(
+    site('/api/search_by_desc', {
+      method: 'POST',
+      headers: advForm,
+      body: 'q=' + 'a'.repeat(33 * 1024),
+    }),
+    413
+  );
+  await check(
+    site('/api/search_advanced_embed', {
+      method: 'POST',
+      headers: advForm,
+      body: 'q=' + 'a'.repeat(33 * 1024),
+    }),
+    413
+  );
+  await check(
+    site('/api/search_by_image', {
+      method: 'POST',
+      headers: advForm,
+      body: 'image=' + 'A'.repeat(1024 * 1024 + 16),
+    }),
+    413
+  );
+  for (const badSim of ['q=', 'q=0', 'q=-5', 'q=abc']) {
+    await check(site('/api/search_similar', { method: 'POST', headers: advForm, body: badSim }), 400);
+  }
+  await check(
+    site('/api/search_by_desc', { method: 'POST', headers: advForm, body: 'q=' + 'x'.repeat(2001) }),
+    400
+  );
+  await check(
+    site('/api/search_advanced_image', { method: 'POST', headers: advForm, body: 'q=img%3A1&images=A,B,C,D,E' }),
+    400
+  );
+  await check(
+    site('/api/search_advanced_image', { method: 'POST', headers: advForm, body: 'q=img%3A1&images=A,,B' }),
+    400
+  );
+  assert.equal((await status()).balance, beforeLimitsBal);
+  assert.equal(upstreamCalls, callsBeforeLimits);
+  // 2.5 MiB upload (> Axum's 2 MiB default, within 4 MiB) succeeds with 4 slots.
+  const slotChunk = 'A'.repeat(650 * 1024);
+  const bigUploadBody = `q=img%3A1&images=${slotChunk},${slotChunk},${slotChunk},${slotChunk}`;
+  await check(
+    site('/api/search_advanced_image', { method: 'POST', headers: advForm, body: bigUploadBody }),
+    200
+  );
+  assert.equal((await status()).balance, beforeLimitsBal - 100);
+
+  // Reserve / Commit / Release: upstream 400/500 refunds wallet daily_free, PAYG balance, window quota, and guest allowance.
+  // 1) Wallet daily_free refund on upstream 500, then commit on 200.
+  const balBeforeFreeRefund = (await status()).balance;
+  nextUpstreamStatus = 500;
+  await check(
+    site('/api/search_by_desc', { method: 'POST', headers: advForm, body: 'q=wallet-free-500' }),
+    500
+  );
+  // Daily free slot was refunded, so this 200 search still costs 0 points.
+  await check(
+    site('/api/search_by_desc', { method: 'POST', headers: advForm, body: 'q=wallet-free-ok' }),
+    200
+  );
+  assert.equal((await status()).balance, balBeforeFreeRefund);
+  // Consume wallet's 1/1 daily free similar search too so subsequent embed searches test PAYG & window.
+  await check(
+    site('/api/search_advanced_embed', { method: 'POST', headers: advForm, body: 'q=dino%3Afree-slot' }),
+    200
+  );
+  assert.equal((await status()).balance, balBeforeFreeRefund);
+
+  // 2) Wallet PAYG balance refund on upstream 500 (/api/search_by_desc) and 400 (/api/search_advanced_embed).
+  const paygBefore = await status();
+  nextUpstreamStatus = 500;
+  await check(
+    site('/api/search_by_desc', { method: 'POST', headers: advForm, body: 'q=wallet-payg-500' }),
+    500
+  );
+  assert.equal((await status()).balance, paygBefore.balance);
+  assert.equal((await status()).total_views, paygBefore.total_views);
+  nextUpstreamStatus = 400;
+  await check(
+    site('/api/search_advanced_embed', { method: 'POST', headers: advForm, body: 'q=dino%3Apayg-400' }),
+    400
+  );
+  assert.equal((await status()).balance, paygBefore.balance);
+  assert.equal((await status()).total_views, paygBefore.total_views);
+  // Retry succeeding commits and dedupes pagination.
+  await check(
+    site('/api/search_advanced_embed', { method: 'POST', headers: advForm, body: 'q=dino%3Apayg-400&offset=0' }),
+    200
+  );
+  assert.equal((await status()).balance, paygBefore.balance - 10);
+  assert.equal((await status()).total_views, paygBefore.total_views + 1);
+  await check(
+    site('/api/search_advanced_embed', { method: 'POST', headers: advForm, body: 'q=dino%3Apayg-400&offset=50' }),
+    200
+  );
+  assert.equal((await status()).balance, paygBefore.balance - 10);
+
+  // 3) Wallet subscription window refund on upstream 500 (searches_remaining) and 400 (views_remaining).
+  await check(command('subscribe', { plan: 'basic', expected_price: 1000 }), 200);
+  const winBefore = await status();
+  nextUpstreamStatus = 500;
+  await check(
+    site('/api/search_by_desc', { method: 'POST', headers: advForm, body: 'q=wallet-win-500' }),
+    500
+  );
+  assert.equal((await status()).searches_remaining, winBefore.searches_remaining);
+  nextUpstreamStatus = 400;
+  await check(
+    site('/api/search_advanced_embed', { method: 'POST', headers: advForm, body: 'q=dino%3Awin-400' }),
+    400
+  );
+  assert.equal((await status()).views_remaining, winBefore.views_remaining);
+  await check(
+    site('/api/search_by_desc', { method: 'POST', headers: advForm, body: 'q=wallet-win-ok&offset=0' }),
+    200
+  );
+  assert.equal((await status()).searches_remaining, winBefore.searches_remaining - 1);
+  await check(
+    site('/api/search_by_desc', { method: 'POST', headers: advForm, body: 'q=wallet-win-ok&offset=50' }),
+    200
+  );
+  assert.equal((await status()).searches_remaining, winBefore.searches_remaining - 1);
+
+  // 4) Guest daily search allowance refund on upstream 500 & 400, commit + pagination dedupe on 200.
+  const guestHoldHeaders = {
+    origin: appOrigin,
+    'cf-connecting-ip': '203.0.113.42',
+    'content-type': 'application/x-www-form-urlencoded',
+  };
+  nextUpstreamStatus = 500;
+  await check(
+    site('/api/search_by_desc', { method: 'POST', headers: guestHoldHeaders, body: 'q=guest-fail-500' }),
+    500
+  );
+  nextUpstreamStatus = 400;
+  await check(
+    site('/api/search_advanced_embed', { method: 'POST', headers: guestHoldHeaders, body: 'q=dino%3Aguest-fail-400' }),
+    400
+  );
+  // Both allowances were refunded, so fresh queries succeed and commit.
+  await check(
+    site('/api/search_by_desc', { method: 'POST', headers: guestHoldHeaders, body: 'q=guest-ok&offset=0' }),
+    200
+  );
+  // Pagination reuses the committed free_usage entry; a failing pagination does NOT delete it.
+  await check(
+    site('/api/search_by_desc', { method: 'POST', headers: guestHoldHeaders, body: 'q=guest-ok&offset=50' }),
+    200
+  );
+  nextUpstreamStatus = 500;
+  await check(
+    site('/api/search_by_desc', { method: 'POST', headers: guestHoldHeaders, body: 'q=guest-ok&offset=100' }),
+    500
+  );
+  await check(
+    site('/api/search_by_desc', { method: 'POST', headers: guestHoldHeaders, body: 'q=guest-over-limit' }),
+    402
+  );
+  await check(
+    site('/api/search_advanced_embed', { method: 'POST', headers: guestHoldHeaders, body: 'q=dino%3Aguest-ok&offset=0' }),
+    200
+  );
+  await check(
+    site('/api/search_advanced_embed', { method: 'POST', headers: guestHoldHeaders, body: 'q=dino%3Aguest-over-limit' }),
+    402
+  );
+
   const selected = await admin('?address=' + wallet);
   assert.match(await selected.text(), /Apply subscription/);
 });
@@ -999,7 +1445,7 @@ test('favorites gallery splits images and posts, supports masonry viewer, unfavo
         const items = decodeURIComponent(url.split('items=')[1]);
         if (items.includes('image:10')) {
           return Response.json([
-            { kind: 'image', target_id: 10, image_id: 10, name: 'album/a b', width: 800, height: 1200 },
+            { kind: 'image', target_id: 10, image_id: 10, name: "album/a b(1)!*'", width: 800, height: 1200 },
             { kind: 'image', target_id: 11, image_id: 11, name: 'solo', width: 1200, height: 800 },
           ]);
         }
@@ -1021,7 +1467,7 @@ test('favorites gallery splits images and posts, supports masonry viewer, unfavo
   assert.equal(env.ids.get('count-image').textContent, '2');
   const imgs = env.findAll(env.ids.get('fav-grid'), (n) => n.tagName === 'IMG');
   assert.equal(imgs.length, 2);
-  assert.equal(imgs[0].src, '/images/album/a%20b.webp');
+  assert.equal(imgs[0].src, '/images/album/a%20b%281%29%21%2A%27.webp');
   assert.equal(imgs[0].style.aspectRatio, '800 / 1200');
 
   // Clicking first image opens full-screen viewer; ArrowRight advances; Escape closes.

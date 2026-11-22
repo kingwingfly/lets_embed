@@ -69,13 +69,13 @@
 
 /* ===== Gallery masonry (matches /user/favorites image-first aesthetic) ===== */
 .gallery-wrap {
-    width: min(1600px, calc(100% - 28px));
-    margin-inline: auto;
-    padding-block: 10px 48px;
+    width: 100%;
+    padding: 10px 14px 48px;
+    box-sizing: border-box;
 }
 .gallery-wrap.gallery-embedded {
     width: 100%;
-    padding-block: 4px 28px;
+    padding: 4px 0 28px;
 }
 .gallery-toolbar {
     display: flex;
@@ -270,8 +270,10 @@
 }
 @media (max-width: 640px) {
     .gallery-wrap {
-        width: calc(100% - 16px);
-        padding-block: 8px 40px;
+        padding: 8px 8px 40px;
+    }
+    .gallery-wrap.gallery-embedded {
+        padding: 4px 0 24px;
     }
     .gallery-toolbar {
         margin-bottom: 10px;
@@ -283,5 +285,10 @@
     .gallery-masonry,
     .gallery-col {
         gap: 8px;
+    }
+}
+@media (max-width: 420px) {
+    .gallery-toolbar {
+        padding-top: 44px;
     }
 }

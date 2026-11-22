@@ -16,6 +16,10 @@ pub const IMAGE_CHANNEL: usize = 3;
 pub const IMAGE_WIDTH: usize = 256;
 pub const IMAGE_HEIGHT: usize = 256;
 
+pub const MAX_IMAGE_DIMENSION: u32 = 8192;
+pub const MAX_IMAGE_PIXELS: u64 = 16_777_216;
+pub const MAX_DECODE_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
+
 pub const MEAN: [f64; 3] = [0.485, 0.456, 0.406];
 pub const STD: [f64; 3] = [0.229, 0.224, 0.225];
 
@@ -73,12 +77,36 @@ where
         .collect())
 }
 
+fn decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC_BYTES);
+    limits
+}
+
 /// Returns normalized CHW (black padded if ratio not match).
 pub fn convert_image<R: Read + Seek>(r: R) -> anyhow::Result<Vec<f32>> {
-    let src_image = image::ImageReader::new(BufReader::new(r))
-        .with_guessed_format()?
-        .decode()?
-        .to_rgb8();
+    let mut buf = BufReader::new(r);
+    let mut dim_reader = image::ImageReader::new(&mut buf).with_guessed_format()?;
+    dim_reader.limits(decode_limits());
+    let (w, h) = dim_reader.into_dimensions()?;
+    let pixels = u64::from(w).saturating_mul(u64::from(h));
+    if w == 0
+        || h == 0
+        || w > MAX_IMAGE_DIMENSION
+        || h > MAX_IMAGE_DIMENSION
+        || pixels > MAX_IMAGE_PIXELS
+    {
+        bail!(
+            "image dimensions {w}x{h} exceed limits (max {MAX_IMAGE_DIMENSION}px per side, {MAX_IMAGE_PIXELS} total pixels)"
+        );
+    }
+
+    buf.rewind()?;
+    let mut reader = image::ImageReader::new(buf).with_guessed_format()?;
+    reader.limits(decode_limits());
+    let src_image = reader.decode()?.to_rgb8();
 
     let mut dst_image = Image::new(IMAGE_WIDTH as u32, IMAGE_HEIGHT as u32, PixelType::U8x3);
 
@@ -150,7 +178,66 @@ fn l2_normalize_inplace_simd(data: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xffff_ffffu32;
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                if crc & 1 != 0 {
+                    crc = (crc >> 1) ^ 0xedb8_8320;
+                } else {
+                    crc >>= 1;
+                }
+            }
+        }
+        !crc
+    }
+
+    fn png_header_only(width: u32, height: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        let mut ihdr = Vec::with_capacity(17);
+        ihdr.extend_from_slice(b"IHDR");
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        out.extend_from_slice(&13u32.to_be_bytes());
+        out.extend_from_slice(&ihdr);
+        out.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+        // Include a 1-byte IDAT chunk header so `into_dimensions()` finishes reading
+        // metadata without needing any compressed pixel payload.
+        let idat = b"IDAT\x00";
+        out.extend_from_slice(&1u32.to_be_bytes());
+        out.extend_from_slice(idat);
+        out.extend_from_slice(&crc32(idat).to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(b"IEND");
+        out.extend_from_slice(&crc32(b"IEND").to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn convert_image_rejects_huge_png_dimensions_without_allocating() {
+        let huge_dim = png_header_only(10_000, 10_000);
+        let err = convert_image(Cursor::new(huge_dim)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("Format error")
+                && (msg.contains("exceed") || msg.contains("limit") || msg.contains("dimension")),
+            "unexpected error for 10000x10000 PNG: {msg}"
+        );
+
+        let huge_pixels = png_header_only(5_000, 5_000);
+        let err_px = convert_image(Cursor::new(huge_pixels)).unwrap_err();
+        assert!(
+            err_px.to_string().contains("5000x5000"),
+            "expected pixel limit rejection for 5000x5000 PNG, got: {err_px}"
+        );
+    }
 
     #[test]
     fn l2_normalize_inplace_simd_test() {

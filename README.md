@@ -115,15 +115,15 @@ Steps:
 - convert all images to `.webp` in R2 with `img2webp` in `gcloud run job` or other CPU provider
 - use `./tsv` to download models to bucket, mount it as needed
 - run `embed` with gcloud or other GPU provider
-- deploy `search` as a serverless api service in `gcloud run services`, it uses pingora to handle cloudflare jwt
+- deploy `lets-embed-web` (images `lets-embed-web:cpu`, `lets-embed-web:cuda12`, `lets-embed-web:cuda13`) as a serverless api service in `gcloud run services`, it uses pingora to handle cloudflare jwt
 - use `domain mappings` to make service reachable at `xx-api.yourdomain.com`
 - use `cloudflare Access` service token to protect `xx-api.yourdomain.com` service
 - use `cloudflare Access` service token to protect `xx-image.yourdomain.com` service
 - leave the public gallery reachable at `xx.yourdomain.com` and protect `/user/admin` and its descendants with a Cloudflare Access policy for administrators
 - publish wallet requirements, guest allowances, pricing, subscriptions and deposit addresses from `/user/admin`. [Gallery controls and deployment](user_worker/README.md)
-- Configure each Worker in its own directory. [Gateway config](gateway_worker/wrangler.toml) · [User Worker config](user_worker/wrangler.toml)
+- Configure each Worker in its own directory: `lets-embed-gateway-worker` ([Gateway config](gateway_worker/wrangler.toml), including `API_UPSTREAM`, `IMAGE_UPSTREAM`, and `VIDEO_UPSTREAM` under `[vars]`) · `lets-embed-user-worker` ([User Worker config](user_worker/wrangler.toml))
 
-From the project root, deploy the user Worker first so its service and Durable Object are available to the gateway.
+From the project root, deploy `lets-embed-user-worker` first so its service and Durable Object are available to `lets-embed-gateway-worker`.
 
 ```sh
 npm ci

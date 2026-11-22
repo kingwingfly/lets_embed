@@ -13,4 +13,4 @@ node_modules
 gateway_worker/build
 user_worker/build
 .claude
-cloudbuild-search-cpu.yaml
+cloudbuild-lets-embed-web-cpu.yaml

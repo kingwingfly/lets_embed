@@ -50,11 +50,12 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 pub fn App() -> impl IntoView {
     provide_meta_context();
     provide_context(crate::types::ImageQuery(RwSignal::new(None)));
+    provide_context(crate::types::AdvancedUploads(RwSignal::new(None)));
     provide_context(LikeStore::new());
     view! {
         <Title text="Let's Embed"/>
         <Router>
-            <main class="min-h-screen w-screen max-w-screen bg-gradient-to-b from-sky-50 via-white to-sky-100">
+            <main class="min-h-screen w-full overflow-x-clip bg-gradient-to-b from-sky-50 via-white to-sky-100">
                 <Routes fallback=|| "Page not found.".into_view()>
                     <ParentRoute path=path!("") view=SearchBar>
                         <Route path=path!("/details/:id") view=ImageDetails/>
@@ -79,7 +80,11 @@ mod tests {
         // Route discovery initializes the SSR runtime, as it does at server startup.
         leptos_axum::generate_route_list(App);
         let render = leptos_axum::render_app_to_stream(|| {
-            shell(LeptosOptions::builder().output_name("search").build())
+            shell(
+                LeptosOptions::builder()
+                    .output_name("lets-embed-web")
+                    .build(),
+            )
         });
         let response = render(Request::builder().uri("/").body(Body::empty()).unwrap()).await;
         let bytes = to_bytes(response.into_body(), 1_000_000).await.unwrap();
@@ -92,7 +97,11 @@ mod tests {
     async fn ssr_title_never_interpolates_untrusted_query_parameters() {
         leptos_axum::generate_route_list(App);
         let render = leptos_axum::render_app_to_stream(|| {
-            shell(LeptosOptions::builder().output_name("search").build())
+            shell(
+                LeptosOptions::builder()
+                    .output_name("lets-embed-web")
+                    .build(),
+            )
         });
         let response = render(
             Request::builder()

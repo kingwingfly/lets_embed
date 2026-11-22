@@ -8,8 +8,8 @@ use serde::de::DeserializeOwned;
 use worker::{Date, DurableObject, Env, Method, Request, Response, Result, State, durable_object};
 
 use crate::types::{
-    BalanceResp, BanReq, ChargeKind, ChargeReq, ChargeResp, CreditReq, InitReq, StatusResp,
-    SubscribeReq,
+    BalanceResp, BanReq, ChargeKind, ChargeReq, ChargeResp, CreditReq, HoldReq, HoldResp, InitReq,
+    StatusResp, SubscribeReq,
 };
 use crate::{
     config,
@@ -137,6 +137,44 @@ fn window_reset(active: bool, win_start: Option<u64>, now: u64) -> u64 {
     }
 }
 
+/// Pure refund math for a released `Window`-sourced hold.
+/// Only adjusts counters when the window that was charged is still the active window.
+fn refund_window_counters(
+    kind: &str,
+    cost: i64,
+    current_win_start: Option<u64>,
+    hold_win_start: i64,
+    win_views: i64,
+    win_search: i64,
+) -> Option<(i64, i64)> {
+    if hold_win_start < 0 || current_win_start != Some(hold_win_start as u64) {
+        return None;
+    }
+    match kind {
+        "upload" | "description" => Some((win_views, (win_search - 1).max(0))),
+        "image" | "video" | "similar" => Some(((win_views - cost.max(0)).max(0), win_search)),
+        _ => None,
+    }
+}
+
+const HOLD_TTL_SECS: i64 = 600;
+
+enum FreeOutcome {
+    NotCovered,
+    AlreadyCovered,
+    Reserved(Vec<u8>),
+}
+
+struct ChargeHold {
+    kind: String,
+    source: String,
+    cost: i64,
+    day: i64,
+    path: String,
+    win_start: i64,
+    free_hash: Vec<u8>,
+}
+
 fn now_secs() -> u64 {
     Date::now().as_millis() / 1000
 }
@@ -155,6 +193,8 @@ pub struct UserAccount {
     env: Env,
     handoff_schema_ready: std::cell::Cell<bool>,
     handoff_last_purge: std::cell::Cell<i64>,
+    holds_schema_ready: std::cell::Cell<bool>,
+    holds_last_purge: std::cell::Cell<i64>,
 }
 
 impl DurableObject for UserAccount {
@@ -164,13 +204,14 @@ impl DurableObject for UserAccount {
             env,
             handoff_schema_ready: std::cell::Cell::new(false),
             handoff_last_purge: std::cell::Cell::new(0),
+            holds_schema_ready: std::cell::Cell::new(false),
+            holds_last_purge: std::cell::Cell::new(0),
         }
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         let path = req.path();
-        // Singleton auth-handoff routes (`__auth_handoff__` DO instance) use
-        // synchronous DO SQLite directly and do not need site policy loading.
+        // Routes that use DO SQLite/storage directly and do not need site policy loading.
         match (req.method(), path.as_str()) {
             (Method::Post, "/handoff-start") => {
                 return self.handoff_start(req.json().await?);
@@ -196,6 +237,18 @@ impl DurableObject for UserAccount {
             (Method::Post, "/transfer-revoke") => {
                 return self.transfer_revoke(req.json().await?);
             }
+            (Method::Post, "/commit") => {
+                return self.commit(req.json().await?).await;
+            }
+            (Method::Post, "/release") => {
+                return self.release(req.json().await?).await;
+            }
+            (Method::Post, "/commit-guest") => {
+                return self.commit_guest(req.json().await?);
+            }
+            (Method::Post, "/release-guest") => {
+                return self.release_guest(req.json().await?);
+            }
             _ => {}
         }
         let policy = settings::load(&self.env).await?;
@@ -203,6 +256,7 @@ impl DurableObject for UserAccount {
             (Method::Post, "/init") => self.init(req.json().await?, &policy).await,
             (Method::Post, "/charge") => self.charge(req.json().await?, &policy, false).await,
             (Method::Post, "/can-charge") => self.charge(req.json().await?, &policy, true).await,
+            (Method::Post, "/reserve") => self.reserve(req.json().await?, &policy).await,
             (Method::Post, "/credit") => self.credit(req.json().await?, &policy).await,
             (Method::Post, "/payment-applied") => {
                 let hash: String = req.json().await?;
@@ -221,6 +275,7 @@ impl DurableObject for UserAccount {
             (Method::Post, "/unsubscribe") => self.unsubscribe(&policy).await,
             (Method::Post, "/ban") => self.ban(req.json().await?, &policy).await,
             (Method::Post, "/guest") => self.guest(req.json().await?, &policy),
+            (Method::Post, "/reserve-guest") => self.reserve_guest(req.json().await?, &policy),
             (Method::Post, "/admin-plan") => self.admin_plan(req.json().await?, &policy).await,
             _ => Response::error("not found", 404),
         }
@@ -285,12 +340,99 @@ impl UserAccount {
         Ok(prorated_refund(paid, plan.period_secs, end - now))
     }
 
-    fn free_item(&self, req: &ChargeReq, limit: i64, day: u64, check_only: bool) -> Result<bool> {
+    fn ensure_holds_table(&self, now: i64) -> Result<worker::SqlStorage> {
+        let db = self.state.storage().sql();
+        if !self.holds_schema_ready.get() {
+            db.exec(
+                "CREATE TABLE IF NOT EXISTS charge_holds (\
+                    hold_id TEXT PRIMARY KEY,\
+                    is_guest INTEGER NOT NULL,\
+                    kind TEXT NOT NULL,\
+                    source TEXT NOT NULL,\
+                    cost INTEGER NOT NULL,\
+                    day INTEGER NOT NULL,\
+                    path TEXT NOT NULL,\
+                    win_start INTEGER NOT NULL,\
+                    free_hash BLOB NOT NULL,\
+                    created_at INTEGER NOT NULL\
+                )",
+                None,
+            )?;
+            db.exec(
+                "CREATE INDEX IF NOT EXISTS idx_charge_holds_created ON charge_holds(created_at)",
+                None,
+            )?;
+            self.holds_schema_ready.set(true);
+        }
+        if now.saturating_sub(self.holds_last_purge.get()) >= 60 {
+            db.exec(
+                "DELETE FROM charge_holds WHERE created_at <= ?",
+                vec![(now.saturating_sub(HOLD_TTL_SECS)).into()],
+            )?;
+            self.holds_last_purge.set(now);
+        }
+        Ok(db)
+    }
+
+    fn take_charge_hold(
+        db: &worker::SqlStorage,
+        hold_id: &str,
+        is_guest: bool,
+    ) -> Result<Option<ChargeHold>> {
+        #[derive(serde::Deserialize)]
+        struct RawHoldRow {
+            kind: String,
+            source: String,
+            cost: i64,
+            day: i64,
+            path: String,
+            win_start: i64,
+            free_hash_hex: String,
+        }
+        let guest_flag: i64 = if is_guest { 1 } else { 0 };
+        let rows: Vec<RawHoldRow> = db
+            .exec(
+                "SELECT kind, source, cost, day, path, win_start, hex(free_hash) AS free_hash_hex \
+                 FROM charge_holds WHERE hold_id = ?1 AND is_guest = ?2",
+                vec![hold_id.into(), guest_flag.into()],
+            )?
+            .to_array()?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        db.exec(
+            "DELETE FROM charge_holds WHERE hold_id = ?1 AND is_guest = ?2",
+            vec![hold_id.into(), guest_flag.into()],
+        )?;
+        let free_hash = if row.free_hash_hex.is_empty() {
+            Vec::new()
+        } else {
+            hex::decode(&row.free_hash_hex)
+                .map_err(|e| worker::Error::RustError(format!("invalid hold free_hash: {e}")))?
+        };
+        Ok(Some(ChargeHold {
+            kind: row.kind,
+            source: row.source,
+            cost: row.cost,
+            day: row.day,
+            path: row.path,
+            win_start: row.win_start,
+            free_hash,
+        }))
+    }
+
+    fn eval_free_item(
+        &self,
+        req: &ChargeReq,
+        limit: i64,
+        day: u64,
+        check_only: bool,
+    ) -> Result<FreeOutcome> {
         if limit == 0 {
-            return Ok(false);
+            return Ok(FreeOutcome::NotCovered);
         }
         if limit < 0 {
-            return Ok(true);
+            return Ok(FreeOutcome::AlreadyCovered);
         }
         // Synchronous DO SQLite calls complete before another request can enter.
         // Store single resource hashes rather than an ever-growing KV value.
@@ -301,7 +443,10 @@ impl UserAccount {
             used: i64,
         }
         let db = self.state.storage().sql();
-        db.exec("CREATE TABLE IF NOT EXISTS free_usage (day INTEGER,kind TEXT,resource BLOB, PRIMARY KEY(day,kind,resource)) WITHOUT ROWID",None)?;
+        db.exec(
+            "CREATE TABLE IF NOT EXISTS free_usage (day INTEGER,kind TEXT,resource BLOB, PRIMARY KEY(day,kind,resource)) WITHOUT ROWID",
+            None,
+        )?;
         if !check_only {
             db.exec(
                 "DELETE FROM free_usage WHERE day < ?",
@@ -310,21 +455,33 @@ impl UserAccount {
         }
         let hash = Sha256::digest(req.path.as_bytes()).to_vec();
         let kind = req.kind.name();
-        let used:Usage=db.exec("SELECT EXISTS(SELECT 1 FROM free_usage WHERE day=?1 AND kind=?2 AND resource=?3) AS seen, COUNT(*) AS used FROM free_usage WHERE day=?1 AND kind=?2",
-            vec![(day as i64).into(),kind.into(),hash.clone().into()])?.one()?;
+        let used: Usage = db
+            .exec(
+                "SELECT EXISTS(SELECT 1 FROM free_usage WHERE day=?1 AND kind=?2 AND resource=?3) AS seen, COUNT(*) AS used FROM free_usage WHERE day=?1 AND kind=?2",
+                vec![(day as i64).into(), kind.into(), hash.clone().into()],
+            )?
+            .one()?;
         if used.seen != 0 {
-            return Ok(true);
+            return Ok(FreeOutcome::AlreadyCovered);
         }
         if used.used >= limit {
-            return Ok(false);
+            return Ok(FreeOutcome::NotCovered);
         }
         if !check_only {
             db.exec(
                 "INSERT INTO free_usage VALUES(?,?,?)",
-                vec![(day as i64).into(), kind.into(), hash.into()],
+                vec![(day as i64).into(), kind.into(), hash.clone().into()],
             )?;
+            return Ok(FreeOutcome::Reserved(hash));
         }
-        Ok(true)
+        Ok(FreeOutcome::AlreadyCovered)
+    }
+
+    fn free_item(&self, req: &ChargeReq, limit: i64, day: u64, check_only: bool) -> Result<bool> {
+        Ok(!matches!(
+            self.eval_free_item(req, limit, day, check_only)?,
+            FreeOutcome::NotCovered
+        ))
     }
 
     fn guest(&self, req: GuestReq, policy: &Policy) -> Result<Response> {
@@ -341,6 +498,79 @@ impl UserAccount {
                     402,
                 );
             }
+        }
+        Response::ok("")
+    }
+
+    fn reserve_guest(&self, req: GuestReq, policy: &Policy) -> Result<Response> {
+        if policy.login_required {
+            return Response::error("Login required", 401);
+        }
+        let Some(item) = req.item else {
+            return json(&HoldResp { hold_id: None }, 200);
+        };
+        let now = now_secs();
+        let day = now / 86_400;
+        let limit = policy.item(item.kind).daily_free;
+        if !policy.free_media_in_scope(&item) {
+            return Response::error(
+                "Sign in to access this item or continue beyond the daily free allowance",
+                402,
+            );
+        }
+        match self.eval_free_item(&item, limit, day, req.head)? {
+            FreeOutcome::NotCovered => Response::error(
+                "Sign in to access this item or continue beyond the daily free allowance",
+                402,
+            ),
+            FreeOutcome::AlreadyCovered => json(&HoldResp { hold_id: None }, 200),
+            FreeOutcome::Reserved(free_hash) => {
+                let hold_id = uuid::Uuid::new_v4().to_string();
+                let db = self.ensure_holds_table(now as i64)?;
+                db.exec(
+                    "INSERT INTO charge_holds \
+                     (hold_id, is_guest, kind, source, cost, day, path, win_start, free_hash, created_at) \
+                     VALUES (?1, 1, ?2, 'free', 0, ?3, ?4, 0, ?5, ?6)",
+                    vec![
+                        hold_id.clone().into(),
+                        item.kind.name().into(),
+                        (day as i64).into(),
+                        item.path.into(),
+                        free_hash.into(),
+                        (now as i64).into(),
+                    ],
+                )?;
+                json(
+                    &HoldResp {
+                        hold_id: Some(hold_id),
+                    },
+                    200,
+                )
+            }
+        }
+    }
+
+    fn commit_guest(&self, req: HoldReq) -> Result<Response> {
+        let now = now_secs() as i64;
+        let db = self.ensure_holds_table(now)?;
+        db.exec(
+            "DELETE FROM charge_holds WHERE hold_id = ?1 AND is_guest = 1",
+            vec![req.hold_id.into()],
+        )?;
+        Response::ok("")
+    }
+
+    fn release_guest(&self, req: HoldReq) -> Result<Response> {
+        let now = now_secs() as i64;
+        let db = self.ensure_holds_table(now)?;
+        let Some(hold) = Self::take_charge_hold(&db, &req.hold_id, true)? else {
+            return Response::ok("");
+        };
+        if !hold.free_hash.is_empty() {
+            db.exec(
+                "DELETE FROM free_usage WHERE day = ?1 AND kind = ?2 AND resource = ?3",
+                vec![hold.day.into(), hold.kind.into(), hold.free_hash.into()],
+            )?;
         }
         Response::ok("")
     }
@@ -598,6 +828,240 @@ impl UserAccount {
             },
             200,
         )
+    }
+
+    async fn reserve(&self, req: ChargeReq, policy: &Policy) -> Result<Response> {
+        self.ensure_init(policy).await?;
+        if self.get_or("banned", false).await? {
+            return Response::error("banned", 403);
+        }
+        let storage = self.state.storage();
+        let now = now_secs();
+        let day = now / 86_400;
+        let today: HashMap<String, u64> =
+            self.get_or(&format!("seen:{day}"), HashMap::new()).await?;
+        let yesterday: HashMap<String, u64> = self
+            .get_or(&format!("seen:{}", day.saturating_sub(1)), HashMap::new())
+            .await?;
+
+        if is_recent_view(&req.path, now, [&today, &yesterday]) {
+            return json(&HoldResp { hold_id: None }, 200);
+        }
+
+        let rule = policy.item(req.kind);
+        let cost = rule.price;
+        let mut balance: i64 = self.get_or("balance", 0).await?;
+        let active = self.plan_active(now).await?;
+        let plan_cfg = if active {
+            storage
+                .get::<String>("plan")
+                .await?
+                .as_deref()
+                .and_then(|id| policy.plan(id))
+        } else {
+            None
+        };
+
+        let mut win_start: Option<u64> = storage.get("win_start").await?;
+        let mut win_views: i64 = self.get_or("win_views", 0).await?;
+        let mut win_search: i64 = self.get_or("win_search", 0).await?;
+        let mut window_dirty = false;
+        if active && should_roll(win_start, now) {
+            win_start = Some(now);
+            win_views = 0;
+            win_search = 0;
+            window_dirty = true;
+        }
+
+        let (included, free_hash) = if cost == 0 {
+            (true, Vec::new())
+        } else if policy.free_media_in_scope(&req) {
+            match self.eval_free_item(&req, rule.daily_free, day, false)? {
+                FreeOutcome::NotCovered => (false, Vec::new()),
+                FreeOutcome::AlreadyCovered => (true, Vec::new()),
+                FreeOutcome::Reserved(hash) => (true, hash),
+            }
+        } else {
+            (false, Vec::new())
+        };
+
+        let source = if included {
+            ChargeSource::FreeUnlimited
+        } else {
+            decide_charge(
+                plan_cfg.as_ref(),
+                active,
+                req.kind,
+                win_views,
+                win_search,
+                balance,
+                cost,
+            )
+        };
+        if source == ChargeSource::Refuse {
+            let views_remaining = views_remaining(plan_cfg.as_ref(), active, win_views);
+            let searches_remaining = searches_remaining(plan_cfg.as_ref(), active, win_search);
+            let window_reset = window_reset(active, win_start, now);
+            return json(
+                &ChargeResp {
+                    charged: false,
+                    cost,
+                    balance,
+                    views_remaining,
+                    searches_remaining,
+                    window_reset,
+                },
+                402,
+            );
+        }
+
+        let source_name = match source {
+            ChargeSource::FreeUnlimited => "free",
+            ChargeSource::Window => {
+                match req.kind {
+                    ChargeKind::Search | ChargeKind::Description => win_search += 1,
+                    ChargeKind::Image | ChargeKind::Video | ChargeKind::EmbedSearch => {
+                        win_views += cost
+                    }
+                }
+                window_dirty = true;
+                "window"
+            }
+            ChargeSource::Balance => {
+                balance -= cost;
+                "balance"
+            }
+            ChargeSource::Refuse => unreachable!("handled above"),
+        };
+
+        if source == ChargeSource::Balance || window_dirty {
+            let mut fields = serde_json::Map::new();
+            if source == ChargeSource::Balance {
+                fields.insert("balance".into(), balance.into());
+            }
+            if window_dirty {
+                fields.insert(
+                    "win_start".into(),
+                    win_start.expect("active window has a start").into(),
+                );
+                fields.insert("win_views".into(), win_views.into());
+                fields.insert("win_search".into(), win_search.into());
+            }
+            self.write_fields(serde_json::Value::Object(fields)).await?;
+        }
+
+        let hold_id = uuid::Uuid::new_v4().to_string();
+        let hold_cost = if source == ChargeSource::FreeUnlimited {
+            0
+        } else {
+            cost
+        };
+        let hold_win_start = if source == ChargeSource::Window {
+            win_start.unwrap_or(0) as i64
+        } else {
+            0
+        };
+        let db = self.ensure_holds_table(now as i64)?;
+        db.exec(
+            "INSERT INTO charge_holds \
+             (hold_id, is_guest, kind, source, cost, day, path, win_start, free_hash, created_at) \
+             VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            vec![
+                hold_id.clone().into(),
+                req.kind.name().into(),
+                source_name.into(),
+                hold_cost.into(),
+                (day as i64).into(),
+                req.path.into(),
+                hold_win_start.into(),
+                free_hash.into(),
+                (now as i64).into(),
+            ],
+        )?;
+
+        json(
+            &HoldResp {
+                hold_id: Some(hold_id),
+            },
+            200,
+        )
+    }
+
+    async fn commit(&self, req: HoldReq) -> Result<Response> {
+        let now = now_secs();
+        let db = self.ensure_holds_table(now as i64)?;
+        let Some(hold) = Self::take_charge_hold(&db, &req.hold_id, false)? else {
+            return Response::ok("");
+        };
+
+        let hold_day = hold.day.max(0) as u64;
+        let day_key = format!("seen:{hold_day}");
+        let storage = self.state.storage();
+        let existing: Option<HashMap<String, u64>> = storage.get(&day_key).await?;
+        let new_day = existing.is_none();
+        let mut day_map = existing.unwrap_or_default();
+        if new_day && hold_day >= 2 {
+            storage.delete(&format!("seen:{}", hold_day - 2)).await?;
+        }
+        day_map.insert(hold.path, now);
+        let total_views: i64 = self.get_or("total_views", 0).await? + 1;
+        self.write_fields(serde_json::json!({
+            (day_key): day_map,
+            "total_views": total_views,
+        }))
+        .await?;
+        Response::ok("")
+    }
+
+    async fn release(&self, req: HoldReq) -> Result<Response> {
+        let now = now_secs() as i64;
+        let db = self.ensure_holds_table(now)?;
+        let Some(hold) = Self::take_charge_hold(&db, &req.hold_id, false)? else {
+            return Response::ok("");
+        };
+
+        if !hold.free_hash.is_empty() {
+            db.exec(
+                "DELETE FROM free_usage WHERE day = ?1 AND kind = ?2 AND resource = ?3",
+                vec![
+                    hold.day.into(),
+                    hold.kind.clone().into(),
+                    hold.free_hash.into(),
+                ],
+            )?;
+        }
+
+        match hold.source.as_str() {
+            "balance" => {
+                let balance: i64 = self.get_or("balance", 0).await?;
+                self.write_fields(serde_json::json!({
+                    "balance": balance.saturating_add(hold.cost.max(0)),
+                }))
+                .await?;
+            }
+            "window" => {
+                let current_win_start: Option<u64> = self.state.storage().get("win_start").await?;
+                let win_views: i64 = self.get_or("win_views", 0).await?;
+                let win_search: i64 = self.get_or("win_search", 0).await?;
+                if let Some((next_views, next_search)) = refund_window_counters(
+                    &hold.kind,
+                    hold.cost,
+                    current_win_start,
+                    hold.win_start,
+                    win_views,
+                    win_search,
+                ) {
+                    self.write_fields(serde_json::json!({
+                        "win_views": next_views,
+                        "win_search": next_search,
+                    }))
+                    .await?;
+                }
+            }
+            _ => {}
+        }
+
+        Response::ok("")
     }
 
     async fn credit(&self, req: CreditReq, policy: &Policy) -> Result<Response> {
@@ -1358,5 +1822,36 @@ mod tests {
         );
         // elapsed window is no longer open
         assert_eq!(window_reset(true, Some(NOW), NOW + config::WINDOW_SECS), 0);
+    }
+
+    #[test]
+    fn refund_window_counters_restores_matching_window_and_clamps() {
+        // Matching window: search-class kinds decrement win_search by 1.
+        assert_eq!(
+            refund_window_counters("description", 100, Some(NOW), NOW as i64, 50, 3),
+            Some((50, 2))
+        );
+        assert_eq!(
+            refund_window_counters("upload", 100, Some(NOW), NOW as i64, 50, 0),
+            Some((50, 0))
+        );
+        // Matching window: view-class kinds decrement win_views by cost, clamped >= 0.
+        assert_eq!(
+            refund_window_counters("similar", 10, Some(NOW), NOW as i64, 25, 2),
+            Some((15, 2))
+        );
+        assert_eq!(
+            refund_window_counters("similar", 10, Some(NOW), NOW as i64, 5, 2),
+            Some((0, 2))
+        );
+        // Different or missing current window: no-op.
+        assert_eq!(
+            refund_window_counters("description", 100, Some(NOW + 1), NOW as i64, 50, 3),
+            None
+        );
+        assert_eq!(
+            refund_window_counters("description", 100, None, NOW as i64, 50, 3),
+            None
+        );
     }
 }

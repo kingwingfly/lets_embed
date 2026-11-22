@@ -52,6 +52,14 @@ pub struct GuestReq {
     pub item: Option<ChargeReq>,
     pub head: bool,
 }
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HoldReq {
+    pub hold_id: String,
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HoldResp {
+    pub hold_id: Option<String>,
+}
 
 pub const ADMIN_HEADER: &str = "x-gallery-admin-email";
 pub const UPGRADE_PATH: &str = "/user/upgrade";

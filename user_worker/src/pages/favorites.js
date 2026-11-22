@@ -86,10 +86,13 @@ function saveDensity(next) {
   renderActiveTab();
 }
 
-// Match search/app/src/util.rs::encode_path: preserve `/` separators while
-// percent-encoding each path segment.
+// Match lets-embed-web/app/src/util.rs::encode_path (Rust urlencoding::encode):
+// preserve `/` separators while percent-encoding each path segment including !'()*.
 function encodePath(path) {
-  return String(path || "").split("/").map(encodeURIComponent).join("/");
+  return String(path || "")
+    .split("/")
+    .map(seg => encodeURIComponent(seg).replace(/[!'()*]/g, c => "%" + c.charCodeAt(0).toString(16).toUpperCase()))
+    .join("/");
 }
 
 function imageUrl(name) {

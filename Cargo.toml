@@ -6,9 +6,9 @@ members = [
     "dinov3",
     "embed",
     "search_engine",
-    "search/app",
-    "search/frontend",
-    "search/server",
+    "lets-embed-web/app",
+    "lets-embed-web/frontend",
+    "lets-embed-web/server",
     "search_types",
     "gateway",
     "gateway_worker",
@@ -63,14 +63,14 @@ codegen-units = 1
 panic = "abort"
 
 [[workspace.metadata.leptos]]
-name = "search"
+name = "lets-embed-web"
 site-addr = "0.0.0.0:3000"
 
 hash-files = true
 
-tailwind-input-file = "search/style/tailwind.css"
+tailwind-input-file = "lets-embed-web/style/tailwind.css"
 
-bin-package = "server"
+bin-package = "lets-embed-web"
 lib-package = "frontend"
 bin-features = []
 lib-features = []

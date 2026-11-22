@@ -2,7 +2,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "lets-embed", version, about = "Image search server")]
+#[command(name = "lets-embed-web", version, about = "Let's Embed web server")]
 pub struct Cli {
     #[arg(long, default_value = "0.0.0.0")]
     pub host: String,

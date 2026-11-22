@@ -1,6 +1,10 @@
-name = "gateway-worker"
+name = "lets-embed-gateway-worker"
 main = "build/index.js"
 compatibility_date = "2026-06-01"
+# Public *.workers.dev and preview URLs stay disabled; bind your gallery hostname
+# via a Custom Domain or Zone Route in Cloudflare Dashboard (or `routes = [...]`).
+workers_dev = false
+preview_urls = false
 
 [build]
 command = "cargo install -q \"worker-build@^0.9\" && worker-build --profile wasm-release"
@@ -11,24 +15,28 @@ invocation_logs = true
 
 # Worker secrets; deploy fails until each is set with `wrangler secret put <NAME>`:
 #   CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET — Access service token for the upstreams
-#   JWT_SECRET — must equal user-worker's JWT_SECRET. Generate it once with
+#   JWT_SECRET — must equal lets-embed-user-worker's JWT_SECRET. Generate it once with
 #     `openssl rand -base64 48` and put the same value into both workers.
 [secrets]
 required = ["CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "JWT_SECRET"]
 
 [[services]]
 binding = "USER_WORKER"
-service = "user-worker"
+service = "lets-embed-user-worker"
 
 # Only the gateway's verified admin path selects this binding.
 [[services]]
 binding = "ADMIN_WORKER"
-service = "user-worker"
+service = "lets-embed-user-worker"
 props = { gallery_admin = true }
 
 [vars]
 # Audience of the Access application protecting /user/admin and its descendants.
 CF_ACCESS_AUD = "5700459f509f888154922a3f93bbf18d7dbd6b4be7fa472716693eb2fefb6ba5"
+# Upstream origins proxied by the gateway (trailing slashes are trimmed at runtime).
+API_UPSTREAM = "https://lets-embed-api.louisfly.icu"
+IMAGE_UPSTREAM = "https://lets-embed-image.louisfly.icu"
+VIDEO_UPSTREAM = "https://lets-embed-video.louisfly.icu"
 
 [durable_objects]
-bindings = [{ name = "USER_ACCOUNT", class_name = "UserAccount", script_name = "user-worker" }]
+bindings = [{ name = "USER_ACCOUNT", class_name = "UserAccount", script_name = "lets-embed-user-worker" }]

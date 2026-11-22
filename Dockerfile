@@ -72,7 +72,7 @@ ENV SQLX_OFFLINE=true
 FROM builder-base AS embed-builder
 RUN cargo build -p embed --release
 
-FROM builder-base AS search-builder
+FROM builder-base AS lets-embed-web-builder
 RUN rustup target add wasm32-unknown-unknown && \
     curl -fL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash && \
     cargo binstall --locked --no-confirm cargo-leptos
@@ -196,17 +196,17 @@ ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
 ENTRYPOINT ["embed"]
 
 ############################################################
-# search runtimes
+# lets-embed-web runtimes
 ############################################################
-FROM debian:bookworm-slim AS search-cpu
+FROM debian:bookworm-slim AS lets-embed-web-cpu
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=ort-cpu /opt/onnxruntime /opt/onnxruntime
-COPY --from=search-builder /app/target/release/server /usr/local/bin/server
-COPY --from=search-builder /app/target/release/gateway /usr/local/bin/gateway
-COPY --from=search-builder /app/target/site /site
-COPY --from=search-builder /app/target/release/hash.txt /hash.txt
+COPY --from=lets-embed-web-builder /app/target/release/lets-embed-web /usr/local/bin/lets-embed-web
+COPY --from=lets-embed-web-builder /app/target/release/gateway /usr/local/bin/gateway
+COPY --from=lets-embed-web-builder /app/target/site /site
+COPY --from=lets-embed-web-builder /app/target/release/hash.txt /hash.txt
 COPY <<'EOF' /usr/local/bin/start.sh
 #!/usr/bin/env bash
 set -uo pipefail
@@ -228,7 +228,7 @@ trap 'on_signal 130' INT
 if (( sig_code )); then
     exit "$sig_code"
 fi
-server "$@" &
+lets-embed-web "$@" &
 gateway &
 if (( sig_code )); then
     cleanup
@@ -250,22 +250,24 @@ WORKDIR /app
 RUN useradd -r -u 10001 appuser
 USER appuser
 ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so \
+    LEPTOS_ENV=PROD \
+    LEPTOS_OUTPUT_NAME=lets-embed-web \
     LEPTOS_SITE_ROOT=/site \
     LEPTOS_HASH_FILES=true \
     LEPTOS_HASH_FILE_NAME=/hash.txt
 ENTRYPOINT ["start.sh"]
 
-FROM nvcr.io/nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04 AS search-cuda12
+FROM nvcr.io/nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04 AS lets-embed-web-cuda12
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates cuda-compat-12-9 && \
     rm -f /etc/ld.so.conf.d/*cuda*compat*.conf && \
     ldconfig && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=ort-cuda12 /opt/onnxruntime /opt/onnxruntime
-COPY --from=search-builder /app/target/release/server /usr/local/bin/server
-COPY --from=search-builder /app/target/release/gateway /usr/local/bin/gateway
-COPY --from=search-builder /app/target/site /site
-COPY --from=search-builder /app/target/release/hash.txt /hash.txt
+COPY --from=lets-embed-web-builder /app/target/release/lets-embed-web /usr/local/bin/lets-embed-web
+COPY --from=lets-embed-web-builder /app/target/release/gateway /usr/local/bin/gateway
+COPY --from=lets-embed-web-builder /app/target/site /site
+COPY --from=lets-embed-web-builder /app/target/release/hash.txt /hash.txt
 COPY <<'EOF' /usr/local/bin/start.sh
 #!/usr/bin/env bash
 set -uo pipefail
@@ -322,7 +324,7 @@ fi
 if (( sig_code )); then
     exit "$sig_code"
 fi
-server "$@" &
+lets-embed-web "$@" &
 gateway &
 if (( sig_code )); then
     cleanup
@@ -344,20 +346,22 @@ WORKDIR /app
 RUN useradd -r -u 10001 appuser
 USER appuser
 ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so \
+    LEPTOS_ENV=PROD \
+    LEPTOS_OUTPUT_NAME=lets-embed-web \
     LEPTOS_SITE_ROOT=/site \
     LEPTOS_HASH_FILES=true \
     LEPTOS_HASH_FILE_NAME=/hash.txt
 ENTRYPOINT ["start.sh"]
 
-FROM nvcr.io/nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04 AS search-cuda13
+FROM nvcr.io/nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04 AS lets-embed-web-cuda13
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=ort-cuda13 /opt/onnxruntime /opt/onnxruntime
-COPY --from=search-builder /app/target/release/server /usr/local/bin/server
-COPY --from=search-builder /app/target/release/gateway /usr/local/bin/gateway
-COPY --from=search-builder /app/target/site /site
-COPY --from=search-builder /app/target/release/hash.txt /hash.txt
+COPY --from=lets-embed-web-builder /app/target/release/lets-embed-web /usr/local/bin/lets-embed-web
+COPY --from=lets-embed-web-builder /app/target/release/gateway /usr/local/bin/gateway
+COPY --from=lets-embed-web-builder /app/target/site /site
+COPY --from=lets-embed-web-builder /app/target/release/hash.txt /hash.txt
 COPY <<'EOF' /usr/local/bin/start.sh
 #!/usr/bin/env bash
 set -uo pipefail
@@ -379,7 +383,7 @@ trap 'on_signal 130' INT
 if (( sig_code )); then
     exit "$sig_code"
 fi
-server "$@" &
+lets-embed-web "$@" &
 gateway &
 if (( sig_code )); then
     cleanup
@@ -401,6 +405,8 @@ WORKDIR /app
 RUN useradd -r -u 10001 appuser
 USER appuser
 ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so \
+    LEPTOS_ENV=PROD \
+    LEPTOS_OUTPUT_NAME=lets-embed-web \
     LEPTOS_SITE_ROOT=/site \
     LEPTOS_HASH_FILES=true \
     LEPTOS_HASH_FILE_NAME=/hash.txt
