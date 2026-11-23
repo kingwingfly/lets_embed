@@ -387,6 +387,18 @@ pub struct AcceptTermsOkResp {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+pub struct AgeConfirmResp {
+    pub ok: bool,
+    pub assurance_level: AssuranceLevel,
+    pub strict_age_ok: bool,
+    pub age_verified: bool,
+    #[serde(default)]
+    pub effective_switchers: Vec<PolicyRef>,
+    #[serde(default)]
+    pub switcher_statuses: Vec<SwitcherEligibility>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct PreferencesResp {
     #[serde(default)]
     pub enabled_switchers: Vec<PolicyRef>,
@@ -488,6 +500,46 @@ pub fn current_hash() -> String {
     web_sys::window()
         .and_then(|w| w.location().hash().ok())
         .unwrap_or_default()
+}
+
+pub fn scroll_to_element(id: &str) {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+    {
+        el.scroll_into_view();
+    }
+}
+
+pub fn clear_hash_if_matches(expected_hash: &str) {
+    let Some(win) = web_sys::window() else {
+        return;
+    };
+    let current = win.location().hash().unwrap_or_default();
+    if !current.eq_ignore_ascii_case(expected_hash) {
+        return;
+    }
+    let path = win.location().pathname().unwrap_or_default();
+    let search = win.location().search().unwrap_or_default();
+    let clean_url = format!("{path}{search}");
+    if let Ok(hist) = win.history() {
+        let _ = hist.replace_state_with_url(&JsValue::NULL, "", Some(&clean_url));
+    }
+}
+
+pub fn use_hash_change_listener(on_hash: impl Fn(String) + Clone + 'static) {
+    if let Some(win) = web_sys::window() {
+        let cb = Closure::<dyn Fn(web_sys::Event)>::new(move |_ev: web_sys::Event| {
+            on_hash(current_hash());
+        });
+        let _ = win.add_event_listener_with_callback("hashchange", cb.as_ref().unchecked_ref());
+        let win_clean = win.clone();
+        let _ = StoredValue::new_local(LocalCleanup(Some(Box::new(move || {
+            let _ = win_clean
+                .remove_event_listener_with_callback("hashchange", cb.as_ref().unchecked_ref());
+            drop(cb);
+        }))));
+    }
 }
 
 pub fn current_origin() -> String {

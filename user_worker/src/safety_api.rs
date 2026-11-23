@@ -19,7 +19,8 @@ use tower_cookies::Cookies;
 use crate::{
     AppState, auth, challenge_do, config,
     do_client::{
-        self, DoPrefsUpdateOutcome, PrefsUpdateReq, SessionRevokeAllReq, TermsAcceptReq,
+        self, AgeConfirmReq, DoPrefsUpdateOutcome, PrefsUpdateReq, SessionRevokeAllReq,
+        TermsAcceptReq,
     },
     identity::{self, StoredContentPrefs, VerifiedExternalIdentity},
     policy_do,
@@ -69,6 +70,27 @@ pub fn evaluate_terms_acceptance(
     let self_attested = req_self_attestation == Some(true)
         && policy.age_policy == AgeVerificationPolicy::SelfAttestation;
     TermsAcceptDecision::Accepted { self_attested }
+}
+
+/// Pure policy check for standalone `POST /user/api/age-confirm`.
+///
+/// Works independently of Terms acceptance so signed-in users can confirm 18+
+/// before or after accepting current Terms whenever `AgeVerificationPolicy::SelfAttestation`
+/// is active. Fails closed under `StrictProviderVerified18` (403) and `Off` (400).
+pub fn evaluate_age_confirm_policy(
+    policy: &PublicSitePolicy,
+) -> Result<(), (StatusCode, &'static str)> {
+    match policy.age_policy {
+        AgeVerificationPolicy::SelfAttestation => Ok(()),
+        AgeVerificationPolicy::StrictProviderVerified18 => Err((
+            StatusCode::FORBIDDEN,
+            "Self-attestation is disabled under Strict Provider-Verified 18+ mode. Sign in with a verified 18+ OIDC provider instead.",
+        )),
+        AgeVerificationPolicy::Off => Err((
+            StatusCode::BAD_REQUEST,
+            "18+ age verification is currently disabled by site policy.",
+        )),
+    }
 }
 
 /// Pure validation for `POST /user/api/reports`.
@@ -733,6 +755,85 @@ pub async fn accept_terms(
         strict_age_ok: updated.strict_age_ok,
     })
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// POST /user/api/age-confirm (Standalone 18+ self-attestation — independent of Terms!)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct AgeConfirmResp {
+    pub ok: bool,
+    pub assurance_level: AssuranceLevel,
+    pub strict_age_ok: bool,
+    pub age_verified: bool,
+    pub effective_switchers: Vec<PolicyRef>,
+    pub switcher_statuses: Vec<SwitcherEligibility>,
+}
+
+#[worker::send]
+pub async fn confirm_age(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    cookies: Cookies,
+) -> Response {
+    if let Err(r) = auth::require_same_origin(&st, &headers) {
+        return r;
+    }
+    let active = match identity::require_active_session(&st, &cookies).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let policy = match policy_do::load_site_policy(&st.env).await {
+        Ok(e) => e.policy,
+        Err(e) => {
+            worker::console_error!("age_confirm: policy load failed: {e:?}");
+            return auth::api_error(StatusCode::SERVICE_UNAVAILABLE, "site policy unavailable");
+        }
+    };
+    if let Err((status, msg)) = evaluate_age_confirm_policy(&policy) {
+        return auth::api_error(status, msg);
+    }
+
+    if let Err(e) = do_client::do_age_confirm(
+        &st.env,
+        &active.do_key,
+        &AgeConfirmReq {
+            sid: active.sid.clone(),
+        },
+    )
+    .await
+    {
+        worker::console_error!("age_confirm DO update failed: {e:?}");
+        return auth::internal_error();
+    }
+
+    let updated = do_client::do_session_context(&st.env, &active.do_key, active.sid.as_deref())
+        .await
+        .unwrap_or(SessionContext {
+            assurance_level: match active.ctx.assurance_level {
+                AssuranceLevel::None => AssuranceLevel::SelfAttestation,
+                other => other,
+            },
+            ..active.ctx
+        });
+    let country = extract_cf_country(&headers);
+    let (effective_switchers, switcher_statuses) =
+        evaluate_switcher_eligibilities(&policy, &updated, country.as_deref());
+    let age_verified = updated.satisfies_age_18(policy.age_policy);
+
+    (
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(AgeConfirmResp {
+            ok: true,
+            assurance_level: updated.assurance_level,
+            strict_age_ok: updated.strict_age_ok,
+            age_verified,
+            effective_switchers,
+            switcher_statuses,
+        }),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1460,5 +1561,81 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.expected_pref_version, Some(7));
         assert_eq!(parsed.enabled_switchers.len(), 1);
+    }
+
+    #[test]
+    fn age_confirm_policy_allows_self_attestation_and_decouples_from_terms() {
+        use site_access::{ContentPolicy, PlaceholderPreset, PolicyAction, PolicyBypass};
+
+        let mut policy = PublicSitePolicy {
+            revision: 1,
+            min_enforce_rev: 1,
+            safety_enabled: true,
+            age_policy: AgeVerificationPolicy::SelfAttestation,
+            policies: vec![ContentPolicy {
+                id: "r18".into(),
+                grant_generation: 1,
+                enabled: true,
+                priority: 10,
+                name: "NSFW / Explicit".into(),
+                preset: PlaceholderPreset::R18,
+                match_expr: "tag:explicit".into(),
+                except_expr: None,
+                default_tag_min: 0.45,
+                action: PolicyAction::Block,
+                bypass: PolicyBypass {
+                    include_switcher: true,
+                    require_gallery_login: true,
+                    require_age_18: true,
+                    require_current_terms: true,
+                    exclude_anonymous: true,
+                    ..Default::default()
+                },
+            }],
+            ..PublicSitePolicy::fresh_bootstrap()
+        };
+        policy.legal.terms_version = 2;
+        policy.refresh_policy_digest();
+
+        // SelfAttestation allows standalone POST /user/api/age-confirm
+        assert!(evaluate_age_confirm_policy(&policy).is_ok());
+
+        // User confirms 18+ BEFORE accepting Terms: age requirement is now satisfied,
+        // while Terms v2 remains clearly reported until accepted!
+        let ctx_age_only = SessionContext {
+            active: true,
+            banned: false,
+            suspended: false,
+            sid_valid: true,
+            assurance_level: AssuranceLevel::SelfAttestation,
+            strict_age_ok: false,
+            terms_version_accepted: None,
+            terms_digest_accepted: None,
+            enabled_switchers: vec![PolicyRef::new("r18", 1)],
+            pref_version: 2,
+        };
+        assert!(ctx_age_only.satisfies_age_18(policy.age_policy));
+        assert!(!ctx_age_only.satisfies_terms(&policy.legal));
+        let (eff_before_terms, st_before_terms) =
+            evaluate_switcher_eligibilities(&policy, &ctx_age_only, Some("US"));
+        assert!(eff_before_terms.is_empty());
+        assert!(!st_before_terms[0]
+            .missing_requirements
+            .iter()
+            .any(|m| m.contains("18+")));
+        assert!(st_before_terms[0]
+            .missing_requirements
+            .iter()
+            .any(|m| m.contains("Terms v2")));
+
+        // StrictProviderVerified18 rejects self-attestation with 403 Forbidden
+        policy.age_policy = AgeVerificationPolicy::StrictProviderVerified18;
+        let strict_err = evaluate_age_confirm_policy(&policy).unwrap_err();
+        assert_eq!(strict_err.0, StatusCode::FORBIDDEN);
+
+        // Off rejects self-attestation with 400 Bad Request
+        policy.age_policy = AgeVerificationPolicy::Off;
+        let off_err = evaluate_age_confirm_policy(&policy).unwrap_err();
+        assert_eq!(off_err.0, StatusCode::BAD_REQUEST);
     }
 }

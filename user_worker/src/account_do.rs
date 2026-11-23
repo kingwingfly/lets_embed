@@ -14,7 +14,7 @@ use crate::types::{
 use crate::{
     config,
     do_client::{
-        DoPrefsConflictResp, PrefsUpdateReq, PreviewBudgetReq, PreviewBudgetResp,
+        AgeConfirmReq, DoPrefsConflictResp, PrefsUpdateReq, PreviewBudgetReq, PreviewBudgetResp,
         SessionContextReq, SessionInfoResp, SessionIssueReq, SessionIssueResp,
         SessionRevokeAllReq, SessionRevokeAllResp, SessionRevokeReq, TermsAcceptReq,
     },
@@ -525,6 +525,9 @@ impl DurableObject for UserAccount {
             }
             (Method::Post, "/terms-accept") => {
                 return self.terms_accept(req.json().await?);
+            }
+            (Method::Post, "/age-confirm") => {
+                return self.age_confirm(req.json().await?);
             }
             (Method::Post, "/preview-budget") => {
                 return self.preview_budget(req.json().await?).await;
@@ -1880,6 +1883,28 @@ impl UserAccount {
         Response::ok("")
     }
 
+    /// Record standalone 18+ self-attestation without modifying Terms acceptance state.
+    fn age_confirm(&self, req: AgeConfirmReq) -> Result<Response> {
+        let now = now_secs() as i64;
+        let db = self.ensure_session_tables(now)?;
+        let _ = self.read_safety_state(&db)?;
+        db.exec(
+            "INSERT INTO user_safety_state (id, self_attested_18) \
+             VALUES (1, 1) \
+             ON CONFLICT(id) DO UPDATE SET self_attested_18 = 1",
+            None,
+        )?;
+        if let Some(sid) = req.sid.as_deref() {
+            // Self-attestation upgrades `none` -> `self_attestation` ONLY (NEVER `verified_18`!).
+            db.exec(
+                "UPDATE sessions SET assurance_level = 'self_attestation' \
+                 WHERE sid = ?1 AND assurance_level = 'none'",
+                vec![sid.into()],
+            )?;
+        }
+        Response::ok("")
+    }
+
     /// Separate preview transform rate budget — NEVER touches clear-view `balance`,
     /// `seen:{day}`, `free_usage`, `charge_holds`, `win_views`, or `total_views` (M1)!
     async fn preview_budget(&self, req: PreviewBudgetReq) -> Result<Response> {
@@ -2847,5 +2872,36 @@ mod tests {
             parsed,
             vec![PolicyRef::new("r18", 2), PolicyRef::new("blood", 1)]
         );
+    }
+
+    #[test]
+    fn standalone_age_confirm_sets_self_attestation_without_requiring_terms() {
+        let safety = StoredSafetyState {
+            enabled_switchers: Vec::new(),
+            pref_version: 1,
+            terms_version: None,
+            terms_digest: None,
+            self_attested_18: true,
+            revoked_all_before: 0,
+        };
+        let plain_session = StoredSessionSnapshot {
+            assurance_level: AssuranceLevel::None,
+            strict_age_ok: false,
+            expires_at: NOW + 3600,
+            revoked_at: None,
+        };
+        let ctx = compute_session_context(
+            false,
+            false,
+            Some("sid-age"),
+            Some(&plain_session),
+            &safety,
+            NOW,
+        );
+        assert!(ctx.sid_valid);
+        assert_eq!(ctx.assurance_level, AssuranceLevel::SelfAttestation);
+        assert!(!ctx.strict_age_ok);
+        assert_eq!(ctx.terms_version_accepted, None);
+        assert_eq!(ctx.terms_digest_accepted, None);
     }
 }
