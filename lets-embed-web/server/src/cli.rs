@@ -7,6 +7,7 @@ use app::{
     util::normalize_public_origin,
 };
 use clap::Parser;
+use site_access::{KeyDomain, resolve_domain_secret, validate_master_secret};
 use url::{Host, Url};
 
 #[derive(Parser, Debug, Clone, Default)]
@@ -42,13 +43,23 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub allow_insecure_local_policy: bool,
 
-    /// Managed Mode HMAC secret for verifying `X-Gateway-Assertion` (`GATEWAY_ASSERTION_SECRET`).
+    /// Master site secret (`SITE_SECRET`, >= 32 bytes) used to derive domain-isolated
+    /// `GatewayAssertion`, `MediaCap`, and `InternalApi` secrets via HKDF-SHA256.
+    /// Individual secret flags/env vars override the derived value for independent rotation.
+    #[arg(long)]
+    pub site_secret: Option<String>,
+
+    /// Optional override for verifying `X-Gateway-Assertion` (`GATEWAY_ASSERTION_SECRET`).
     #[arg(long)]
     pub gateway_assertion_secret: Option<String>,
 
-    /// Managed Mode HMAC secret for minting `/media/*` capabilities (`MEDIA_CAP_SECRET`).
+    /// Optional override for minting `/media/*` capabilities (`MEDIA_CAP_SECRET`).
     #[arg(long)]
     pub media_cap_secret: Option<String>,
+
+    /// Optional override for authenticating `/internal/*` endpoints (`INTERNAL_API_SECRET`).
+    #[arg(long)]
+    pub internal_api_secret: Option<String>,
 
     /// Optional Cloudflare Access service token client ID for `POLICY_URL` (`CF_ACCESS_CLIENT_ID`).
     #[arg(long)]
@@ -105,6 +116,9 @@ pub struct RuntimeConfig {
     pub gateway_assertion_secret: Option<Vec<u8>>,
     /// Managed Mode HMAC secret for minting `/media/*` capabilities.
     pub media_cap_secret: Option<Vec<u8>>,
+    /// Managed Mode secret for authenticating `/internal/*` requests (`INTERNAL_API_SECRET`
+    /// or HKDF-derived from `SITE_SECRET`).
+    pub internal_api_secret: Option<Vec<u8>>,
 }
 
 fn non_empty(v: Option<String>) -> Option<String> {
@@ -198,31 +212,61 @@ pub fn resolve_runtime_config(
             managed_policy_sync: None,
             gateway_assertion_secret: None,
             media_cap_secret: None,
+            internal_api_secret: None,
         }),
         DeploymentMode::Managed => {
             let Some(pinned_public_url) = public_url else {
                 bail!("PUBLIC_URL (--public-url or PUBLIC_URL env) is required in managed mode");
             };
             let raw_policy_url = cli_or_env(&cli.policy_url, "POLICY_URL", &env_get)
-                .ok_or_else(|| anyhow::anyhow!("POLICY_URL (--policy-url or POLICY_URL env) is required in managed mode"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "POLICY_URL (--policy-url or POLICY_URL env) is required in managed mode"
+                    )
+                })?;
             let policy_url = validate_policy_url(&raw_policy_url, cli.allow_insecure_local_policy)?;
 
-            let assertion_secret = cli_or_env(
+            let site_secret = cli_or_env(&cli.site_secret, "SITE_SECRET", &env_get);
+            if let Some(ref master) = site_secret {
+                validate_master_secret(master)
+                    .map_err(|msg| anyhow::anyhow!("invalid SITE_SECRET: {msg}"))?;
+            }
+
+            let explicit_assertion = cli_or_env(
                 &cli.gateway_assertion_secret,
                 "GATEWAY_ASSERTION_SECRET",
                 &env_get,
+            );
+            let explicit_media_cap =
+                cli_or_env(&cli.media_cap_secret, "MEDIA_CAP_SECRET", &env_get);
+            let explicit_internal =
+                cli_or_env(&cli.internal_api_secret, "INTERNAL_API_SECRET", &env_get);
+
+            let assertion_secret = resolve_domain_secret(
+                explicit_assertion.as_deref(),
+                site_secret.as_deref(),
+                KeyDomain::GatewayAssertion,
             )
-            .ok_or_else(|| {
+            .map_err(|_| {
                 anyhow::anyhow!(
-                    "GATEWAY_ASSERTION_SECRET (--gateway-assertion-secret or env) is required in managed mode"
+                    "GATEWAY_ASSERTION_SECRET or SITE_SECRET is required in managed mode"
                 )
             })?;
-            let media_cap_secret =
-                cli_or_env(&cli.media_cap_secret, "MEDIA_CAP_SECRET", &env_get).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "MEDIA_CAP_SECRET (--media-cap-secret or env) is required in managed mode"
-                    )
-                })?;
+            let media_cap_secret = resolve_domain_secret(
+                explicit_media_cap.as_deref(),
+                site_secret.as_deref(),
+                KeyDomain::MediaCap,
+            )
+            .map_err(|_| {
+                anyhow::anyhow!("MEDIA_CAP_SECRET or SITE_SECRET is required in managed mode")
+            })?;
+            let internal_api_secret = resolve_domain_secret(
+                explicit_internal.as_deref(),
+                site_secret.as_deref(),
+                KeyDomain::InternalApi,
+            )
+            .ok()
+            .map(String::into_bytes);
 
             let cf_access_client_id =
                 cli_or_env(&cli.cf_access_client_id, "CF_ACCESS_CLIENT_ID", &env_get);
@@ -248,6 +292,7 @@ pub fn resolve_runtime_config(
                 }),
                 gateway_assertion_secret: Some(assertion_secret.into_bytes()),
                 media_cap_secret: Some(media_cap_secret.into_bytes()),
+                internal_api_secret,
             })
         }
     }
@@ -394,6 +439,85 @@ mod tests {
         assert_eq!(
             prod_cfg.managed_policy_sync.as_ref().unwrap().policy_url,
             "https://policy.example.com/policy"
+        );
+    }
+
+    #[test]
+    fn managed_mode_derives_domain_secrets_from_site_secret_with_override_precedence() {
+        let master = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        let cli = Cli {
+            mode: Some("managed".into()),
+            ..Cli::default()
+        };
+
+        // Short SITE_SECRET rejected fast.
+        assert!(
+            resolve_runtime_config(
+                &cli,
+                env_map(&[
+                    ("PUBLIC_URL", "https://gallery.example.com"),
+                    ("POLICY_URL", "https://policy.example.com/policy"),
+                    ("SITE_SECRET", "too-short"),
+                ])
+            )
+            .is_err()
+        );
+
+        // Single SITE_SECRET derives distinct GatewayAssertion, MediaCap, and InternalApi secrets.
+        let derived = resolve_runtime_config(
+            &cli,
+            env_map(&[
+                ("PUBLIC_URL", "https://gallery.example.com"),
+                ("POLICY_URL", "https://policy.example.com/policy"),
+                ("SITE_SECRET", master),
+            ]),
+        )
+        .expect("managed config from SITE_SECRET");
+
+        let ga = derived.gateway_assertion_secret.as_ref().unwrap();
+        let mc = derived.media_cap_secret.as_ref().unwrap();
+        let ia = derived.internal_api_secret.as_ref().unwrap();
+        assert_eq!(
+            ga.as_slice(),
+            site_access::derive_domain_secret(master, KeyDomain::GatewayAssertion).as_bytes()
+        );
+        assert_eq!(
+            mc.as_slice(),
+            site_access::derive_domain_secret(master, KeyDomain::MediaCap).as_bytes()
+        );
+        assert_eq!(
+            ia.as_slice(),
+            site_access::derive_domain_secret(master, KeyDomain::InternalApi).as_bytes()
+        );
+        assert_ne!(ga, mc);
+        assert_ne!(ga, ia);
+        assert_ne!(mc, ia);
+
+        // Explicit overrides take precedence over SITE_SECRET while other domains still derive.
+        let overridden = resolve_runtime_config(
+            &cli,
+            env_map(&[
+                ("PUBLIC_URL", "https://gallery.example.com"),
+                ("POLICY_URL", "https://policy.example.com/policy"),
+                ("SITE_SECRET", master),
+                ("MEDIA_CAP_SECRET", "explicit-media-override"),
+                ("INTERNAL_API_SECRET", "explicit-internal-override"),
+            ]),
+        )
+        .expect("managed config with overrides");
+        assert_eq!(
+            overridden.gateway_assertion_secret.as_deref(),
+            Some(
+                site_access::derive_domain_secret(master, KeyDomain::GatewayAssertion).as_bytes()
+            )
+        );
+        assert_eq!(
+            overridden.media_cap_secret.as_deref(),
+            Some(b"explicit-media-override".as_slice())
+        );
+        assert_eq!(
+            overridden.internal_api_secret.as_deref(),
+            Some(b"explicit-internal-override".as_slice())
         );
     }
 }

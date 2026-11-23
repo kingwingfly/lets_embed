@@ -1,10 +1,10 @@
 use leptos::prelude::{RwSignal, Set};
 use lets_embed_ui::{
-    Density, GalleryBlurMode, GalleryCard, GalleryCardKind, GalleryMask, GalleryMaskPreset,
-    GalleryMedia, GalleryMediaKind, ReportTargetKind, ViewerItem,
+    Density, GalleryCard, GalleryCardKind, GalleryMask, GalleryMaskPreset, GalleryMedia,
+    GalleryMediaKind, ReportTargetKind, ViewerItem,
 };
 use search_types::{
-    Author, BlurDeliveryMode, MaskMetadata, Post, ProjectedImage, ProjectedVideo, Tag,
+    Author, MaskMetadata, PlaceholderPreset, Post, ProjectedImage, ProjectedVideo, Tag,
 };
 use serde::{Deserialize, Serialize};
 
@@ -87,12 +87,11 @@ pub fn save_gallery_density(density: GalleryDensity) {
     lets_embed_ui::browser::save_density(density);
 }
 
-/// Public UI configuration hydrated from the pinned server policy snapshot.
+/// Public UI configuration hydrated from the pinned Policy v3 server snapshot.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SiteUiConfig {
     pub is_managed: bool,
     pub safety_enabled: bool,
-    pub safe_mode: bool,
     pub default_dinov3_min: f32,
     pub default_siglip2_min: f32,
     pub notice_banner_enabled: bool,
@@ -100,7 +99,6 @@ pub struct SiteUiConfig {
     pub notice_banner_key: String,
     pub rta_meta_enabled: bool,
     pub noindex_restricted: bool,
-    pub panic_shortcut: String,
 }
 
 /// Pending report dialog target `(kind, id, label)`.
@@ -111,14 +109,15 @@ pub struct ReportTarget {
     pub label: String,
 }
 
-/// Shared client-side safety, Safe Mode panic epoch, similarity defaults, and
+/// Shared client-side Policy v3 safety invalidation epochs, similarity defaults, and
 /// report dialog trigger provided at the `<App/>` root.
 #[derive(Clone, Copy)]
 pub struct SafetyUiState {
-    pub safe_mode: RwSignal<bool>,
-    pub panic_epoch: RwSignal<u64>,
-    /// Bumped whenever `safe_mode` toggles (either ON or OFF) so active galleries
-    /// discard stale in-flight fetches and reload from server projection.
+    /// Bumped on logout / account switch / opt-out / policy change via `BroadcastChannel`
+    /// so revealed blurred cards, viewers, and lightboxes wipe DOM media immediately.
+    pub invalidation_epoch: RwSignal<u64>,
+    /// Bumped whenever cross-tab safety/session state changes so active galleries
+    /// discard stale in-flight fetches and reload fresh server projections.
     pub reload_epoch: RwSignal<u64>,
     pub is_managed: RwSignal<bool>,
     pub safety_enabled: RwSignal<bool>,
@@ -133,8 +132,7 @@ pub struct SafetyUiState {
 impl SafetyUiState {
     pub fn new() -> Self {
         Self {
-            safe_mode: RwSignal::new(false),
-            panic_epoch: RwSignal::new(0),
+            invalidation_epoch: RwSignal::new(0),
             reload_epoch: RwSignal::new(0),
             is_managed: RwSignal::new(false),
             safety_enabled: RwSignal::new(false),
@@ -150,7 +148,6 @@ impl SafetyUiState {
     pub fn apply_site_config(&self, cfg: &SiteUiConfig) {
         self.is_managed.set(cfg.is_managed);
         self.safety_enabled.set(cfg.safety_enabled);
-        self.safe_mode.set(cfg.safe_mode);
         self.default_dinov3_min
             .set(if cfg.default_dinov3_min.is_finite() {
                 cfg.default_dinov3_min.clamp(0.0, 1.0)
@@ -256,8 +253,8 @@ pub struct PostItem {
 
 /// Projected image details response returned by `/api/fetch_image_details`.
 ///
-/// When `image` is `ProjectedImage::Locked`, `image` contains ZERO `name`/`url`/`cap`,
-/// `tags` is withheld (empty), and `og_image_allowed` is `false`.
+/// Whenever `image` is NOT `ProjectedImage::Clear` (`Placeholder` or `Blurred`),
+/// `tags` is withheld (empty) and `og_image_allowed` is `false`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProjectedImageDetails {
     pub image: ProjectedImage,
@@ -282,26 +279,28 @@ pub struct SearchResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Conversion helpers between `search_types::Projected*` and `lets-embed-ui`
+// Conversion helpers between Policy v3 `search_types::Projected*` and `lets-embed-ui`
 // ---------------------------------------------------------------------------
+
+pub const fn preset_to_ui(preset: PlaceholderPreset) -> GalleryMaskPreset {
+    match preset {
+        PlaceholderPreset::R18 => GalleryMaskPreset::R18,
+        PlaceholderPreset::Blood => GalleryMaskPreset::Blood,
+        PlaceholderPreset::Sensitive => GalleryMaskPreset::Sensitive,
+        PlaceholderPreset::Custom => GalleryMaskPreset::Custom,
+    }
+}
 
 pub fn mask_to_ui(mask: &MaskMetadata) -> GalleryMask {
     GalleryMask {
-        rule_id: mask.rule_id.clone(),
+        rule_id: mask.policy_id.clone(),
         label: mask.label.clone(),
-        preset: GalleryMaskPreset::parse(&mask.preset),
+        preset: preset_to_ui(mask.preset),
         reason: None,
         requires_login: mask.requires_login,
         requires_age: mask.requires_age,
         requires_terms: mask.requires_terms,
         cta_label: None,
-    }
-}
-
-pub fn blur_mode_to_ui(mode: BlurDeliveryMode) -> GalleryBlurMode {
-    match mode {
-        BlurDeliveryMode::ServerTransform => GalleryBlurMode::ServerTransform,
-        BlurDeliveryMode::CssCourtesy => GalleryBlurMode::CssCourtesy,
     }
 }
 
@@ -333,39 +332,42 @@ pub fn projected_image_to_ui(img: &ProjectedImage, fallback_alt: impl Into<Strin
                 }),
             duration_secs: None,
         },
-        ProjectedImage::Spoiler {
+        // Policy v3 NEVER pre-mints a clear `reveal_url`; `Blurred` cards render through
+        // `BlurredMediaCard` (explicit `POST /api/safety/reveal`) and map safely to `Locked`
+        // in generic UI containers.
+        ProjectedImage::Blurred {
             id,
-            preview_url,
-            reveal_url,
             width,
             height,
-            rule_id,
+            matched_policy_ids,
             label,
             preset,
-            blur_mode,
-        } => GalleryMedia::Spoiler {
+            ..
+        } => GalleryMedia::Locked {
             id: *id,
             kind: GalleryMediaKind::Image,
             width: *width,
             height: *height,
-            preview_url: preview_url.clone(),
-            reveal_url: reveal_url.clone(),
-            alt: if fallback_alt.is_empty() {
-                format!("Image #{id}")
-            } else {
-                fallback_alt
+            mask: GalleryMask {
+                rule_id: matched_policy_ids
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "blur".to_string()),
+                label: label.clone(),
+                preset: preset_to_ui(*preset),
+                reason: Some("Blurred by safety policy.".to_string()),
+                requires_login: false,
+                requires_age: false,
+                requires_terms: false,
+                cta_label: None,
             },
-            duration_secs: None,
-            rule_id: rule_id.clone(),
-            label: label.clone(),
-            preset: GalleryMaskPreset::parse(preset),
-            blur_mode: blur_mode_to_ui(*blur_mode),
         },
-        ProjectedImage::Locked {
+        ProjectedImage::Placeholder {
             id,
             width,
             height,
             mask,
+            ..
         } => GalleryMedia::Locked {
             id: *id,
             kind: GalleryMediaKind::Image,
@@ -405,7 +407,34 @@ pub fn projected_video_to_ui(vid: &ProjectedVideo, fallback_alt: impl Into<Strin
                 }),
             duration_secs: (*duration > 0).then_some(*duration),
         },
-        ProjectedVideo::Locked {
+        ProjectedVideo::Blurred {
+            id,
+            width,
+            height,
+            matched_policy_ids,
+            label,
+            preset,
+            ..
+        } => GalleryMedia::Locked {
+            id: *id,
+            kind: GalleryMediaKind::Video,
+            width: *width,
+            height: *height,
+            mask: GalleryMask {
+                rule_id: matched_policy_ids
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "blur".to_string()),
+                label: label.clone(),
+                preset: preset_to_ui(*preset),
+                reason: Some("Blurred by safety policy.".to_string()),
+                requires_login: false,
+                requires_age: false,
+                requires_terms: false,
+                cta_label: None,
+            },
+        },
+        ProjectedVideo::Placeholder {
             id,
             width,
             height,
@@ -442,7 +471,7 @@ pub fn projected_image_to_card(
         media,
         image_count: 0,
         video_count: 0,
-        details_href: (!img.is_locked()).then(|| format!("/details/{id}")),
+        details_href: (!img.is_placeholder()).then(|| format!("/details/{id}")),
         liked,
     }
 }
@@ -457,8 +486,7 @@ pub fn projected_image_to_viewer_item(
     let media = projected_image_to_ui(img, &title);
     let download_url = match img {
         ProjectedImage::Clear { url, .. } => Some(url.clone()),
-        ProjectedImage::Spoiler { reveal_url, .. } => Some(reveal_url.clone()),
-        ProjectedImage::Locked { .. } => None,
+        ProjectedImage::Blurred { .. } | ProjectedImage::Placeholder { .. } => None,
     };
     ViewerItem {
         id,
@@ -469,7 +497,8 @@ pub fn projected_image_to_viewer_item(
             title
         },
         media,
-        details_href: (!img.is_locked()).then(|| format!("/details/{id}?mode=similar&q={id}&limit=50")),
+        details_href: (!img.is_placeholder())
+            .then(|| format!("/details/{id}?mode=similar&q={id}&limit=50")),
         download_url,
         download_filename: None,
         liked,

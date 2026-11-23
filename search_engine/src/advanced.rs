@@ -1,3 +1,7 @@
+//! Policy v3 Web-of-Science-style advanced query execution with independent
+//! per-condition thresholds, zero cross-model weighted summation, zero centroid
+//! averaging, single-snapshot seed authorization, and hard bounded SQL `LIMIT`.
+
 use std::{
     collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
@@ -10,34 +14,37 @@ use moka::future::Cache;
 use pgvector::HalfVector;
 use search_types::{
     Image, Post,
-    query::{AdvancedSort, QueryExpr, QueryPlan, ResultKind, SearchField, parse_and_compile},
+    query::{
+        AdvancedSort, QueryExpr, QueryPlan, ResultKind, SearchField, VectorTarget,
+        parse_and_compile,
+    },
     validate_min_similarity,
 };
 use sqlx::{Executor as _, Postgres, QueryBuilder, Row as _};
 
 use crate::{
     Engine, VECTOR_STATEMENT_TIMEOUT_SQL, escape_like,
-    safety::SafetyFilter,
+    safety::{MediaOutcome, SafetyFilter, SeedLockedError, begin_repeatable_read_tx, load_image_facts_in_tx},
 };
 
-/// Relative weight subtracted for negative semantic prompts (`NOT clip:...` / `NOT dino:...`).
-const NEGATIVE_VECTOR_WEIGHT: f32 = 0.6;
-/// Fixed per-index HNSW candidate pool for vector queries so `halfvec` distance ties
-/// paginate deterministically with `ORDER BY dist ASC, id DESC` and zero cross-page duplicates.
+/// Hard upper bound on candidate rows scanned per request (replaces unbounded `WITH TIES`).
 const VECTOR_CANDIDATE_LIMIT: i64 = 2000;
-/// Fixed per-index HNSW candidate pool when blending CLIP + DINOv3 so pagination is stable.
-const DUAL_VECTOR_CANDIDATE_LIMIT: i64 = 1000;
+
+/// Fallback similarity cutoff for negated vector leaves (`NOT clip:`, `NOT dino:`,
+/// `NOT upload:`) when neither an explicit `>=` threshold nor a positive site default
+/// is configured, ensuring negated leaves actively exclude matching items.
+const DEFAULT_NEGATED_VECTOR_SIMILARITY: f32 = 0.25;
 
 #[derive(Debug, Clone)]
 pub struct AdvancedSearchRequest {
     pub query: String,
     pub uploads: Vec<Vec<u8>>,
     pub sort: AdvancedSort,
-    /// Weight for CLIP in `[0.05, 0.95]` when both CLIP and DINOv3 are active (default `0.5`).
-    pub clip_weight: f32,
-    /// Optional minimum SigLIP2 cosine similarity cutoff in `[0.0, 1.0]`.
+    /// Optional default minimum SigLIP2 cosine similarity cutoff in `[0.0, 1.0]`
+    /// used when a `clip:` leaf omits an explicit `>=` threshold.
     pub clip_min_similarity: Option<f32>,
-    /// Optional minimum DINOv3 cosine similarity cutoff in `[0.0, 1.0]`.
+    /// Optional default minimum DINOv3 cosine similarity cutoff in `[0.0, 1.0]`
+    /// used when a `dino:` or `upload:` leaf omits an explicit `>=` threshold.
     pub dino_min_similarity: Option<f32>,
     pub limit: i64,
     pub offset: i64,
@@ -49,96 +56,31 @@ pub enum AdvancedSearchResult {
     Images(Vec<Image>),
 }
 
-/// L2-normalize `vec` in place; returns `Err` on zero-length or non-finite values.
-fn normalize_unit_vec(vec: &mut [f32]) -> anyhow::Result<()> {
-    if vec.iter().any(|x| !x.is_finite()) {
+/// Independent resolved vector leaf clause evaluated against its OWN embedding
+/// and its OWN per-condition threshold (zero weighting or centroid averaging).
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedVectorClause {
+    pub positive: bool,
+    pub col: &'static str,
+    pub vec: HalfVector,
+    pub threshold: Option<f32>,
+}
+
+/// L2-normalize a single embedding vector and convert to `HalfVector`.
+pub(crate) fn unit_halfvec(raw: &[f32], dim: usize) -> anyhow::Result<HalfVector> {
+    if raw.len() != dim {
+        bail!("unexpected embedding dimension {}, expected {dim}", raw.len());
+    }
+    if raw.iter().any(|x| !x.is_finite()) {
         bail!("embedding vector contains non-finite values");
     }
-    let norm = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
     if !norm.is_finite() || norm < 1e-6 {
         bail!("embedding vector collapsed to zero");
     }
     let inv = 1.0 / norm;
-    for x in vec {
-        *x *= inv;
-    }
-    Ok(())
-}
-
-/// Combine L2-normalized positive and negative embedding vectors into a single
-/// L2-normalized query vector compatible with pgvector `<=>` cosine distance.
-pub(crate) fn combine_unit_vectors(
-    pos: &[Vec<f32>],
-    neg: &[Vec<f32>],
-    dim: usize,
-) -> anyhow::Result<HalfVector> {
-    if pos.is_empty() && neg.is_empty() {
-        bail!("cannot combine empty vector sets");
-    }
-    for v in pos.iter().chain(neg.iter()) {
-        if v.len() != dim {
-            bail!("unexpected embedding dimension {}, expected {dim}", v.len());
-        }
-        if v.iter().any(|x| !x.is_finite()) {
-            bail!("embedding vector contains non-finite values");
-        }
-    }
-
-    let mut pos_unit = vec![0.0f32; dim];
-    if !pos.is_empty() {
-        let inv = 1.0 / pos.len() as f32;
-        for v in pos {
-            for (acc, &x) in pos_unit.iter_mut().zip(v.iter()) {
-                *acc += x * inv;
-            }
-        }
-        normalize_unit_vec(&mut pos_unit)?;
-    }
-
-    let mut neg_unit = vec![0.0f32; dim];
-    let mut has_neg = false;
-    if !neg.is_empty() {
-        let inv = 1.0 / neg.len() as f32;
-        for v in neg {
-            for (acc, &x) in neg_unit.iter_mut().zip(v.iter()) {
-                *acc += x * inv;
-            }
-        }
-        if normalize_unit_vec(&mut neg_unit).is_ok() {
-            has_neg = true;
-        } else if pos.is_empty() {
-            bail!("negative semantic query vectors collapsed to zero");
-        }
-    }
-
-    let mut combined = vec![0.0f32; dim];
-    match (!pos.is_empty(), has_neg) {
-        (true, false) => combined.copy_from_slice(&pos_unit),
-        (false, true) => {
-            for (out, &n) in combined.iter_mut().zip(neg_unit.iter()) {
-                *out = -n;
-            }
-        }
-        (true, true) => {
-            for ((out, &p), &n) in combined
-                .iter_mut()
-                .zip(pos_unit.iter())
-                .zip(neg_unit.iter())
-            {
-                *out = p - NEGATIVE_VECTOR_WEIGHT * n;
-            }
-        }
-        (false, false) => unreachable!(),
-    }
-
-    if normalize_unit_vec(&mut combined).is_err() {
-        // Fallback to unit positive centroid if positive & negative nearly cancel out.
-        if !pos.is_empty() {
-            return Ok(HalfVector::from_f32_slice(&pos_unit));
-        }
-        bail!("combined semantic query vector collapsed to zero");
-    }
-    Ok(HalfVector::from_f32_slice(&combined))
+    let normalized: Vec<f32> = raw.iter().map(|x| x * inv).collect();
+    Ok(HalfVector::from_f32_slice(&normalized))
 }
 
 fn collect_all_tag_values(expr: &QueryExpr, out: &mut Vec<String>) {
@@ -146,6 +88,7 @@ fn collect_all_tag_values(expr: &QueryExpr, out: &mut Vec<String>) {
         QueryExpr::Term {
             field: SearchField::Tag,
             value,
+            ..
         } => {
             if !out.iter().any(|v| v == value) {
                 out.push(value.clone());
@@ -168,7 +111,7 @@ fn halfvec_to_f32(hv: &HalfVector) -> Vec<f32> {
 
 pub(crate) fn push_post_predicate(qb: &mut QueryBuilder<Postgres>, expr: &QueryExpr) {
     match expr {
-        QueryExpr::Term { field, value } => {
+        QueryExpr::Term { field, value, .. } => {
             let pat = format!("%{}%", escape_like(value.trim()));
             match field {
                 SearchField::Title => {
@@ -288,7 +231,11 @@ pub(crate) fn push_image_predicate(
     tag_map: &HashMap<String, Vec<i64>>,
 ) {
     match expr {
-        QueryExpr::Term { field, value } => match field {
+        QueryExpr::Term {
+            field,
+            value,
+            threshold,
+        } => match field {
             SearchField::Tag => {
                 let ids = tag_map.get(value).map(Vec::as_slice).unwrap_or(&[]);
                 if ids.is_empty() {
@@ -298,7 +245,12 @@ pub(crate) fn push_image_predicate(
                         "EXISTS (SELECT 1 FROM wd_tag_images wti WHERE wti.image_id = i.id AND wti.wd_tag_id = ANY(",
                     );
                     qb.push_bind(ids.to_vec());
-                    qb.push("::BIGINT[]))");
+                    qb.push("::BIGINT[])");
+                    if let Some(min_score) = threshold.filter(|v| v.is_finite() && *v > 0.0) {
+                        qb.push(" AND wti.score >= ");
+                        qb.push_bind(min_score);
+                    }
+                    qb.push(")");
                 }
             }
             SearchField::Title | SearchField::Author | SearchField::All => {
@@ -477,130 +429,140 @@ pub(crate) fn build_metadata_images_query(
     qb
 }
 
+/// Build a bounded single-request SQL query evaluating EVERY resolved vector leaf
+/// independently against its OWN embedding and per-condition threshold (including
+/// negated leaves `NOT clip:`, `NOT dino:`, `NOT upload:`), with a hard `LIMIT`
+/// (zero `WITH TIES`), ranked by the first declared positive vector (`primary_positive_vector`)
+/// and stable asset ID `DESC`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_single_vector_query(
-    col: &'static str,
-    vec: HalfVector,
+pub(crate) fn build_vector_clauses_query(
+    clauses: &[ResolvedVectorClause],
     meta_filter: Option<&QueryExpr>,
     tag_map: &HashMap<String, Vec<i64>>,
-    min_similarity: Option<f32>,
     safety: Option<&SafetyFilter<'_>>,
     limit: i64,
     offset: i64,
 ) -> QueryBuilder<Postgres> {
-    // Fetch a fixed-size HNSW candidate pool WITH TIES first, then apply a deterministic
-    // `(dist ASC, id DESC)` tie-breaker so `halfvec` ties never duplicate or skip items
-    // across OFFSET pages.
-    let mut qb = QueryBuilder::<Postgres>::new(
-        "WITH cands AS (SELECT i.id, i.name::TEXT AS name, i.width, i.height, (i.",
-    );
-    qb.push(col);
-    qb.push(" <=> ");
-    qb.push_bind(vec.clone());
-    qb.push("::halfvec) AS dist FROM images i WHERE i.");
-    qb.push(col);
-    qb.push(" IS NOT NULL");
-    if let Some(meta) = meta_filter {
-        qb.push(" AND ");
-        push_image_predicate(&mut qb, meta, tag_map);
-    }
-    if let Some(sf) = safety {
-        sf.push_allowed_image_sql(&mut qb, "i");
-    }
-    qb.push(" ORDER BY i.");
-    qb.push(col);
-    qb.push(" <=> ");
-    qb.push_bind(vec);
-    qb.push("::halfvec FETCH FIRST ");
-    qb.push(VECTOR_CANDIDATE_LIMIT);
-    qb.push(" ROWS WITH TIES) SELECT id, name, width, height FROM cands");
-    if let Some(min_sim) = min_similarity.filter(|&v| v > 0.0) {
-        qb.push(" WHERE (1.0 - dist) >= ");
-        qb.push_bind(f64::from(min_sim));
-    }
-    qb.push(" ORDER BY dist ASC, id DESC LIMIT ");
-    qb.push_bind(limit);
-    qb.push(" OFFSET ");
-    qb.push_bind(offset);
-    qb
-}
+    let primary_idx = clauses.iter().position(|c| c.positive);
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn build_dual_vector_query(
-    clip_vec: HalfVector,
-    dino_vec: HalfVector,
-    clip_weight: f32,
-    meta_filter: Option<&QueryExpr>,
-    tag_map: &HashMap<String, Vec<i64>>,
-    clip_min_similarity: Option<f32>,
-    dino_min_similarity: Option<f32>,
-    safety: Option<&SafetyFilter<'_>>,
-    limit: i64,
-    offset: i64,
-) -> QueryBuilder<Postgres> {
-    let dino_weight = 1.0 - clip_weight;
-    let mut qb = QueryBuilder::<Postgres>::new(
-        "WITH clip_cands AS (SELECT i.id FROM images i WHERE i.clip_embedding IS NOT NULL AND i.dinov3_embedding IS NOT NULL",
-    );
-    if let Some(meta) = meta_filter {
-        qb.push(" AND ");
-        push_image_predicate(&mut qb, meta, tag_map);
-    }
-    if let Some(sf) = safety {
-        sf.push_allowed_image_sql(&mut qb, "i");
-    }
-    qb.push(" ORDER BY i.clip_embedding <=> ");
-    qb.push_bind(clip_vec.clone());
-    qb.push("::halfvec FETCH FIRST ");
-    qb.push(DUAL_VECTOR_CANDIDATE_LIMIT);
-    qb.push(
-        " ROWS WITH TIES), dino_cands AS (SELECT i.id FROM images i WHERE i.clip_embedding IS NOT NULL AND i.dinov3_embedding IS NOT NULL",
-    );
-    if let Some(meta) = meta_filter {
-        qb.push(" AND ");
-        push_image_predicate(&mut qb, meta, tag_map);
-    }
-    if let Some(sf) = safety {
-        sf.push_allowed_image_sql(&mut qb, "i");
-    }
-    qb.push(" ORDER BY i.dinov3_embedding <=> ");
-    qb.push_bind(dino_vec.clone());
-    qb.push("::halfvec FETCH FIRST ");
-    qb.push(DUAL_VECTOR_CANDIDATE_LIMIT);
-    qb.push(
-        " ROWS WITH TIES), candidates AS (SELECT id FROM clip_cands UNION SELECT id FROM dino_cands) SELECT i.id, i.name::TEXT AS name, i.width, i.height FROM candidates c JOIN images i ON i.id = c.id",
-    );
-    let clip_cut = clip_min_similarity.filter(|&v| v > 0.0);
-    let dino_cut = dino_min_similarity.filter(|&v| v > 0.0);
-    if clip_cut.is_some() || dino_cut.is_some() {
-        qb.push(" WHERE ");
-        let mut need_and = false;
-        if let Some(cm) = clip_cut {
-            qb.push("(1.0 - (i.clip_embedding <=> ");
-            qb.push_bind(clip_vec.clone());
-            qb.push("::halfvec)) >= ");
-            qb.push_bind(f64::from(cm));
-            need_and = true;
+    if let Some(p_idx) = primary_idx {
+        let primary = &clauses[p_idx];
+        let needs_clip_non_null = clauses
+            .iter()
+            .any(|c| c.positive && c.col == "clip_embedding");
+        let needs_dino_non_null = clauses
+            .iter()
+            .any(|c| c.positive && c.col == "dinov3_embedding");
+
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "WITH cands AS (SELECT i.id, i.name::TEXT AS name, i.width, i.height, (i.",
+        );
+        qb.push(primary.col);
+        qb.push(" <=> ");
+        qb.push_bind(primary.vec.clone());
+        qb.push("::halfvec) AS primary_dist FROM images i WHERE TRUE");
+        if needs_clip_non_null {
+            qb.push(" AND i.clip_embedding IS NOT NULL");
         }
-        if let Some(dm) = dino_cut {
-            if need_and {
-                qb.push(" AND ");
+        if needs_dino_non_null {
+            qb.push(" AND i.dinov3_embedding IS NOT NULL");
+        }
+        if let Some(meta) = meta_filter {
+            qb.push(" AND ");
+            push_image_predicate(&mut qb, meta, tag_map);
+        }
+        if let Some(sf) = safety {
+            sf.push_allowed_image_sql(&mut qb, "i");
+        }
+        qb.push(" ORDER BY i.");
+        qb.push(primary.col);
+        qb.push(" <=> ");
+        qb.push_bind(primary.vec.clone());
+        qb.push("::halfvec LIMIT ");
+        qb.push(VECTOR_CANDIDATE_LIMIT);
+        qb.push(") SELECT c.id, c.name, c.width, c.height FROM cands c");
+
+        let has_secondary = clauses.len() > 1;
+        if has_secondary {
+            qb.push(" JOIN images i ON i.id = c.id");
+        }
+        qb.push(" WHERE TRUE");
+
+        if let Some(min_sim) = primary.threshold.filter(|&v| v > 0.0) {
+            qb.push(" AND (1.0 - c.primary_dist) >= ");
+            qb.push_bind(f64::from(min_sim));
+        }
+
+        for (idx, clause) in clauses.iter().enumerate() {
+            if idx == p_idx {
+                continue;
             }
-            qb.push("(1.0 - (i.dinov3_embedding <=> ");
-            qb.push_bind(dino_vec.clone());
-            qb.push("::halfvec)) >= ");
-            qb.push_bind(f64::from(dm));
+            if clause.positive {
+                if let Some(min_sim) = clause.threshold.filter(|&v| v > 0.0) {
+                    qb.push(" AND (1.0 - (i.");
+                    qb.push(clause.col);
+                    qb.push(" <=> ");
+                    qb.push_bind(clause.vec.clone());
+                    qb.push("::halfvec)) >= ");
+                    qb.push_bind(f64::from(min_sim));
+                }
+            } else {
+                let cutoff = clause
+                    .threshold
+                    .filter(|&v| v > 0.0)
+                    .unwrap_or(DEFAULT_NEGATED_VECTOR_SIMILARITY);
+                qb.push(" AND (i.");
+                qb.push(clause.col);
+                qb.push(" IS NULL OR (1.0 - (i.");
+                qb.push(clause.col);
+                qb.push(" <=> ");
+                qb.push_bind(clause.vec.clone());
+                qb.push("::halfvec)) < ");
+                qb.push_bind(f64::from(cutoff));
+                qb.push(")");
+            }
         }
+
+        qb.push(" ORDER BY c.primary_dist ASC, c.id DESC LIMIT ");
+        qb.push_bind(limit);
+        qb.push(" OFFSET ");
+        qb.push_bind(offset);
+        return qb;
     }
-    qb.push(" ORDER BY (");
-    qb.push_bind(f64::from(clip_weight));
-    qb.push(" * (i.clip_embedding <=> ");
-    qb.push_bind(clip_vec);
-    qb.push("::halfvec) + ");
-    qb.push_bind(f64::from(dino_weight));
-    qb.push(" * (i.dinov3_embedding <=> ");
-    qb.push_bind(dino_vec);
-    qb.push("::halfvec)) ASC, i.id DESC LIMIT ");
+
+    // Negated-only vector query (e.g. `tag:maid AND NOT clip:"dark"`):
+    // take bounded candidate pool by stable asset ID, then exclude every negated leaf independently.
+    let mut qb = QueryBuilder::<Postgres>::new(
+        "WITH cands AS (SELECT i.id, i.name::TEXT AS name, i.width, i.height FROM images i WHERE TRUE",
+    );
+    if let Some(meta) = meta_filter {
+        qb.push(" AND ");
+        push_image_predicate(&mut qb, meta, tag_map);
+    }
+    if let Some(sf) = safety {
+        sf.push_allowed_image_sql(&mut qb, "i");
+    }
+    qb.push(" ORDER BY i.id DESC LIMIT ");
+    qb.push(VECTOR_CANDIDATE_LIMIT);
+    qb.push(") SELECT c.id, c.name, c.width, c.height FROM cands c JOIN images i ON i.id = c.id WHERE TRUE");
+
+    for clause in clauses {
+        let cutoff = clause
+            .threshold
+            .filter(|&v| v > 0.0)
+            .unwrap_or(DEFAULT_NEGATED_VECTOR_SIMILARITY);
+        qb.push(" AND (i.");
+        qb.push(clause.col);
+        qb.push(" IS NULL OR (1.0 - (i.");
+        qb.push(clause.col);
+        qb.push(" <=> ");
+        qb.push_bind(clause.vec.clone());
+        qb.push("::halfvec)) < ");
+        qb.push_bind(f64::from(cutoff));
+        qb.push(")");
+    }
+
+    qb.push(" ORDER BY c.id DESC LIMIT ");
     qb.push_bind(limit);
     qb.push(" OFFSET ");
     qb.push_bind(offset);
@@ -634,9 +596,9 @@ pub(crate) fn build_similar_images_query(
     }
     qb.push(" ORDER BY i.dinov3_embedding <=> ");
     qb.push_bind(seed_vec);
-    qb.push("::halfvec FETCH FIRST ");
+    qb.push("::halfvec LIMIT ");
     qb.push(VECTOR_CANDIDATE_LIMIT);
-    qb.push(" ROWS WITH TIES) SELECT id, name, width, height FROM cands");
+    qb.push(") SELECT id, name, width, height FROM cands");
     if let Some(min_sim) = min_similarity.filter(|&v| v > 0.0) {
         qb.push(" WHERE (1.0 - dist) >= ");
         qb.push_bind(f64::from(min_sim));
@@ -686,15 +648,7 @@ impl Engine {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter()
-            .map(|r| -> sqlx::Result<Post> {
-                Ok(Post {
-                    id: r.try_get("id")?,
-                    title: r.try_get("title")?,
-                })
-            })
-            .try_collect()
-            .map_err(Into::into)
+        map_post_rows(rows)
     }
 
     async fn resolve_tag_ids(&self, raw: &str) -> anyhow::Result<Vec<i64>> {
@@ -760,13 +714,53 @@ impl Engine {
             .map_err(|e| anyhow!("{e}"))
     }
 
-    pub(crate) async fn fetch_dino_id_vectors(
-        &self,
+    /// Authorize EVERY positive AND negative stored `dino:<id>` seed (Clear only!)
+    /// and fetch its `dinov3_embedding` inside ONE `REPEATABLE READ READ ONLY`
+    /// transaction snapshot. Fails closed with [`SeedLockedError`] if ANY seed
+    /// is not Clear or missing trusted facts.
+    pub(crate) async fn authorize_and_fetch_dino_seeds_in_tx(
+        tx: &mut sqlx::Transaction<'_, Postgres>,
         ids: &[i64],
+        safety: Option<&SafetyFilter<'_>>,
     ) -> anyhow::Result<HashMap<i64, Vec<f32>>> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
+
+        if let Some(sf) = safety
+            && sf.is_filtering_active()
+        {
+            let facts_map = load_image_facts_in_tx(tx, ids, sf.policy).await?;
+            for &id in ids {
+                let Some(facts) = facts_map.get(&id) else {
+                    return Err(anyhow::Error::new(SeedLockedError {
+                        image_id: id,
+                        policy_id: "unclassified".to_string(),
+                        label: "Pending classification".to_string(),
+                    }));
+                };
+                match sf.policy.evaluate_image(facts, sf.caller) {
+                    MediaOutcome::Clear { .. } => {}
+                    MediaOutcome::Blurred {
+                        policy_id, label, ..
+                    } => {
+                        return Err(anyhow::Error::new(SeedLockedError {
+                            image_id: id,
+                            policy_id,
+                            label,
+                        }));
+                    }
+                    MediaOutcome::Placeholder { mask, .. } => {
+                        return Err(anyhow::Error::new(SeedLockedError {
+                            image_id: id,
+                            policy_id: mask.policy_id,
+                            label: mask.label,
+                        }));
+                    }
+                }
+            }
+        }
+
         let rows = sqlx::query(
             r#"
             SELECT id, dinov3_embedding
@@ -776,7 +770,7 @@ impl Engine {
             "#,
         )
         .bind(ids)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **tx)
         .await?;
 
         let mut map = HashMap::with_capacity(rows.len());
@@ -794,10 +788,6 @@ impl Engine {
         Ok(map)
     }
 
-    /// Execute a parsed Web-of-Science-style advanced query.
-    ///
-    /// - Post-only queries (`All` / `Title` / `Author`) paginate `posts` directly in SQL.
-    /// - Queries with any `Tag` / `CLIP` / `DINO` / `Upload` paginate `images` directly in SQL.
     pub async fn advanced_search(
         &self,
         req: AdvancedSearchRequest,
@@ -836,10 +826,10 @@ impl Engine {
         if req.limit < 0 || req.offset < 0 {
             bail!("both limit and offset should >= 0");
         }
-        let clip_min_sim = validate_min_similarity(req.clip_min_similarity)
-            .map_err(|e| anyhow!("{e}"))?;
-        let dino_min_sim = validate_min_similarity(req.dino_min_similarity)
-            .map_err(|e| anyhow!("{e}"))?;
+        let clip_default_min =
+            validate_min_similarity(req.clip_min_similarity).map_err(|e| anyhow!("{e}"))?;
+        let dino_default_min =
+            validate_min_similarity(req.dino_min_similarity).map_err(|e| anyhow!("{e}"))?;
 
         if plan.result_kind == ResultKind::Posts {
             let Some(meta) = &plan.meta_filter else {
@@ -855,31 +845,7 @@ impl Engine {
             qb.push_bind(req.offset);
 
             let rows = qb.build().fetch_all(&self.pool).await?;
-            let posts = rows
-                .into_iter()
-                .map(|r| -> sqlx::Result<Post> {
-                    Ok(Post {
-                        id: r.try_get("id")?,
-                        title: r.try_get("title")?,
-                    })
-                })
-                .try_collect()?;
-            return Ok(AdvancedSearchResult::Posts(posts));
-        }
-
-        // Anti-oracle seed check BEFORE reading ANY `dinov3_embedding` (both positive and negated `dino:<id>`).
-        if plan.has_dino() {
-            let mut all_ids: Vec<i64> = plan
-                .dino_pos
-                .iter()
-                .chain(plan.dino_neg.iter())
-                .copied()
-                .collect();
-            all_ids.sort_unstable();
-            all_ids.dedup();
-            if let Some(sf) = safety {
-                self.ensure_images_unlocked(&all_ids, sf).await?;
-            }
+            return Ok(AdvancedSearchResult::Posts(map_post_rows(rows)?));
         }
 
         // Pre-resolve every distinct Tag string referenced in the metadata AST.
@@ -893,72 +859,9 @@ impl Engine {
             }
         }
 
-        // Compute CLIP query vector (if any CLIP clauses exist).
-        let clip_vec = if plan.has_clip() {
-            let mut pos = Vec::with_capacity(plan.clip_pos.len());
-            for text in &plan.clip_pos {
-                pos.push((*self.clip_text_vec_cached(text).await?).clone());
-            }
-            let mut neg = Vec::with_capacity(plan.clip_neg.len());
-            for text in &plan.clip_neg {
-                neg.push((*self.clip_text_vec_cached(text).await?).clone());
-            }
-            Some(combine_unit_vectors(&pos, &neg, siglip2::EMBED_DIM)?)
-        } else {
-            None
-        };
-
-        // Compute DINOv3 query vector (combining stored image IDs and uploaded images).
-        let dino_vec = if plan.has_dino() {
-            let mut all_ids: Vec<i64> = plan
-                .dino_pos
-                .iter()
-                .chain(plan.dino_neg.iter())
-                .copied()
-                .collect();
-            all_ids.sort_unstable();
-            all_ids.dedup();
-            let id_vecs = self.fetch_dino_id_vectors(&all_ids).await?;
-
-            // Validate every referenced upload index exists in `req.uploads`.
-            let mut upload_vecs: HashMap<usize, Vec<f32>> = HashMap::new();
-            for &idx in plan.upload_pos.iter().chain(plan.upload_neg.iter()) {
-                if upload_vecs.contains_key(&idx) {
-                    continue;
-                }
-                let Some(bytes) = req.uploads.get(idx) else {
-                    bail!("Uploaded image #{idx} is missing — re-upload the image and try again");
-                };
-                if bytes.is_empty() {
-                    bail!("Uploaded image #{idx} is empty");
-                }
-                let vec = (*self.dinov3_upload_vec_cached(bytes.clone()).await?).clone();
-                upload_vecs.insert(idx, vec);
-            }
-
-            let mut pos = Vec::with_capacity(plan.dino_pos.len() + plan.upload_pos.len());
-            for id in &plan.dino_pos {
-                pos.push(id_vecs[id].clone());
-            }
-            for idx in &plan.upload_pos {
-                pos.push(upload_vecs[idx].clone());
-            }
-            let mut neg = Vec::with_capacity(plan.dino_neg.len() + plan.upload_neg.len());
-            for id in &plan.dino_neg {
-                neg.push(id_vecs[id].clone());
-            }
-            for idx in &plan.upload_neg {
-                neg.push(upload_vecs[idx].clone());
-            }
-            Some(combine_unit_vectors(&pos, &neg, dinov3::EMBED_DIM)?)
-        } else {
-            None
-        };
-
-        // Dispatch by vector combination: None, Single (CLIP or DINO), or Dual (CLIP + DINO).
-        let images = match (clip_vec, dino_vec) {
-            (None, None) => {
-                self.query_images_metadata_only(
+        if !plan.has_vectors() {
+            let images = self
+                .query_images_metadata_only(
                     plan,
                     &tag_map,
                     req.sort,
@@ -966,55 +869,101 @@ impl Engine {
                     req.limit,
                     req.offset,
                 )
-                .await?
-            }
-            (Some(c), None) => {
-                self.query_images_single_vector(
-                    "clip_embedding",
-                    c,
-                    plan.meta_filter.as_ref(),
-                    &tag_map,
-                    clip_min_sim,
-                    safety,
-                    req.limit,
-                    req.offset,
-                )
-                .await?
-            }
-            (None, Some(d)) => {
-                self.query_images_single_vector(
-                    "dinov3_embedding",
-                    d,
-                    plan.meta_filter.as_ref(),
-                    &tag_map,
-                    dino_min_sim,
-                    safety,
-                    req.limit,
-                    req.offset,
-                )
-                .await?
-            }
-            (Some(c), Some(d)) => {
-                let clip_weight = if req.clip_weight.is_finite() {
-                    req.clip_weight.clamp(0.05, 0.95)
-                } else {
-                    0.5
-                };
-                self.query_images_dual_vector(
-                    c,
-                    d,
-                    clip_weight,
-                    plan.meta_filter.as_ref(),
-                    &tag_map,
-                    clip_min_sim,
-                    dino_min_sim,
-                    safety,
-                    req.limit,
-                    req.offset,
-                )
-                .await?
-            }
+                .await?;
+            return Ok(AdvancedSearchResult::Images(images));
+        }
+
+        // Collect all unique stored `dino:<id>` seeds (both positive AND negated!).
+        let mut all_dino_ids: Vec<i64> = plan
+            .dino_pos
+            .iter()
+            .chain(plan.dino_neg.iter())
+            .map(|c| c.image_id)
+            .collect();
+        all_dino_ids.sort_unstable();
+        all_dino_ids.dedup();
+
+        // Single-snapshot authorization + embedding read for ALL stored `dino:<id>` seeds
+        // BEFORE running any inference or search so locked seeds fail fast with zero oracle leakage!
+        let id_vecs = if !all_dino_ids.is_empty() {
+            let mut tx = begin_repeatable_read_tx(&self.pool).await?;
+            let vecs =
+                Self::authorize_and_fetch_dino_seeds_in_tx(&mut tx, &all_dino_ids, safety).await?;
+            tx.commit().await?;
+            vecs
+        } else {
+            HashMap::new()
         };
+
+        // Resolve every distinct CLIP text embedding independently (zero averaging).
+        let mut clip_vecs: HashMap<String, HalfVector> = HashMap::new();
+        for clause in plan.clip_pos.iter().chain(plan.clip_neg.iter()) {
+            if !clip_vecs.contains_key(&clause.text) {
+                let raw = self.clip_text_vec_cached(&clause.text).await?;
+                let hv = unit_halfvec(&raw, siglip2::EMBED_DIM)?;
+                clip_vecs.insert(clause.text.clone(), hv);
+            }
+        }
+
+        // Resolve every distinct uploaded image embedding independently (zero averaging).
+        let mut upload_vecs: HashMap<usize, HalfVector> = HashMap::new();
+        for clause in plan.upload_pos.iter().chain(plan.upload_neg.iter()) {
+            if upload_vecs.contains_key(&clause.slot) {
+                continue;
+            }
+            let Some(bytes) = req.uploads.get(clause.slot) else {
+                bail!(
+                    "Uploaded image #{} is missing — re-upload the image and try again",
+                    clause.slot
+                );
+            };
+            if bytes.is_empty() {
+                bail!("Uploaded image #{} is empty", clause.slot);
+            }
+            let raw = self.dinov3_upload_vec_cached(bytes.clone()).await?;
+            let hv = unit_halfvec(&raw, dinov3::EMBED_DIM)?;
+            upload_vecs.insert(clause.slot, hv);
+        }
+
+        // Build per-clause resolved vector list in exact declared AST order
+        // (preserving `plan.primary_positive_vector()` as the first positive clause).
+        let mut resolved_clauses = Vec::with_capacity(plan.vector_clauses.len());
+        for vc in &plan.vector_clauses {
+            let (col, vec, default_min) = match &vc.target {
+                VectorTarget::Clip(text) => (
+                    "clip_embedding",
+                    clip_vecs[text].clone(),
+                    clip_default_min,
+                ),
+                VectorTarget::Dino(id) => (
+                    "dinov3_embedding",
+                    unit_halfvec(&id_vecs[id], dinov3::EMBED_DIM)?,
+                    dino_default_min,
+                ),
+                VectorTarget::Upload(slot) => (
+                    "dinov3_embedding",
+                    upload_vecs[slot].clone(),
+                    dino_default_min,
+                ),
+            };
+            resolved_clauses.push(ResolvedVectorClause {
+                positive: vc.positive,
+                col,
+                vec,
+                threshold: vc.threshold.or(default_min),
+            });
+        }
+
+        let images = self
+            .query_images_vector_clauses(
+                &resolved_clauses,
+                plan.meta_filter.as_ref(),
+                &tag_map,
+                safety,
+                req.limit,
+                req.offset,
+            )
+            .await?;
 
         Ok(AdvancedSearchResult::Images(images))
     }
@@ -1033,11 +982,12 @@ impl Engine {
         };
 
         // Fast path for a single positive Tag term with Relevance sort: uses the
-        // `wd_tag_images(wd_tag_id, image_id)` PK index directly, matching `search_images_by_tag`.
+        // `wd_tag_images(wd_tag_id, image_id)` PK index directly.
         if sort == AdvancedSort::Relevance
             && let QueryExpr::Term {
                 field: SearchField::Tag,
                 value,
+                threshold,
             } = meta
         {
             let ids = tag_map.get(value).map(Vec::as_slice).unwrap_or(&[]);
@@ -1048,8 +998,13 @@ impl Engine {
                 "WITH img_match AS (SELECT wti.image_id, MAX(wti.score) AS max_score FROM wd_tag_images wti WHERE wti.wd_tag_id = ANY(",
             );
             qb.push_bind(ids.to_vec());
+            qb.push("::BIGINT[])");
+            if let Some(min_score) = threshold.filter(|v| v.is_finite() && *v > 0.0) {
+                qb.push(" AND wti.score >= ");
+                qb.push_bind(min_score);
+            }
             qb.push(
-                "::BIGINT[]) GROUP BY wti.image_id) SELECT i.id, i.name::TEXT AS name, i.width, i.height FROM img_match im JOIN images i ON i.id = im.image_id WHERE TRUE",
+                " GROUP BY wti.image_id) SELECT i.id, i.name::TEXT AS name, i.width, i.height FROM img_match im JOIN images i ON i.id = im.image_id WHERE TRUE",
             );
             if let Some(sf) = safety {
                 sf.push_allowed_image_sql(&mut qb, "i");
@@ -1087,61 +1042,33 @@ impl Engine {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<Image>> {
-        let safety_active = safety.is_some_and(SafetyFilter::is_filtering_active);
-        let mut qb = build_single_vector_query(
+        let clauses = [ResolvedVectorClause {
+            positive: true,
             col,
             vec,
-            meta_filter,
-            tag_map,
-            min_similarity,
-            safety,
-            limit,
-            offset,
-        );
-
-        let mut tx = self.pool.begin().await?;
-        tx.execute("SET TRANSACTION READ ONLY").await?;
-        tx.execute(VECTOR_STATEMENT_TIMEOUT_SQL).await?;
-        if meta_filter.is_some() || safety_active {
-            tx.execute("SET LOCAL hnsw.max_scan_tuples = 20000").await?;
-        }
-        let rows = qb.build().fetch_all(&mut *tx).await?;
-        tx.commit().await?;
-        map_image_rows(rows)
+            threshold: min_similarity,
+        }];
+        self.query_images_vector_clauses(&clauses, meta_filter, tag_map, safety, limit, offset)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn query_images_dual_vector(
+    async fn query_images_vector_clauses(
         &self,
-        clip_vec: HalfVector,
-        dino_vec: HalfVector,
-        clip_weight: f32,
+        clauses: &[ResolvedVectorClause],
         meta_filter: Option<&QueryExpr>,
         tag_map: &HashMap<String, Vec<i64>>,
-        clip_min_similarity: Option<f32>,
-        dino_min_similarity: Option<f32>,
         safety: Option<&SafetyFilter<'_>>,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<Image>> {
         let safety_active = safety.is_some_and(SafetyFilter::is_filtering_active);
-        let mut qb = build_dual_vector_query(
-            clip_vec,
-            dino_vec,
-            clip_weight,
-            meta_filter,
-            tag_map,
-            clip_min_similarity,
-            dino_min_similarity,
-            safety,
-            limit,
-            offset,
-        );
+        let mut qb =
+            build_vector_clauses_query(clauses, meta_filter, tag_map, safety, limit, offset);
 
-        let mut tx = self.pool.begin().await?;
-        tx.execute("SET TRANSACTION READ ONLY").await?;
+        let mut tx = begin_repeatable_read_tx(&self.pool).await?;
         tx.execute(VECTOR_STATEMENT_TIMEOUT_SQL).await?;
-        if meta_filter.is_some() || safety_active {
+        if meta_filter.is_some() || safety_active || clauses.len() > 1 {
             tx.execute("SET LOCAL hnsw.max_scan_tuples = 20000").await?;
         }
         let rows = qb.build().fetch_all(&mut *tx).await?;
@@ -1157,45 +1084,20 @@ mod tests {
     use sqlx::Execute as _;
 
     #[test]
-    fn combine_unit_vectors_handles_positive_negative_and_cancel() {
-        let pos = vec![vec![1.0, 0.0, 0.0, 0.0]];
-        let neg = vec![vec![0.0, 1.0, 0.0, 0.0]];
-        let combined = halfvec_to_f32(&combine_unit_vectors(&pos, &neg, 4).unwrap());
-        let norm: f32 = combined.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-2);
-        assert!(combined[0] > 0.8);
-        assert!(combined[1] < -0.4);
+    fn unit_halfvec_normalizes_single_vector_and_rejects_bad_inputs() {
+        let hv = unit_halfvec(&[3.0, 4.0, 0.0, 0.0], 4).unwrap();
+        let v = halfvec_to_f32(&hv);
+        assert!((v[0] - 0.6).abs() < 1e-2);
+        assert!((v[1] - 0.8).abs() < 1e-2);
 
-        let neg_only = halfvec_to_f32(&combine_unit_vectors(&[], &neg, 4).unwrap());
-        assert!((neg_only[1] + 1.0).abs() < 1e-2);
-
-        // Positive and negative along identical direction stays non-zero & normalized.
-        let same = halfvec_to_f32(&combine_unit_vectors(&pos, &pos, 4).unwrap());
-        assert!((same[0] - 1.0).abs() < 1e-2);
-
-        // Opposing negative vectors canceling to zero fall back to `pos_unit` when `!pos.is_empty()`.
-        let cancel_neg = vec![vec![0.0, 1.0, 0.0, 0.0], vec![0.0, -1.0, 0.0, 0.0]];
-        let fallback = halfvec_to_f32(&combine_unit_vectors(&pos, &cancel_neg, 4).unwrap());
-        assert!((fallback[0] - 1.0).abs() < 1e-2);
-        assert!(fallback[1].abs() < 1e-2);
-        // Without positive vectors, canceling negative vectors still fail.
-        assert!(combine_unit_vectors(&[], &cancel_neg, 4).is_err());
-
-        // Diverse positive vectors are L2-normalized before subtracting negative prompt.
-        let diverse_pos = vec![
-            vec![0.5, 0.866_025_4, 0.0, 0.0],
-            vec![0.5, -0.866_025_4, 0.0, 0.0],
-        ];
-        let diverse_out = halfvec_to_f32(&combine_unit_vectors(&diverse_pos, &neg, 4).unwrap());
-        assert!(diverse_out[0] > 0.8);
-
-        // Non-finite inputs are rejected.
-        assert!(combine_unit_vectors(&[vec![f32::NAN, 0.0, 0.0, 0.0]], &[], 4).is_err());
-        assert!(combine_unit_vectors(&[vec![f32::INFINITY, 0.0, 0.0, 0.0]], &[], 4).is_err());
+        assert!(unit_halfvec(&[1.0, 2.0], 4).is_err());
+        assert!(unit_halfvec(&[0.0, 0.0, 0.0, 0.0], 4).is_err());
+        assert!(unit_halfvec(&[f32::NAN, 1.0, 0.0, 0.0], 4).is_err());
+        assert!(unit_halfvec(&[f32::INFINITY, 1.0, 0.0, 0.0], 4).is_err());
     }
 
     #[test]
-    fn builds_parameterized_post_and_image_predicates() {
+    fn builds_parameterized_post_and_image_predicates_with_per_leaf_tag_threshold() {
         let expr = parse_query(r#"(title:"咖啡" OR author:渡久山) NOT title:预告"#).unwrap();
         let mut qb = QueryBuilder::<Postgres>::new("SELECT p.id FROM posts p WHERE ");
         push_post_predicate(&mut qb, &expr);
@@ -1207,7 +1109,7 @@ mod tests {
         assert!(sql.contains("NOT (p.title ILIKE $3"));
         assert!(!sql.contains("渡久山"));
 
-        let img_expr = parse_query(r#"(tag:maid OR tag:missing) AND author:渡久山"#).unwrap();
+        let img_expr = parse_query(r#"(tag:maid>=0.45 OR tag:missing) AND author:渡久山"#).unwrap();
         let mut tag_map = HashMap::new();
         tag_map.insert("maid".to_string(), vec![10, 20]);
         tag_map.insert("missing".to_string(), vec![]);
@@ -1217,7 +1119,7 @@ mod tests {
         let sql_str2 = built2.sql();
         let sql2 = sql_str2.as_str();
         assert!(sql2.contains("a.name ILIKE $1"));
-        assert!(sql2.contains("wti.wd_tag_id = ANY($2::BIGINT[])"));
+        assert!(sql2.contains("wti.wd_tag_id = ANY($2::BIGINT[]) AND wti.score >= $3"));
         assert!(sql2.contains("OR FALSE"));
     }
 
@@ -1226,7 +1128,6 @@ mod tests {
         let mut tag_map = HashMap::new();
         tag_map.insert("cat".to_string(), vec![10, 11]);
 
-        // 1. Positive post conjuncts correlate in ONE post_images EXISTS.
         let expr1 = parse_query("title:Foo AND author:Bar AND tag:cat").unwrap();
         let mut qb1 = QueryBuilder::<Postgres>::new("SELECT i.id FROM images i WHERE ");
         push_image_predicate(&mut qb1, &expr1, &tag_map);
@@ -1236,14 +1137,9 @@ mod tests {
         assert_eq!(
             sql1.matches("FROM post_images pi JOIN posts p ON p.id = pi.post_id")
                 .count(),
-            1,
-            "expected single correlated post EXISTS: {sql1}"
+            1
         );
-        assert!(sql1.contains("p.title ILIKE $1"));
-        assert!(sql1.contains("a.name ILIKE $2"));
-        assert!(sql1.contains("wti.wd_tag_id = ANY($3::BIGINT[])"));
 
-        // 2. Positive + negated post conjunct correlate against the SAME post.
         let expr2 = parse_query("title:Foo AND NOT author:Bar AND tag:cat").unwrap();
         let mut qb2 = QueryBuilder::<Postgres>::new("SELECT i.id FROM images i WHERE ");
         push_image_predicate(&mut qb2, &expr2, &tag_map);
@@ -1253,80 +1149,88 @@ mod tests {
         assert_eq!(
             sql2.matches("FROM post_images pi JOIN posts p ON p.id = pi.post_id")
                 .count(),
-            1,
-            "expected single correlated post EXISTS for title AND NOT author: {sql2}"
+            1
         );
-        assert!(sql2.contains("(p.title ILIKE $1 ESCAPE '\\') AND (NOT EXISTS"));
-        assert!(sql2.contains("wti.wd_tag_id = ANY($3::BIGINT[])"));
-
-        // 3. Only negated post term excludes images belonging to ANY matching post.
-        let expr3 = parse_query("NOT author:Bar AND tag:cat").unwrap();
-        let mut qb3 = QueryBuilder::<Postgres>::new("SELECT i.id FROM images i WHERE ");
-        push_image_predicate(&mut qb3, &expr3, &tag_map);
-        let built3 = qb3.build();
-        let sql_str3 = built3.sql();
-        let sql3 = sql_str3.as_str();
-        assert!(
-            sql3.contains("(NOT EXISTS (SELECT 1 FROM post_images pi JOIN posts p ON p.id = pi.post_id WHERE pi.image_id = i.id AND EXISTS"),
-            "expected NOT EXISTS post_images for negated-only post term: {sql3}"
-        );
-        assert!(sql3.contains("wti.wd_tag_id = ANY($2::BIGINT[])"));
     }
 
     #[test]
-    fn scores_each_distinct_positive_tag_clause_with_max_not_flat_avg() {
-        let mut tag_map = HashMap::new();
-        tag_map.insert("cat".to_string(), vec![10, 11]);
-        tag_map.insert("dog".to_string(), vec![20]);
-        tag_map.insert("maid".to_string(), vec![30, 31]);
+    fn independent_multi_clause_vectors_use_hard_limit_per_clause_thresholds_and_primary_ranking() {
+        let v1 = HalfVector::from_f32_slice(&[1.0, 0.0, 0.0, 0.0]);
+        let v2 = HalfVector::from_f32_slice(&[0.0, 1.0, 0.0, 0.0]);
+        let v3 = HalfVector::from_f32_slice(&[0.0, 0.0, 1.0, 0.0]);
 
-        // Repeating the same tag uses a single MAX(wti.score) clause (never AVG over union).
-        let (_, plan_dup) = parse_and_compile("tag:cat AND tag:cat").unwrap();
-        let mut qb_dup = build_metadata_images_query(
-            plan_dup.meta_filter.as_ref().unwrap(),
-            &tag_map,
-            &plan_dup.positive_tags,
-            AdvancedSort::Relevance,
-            None,
-            50,
-            0,
-        );
-        let built_dup = qb_dup.build();
-        let sql_str_dup = built_dup.sql();
-        let sql_dup = sql_str_dup.as_str();
-        assert!(!sql_dup.contains("AVG("), "should not use AVG: {sql_dup}");
-        assert_eq!(
-            sql_dup
-                .matches("COALESCE((SELECT MAX(wti.score) FROM wd_tag_images wti")
-                .count(),
-            1,
-            "expected 1 MAX clause for repeated tag: {sql_dup}"
-        );
+        let clauses = vec![
+            ResolvedVectorClause {
+                positive: true,
+                col: "clip_embedding",
+                vec: v1.clone(),
+                threshold: Some(0.30),
+            },
+            ResolvedVectorClause {
+                positive: true,
+                col: "dinov3_embedding",
+                vec: v2.clone(),
+                threshold: Some(0.65),
+            },
+            ResolvedVectorClause {
+                positive: false,
+                col: "clip_embedding",
+                vec: v3,
+                threshold: Some(0.40),
+            },
+        ];
 
-        // Single positive tag + negated tag also uses 1 MAX(wti.score) clause.
-        let (_, plan_neg) = parse_and_compile("tag:cat AND NOT tag:dog").unwrap();
-        let mut qb_neg = build_metadata_images_query(
-            plan_neg.meta_filter.as_ref().unwrap(),
-            &tag_map,
-            &plan_neg.positive_tags,
-            AdvancedSort::Relevance,
-            None,
-            50,
-            0,
-        );
+        let mut qb = build_vector_clauses_query(&clauses, None, &HashMap::new(), None, 50, 0);
+        let built = qb.build();
+        let sql_str = built.sql();
+        let sql = sql_str.as_str();
+
+        // Hard LIMIT (ZERO FETCH FIRST ... WITH TIES!)
+        assert!(!sql.contains("WITH TIES"), "must not use WITH TIES: {sql}");
+        assert!(sql.contains("LIMIT 2000"));
+        // Primary positive vector drives HNSW scan & final ORDER BY (zero weighted blend!)
+        assert!(sql.contains("ORDER BY i.clip_embedding <=>") && sql.contains("ORDER BY c.primary_dist ASC, c.id DESC"));
+        // Independent positive threshold on CLIP, independent positive threshold on DINO,
+        // and independent negated threshold on NOT CLIP!
+        assert!(sql.contains("(1.0 - c.primary_dist) >="));
+        assert!(sql.contains("(1.0 - (i.dinov3_embedding <=>") && sql.contains(")) >="));
+        assert!(sql.contains("(i.clip_embedding IS NULL OR (1.0 - (i.clip_embedding <=>") && sql.contains(")) < "));
+
+        // Negated-only vector query works cleanly with hard LIMIT and stable ID order
+        let neg_only = vec![ResolvedVectorClause {
+            positive: false,
+            col: "clip_embedding",
+            vec: v1.clone(),
+            threshold: None,
+        }];
+        let mut qb_neg =
+            build_vector_clauses_query(&neg_only, None, &HashMap::new(), None, 25, 0);
         let built_neg = qb_neg.build();
         let sql_str_neg = built_neg.sql();
         let sql_neg = sql_str_neg.as_str();
-        assert_eq!(
-            sql_neg
-                .matches("COALESCE((SELECT MAX(wti.score) FROM wd_tag_images wti")
-                .count(),
-            1,
-            "expected 1 MAX clause for tag AND NOT tag: {sql_neg}"
-        );
+        assert!(!sql_neg.contains("WITH TIES"));
+        assert!(sql_neg.contains("ORDER BY i.id DESC LIMIT 2000"));
+        assert!(sql_neg.contains(")) < "));
+        assert!(sql_neg.contains("ORDER BY c.id DESC LIMIT"));
 
-        // Two distinct positive tag clauses average their per-clause MAX scores.
-        let (_, plan_two) = parse_and_compile("tag:cat AND tag:maid").unwrap();
+        // Similar images query ALSO uses hard LIMIT (zero WITH TIES)
+        let mut qb_sim = build_similar_images_query(v1, 42, Some(7), Some(0.6), None, 50, 0);
+        let built_sim = qb_sim.build();
+        let sql_str_sim = built_sim.sql();
+        let sql_sim = sql_str_sim.as_str();
+        assert!(!sql_sim.contains("WITH TIES"));
+        assert!(sql_sim.contains("LIMIT 2000"));
+        assert!(sql_sim.contains("i.id <> $2"));
+        assert!(sql_sim.contains("ORDER BY dist ASC, id DESC LIMIT"));
+    }
+
+    #[test]
+    fn scores_each_distinct_positive_tag_clause_with_max() {
+        let mut tag_map = HashMap::new();
+        tag_map.insert("cat".to_string(), vec![10, 11]);
+        tag_map.insert("maid".to_string(), vec![30, 31]);
+
+        let (_, plan_two) = parse_and_compile("tag:cat>=0.45 AND tag:maid").unwrap();
         let mut qb_two = build_metadata_images_query(
             plan_two.meta_filter.as_ref().unwrap(),
             &tag_map,
@@ -1343,67 +1247,9 @@ mod tests {
             sql_two
                 .matches("COALESCE((SELECT MAX(wti.score) FROM wd_tag_images wti")
                 .count(),
-            2,
-            "expected 2 MAX clauses for two distinct tags: {sql_two}"
-        );
-        assert!(
-            sql_two.contains("/ 2.0) DESC"),
-            "expected average by 2.0: {sql_two}"
-        );
-    }
-
-    #[test]
-    fn vector_queries_use_fetch_first_with_ties_and_similar_excludes_seed_and_post() {
-        let hv = HalfVector::from_f32_slice(&[1.0, 0.0, 0.0, 0.0]);
-        let mut qb_single = build_single_vector_query(
-            "clip_embedding",
-            hv.clone(),
-            None,
-            &HashMap::new(),
-            Some(0.45),
-            None,
-            50,
-            0,
-        );
-        let built_single = qb_single.build();
-        let sql_str_single = built_single.sql();
-        let sql_single = sql_str_single.as_str();
-        assert!(sql_single.contains("FETCH FIRST 2000 ROWS WITH TIES"));
-        assert!(sql_single.contains("WHERE (1.0 - dist) >= $3"));
-        assert!(sql_single.contains("ORDER BY dist ASC, id DESC LIMIT"));
-
-        let mut qb_dual = build_dual_vector_query(
-            hv.clone(),
-            hv.clone(),
-            0.5,
-            None,
-            &HashMap::new(),
-            Some(0.35),
-            Some(0.55),
-            None,
-            50,
-            0,
-        );
-        let built_dual = qb_dual.build();
-        let sql_str_dual = built_dual.sql();
-        let sql_dual = sql_str_dual.as_str();
-        assert_eq!(
-            sql_dual.matches("FETCH FIRST 1000 ROWS WITH TIES").count(),
             2
         );
-        assert!(sql_dual.contains("(1.0 - (i.clip_embedding <=>"));
-        assert!(sql_dual.contains("(1.0 - (i.dinov3_embedding <=>"));
-
-        let mut qb_sim = build_similar_images_query(hv, 42, Some(7), Some(0.6), None, 50, 0);
-        let built_sim = qb_sim.build();
-        let sql_str_sim = built_sim.sql();
-        let sql_sim = sql_str_sim.as_str();
-        assert!(sql_sim.contains("i.id <> $2"));
-        assert!(sql_sim.contains(
-            "NOT EXISTS (SELECT 1 FROM post_images pi WHERE pi.image_id = i.id AND pi.post_id = $3)"
-        ));
-        assert!(sql_sim.contains("FETCH FIRST 2000 ROWS WITH TIES"));
-        assert!(sql_sim.contains("WHERE (1.0 - dist) >= $5"));
-        assert!(sql_sim.contains("ORDER BY dist ASC, id DESC LIMIT"));
+        assert!(sql_two.contains("wti.score >= $2"));
+        assert!(sql_two.contains("/ 2.0) DESC"));
     }
 }

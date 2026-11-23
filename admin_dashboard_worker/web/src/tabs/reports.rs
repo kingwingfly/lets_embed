@@ -2,8 +2,10 @@
 //!
 //! Security: user-submitted `note` is rendered STRICTLY as escaped plain text
 //! (`<p class="adm-report-note">{note}</p>` — NEVER `inner_html`) to prevent stored XSS.
+//! Uses GCP top-right toasts via `use_toast_store()`.
 
 use leptos::prelude::*;
+use lets_embed_ui::use_toast_store;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::api::{
@@ -13,11 +15,12 @@ use crate::api::{
 
 #[component]
 pub fn ReportsTab(on_resolved: Callback<()>) -> impl IntoView {
+    let toasts = use_toast_store();
+
     let status_filter = RwSignal::new("open".to_string());
     let data = RwSignal::new(Option::<ReportsListResp>::None);
     let loading = RwSignal::new(false);
     let busy_id = RwSignal::new(Option::<String>::None);
-    let feedback = RwSignal::new(Option::<(bool, String)>::None);
 
     let load_reports = move || {
         loading.set(true);
@@ -26,7 +29,9 @@ pub fn ReportsTab(on_resolved: Callback<()>) -> impl IntoView {
         spawn_local(async move {
             match get_json::<ReportsListResp>(&url).await {
                 Ok(resp) => data.set(Some(resp)),
-                Err(err) => feedback.set(Some((false, err))),
+                Err(err) => {
+                    toasts.error("Failed to load content reports", Some(err));
+                }
             }
             loading.set(false);
         });
@@ -41,7 +46,6 @@ pub fn ReportsTab(on_resolved: Callback<()>) -> impl IntoView {
             return;
         }
         busy_id.set(Some(report_id.clone()));
-        feedback.set(None);
         let url = format!(
             "/admin/api/reports/{}/resolve",
             url_encode_component(&report_id)
@@ -52,18 +56,20 @@ pub fn ReportsTab(on_resolved: Callback<()>) -> impl IntoView {
         spawn_local(async move {
             match post_json::<_, ResolveReportResp>(&url, &req).await {
                 Ok(resp) => {
-                    let msg = match resp.resolved_by {
-                        Some(by) => format!(
-                            "Report {} marked as '{}' by {}.",
-                            resp.id, resp.status, by
-                        ),
-                        None => format!("Report {} marked as '{}'.", resp.id, resp.status),
-                    };
-                    feedback.set(Some((true, msg)));
+                    let detail = resp
+                        .resolved_by
+                        .map(|by| format!("Handled by {by}"))
+                        .unwrap_or_else(|| "Status updated.".to_string());
+                    toasts.success(
+                        format!("Report {} marked as '{}'", resp.id, resp.status),
+                        Some(detail),
+                    );
                     load_reports();
                     on_resolved.run(());
                 }
-                Err(err) => feedback.set(Some((false, err))),
+                Err(err) => {
+                    toasts.error("Failed to update report status", Some(err));
+                }
             }
             busy_id.set(None);
         });
@@ -71,12 +77,6 @@ pub fn ReportsTab(on_resolved: Callback<()>) -> impl IntoView {
 
     view! {
         <div class="adm-stack">
-            {move || feedback.get().map(|(ok, msg)| view! {
-                <div class=if ok { "adm-alert adm-alert--ok" } else { "adm-alert adm-alert--err" } role="status">
-                    {msg}
-                </div>
-            })}
-
             <section class="adm-card">
                 <div class="adm-card-head">
                     <div>

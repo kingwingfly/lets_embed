@@ -20,7 +20,9 @@ use leptos_router::{
     components::{ParentRoute, Route, Router, Routes},
     path,
 };
-use lets_embed_ui::{ReportDialog, ReportSubmission, ReportTargetKind};
+use lets_embed_ui::{
+    ReportDialog, ReportSubmission, ReportTargetKind, ToastHost, provide_toast_store,
+};
 
 pub const SITE_DESCRIPTION: &str = "Explore and search curated artwork and photo albums by title, artist, tags, CLIP descriptions, and visual similarity on Let's Embed.";
 
@@ -193,6 +195,7 @@ fn GlobalReportDialog() -> impl IntoView {
 #[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
+    provide_toast_store();
     provide_context(crate::types::ImageQuery(RwSignal::new(None)));
     provide_context(crate::types::AdvancedUploads(RwSignal::new(None)));
     let density = crate::types::GalleryDensityState::new();
@@ -249,6 +252,7 @@ pub fn App() -> impl IntoView {
                     </div>
                 </footer>
                 <GlobalReportDialog />
+                <ToastHost />
             </div>
         </Router>
     }
@@ -270,7 +274,6 @@ fn build_site_ui_config(ctx: &state::RequestSafetyContext) -> SiteUiConfig {
     SiteUiConfig {
         is_managed: ctx.mode.is_managed(),
         safety_enabled: ctx.policy.is_enabled(),
-        safe_mode: ctx.caller.safe_mode,
         default_dinov3_min: pol.similarity.dinov3_min,
         default_siglip2_min: pol.similarity.siglip2_min,
         notice_banner_enabled: pol.legal.notice_banner_enabled && notice_html.is_some(),
@@ -278,7 +281,6 @@ fn build_site_ui_config(ctx: &state::RequestSafetyContext) -> SiteUiConfig {
         notice_banner_key: notice_key,
         rta_meta_enabled: pol.legal.rta_meta_enabled,
         noindex_restricted: pol.legal.noindex_restricted,
-        panic_shortcut: pol.panic_shortcut.clone(),
     }
 }
 
@@ -366,13 +368,8 @@ mod tests {
         leptos_axum::generate_route_list(App);
         let mut pol = site_access::PublicSitePolicy::default();
         pol.legal.rta_meta_enabled = true;
-        let compiled = search_engine::CompiledPolicy::compile_with_resolver(
-            pol,
-            &Default::default(),
-            &Default::default(),
-            &Default::default(),
-        )
-        .unwrap();
+        pol.refresh_policy_digest();
+        let compiled = search_engine::CompiledPolicy::compile(pol).unwrap();
         let ctx = state::RequestSafetyContext::standalone(std::sync::Arc::new(compiled), false);
 
         let render = leptos_axum::render_app_to_stream(|| {

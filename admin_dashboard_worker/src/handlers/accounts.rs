@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Query, State},
     http::HeaderMap,
     response::{IntoResponse, Response},
@@ -31,6 +31,7 @@ use crate::{
         bad_request, guard_mutation, guard_read, internal_error, not_found,
         overview::load_accounts_summary,
     },
+    security::AdminIdentity,
     settings::{MAX_VALUE, PLAN_IDS},
 };
 
@@ -188,10 +189,10 @@ async fn load_identities_for_users(
 #[worker::send]
 pub async fn list_accounts(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    Extension(admin): Extension<AdminIdentity>,
     Query(q): Query<AccountsQuery>,
 ) -> Response {
-    if let Err(resp) = guard_read(&st, &headers) {
+    if let Err(resp) = guard_read(&st, &admin) {
         return resp;
     }
 
@@ -508,10 +509,11 @@ async fn load_single_account(
 #[worker::send]
 pub async fn set_account_plan(
     State(st): State<AppState>,
+    Extension(admin): Extension<AdminIdentity>,
     headers: HeaderMap,
     Json(req): Json<AdminPlanMutationReq>,
 ) -> Response {
-    let actor = match guard_mutation(&st, &headers) {
+    let actor = match guard_mutation(&st, &admin, &headers) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -599,10 +601,11 @@ pub async fn set_account_plan(
 #[worker::send]
 pub async fn credit_account(
     State(st): State<AppState>,
+    Extension(admin): Extension<AdminIdentity>,
     headers: HeaderMap,
     Json(req): Json<AdminCreditMutationReq>,
 ) -> Response {
-    let actor = match guard_mutation(&st, &headers) {
+    let actor = match guard_mutation(&st, &admin, &headers) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -663,10 +666,11 @@ pub async fn credit_account(
 #[worker::send]
 pub async fn ban_account(
     State(st): State<AppState>,
+    Extension(admin): Extension<AdminIdentity>,
     headers: HeaderMap,
     Json(req): Json<AdminBanMutationReq>,
 ) -> Response {
-    let actor = match guard_mutation(&st, &headers) {
+    let actor = match guard_mutation(&st, &admin, &headers) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -734,10 +738,10 @@ pub async fn ban_account(
 #[worker::send]
 pub async fn list_payments(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    Extension(admin): Extension<AdminIdentity>,
     Query(q): Query<PaymentsQuery>,
 ) -> Response {
-    if let Err(resp) = guard_read(&st, &headers) {
+    if let Err(resp) = guard_read(&st, &admin) {
         return resp;
     }
 

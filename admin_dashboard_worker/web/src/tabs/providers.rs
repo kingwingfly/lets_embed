@@ -1,18 +1,18 @@
 //! Auth Providers tab:
-//! - Configure all pluggable auth providers (Age-Assurance OIDC, Google, GitHub, X,
-//!   Discord, Email OTP, Telegram, SIWE, SIWS)
+//! - Configure all pluggable auth providers with clean left-aligned cards & `<ToggleSwitch>`
 //! - Inline disabled notice on non-age-capable providers under Strict Provider-Verified 18+
-//! - Masked write-only secret inputs (NEVER displays plaintext secrets)
+//! - Masked write-only secret inputs encrypted via HKDF(`SITE_SECRET`) / `PROVIDER_SECRETS_KEY`
 //! - Zero-downtime AES-256-GCM key rotation trigger (`POST /admin/api/secrets/rotate`)
+//! - GCP top-right toasts via `use_toast_store()`
 
 use leptos::prelude::*;
-use lets_embed_ui::{NoticeBanner, NoticeContent, NoticeTone};
+use lets_embed_ui::{NoticeBanner, NoticeContent, NoticeTone, ToggleSwitch, use_toast_store};
 use site_access::{AgeVerificationPolicy, AuthProviderId};
 use wasm_bindgen_futures::spawn_local;
 
 use crate::api::{
-    ProviderUpdateItem, ProviderView, ProvidersResp, RotateSecretsResp, SaveProvidersReq,
-    format_ts_utc, get_json, post_json,
+    ActivationResult, ProviderUpdateItem, ProviderView, ProvidersResp, RotateSecretsResp,
+    SaveProvidersReq, format_ts_utc, get_json, post_json, post_json_activatable,
 };
 
 #[derive(Clone)]
@@ -82,12 +82,16 @@ fn client_id_label(id: AuthProviderId) -> &'static str {
 
 fn issuer_label(id: AuthProviderId) -> Option<&'static str> {
     match id {
-        AuthProviderId::OidcAgeAssurance => Some("OIDC Issuer URL (https:// required, SSRF validated)"),
+        AuthProviderId::OidcAgeAssurance => {
+            Some("OIDC Issuer URL (https:// required, SSRF validated)")
+        }
         AuthProviderId::EmailOtp => Some("HTTP Mail API Endpoint (https:// optional)"),
         AuthProviderId::Google
         | AuthProviderId::GitHub
         | AuthProviderId::X
-        | AuthProviderId::Discord => Some("Custom OIDC / OAuth Issuer Override (https:// optional)"),
+        | AuthProviderId::Discord => {
+            Some("Custom OIDC / OAuth Issuer Override (https:// optional)")
+        }
         AuthProviderId::Siwe | AuthProviderId::Siws | AuthProviderId::Telegram => None,
     }
 }
@@ -97,7 +101,9 @@ pub fn ProvidersTab(
     refresh_epoch: RwSignal<u32>,
     on_saved: Callback<()>,
 ) -> impl IntoView {
-    let revision = RwSignal::new(0u32);
+    let toasts = use_toast_store();
+
+    let revision = RwSignal::new(0u64);
     let age_policy = RwSignal::new(AgeVerificationPolicy::Off);
     let current_kid = RwSignal::new(String::new());
     let has_prev_key = RwSignal::new(false);
@@ -106,7 +112,6 @@ pub fn ProvidersTab(
     let loading = RwSignal::new(false);
     let saving = RwSignal::new(false);
     let rotating = RwSignal::new(false);
-    let feedback = RwSignal::new(Option::<(bool, String)>::None);
 
     let load_providers = move || {
         loading.set(true);
@@ -119,7 +124,9 @@ pub fn ProvidersTab(
                     has_prev_key.set(resp.has_prev_key);
                     rows.set(resp.providers.iter().map(EditableProvider::from_view).collect());
                 }
-                Err(err) => feedback.set(Some((false, err))),
+                Err(err) => {
+                    toasts.error("Failed to load auth providers", Some(err));
+                }
             }
             loading.set(false);
         });
@@ -136,7 +143,6 @@ pub fn ProvidersTab(
             return;
         }
         saving.set(true);
-        feedback.set(None);
 
         let providers: Vec<ProviderUpdateItem> = rows
             .get_untracked()
@@ -149,23 +155,36 @@ pub fn ProvidersTab(
         };
 
         spawn_local(async move {
-            match post_json::<_, ProvidersResp>("/admin/api/providers", &req).await {
-                Ok(resp) => {
+            match post_json_activatable::<_, ProvidersResp>("/admin/api/providers", &req).await {
+                Ok(ActivationResult::Active(resp)) => {
                     revision.set(resp.revision);
                     age_policy.set(resp.age_policy);
                     current_kid.set(resp.current_kid);
                     has_prev_key.set(resp.has_prev_key);
                     rows.set(resp.providers.iter().map(EditableProvider::from_view).collect());
-                    feedback.set(Some((
-                        true,
-                        format!(
-                            "Saved auth providers at revision #{} (secrets encrypted with AES-256-GCM in provider_secrets).",
-                            resp.revision
+                    toasts.success(
+                        format!("Saved Auth Providers rev #{}", resp.revision),
+                        Some(
+                            "Secrets encrypted with AES-256-GCM in provider_secrets and activated on SitePolicyDO."
+                                .to_string(),
                         ),
-                    )));
+                    );
                     on_saved.run(());
                 }
-                Err(err) => feedback.set(Some((false, err))),
+                Ok(ActivationResult::PendingActivation(pending)) => {
+                    revision.set(pending.revision);
+                    toasts.warning(
+                        format!(
+                            "Saved rev #{} to D1 — awaiting SitePolicyDO activation",
+                            pending.revision
+                        ),
+                        Some(pending.error),
+                    );
+                    on_saved.run(());
+                }
+                Err(err) => {
+                    toasts.error("Failed to save auth providers", Some(err.message));
+                }
             }
             saving.set(false);
         });
@@ -176,25 +195,28 @@ pub fn ProvidersTab(
             return;
         }
         rotating.set(true);
-        feedback.set(None);
         spawn_local(async move {
             let empty = serde_json::json!({});
             match post_json::<_, RotateSecretsResp>("/admin/api/secrets/rotate", &empty).await {
                 Ok(resp) => {
-                    feedback.set(Some((
-                        resp.failed == 0,
-                        format!(
-                            "Secret rotation complete (target kid={}): total={}, rotated={}, already_current={}, failed={}.",
-                            resp.current_kid,
-                            resp.total_rows,
-                            resp.rotated,
-                            resp.skipped_current,
-                            resp.failed
-                        ),
-                    )));
+                    let detail = format!(
+                        "kid={} · total={} · rotated={} · current={} · failed={}",
+                        resp.current_kid,
+                        resp.total_rows,
+                        resp.rotated,
+                        resp.skipped_current,
+                        resp.failed
+                    );
+                    if resp.failed == 0 {
+                        toasts.success("Secret rotation complete", Some(detail));
+                    } else {
+                        toasts.warning("Secret rotation completed with failures", Some(detail));
+                    }
                     load_providers();
                 }
-                Err(err) => feedback.set(Some((false, err))),
+                Err(err) => {
+                    toasts.error("Secret rotation failed", Some(err));
+                }
             }
             rotating.set(false);
         });
@@ -202,17 +224,13 @@ pub fn ProvidersTab(
 
     view! {
         <form class="adm-stack" on:submit=on_save>
-            {move || feedback.get().map(|(ok, msg)| view! {
-                <div class=if ok { "adm-alert adm-alert--ok" } else { "adm-alert adm-alert--err" } role="status">
-                    {msg}
-                </div>
-            })}
-
             <section class="adm-card">
                 <div class="adm-card-head">
                     <div>
-                        <h2>"Encrypted Secret Keyring (`SETTINGS_ENCRYPTION_KEY`)"</h2>
-                        <p class="adm-sub">"Provider secrets are encrypted with AES-256-GCM, 96-bit CSPRNG nonces, and deployment/provider/field AAD inside D1 `provider_secrets` — never stored in `site_settings` or returned in API responses."</p>
+                        <h2>"Encrypted Secret Keyring (`SITE_SECRET` / `PROVIDER_SECRETS_KEY`)"</h2>
+                        <p class="adm-sub">
+                            "Provider secrets are encrypted with AES-256-GCM (derived via HKDF from `SITE_SECRET` or explicit `PROVIDER_SECRETS_KEY` / `SETTINGS_ENCRYPTION_KEY`), fresh 96-bit CSPRNG nonces, and deployment/provider/field AAD inside D1 `provider_secrets`."
+                        </p>
                     </div>
                     <button
                         type="button"
@@ -229,7 +247,7 @@ pub fn ProvidersTab(
                     </span>
                     <span class="adm-badge">
                         {move || if has_prev_key.get() {
-                            "SETTINGS_ENCRYPTION_KEY_PREV configured (zero-downtime rotation ready)"
+                            "Previous rotation key configured (zero-downtime rotation ready)"
                         } else {
                             "Single active key (no PREV key set)"
                         }}
@@ -276,15 +294,13 @@ pub fn ProvidersTab(
                                         <h3>{id.display_name()}</h3>
                                         <span class="adm-mono adm-sub">{id.as_str()}</span>
                                     </div>
-                                    <label class="adm-check">
-                                        <input
-                                            type="checkbox"
-                                            disabled=move || blocked_by_strict.get()
-                                            prop:checked=move || prov.enabled.get() && !blocked_by_strict.get()
-                                            on:change=move |ev| prov.enabled.set(event_target_checked(&ev))
-                                        />
-                                        <span>"Enabled"</span>
-                                    </label>
+                                    <ToggleSwitch
+                                        checked=Signal::derive(move || prov.enabled.get() && !blocked_by_strict.get())
+                                        on_change=Callback::new(move |v| prov.enabled.set(v))
+                                        disabled=Signal::derive(move || blocked_by_strict.get())
+                                        label="Enabled"
+                                        compact=true
+                                    />
                                 </div>
 
                                 {move || blocked_by_strict.get().then(|| view! {
@@ -294,7 +310,9 @@ pub fn ProvidersTab(
                                 })}
 
                                 {supports_strict.then(|| view! {
-                                    <span class="adm-badge adm-badge--ok">"Strict 18+ Eligible"</span>
+                                    <div class="adm-chips">
+                                        <span class="adm-badge adm-badge--ok">"Strict 18+ Eligible"</span>
+                                    </div>
                                 })}
 
                                 <label class="adm-field">
@@ -330,15 +348,13 @@ pub fn ProvidersTab(
                                 </label>
 
                                 {(id == AuthProviderId::Google).then(|| view! {
-                                    <label class="adm-check">
-                                        <input
-                                            type="checkbox"
-                                            disabled=move || age_policy.get() != AgeVerificationPolicy::SelfAttestation
-                                            prop:checked=move || prov.soft_birthday_check.get()
-                                            on:change=move |ev| prov.soft_birthday_check.set(event_target_checked(&ev))
-                                        />
-                                        <span>"Optional soft birthday pre-check (Self-Attestation only; never grants Verified18)"</span>
-                                    </label>
+                                    <ToggleSwitch
+                                        checked=Signal::derive(move || prov.soft_birthday_check.get())
+                                        on_change=Callback::new(move |v| prov.soft_birthday_check.set(v))
+                                        disabled=Signal::derive(move || age_policy.get() != AgeVerificationPolicy::SelfAttestation)
+                                        label="Optional soft birthday pre-check"
+                                        description="Self-Attestation only; never grants Verified18."
+                                    />
                                 })}
 
                                 {secret_field.map(|field_name| view! {
@@ -381,14 +397,12 @@ pub fn ProvidersTab(
                                             }
                                         />
                                         {move || prov.has_client_secret.get().then(|| view! {
-                                            <label class="adm-check">
-                                                <input
-                                                    type="checkbox"
-                                                    prop:checked=move || prov.clear_secret.get()
-                                                    on:change=move |ev| prov.clear_secret.set(event_target_checked(&ev))
-                                                />
-                                                <span>"Delete stored secret on save"</span>
-                                            </label>
+                                            <ToggleSwitch
+                                                checked=Signal::derive(move || prov.clear_secret.get())
+                                                on_change=Callback::new(move |v| prov.clear_secret.set(v))
+                                                label="Delete stored secret on save"
+                                                compact=true
+                                            />
                                         })}
                                     </div>
                                 })}

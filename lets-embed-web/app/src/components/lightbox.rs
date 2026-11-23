@@ -1,11 +1,11 @@
 use crate::{
     components::{
-        LikeButton, LikeVariant, Viewer,
+        BlurredMediaCard, LikeButton, LikeVariant, Viewer,
         image_details::{list_post_images, list_post_videos},
     },
     types::{
-        GalleryDensityState, PostItem, SafetyUiState, blur_mode_to_ui, mask_to_ui,
-        navigate_external, unlock_href_for_mask,
+        GalleryDensityState, PostItem, SafetyUiState, mask_to_ui, navigate_external,
+        unlock_href_for_mask,
     },
     util::{
         encode_path, format_duration, layout_image_masonry, lock_body_scroll, navigate_from_modal,
@@ -17,11 +17,8 @@ use leptos_router::{NavigateOptions, hooks::use_navigate};
 use leptos_use_element_size::{UseElementSizeReturn, use_element_size};
 use leptos_use_event_listener::use_event_listener;
 use leptos_use_intersection_observer::use_intersection_observer;
-use lets_embed_ui::{
-    ContentMaskCard, DensityPicker, GalleryMask, GalleryMaskPreset, GalleryMediaKind,
-    ReportTargetKind, SpoilerOverlay,
-};
-use search_types::{PostMeta, ProjectedImage, ProjectedVideo};
+use lets_embed_ui::{ContentMaskCard, DensityPicker, GalleryMask, ReportTargetKind};
+use search_types::{MediaKind, PostMeta, ProjectedImage, ProjectedVideo};
 
 const PAGE: usize = 20;
 
@@ -44,7 +41,6 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
     let navigate = use_navigate();
     let dialog_ref: NodeRef<html::Div> = NodeRef::new();
     let safety = use_context::<SafetyUiState>();
-    let panic_epoch_sig: Option<Signal<u64>> = safety.map(|s| s.panic_epoch.into());
 
     lock_body_scroll();
     push_modal_history(move || lightbox.set(None));
@@ -73,11 +69,11 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
     let viewer = RwSignal::new(None::<usize>);
     let viewer_open = Memo::new(move |_| viewer.get().is_some());
 
-    // Immediately wipe DOM media elements and close Lightbox when Safe Mode / Panic activates.
+    // Immediately wipe DOM media elements and close Lightbox on cross-tab safety invalidation.
     if let Some(s) = safety {
-        let last_epoch = StoredValue::new(s.panic_epoch.get_untracked());
+        let last_epoch = StoredValue::new(s.invalidation_epoch.get_untracked());
         Effect::new(move |_| {
-            let cur = s.panic_epoch.get();
+            let cur = s.invalidation_epoch.get();
             if cur != last_epoch.get_value() {
                 last_epoch.set_value(cur);
                 #[cfg(feature = "hydrate")]
@@ -247,12 +243,58 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                         }
                         .into_any()
                     }
-                    ProjectedVideo::Locked {
+                    ProjectedVideo::Blurred {
+                        id,
+                        preview_url,
+                        can_click_reveal,
+                        policy_rev,
+                        label,
+                        preset,
+                        width,
+                        height,
+                        duration,
+                        ..
+                    } => {
+                        let vid_id = *id;
+                        let dur = (*duration > 0).then(|| format_duration(*duration));
+                        view! {
+                            <div class="relative group rounded-xl overflow-hidden bg-slate-900 ring-1 ring-white/10">
+                                <BlurredMediaCard
+                                    kind=MediaKind::Video
+                                    asset_id=vid_id
+                                    width=*width
+                                    height=*height
+                                    preview_url=preview_url.clone().unwrap_or_default()
+                                    can_click_reveal=*can_click_reveal
+                                    policy_rev=*policy_rev
+                                    label=label.clone()
+                                    preset=*preset
+                                    alt=format!("Video #{vid_id}")
+                                    compact=true
+                                />
+                                <div class="absolute top-1.5 right-1.5 z-10">
+                                    <LikeButton
+                                        kind="video"
+                                        target_id=vid_id
+                                        variant=LikeVariant::Card
+                                    />
+                                </div>
+                                {dur.map(|d| view! {
+                                    <span class="absolute top-1.5 left-1.5 z-10 pointer-events-none px-2 py-0.5 rounded-full bg-black/70 text-white text-[11px] font-medium tabular-nums">
+                                        {d}
+                                    </span>
+                                })}
+                            </div>
+                        }
+                        .into_any()
+                    }
+                    ProjectedVideo::Placeholder {
                         id,
                         width,
                         height,
                         duration,
                         mask,
+                        ..
                     } => {
                         let vid_id = *id;
                         let dur = (*duration > 0).then(|| format_duration(*duration));
@@ -448,7 +490,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                                 >
                                     {
                                         let img_id = im.id();
-                                        let locked = im.is_locked();
+                                        let is_placeholder = im.is_placeholder();
                                         let href = format!("/details/{img_id}");
                                         let click_href = href.clone();
                                         let nav = use_navigate();
@@ -489,58 +531,38 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                                                 }
                                                 .into_any()
                                             }
-                                            ProjectedImage::Spoiler {
+                                            ProjectedImage::Blurred {
                                                 preview_url,
-                                                reveal_url,
+                                                can_click_reveal,
+                                                policy_rev,
                                                 label,
                                                 preset,
-                                                blur_mode,
                                                 ..
                                             } => {
-                                                let ui_preset = GalleryMaskPreset::parse(&preset);
-                                                let ui_blur = blur_mode_to_ui(blur_mode);
                                                 let open_cb = Callback::new(move |()| {
                                                     viewer_images.set_value(images_sig.get_untracked());
                                                     viewer.set(Some(i));
                                                 });
                                                 let alt = format!("Image #{img_id}");
-                                                match panic_epoch_sig {
-                                                    Some(epoch) => view! {
-                                                        <SpoilerOverlay
-                                                            id=img_id
-                                                            kind=GalleryMediaKind::Image
-                                                            width=w
-                                                            height=h
-                                                            preview_url=preview_url
-                                                            reveal_url=reveal_url
-                                                            alt=alt
-                                                            label=label
-                                                            preset=ui_preset
-                                                            blur_mode=ui_blur
-                                                            panic_epoch=epoch
-                                                            on_open=open_cb
-                                                        />
-                                                    }
-                                                    .into_any(),
-                                                    None => view! {
-                                                        <SpoilerOverlay
-                                                            id=img_id
-                                                            kind=GalleryMediaKind::Image
-                                                            width=w
-                                                            height=h
-                                                            preview_url=preview_url
-                                                            reveal_url=reveal_url
-                                                            alt=alt
-                                                            label=label
-                                                            preset=ui_preset
-                                                            blur_mode=ui_blur
-                                                            on_open=open_cb
-                                                        />
-                                                    }
-                                                    .into_any(),
+                                                view! {
+                                                    <BlurredMediaCard
+                                                        kind=MediaKind::Image
+                                                        asset_id=img_id
+                                                        width=w
+                                                        height=h
+                                                        preview_url=preview_url.unwrap_or_default()
+                                                        can_click_reveal=can_click_reveal
+                                                        policy_rev=policy_rev
+                                                        label=label
+                                                        preset=preset
+                                                        alt=alt
+                                                        compact=true
+                                                        on_open=open_cb
+                                                    />
                                                 }
+                                                .into_any()
                                             }
-                                            ProjectedImage::Locked { mask, .. } => {
+                                            ProjectedImage::Placeholder { mask, .. } => {
                                                 let ui_mask = mask_to_ui(&mask);
                                                 view! {
                                                     <ContentMaskCard
@@ -564,7 +586,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                                                         variant=LikeVariant::Card
                                                     />
                                                 </div>
-                                                {(!locked).then(|| view! {
+                                                {(!is_placeholder).then(|| view! {
                                                     <a
                                                         href=href
                                                         title="Open image details & similar"

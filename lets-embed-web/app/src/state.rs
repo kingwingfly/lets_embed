@@ -114,4 +114,6 @@ pub struct AppState {
     pub gateway_assertion_secret: Option<Arc<Vec<u8>>>,
     #[from_ref(skip)]
     pub media_cap_secret: Option<Arc<Vec<u8>>>,
+    #[from_ref(skip)]
+    pub internal_api_secret: Option<Arc<Vec<u8>>>,
 }

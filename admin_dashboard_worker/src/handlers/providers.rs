@@ -6,14 +6,14 @@
 //!   any provider where `!id.supports_strict_age_verification()`.
 //! - Enforces OIDC SSRF URL validation (H11) on all issuer URLs.
 //! - Stores secrets ONLY in D1 `provider_secrets` encrypted via AES-256-GCM using
-//!   dedicated `SETTINGS_ENCRYPTION_KEY`, fresh 96-bit CSPRNG nonce, explicit `kid`,
-//!   and AAD = `"{deployment_id}|{provider_id}|{field_name}"`.
+//!   `PROVIDER_SECRETS_KEY` / `SETTINGS_ENCRYPTION_KEY` / HKDF(`SITE_SECRET`),
+//!   fresh 96-bit CSPRNG nonce, explicit `kid`, and AAD = `"{deployment_id}|{provider_id}|{field_name}"`.
 //! - NEVER returns plaintext secrets and NEVER logs secret material.
 
 use std::collections::HashMap;
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::State,
     http::HeaderMap,
     response::{IntoResponse, Response},
@@ -24,9 +24,18 @@ use worker::wasm_bindgen::JsValue;
 
 use crate::{
     AppState, D1_BINDING,
-    api::{ProviderView, ProvidersResp, RotateSecretsResp, SaveProvidersReq},
-    handlers::{bad_request, conflict, guard_mutation, guard_read, internal_error},
-    settings::{LoadedSettings, secret_field_for_provider, validate_provider_updates},
+    api::{
+        ActivationStatus, ProviderView, ProvidersResp, RotateSecretsResp, SaveProvidersReq,
+    },
+    handlers::{
+        bad_request, conflict, guard_mutation, guard_read, internal_error,
+        pending_activation_response,
+    },
+    security::AdminIdentity,
+    settings::{
+        ActivationOutcome, LoadedSettings, ensure_v3_ready_for_non_safety_mutation,
+        secret_field_for_provider, validate_provider_updates,
+    },
 };
 
 #[derive(Deserialize)]
@@ -105,8 +114,11 @@ fn build_provider_views(
 }
 
 #[worker::send]
-pub async fn get_providers(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = guard_read(&st, &headers) {
+pub async fn get_providers(
+    State(st): State<AppState>,
+    Extension(admin): Extension<AdminIdentity>,
+) -> Response {
+    if let Err(resp) = guard_read(&st, &admin) {
         return resp;
     }
 
@@ -128,11 +140,16 @@ pub async fn get_providers(State(st): State<AppState>, headers: HeaderMap) -> Re
 
     let public = &loaded.doc.public;
     let providers = build_provider_views(public.age_policy, &public.enabled_providers, &secret_meta);
+    let policy_digest = compute_policy_digest(public);
 
     Json(ProvidersResp {
+        ok: !loaded.activation_status.is_pending(),
+        pending_activation: loaded.activation_status.is_pending(),
+        activation_status: loaded.activation_status.as_str().to_string(),
         revision: loaded.revision,
         min_enforce_rev: public.min_enforce_rev,
-        digest: compute_policy_digest(public),
+        digest: policy_digest.clone(),
+        policy_digest,
         age_policy: public.age_policy,
         current_kid: st.keyring.current.kid().to_string(),
         has_prev_key: st.keyring.has_previous(),
@@ -144,10 +161,11 @@ pub async fn get_providers(State(st): State<AppState>, headers: HeaderMap) -> Re
 #[worker::send]
 pub async fn save_providers(
     State(st): State<AppState>,
+    Extension(admin): Extension<AdminIdentity>,
     headers: HeaderMap,
     Json(req): Json<SaveProvidersReq>,
 ) -> Response {
-    let admin = match guard_mutation(&st, &headers) {
+    let editor = match guard_mutation(&st, &admin, &headers) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -159,6 +177,12 @@ pub async fn save_providers(
             return internal_error();
         }
     };
+
+    if let Err(msg) =
+        ensure_v3_ready_for_non_safety_mutation(loaded.legacy_upgrade_notice.as_deref())
+    {
+        return conflict(msg);
+    }
 
     if loaded.revision != req.revision {
         return conflict(
@@ -223,11 +247,11 @@ pub async fn save_providers(
         }
     }
 
-    // Step 1: Commit strictly non-secret provider config via D1 CAS (do NOT publish
-    // to SitePolicyDO yet until encrypted `provider_secrets` writes succeed).
+    // Phase 1: Commit strictly non-secret provider config via D1 CAS (`pending_do_ack`).
     loaded.doc.public.enabled_providers = public_configs.clone();
     let (new_rev, stored_public, digest) =
-        match LoadedSettings::save_d1_cas(&st.env, req.revision, &loaded.doc, admin).await {
+        match LoadedSettings::save_d1_cas_pending(&st.env, req.revision, &loaded.doc, editor).await
+        {
             Ok(Some(res)) => res,
             Ok(None) => {
                 return conflict(
@@ -240,7 +264,7 @@ pub async fn save_providers(
             }
         };
 
-    // Step 2: Persist any submitted write-only secrets ONLY in encrypted `provider_secrets` table.
+    // Persist any submitted write-only secrets ONLY in encrypted `provider_secrets` table.
     let db = match st.env.d1(D1_BINDING) {
         Ok(db) => db,
         Err(e) => {
@@ -294,7 +318,7 @@ pub async fn save_providers(
                         enc.kid.as_str().into(),
                         nonce_val,
                         ct_val,
-                        admin.into(),
+                        editor.into(),
                     ])
                 {
                     Ok(stmt) => {
@@ -317,45 +341,68 @@ pub async fn save_providers(
         return internal_error();
     }
 
-    // Step 3: Publish to SitePolicyDO ONLY AFTER both D1 CAS and `provider_secrets` succeed.
-    if let Err(e) = crate::do_client::publish_site_policy(&st.env, &stored_public, &digest).await {
-        worker::console_error!("SitePolicyDO publish after provider save failed: {e:?}");
-        return internal_error();
-    }
+    // Phase 2: Activate on SitePolicyDO ONLY AFTER both D1 CAS and `provider_secrets` succeed.
+    match LoadedSettings::activate_saved_revision(&st.env, &stored_public, &digest).await {
+        Ok(ActivationOutcome::Active {
+            ack,
+            min_enforce_rev,
+        }) => {
+            worker::console_log!(
+                "Admin {editor} saved & activated providers rev={} secrets_updated={updated_secret_count} secrets_cleared={cleared_secret_count}",
+                ack.revision
+            );
 
-    worker::console_log!(
-        "Admin {admin} saved providers rev={new_rev} secrets_updated={updated_secret_count} secrets_cleared={cleared_secret_count}"
-    );
+            let secret_meta = match load_secret_metadata(&st.env).await {
+                Ok(m) => m,
+                Err(e) => {
+                    worker::console_error!("reload provider_secrets metadata failed: {e:?}");
+                    return internal_error();
+                }
+            };
+            let providers = build_provider_views(age_policy, &public_configs, &secret_meta);
 
-    let secret_meta = match load_secret_metadata(&st.env).await {
-        Ok(m) => m,
-        Err(e) => {
-            worker::console_error!("reload provider_secrets metadata failed: {e:?}");
-            return internal_error();
+            Json(ProvidersResp {
+                ok: true,
+                pending_activation: false,
+                activation_status: ActivationStatus::Active.as_str().to_string(),
+                revision: ack.revision,
+                min_enforce_rev,
+                digest: ack.policy_digest.clone(),
+                policy_digest: ack.policy_digest,
+                age_policy,
+                current_kid: st.keyring.current.kid().to_string(),
+                has_prev_key: st.keyring.has_previous(),
+                providers,
+            })
+            .into_response()
         }
-    };
-    let providers = build_provider_views(age_policy, &public_configs, &secret_meta);
-
-    Json(ProvidersResp {
-        revision: new_rev,
-        min_enforce_rev: loaded.doc.public.min_enforce_rev,
-        digest,
-        age_policy,
-        current_kid: st.keyring.current.kid().to_string(),
-        has_prev_key: st.keyring.has_previous(),
-        providers,
-    })
-    .into_response()
+        Ok(ActivationOutcome::PendingDoAck {
+            revision,
+            min_enforce_rev,
+            policy_digest,
+            error,
+        }) => {
+            worker::console_warn!(
+                "Admin {editor} saved providers rev={new_rev} (pending_do_ack): {error}"
+            );
+            pending_activation_response(revision, min_enforce_rev, policy_digest, error)
+        }
+        Err(e) => {
+            worker::console_error!("activate providers policy failed: {e:?}");
+            internal_error()
+        }
+    }
 }
 
-/// Re-encrypts rows in `provider_secrets` from `SETTINGS_ENCRYPTION_KEY_PREV` (or any
-/// older `kid`) to the active `SETTINGS_ENCRYPTION_KEY` with fresh 96-bit CSPRNG nonces.
-///
-/// Uses per-row optimistic CAS (`WHERE provider_id = ? AND field_name = ? AND kid = ?`)
-/// so rotation is safe and resumable across retries.
+/// Re-encrypts rows in `provider_secrets` from the previous key (or any older `kid`)
+/// to the active provider encryption key with fresh 96-bit CSPRNG nonces.
 #[worker::send]
-pub async fn rotate_secrets(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let admin = match guard_mutation(&st, &headers) {
+pub async fn rotate_secrets(
+    State(st): State<AppState>,
+    Extension(admin): Extension<AdminIdentity>,
+    headers: HeaderMap,
+) -> Response {
+    let editor = match guard_mutation(&st, &admin, &headers) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -432,7 +479,6 @@ pub async fn rotate_secrets(State(st): State<AppState>, headers: HeaderMap) -> R
         let nonce_val: JsValue = js_sys::Uint8Array::from(&reenc.nonce[..]).into();
         let ct_val: JsValue = js_sys::Uint8Array::from(reenc.ciphertext.as_slice()).into();
 
-        // Resumable CAS update: only updates if `kid` has not already changed concurrently.
         let res = db
             .prepare(
                 "UPDATE provider_secrets \
@@ -443,7 +489,7 @@ pub async fn rotate_secrets(State(st): State<AppState>, headers: HeaderMap) -> R
                 reenc.kid.as_str().into(),
                 nonce_val,
                 ct_val,
-                admin.into(),
+                editor.into(),
                 row.provider_id.as_str().into(),
                 row.field_name.as_str().into(),
                 row.kid.as_str().into(),
@@ -474,7 +520,7 @@ pub async fn rotate_secrets(State(st): State<AppState>, headers: HeaderMap) -> R
     }
 
     worker::console_log!(
-        "Admin {admin} rotated provider_secrets: total={total_rows} rotated={rotated} skipped={skipped_current} failed={failed} target_kid={current_kid}"
+        "Admin {editor} rotated provider_secrets: total={total_rows} rotated={rotated} skipped={skipped_current} failed={failed} target_kid={current_kid}"
     );
 
     Json(RotateSecretsResp {

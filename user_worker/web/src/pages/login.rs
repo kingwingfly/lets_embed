@@ -3,7 +3,9 @@
 //! cross-device QR handoff, and transfer code claiming.
 
 use leptos::{ev, prelude::*, task::spawn_local};
-use lets_embed_ui::{FloatingHeader, HeaderVariant, NoticeBanner, NoticeContent, NoticeTone};
+use lets_embed_ui::{
+    FloatingHeader, HeaderVariant, NoticeBanner, NoticeContent, NoticeTone, use_toast_store,
+};
 use serde_json::json;
 use site_access::{AgeVerificationPolicy, AuthProviderId, AuthProviderPublicConfig};
 
@@ -68,10 +70,9 @@ pub fn LoginView(
             .or(Some(default_next)),
     ));
 
+    let toasts = use_toast_store();
     let boot = RwSignal::new(None::<BootstrapResp>);
     let busy = RwSignal::new(false);
-    let error_msg = RwSignal::new(api::current_search_param("error"));
-    let info_msg = RwSignal::new(None::<String>);
 
     // Email OTP / Magic link state
     let email_input = RwSignal::new(api::current_search_param("email").unwrap_or_default());
@@ -87,12 +88,17 @@ pub fn LoginView(
 
     // Initial bootstrap + auto-handle magic link (`?email_token=`) or `#transfer=` fragment.
     Effect::new(move |_| {
+        if let Some(err) = api::current_search_param("error") {
+            toasts.error("Sign-in failed", Some(err));
+        }
         spawn_local(async move {
             match api::get_json::<BootstrapResp>("/user/api/bootstrap").await {
                 Ok(b) => {
                     boot.set(Some(b));
                 }
-                Err(e) => error_msg.set(Some(e.display())),
+                Err(e) => {
+                    toasts.error("Could not load sign-in options", Some(e.display()));
+                }
             }
 
             // Magic-link email token landing
@@ -101,7 +107,7 @@ pub fn LoginView(
                 api::current_search_param("email_token"),
             ) {
                 busy.set(true);
-                info_msg.set(Some("Verifying your email sign-in link...".into()));
+                toasts.info("Verifying sign-in link...", None);
                 match api::post_json::<_, EmailVerifyResp>(
                     "/user/auth/email/verify",
                     &json!({ "email": email, "token": token }),
@@ -109,12 +115,12 @@ pub fn LoginView(
                 .await
                 {
                     Ok(resp) => {
+                        api::broadcast_safety_invalidation("account_change");
                         api::navigate_hard(&api::sanitize_next(Some(&resp.next)));
                         return;
                     }
                     Err(e) => {
-                        info_msg.set(None);
-                        error_msg.set(Some(e.display()));
+                        toasts.error("Email sign-in failed", Some(e.display()));
                     }
                 }
                 busy.set(false);
@@ -124,17 +130,17 @@ pub fn LoginView(
             let hash = api::current_hash();
             if let Some(tok) = hash.strip_prefix("#transfer=").filter(|s| !s.is_empty()) {
                 busy.set(true);
-                info_msg.set(Some("Claiming transfer token...".into()));
+                toasts.info("Claiming transfer token...", None);
                 match api::post_json_empty("/user/api/transfer/claim", &json!({ "token": tok }))
                     .await
                 {
                     Ok(()) => {
+                        api::broadcast_safety_invalidation("account_change");
                         api::navigate_hard(&next_url.get_value());
                         return;
                     }
                     Err(e) => {
-                        info_msg.set(None);
-                        error_msg.set(Some(e.display()));
+                        toasts.error("Transfer claim failed", Some(e.display()));
                     }
                 }
                 busy.set(false);
@@ -163,17 +169,23 @@ pub fn LoginView(
             wallet::mount_telegram_widget("le-telegram-login-mount", &bot, move |payload_json| {
                 let dest = dest.clone();
                 busy.set(true);
-                error_msg.set(None);
                 spawn_local(async move {
                     let parsed: Result<serde_json::Value, _> = serde_json::from_str(&payload_json);
                     match parsed {
                         Ok(val) => {
                             match api::post_json_empty("/user/auth/telegram/verify", &val).await {
-                                Ok(()) => api::navigate_hard(&dest),
-                                Err(e) => error_msg.set(Some(e.display())),
+                                Ok(()) => {
+                                    api::broadcast_safety_invalidation("account_change");
+                                    api::navigate_hard(&dest);
+                                }
+                                Err(e) => {
+                                    toasts.error("Telegram sign-in failed", Some(e.display()));
+                                }
                             }
                         }
-                        Err(_) => error_msg.set(Some("Invalid Telegram payload.".into())),
+                        Err(_) => {
+                            toasts.error("Telegram sign-in failed", Some("Invalid Telegram payload.".into()));
+                        }
                     }
                     busy.set(false);
                 });
@@ -189,8 +201,6 @@ pub fn LoginView(
             return;
         }
         busy.set(true);
-        error_msg.set(None);
-        info_msg.set(None);
         let dest = next_url.get_value();
         spawn_local(async move {
             match api::post_json::<_, EmailStartResp>(
@@ -201,9 +211,11 @@ pub fn LoginView(
             {
                 Ok(resp) => {
                     email_code_sent.set(true);
-                    info_msg.set(Some(resp.message));
+                    toasts.success("Sign-in email sent", Some(resp.message));
                 }
-                Err(e) => error_msg.set(Some(e.display())),
+                Err(e) => {
+                    toasts.error("Could not send email", Some(e.display()));
+                }
             }
             busy.set(false);
         });
@@ -218,7 +230,6 @@ pub fn LoginView(
             return;
         }
         busy.set(true);
-        error_msg.set(None);
         spawn_local(async move {
             match api::post_json::<_, EmailVerifyResp>(
                 "/user/auth/email/verify",
@@ -226,8 +237,13 @@ pub fn LoginView(
             )
             .await
             {
-                Ok(resp) => api::navigate_hard(&api::sanitize_next(Some(&resp.next))),
-                Err(e) => error_msg.set(Some(e.display())),
+                Ok(resp) => {
+                    api::broadcast_safety_invalidation("account_change");
+                    api::navigate_hard(&api::sanitize_next(Some(&resp.next)));
+                }
+                Err(e) => {
+                    toasts.error("Code verification failed", Some(e.display()));
+                }
             }
             busy.set(false);
         });
@@ -239,13 +255,12 @@ pub fn LoginView(
             return;
         };
         busy.set(true);
-        error_msg.set(None);
         let dest = next_url.get_value();
         spawn_local(async move {
             let nonce_resp = match api::get_json::<NonceResp>("/user/api/nonce").await {
                 Ok(n) => n,
                 Err(e) => {
-                    error_msg.set(Some(e.display()));
+                    toasts.error("Sign-in failed", Some(e.display()));
                     busy.set(false);
                     return;
                 }
@@ -267,11 +282,18 @@ pub fn LoginView(
                     )
                     .await
                     {
-                        Ok(()) => api::navigate_hard(&dest),
-                        Err(e) => error_msg.set(Some(e.display())),
+                        Ok(()) => {
+                            api::broadcast_safety_invalidation("account_change");
+                            api::navigate_hard(&dest);
+                        }
+                        Err(e) => {
+                            toasts.error("Ethereum sign-in failed", Some(e.display()));
+                        }
                     }
                 }
-                Err(msg) => error_msg.set(Some(msg)),
+                Err(msg) => {
+                    toasts.error("Wallet signature failed", Some(msg));
+                }
             }
             busy.set(false);
         });
@@ -283,13 +305,12 @@ pub fn LoginView(
             return;
         };
         busy.set(true);
-        error_msg.set(None);
         let dest = next_url.get_value();
         spawn_local(async move {
             let nonce_resp = match api::get_json::<NonceResp>("/user/api/nonce").await {
                 Ok(n) => n,
                 Err(e) => {
-                    error_msg.set(Some(e.display()));
+                    toasts.error("Sign-in failed", Some(e.display()));
                     busy.set(false);
                     return;
                 }
@@ -311,11 +332,18 @@ pub fn LoginView(
                     )
                     .await
                     {
-                        Ok(()) => api::navigate_hard(&dest),
-                        Err(e) => error_msg.set(Some(e.display())),
+                        Ok(()) => {
+                            api::broadcast_safety_invalidation("account_change");
+                            api::navigate_hard(&dest);
+                        }
+                        Err(e) => {
+                            toasts.error("Solana sign-in failed", Some(e.display()));
+                        }
                     }
                 }
-                Err(msg) => error_msg.set(Some(msg)),
+                Err(msg) => {
+                    toasts.error("Wallet signature failed", Some(msg));
+                }
             }
             busy.set(false);
         });
@@ -324,7 +352,6 @@ pub fn LoginView(
     // Start QR handoff & poll
     let on_start_handoff = move |_| {
         busy.set(true);
-        error_msg.set(None);
         let dest = next_url.get_value();
         spawn_local(async move {
             match api::post_json::<_, HandoffStartResp>("/user/api/handoff/start", &json!({})).await
@@ -360,6 +387,7 @@ pub fn LoginView(
                         {
                             Ok(resp) if resp.status == "approved" => {
                                 handoff_polling.set(false);
+                                api::broadcast_safety_invalidation("account_change");
                                 api::navigate_hard(&dest);
                                 return;
                             }
@@ -367,19 +395,22 @@ pub fn LoginView(
                             Ok(_) => {
                                 handoff_polling.set(false);
                                 handoff.set(None);
-                                error_msg.set(Some("QR sign-in expired. Please start again.".into()));
+                                toasts.warning(
+                                    "QR sign-in expired",
+                                    Some("Please start a new QR sign-in.".into()),
+                                );
                                 return;
                             }
                             Err(e) => {
                                 handoff_polling.set(false);
-                                error_msg.set(Some(e.display()));
+                                toasts.error("QR handoff failed", Some(e.display()));
                                 return;
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    error_msg.set(Some(e.display()));
+                    toasts.error("Could not start QR sign-in", Some(e.display()));
                     busy.set(false);
                 }
             }
@@ -394,12 +425,16 @@ pub fn LoginView(
             return;
         }
         busy.set(true);
-        error_msg.set(None);
         let dest = next_url.get_value();
         spawn_local(async move {
             match api::post_json_empty("/user/api/transfer/claim", &json!({ "code": code })).await {
-                Ok(()) => api::navigate_hard(&dest),
-                Err(e) => error_msg.set(Some(e.display())),
+                Ok(()) => {
+                    api::broadcast_safety_invalidation("account_change");
+                    api::navigate_hard(&dest);
+                }
+                Err(e) => {
+                    toasts.error("Transfer code rejected", Some(e.display()));
+                }
             }
             busy.set(false);
         });
@@ -629,24 +664,6 @@ pub fn LoginView(
 
             <div class="u-stack">
                 {extra_header.map(|f| f.run())}
-
-                {move || error_msg.get().map(|msg| view! {
-                    <NoticeBanner
-                        content=NoticeContent::Text(msg)
-                        tone=NoticeTone::Danger
-                        dismissible=true
-                        on_dismiss=Callback::new(move |_| error_msg.set(None))
-                    />
-                })}
-
-                {move || info_msg.get().map(|msg| view! {
-                    <NoticeBanner
-                        content=NoticeContent::Text(msg)
-                        tone=NoticeTone::Info
-                        dismissible=true
-                        on_dismiss=Callback::new(move |_| info_msg.set(None))
-                    />
-                })}
 
                 <section class="u-card">
                     <h1>{heading}</h1>

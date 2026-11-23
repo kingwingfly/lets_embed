@@ -1,28 +1,33 @@
 //! Similarity & Geo tab:
-//! - Default DINOv3 & SigLIP2 cosine similarity cutoffs via `lets_embed_ui::MinSimilaritySlider`
-//! - Authoritative ISO-3166 country blocklist + `XX` (unknown) & `T1` (Tor) toggles
+//! - Default DINOv3 & SigLIP2 cosine similarity cutoffs using keyboard-friendly
+//!   `lets_embed_ui::ScoreInput` (`0.00..=1.00`, `step=0.01`, zero native HTML5 step popups)
+//! - Authoritative ISO-3166 country blocklist + `XX` (unknown) & `T1` (Tor) `<ToggleSwitch>`
+//! - GCP top-right toasts via `use_toast_store()`
 
 use leptos::prelude::*;
-use lets_embed_ui::MinSimilaritySlider;
+use lets_embed_ui::{ScoreInput, ToggleSwitch, use_toast_store};
 use site_access::{GeoPolicy, SimilarityDefaults};
 use wasm_bindgen_futures::spawn_local;
 
-use crate::api::{SafetyConfigResp, SaveSafetyReq, SaveSafetyResp, post_json};
+use crate::api::{
+    ActivationResult, SafetyConfigResp, SaveSafetyReq, SaveSafetyResp, post_json_activatable,
+};
 
 #[component]
 pub fn SimilarityGeoTab(
     safety: RwSignal<Option<SafetyConfigResp>>,
     on_saved: Callback<()>,
 ) -> impl IntoView {
+    let toasts = use_toast_store();
+
     let dinov3_min = RwSignal::new(0.0f32);
     let siglip2_min = RwSignal::new(0.0f32);
     let countries_text = RwSignal::new(String::new());
     let block_unknown = RwSignal::new(false);
     let block_tor = RwSignal::new(false);
-    let revision = RwSignal::new(0u32);
+    let revision = RwSignal::new(0u64);
 
     let saving = RwSignal::new(false);
-    let feedback = RwSignal::new(Option::<(bool, String)>::None);
 
     Effect::new(move |_| {
         if let Some(cfg) = safety.get() {
@@ -53,14 +58,13 @@ pub fn SimilarityGeoTab(
             .collect();
 
         saving.set(true);
-        feedback.set(None);
 
         let req = SaveSafetyReq {
             revision: revision.get_untracked(),
             safety_enabled: current.safety_enabled,
-            rules: current.rules,
+            policies: current.policies,
             unclassified_mode: current.unclassified_mode,
-            cloudflare_images_blur: current.cloudflare_images_blur,
+            fixed_blur_enabled: current.fixed_blur_enabled,
             age_policy: current.age_policy,
             age_gate_trigger: current.age_gate_trigger,
             similarity: SimilarityDefaults {
@@ -73,23 +77,36 @@ pub fn SimilarityGeoTab(
                 block_tor: block_tor.get_untracked(),
             },
             legal: current.legal,
-            panic_shortcut: current.panic_shortcut,
+            confirm_policy_v3_migration: false,
         };
 
         spawn_local(async move {
-            match post_json::<_, SaveSafetyResp>("/admin/api/safety", &req).await {
-                Ok(resp) => {
+            match post_json_activatable::<_, SaveSafetyResp>("/admin/api/safety", &req).await {
+                Ok(ActivationResult::Active(resp)) => {
                     revision.set(resp.revision);
-                    feedback.set(Some((
-                        true,
-                        format!(
-                            "Published Similarity & Geo policy rev #{} (min_enforce_rev={}, tightened={}).",
-                            resp.revision, resp.min_enforce_rev, resp.tightened
-                        ),
-                    )));
+                    toasts.success(
+                        format!("Published Similarity & Geo policy rev #{}", resp.revision),
+                        Some(format!(
+                            "min_enforce_rev #{} · tightened={}",
+                            resp.min_enforce_rev, resp.tightened
+                        )),
+                    );
                     on_saved.run(());
                 }
-                Err(err) => feedback.set(Some((false, err))),
+                Ok(ActivationResult::PendingActivation(pending)) => {
+                    revision.set(pending.revision);
+                    toasts.warning(
+                        format!(
+                            "Saved rev #{} to D1 — awaiting SitePolicyDO activation",
+                            pending.revision
+                        ),
+                        Some(pending.error),
+                    );
+                    on_saved.run(());
+                }
+                Err(err) => {
+                    toasts.error("Failed to save Similarity & Geo policy", Some(err.message));
+                }
             }
             saving.set(false);
         });
@@ -97,35 +114,89 @@ pub fn SimilarityGeoTab(
 
     view! {
         <form class="adm-stack" on:submit=on_save>
-            {move || feedback.get().map(|(ok, msg)| view! {
-                <div class=if ok { "adm-alert adm-alert--ok" } else { "adm-alert adm-alert--err" } role="status">
-                    {msg}
-                </div>
-            })}
-
             <section class="adm-card">
                 <div class="adm-card-head">
                     <div>
                         <h2>"Default Vector Similarity Thresholds"</h2>
-                        <p class="adm-sub">"Site-wide default minimum cosine similarity (`1.0 - distance >= min_similarity`). Visitors can adjust per-search sliders on `/` and `/details/:id`."</p>
+                        <p class="adm-sub">
+                            "Site-wide default minimum cosine similarity (`1.0 - distance >= min_similarity`, 0.00 = no cutoff). Visitors can override per-condition thresholds in Advanced Search."
+                        </p>
                     </div>
                 </div>
+
                 <div class="adm-grid-2">
                     <div class="adm-subcard">
-                        <MinSimilaritySlider
-                            value=dinov3_min
-                            label="Default Image Similarity"
-                            model_badge="DINOv3"
-                        />
-                        <p class="adm-sub">"Applies to similar-image lookups (`dino:<id>`) and uploaded-image searches."</p>
+                        <div class="adm-score-card-head">
+                            <div>
+                                <h3>"Default Image Similarity"</h3>
+                                <p class="adm-sub">"Applies to `dino:<id>` and `upload:` searches when no inline `>=` threshold is set."</p>
+                            </div>
+                            <span class="adm-pill">"DINOv3"</span>
+                        </div>
+                        <div class="adm-score-control-row">
+                            <input
+                                type="range"
+                                class="adm-range"
+                                min="0"
+                                max="1"
+                                step="0.01"
+                                prop:value=move || format!("{:.2}", dinov3_min.get())
+                                on:input=move |ev| {
+                                    if let Ok(v) = event_target_value(&ev).parse::<f32>()
+                                        && v.is_finite()
+                                    {
+                                        dinov3_min.set(v.clamp(0.0, 1.0));
+                                    }
+                                }
+                            />
+                            <div class="adm-score-input-box">
+                                <ScoreInput
+                                    value=Signal::derive(move || dinov3_min.get())
+                                    on_change=Callback::new(move |v| dinov3_min.set(v))
+                                    min=0.00
+                                    max=1.00
+                                    step=0.01
+                                    aria_label="DINOv3 default minimum similarity"
+                                />
+                            </div>
+                        </div>
                     </div>
+
                     <div class="adm-subcard">
-                        <MinSimilaritySlider
-                            value=siglip2_min
-                            label="Default Description Similarity"
-                            model_badge="SigLIP2"
-                        />
-                        <p class="adm-sub">"Applies to natural-language text description searches (`clip:`)."</p>
+                        <div class="adm-score-card-head">
+                            <div>
+                                <h3>"Default Description Similarity"</h3>
+                                <p class="adm-sub">"Applies to `clip:` natural-language searches when no inline `>=` threshold is set."</p>
+                            </div>
+                            <span class="adm-pill">"SigLIP2"</span>
+                        </div>
+                        <div class="adm-score-control-row">
+                            <input
+                                type="range"
+                                class="adm-range"
+                                min="0"
+                                max="1"
+                                step="0.01"
+                                prop:value=move || format!("{:.2}", siglip2_min.get())
+                                on:input=move |ev| {
+                                    if let Ok(v) = event_target_value(&ev).parse::<f32>()
+                                        && v.is_finite()
+                                    {
+                                        siglip2_min.set(v.clamp(0.0, 1.0));
+                                    }
+                                }
+                            />
+                            <div class="adm-score-input-box">
+                                <ScoreInput
+                                    value=Signal::derive(move || siglip2_min.get())
+                                    on_change=Callback::new(move |v| siglip2_min.set(v))
+                                    min=0.00
+                                    max=1.00
+                                    step=0.01
+                                    aria_label="SigLIP2 default minimum similarity"
+                                />
+                            </div>
+                        </div>
                     </div>
                 </div>
             </section>
@@ -134,7 +205,9 @@ pub fn SimilarityGeoTab(
                 <div class="adm-card-head">
                     <div>
                         <h2>"Authoritative Geo-Restriction (Edge `request.cf().country()`)"</h2>
-                        <p class="adm-sub">"Evaluated at `gateway_worker` before routing, caching, or admin browse pass, returning HTTP 451. `/admin*` is always exempt so staff cannot lock themselves out."</p>
+                        <p class="adm-sub">
+                            "Evaluated at `gateway_worker` before routing, caching, or admin browse pass, returning HTTP 451. `/admin*` is always exempt so staff cannot lock themselves out."
+                        </p>
                     </div>
                 </div>
 
@@ -149,33 +222,23 @@ pub fn SimilarityGeoTab(
                 </label>
 
                 <div class="adm-toggle-grid">
-                    <label class="adm-switch-row">
-                        <input
-                            type="checkbox"
-                            prop:checked=move || block_unknown.get()
-                            on:change=move |ev| block_unknown.set(event_target_checked(&ev))
-                        />
-                        <span>
-                            <strong>"Block unknown / missing country (`XX`)"</strong>
-                            <small>"Reject visitors whose IP has no resolved Cloudflare country code with HTTP 451."</small>
-                        </span>
-                    </label>
-                    <label class="adm-switch-row">
-                        <input
-                            type="checkbox"
-                            prop:checked=move || block_tor.get()
-                            on:change=move |ev| block_tor.set(event_target_checked(&ev))
-                        />
-                        <span>
-                            <strong>"Block Tor exit nodes (`T1`)"</strong>
-                            <small>"Reject traffic Cloudflare identifies as Tor exit network (`T1`) with HTTP 451."</small>
-                        </span>
-                    </label>
+                    <ToggleSwitch
+                        checked=Signal::derive(move || block_unknown.get())
+                        on_change=Callback::new(move |v| block_unknown.set(v))
+                        label="Block unknown / missing country (`XX`)"
+                        description="Reject visitors whose IP has no resolved Cloudflare country code with HTTP 451."
+                    />
+                    <ToggleSwitch
+                        checked=Signal::derive(move || block_tor.get())
+                        on_change=Callback::new(move |v| block_tor.set(v))
+                        label="Block Tor exit nodes (`T1`)"
+                        description="Reject traffic Cloudflare identifies as Tor exit network (`T1`) with HTTP 451."
+                    />
                 </div>
             </section>
 
             <div class="adm-save-bar">
-                <span class="adm-sub">"Expanding the blocked country list or enabling XX/T1 blocking immediately bumps min_enforce_rev."</span>
+                <span class="adm-sub">"Editing geo-restrictions conservatively bumps min_enforce_rev and notifies SitePolicyDO."</span>
                 <button type="submit" class="adm-btn adm-btn--primary" disabled=move || saving.get()>
                     {move || if saving.get() { "Publishing…" } else { "Save Similarity & Geo Policy" }}
                 </button>

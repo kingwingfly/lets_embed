@@ -5,8 +5,10 @@ pub mod safety;
 
 pub use advanced::{AdvancedSearchRequest, AdvancedSearchResult};
 pub use safety::{
-    CallerContext, CompiledPolicy, ImageFacts, MediaOutcome, MediaSigner, ParentPostFacts,
-    SafetyFilter, SeedLockedError,
+    CLICK_REVEAL_MEDIA_CAP_TTL_SECS, CallerContext, CatalogValidationResult, CompiledPolicy,
+    ImageFacts, ImageParentPostFacts, MediaOutcome, MediaSigner, PUBLIC_MEDIA_CAP_TTL_SECS,
+    ParentPostFacts, RESTRICTED_MEDIA_CAP_TTL_SECS, RevealCheckResult, SafetyFilter,
+    SeedLockedError,
 };
 
 use std::{
@@ -311,7 +313,9 @@ impl Engine {
     /// Construct a lightweight `Engine` backed by a lazy `PgPool` with no ONNX models.
     /// Useful for offline/HTTP router tests that do not execute database queries.
     pub fn connect_lazy_without_models(database_url: &str) -> anyhow::Result<Self> {
-        let pool = PgPoolOptions::new().connect_lazy(database_url)?;
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(500))
+            .connect_lazy(database_url)?;
         Ok(Self {
             pool,
             clip_text_session: None,
@@ -323,38 +327,54 @@ impl Engine {
         })
     }
 
-    /// Compile a [`PublicSitePolicy`] against exact canonical Postgres IDs.
-    pub async fn compile_policy(&self, policy: PublicSitePolicy) -> anyhow::Result<CompiledPolicy> {
-        CompiledPolicy::compile(policy, &self.pool).await
+    /// Compile a [`PublicSitePolicy`] into a Policy v3 [`CompiledPolicy`] (pure,
+    /// zero DB tag-ID lookup).
+    pub fn compile_policy(&self, policy: PublicSitePolicy) -> anyhow::Result<CompiledPolicy> {
+        CompiledPolicy::compile(policy)
     }
 
-    /// Verify that every requested seed image ID is unlocked for the caller
-    /// BEFORE loading its embedding vector (anti-oracle defense H5).
-    pub async fn ensure_images_unlocked(
+    /// Authoritative single-snapshot `facts_rev` lookup backing `GET /internal/facts-rev/{kind}/{id}`.
+    pub async fn lookup_facts_rev(
         &self,
-        image_ids: &[i64],
-        safety: &SafetyFilter<'_>,
-    ) -> anyhow::Result<()> {
-        if image_ids.is_empty() || !safety.is_filtering_active() {
-            return Ok(());
-        }
-        let facts_map = safety::load_image_facts(&self.pool, image_ids, safety.policy).await?;
-        for &id in image_ids {
-            if let Some(facts) = facts_map.get(&id)
-                && let MediaOutcome::Locked { mask } =
-                    safety.policy.evaluate_image(facts, safety.caller)
-            {
-                return Err(anyhow::Error::new(SeedLockedError {
-                    image_id: id,
-                    rule_id: mask.rule_id,
-                    label: mask.label,
-                }));
-            }
-        }
-        Ok(())
+        kind: search_types::MediaKind,
+        asset_id: i64,
+    ) -> anyhow::Result<Option<u64>> {
+        safety::lookup_facts_rev(&self.pool, kind, asset_id).await
     }
 
-    /// Evaluate safety outcomes for a batch of image IDs.
+    /// Exact catalog validation backing `POST /internal/validate-safety-catalog`.
+    pub async fn validate_safety_catalog(
+        &self,
+        post_tags: &[String],
+        authors: &[String],
+    ) -> anyhow::Result<CatalogValidationResult> {
+        safety::validate_safety_catalog(&self.pool, post_tags, authors).await
+    }
+
+    /// Single-snapshot Policy v3 evaluation for `POST /api/safety/reveal`.
+    pub async fn evaluate_single_asset_for_reveal(
+        &self,
+        kind: search_types::MediaKind,
+        asset_id: i64,
+        policy: &CompiledPolicy,
+        caller: &CallerContext,
+    ) -> anyhow::Result<RevealCheckResult> {
+        safety::evaluate_single_asset_for_reveal(&self.pool, kind, asset_id, policy, caller).await
+    }
+
+    /// Single-snapshot Policy v3 evaluation by canonical DB filename (Standalone Media Guard).
+    pub async fn evaluate_asset_by_name(
+        &self,
+        kind: search_types::MediaKind,
+        canonical_name: &str,
+        policy: &CompiledPolicy,
+        caller: &CallerContext,
+    ) -> anyhow::Result<Option<(i64, MediaOutcome)>> {
+        safety::evaluate_asset_by_name(&self.pool, kind, canonical_name, policy, caller).await
+    }
+
+    /// Evaluate Policy v3 outcomes and authoritative `facts_rev` for a batch of image IDs
+    /// in a single `REPEATABLE READ READ ONLY` transaction snapshot.
     pub async fn evaluate_images(
         &self,
         image_ids: &[i64],
@@ -363,17 +383,6 @@ impl Engine {
     ) -> anyhow::Result<HashMap<i64, MediaOutcome>> {
         let mut out = HashMap::with_capacity(image_ids.len());
         if image_ids.is_empty() {
-            return Ok(out);
-        }
-        if !policy.is_enabled() {
-            for &id in image_ids {
-                out.insert(
-                    id,
-                    MediaOutcome::Clear {
-                        req_switchers: Vec::new(),
-                    },
-                );
-            }
             return Ok(out);
         }
         let facts_map = safety::load_image_facts(&self.pool, image_ids, policy).await?;
@@ -387,7 +396,7 @@ impl Engine {
         Ok(out)
     }
 
-    /// Project a slice of images into typed [`ProjectedImage`] values before serialization.
+    /// Project a slice of images into typed Policy v3 [`ProjectedImage`] values before serialization.
     pub async fn project_images(
         &self,
         images: &[Image],
@@ -397,6 +406,24 @@ impl Engine {
     ) -> anyhow::Result<Vec<ProjectedImage>> {
         if images.is_empty() {
             return Ok(Vec::new());
+        }
+        // In Standalone mode with safety disabled, skip DB facts lookup completely (zero overhead!).
+        if !policy.is_enabled() && matches!(signer, MediaSigner::Standalone) {
+            return Ok(images
+                .iter()
+                .map(|img| {
+                    policy.project_image(
+                        img,
+                        MediaOutcome::Clear {
+                            matched_blocks: Vec::new(),
+                            matched_blurs: Vec::new(),
+                            facts_rev: 1,
+                        },
+                        caller,
+                        signer,
+                    )
+                })
+                .collect());
         }
         let ids: Vec<i64> = images.iter().map(|i| i.id).collect();
         let outcomes = self.evaluate_images(&ids, policy, caller).await?;
@@ -411,8 +438,8 @@ impl Engine {
         Ok(out)
     }
 
-    /// Project a slice of videos into typed [`ProjectedVideo`] values before serialization,
-    /// inheriting the strictest rule outcome of each video's parent post(s).
+    /// Project a slice of videos into typed Policy v3 [`ProjectedVideo`] values before serialization,
+    /// inheriting BOTH `Block` and `Blur` outcomes across parent post(s) and sibling images.
     pub async fn project_videos(
         &self,
         videos: &[Video],
@@ -423,13 +450,31 @@ impl Engine {
         if videos.is_empty() {
             return Ok(Vec::new());
         }
+        if !policy.is_enabled() && matches!(signer, MediaSigner::Standalone) {
+            return Ok(videos
+                .iter()
+                .map(|vid| {
+                    policy.project_video(
+                        vid,
+                        MediaOutcome::Clear {
+                            matched_blocks: Vec::new(),
+                            matched_blurs: Vec::new(),
+                            facts_rev: 1,
+                        },
+                        caller,
+                        signer,
+                    )
+                })
+                .collect());
+        }
         let ids: Vec<i64> = videos.iter().map(|v| v.id).collect();
         let outcomes = safety::evaluate_videos_batch(&self.pool, &ids, policy, caller).await?;
         let mut out = Vec::with_capacity(videos.len());
         for vid in videos {
-            let outcome = outcomes.get(&vid.id).cloned().unwrap_or_else(|| {
-                policy.evaluate_video(&[], &Default::default(), &Default::default(), caller)
-            });
+            let outcome = outcomes
+                .get(&vid.id)
+                .cloned()
+                .unwrap_or_else(|| policy.evaluate_video_posts(&[], 1, caller));
             out.push(policy.project_video(vid, outcome, caller, signer));
         }
         Ok(out)
@@ -1623,7 +1668,7 @@ impl Engine {
             bail!("description should not be empty")
         }
         let vec = self.clip_text_vec_cached(raw).await?;
-        let hv = advanced::combine_unit_vectors(&[(*vec).clone()], &[], siglip2::EMBED_DIM)?;
+        let hv = advanced::unit_halfvec(&vec, siglip2::EMBED_DIM)?;
         self.query_images_single_vector(
             "clip_embedding",
             hv,
@@ -1653,7 +1698,7 @@ impl Engine {
             bail!("uploaded image is empty")
         }
         let vec = self.dinov3_upload_vec_cached(bytes).await?;
-        let hv = advanced::combine_unit_vectors(&[(*vec).clone()], &[], dinov3::EMBED_DIM)?;
+        let hv = advanced::unit_halfvec(&vec, dinov3::EMBED_DIM)?;
         self.query_images_single_vector(
             "dinov3_embedding",
             hv,
@@ -1683,14 +1728,14 @@ impl Engine {
         if image_id <= 0 {
             bail!("Image #{image_id} not found or has no visual embedding")
         }
-        // Anti-oracle seed check BEFORE loading `dinov3_embedding` (H5).
-        if let Some(sf) = safety {
-            self.ensure_images_unlocked(&[image_id], sf).await?;
-        }
-        let id_vecs = self.fetch_dino_id_vectors(&[image_id]).await?;
-        let seed_vec =
-            advanced::combine_unit_vectors(&[id_vecs[&image_id].clone()], &[], dinov3::EMBED_DIM)?;
+
+        // Single REPEATABLE READ READ ONLY transaction: authorize Clear seed, read its
+        // `dinov3_embedding`, AND run the similar-images query against the SAME snapshot!
         let safety_active = safety.is_some_and(SafetyFilter::is_filtering_active);
+        let mut tx = safety::begin_repeatable_read_tx(&self.pool).await?;
+        let id_vecs =
+            Self::authorize_and_fetch_dino_seeds_in_tx(&mut tx, &[image_id], safety).await?;
+        let seed_vec = advanced::unit_halfvec(&id_vecs[&image_id], dinov3::EMBED_DIM)?;
         let mut qb = advanced::build_similar_images_query(
             seed_vec,
             image_id,
@@ -1700,8 +1745,54 @@ impl Engine {
             limit,
             offset,
         );
-        let mut tx = self.pool.begin().await?;
-        tx.execute("SET TRANSACTION READ ONLY").await?;
+        tx.execute(VECTOR_STATEMENT_TIMEOUT_SQL).await?;
+        if exclude_post_id.is_some() || safety_active {
+            tx.execute("SET LOCAL hnsw.max_scan_tuples = 20000").await?;
+        }
+        let rows = qb.build().fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        advanced::map_image_rows(rows)
+    }
+
+    /// Single-snapshot similarity search for a seed image ID that authorizes the seed,
+    /// reads its embedding, looks up its parent post to exclude same-album duplicates,
+    /// and executes the bounded HNSW query inside ONE `REPEATABLE READ READ ONLY` transaction.
+    pub async fn search_similar_images_for_seed(
+        &self,
+        image_id: i64,
+        limit: i64,
+        offset: i64,
+        min_similarity: Option<f32>,
+        safety: Option<&SafetyFilter<'_>>,
+    ) -> anyhow::Result<Vec<Image>> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
+        let min_sim = validate_min_similarity(min_similarity).map_err(|e| anyhow!("{e}"))?;
+        if image_id <= 0 {
+            bail!("Image #{image_id} not found or has no visual embedding")
+        }
+
+        let safety_active = safety.is_some_and(SafetyFilter::is_filtering_active);
+        let mut tx = safety::begin_repeatable_read_tx(&self.pool).await?;
+        let id_vecs =
+            Self::authorize_and_fetch_dino_seeds_in_tx(&mut tx, &[image_id], safety).await?;
+        let seed_vec = advanced::unit_halfvec(&id_vecs[&image_id], dinov3::EMBED_DIM)?;
+        let exclude_post_id: Option<i64> = sqlx::query_scalar(
+            "SELECT post_id FROM post_images WHERE image_id = $1 ORDER BY post_id ASC LIMIT 1",
+        )
+        .bind(image_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let mut qb = advanced::build_similar_images_query(
+            seed_vec,
+            image_id,
+            exclude_post_id,
+            min_sim,
+            safety,
+            limit,
+            offset,
+        );
         tx.execute(VECTOR_STATEMENT_TIMEOUT_SQL).await?;
         if exclude_post_id.is_some() || safety_active {
             tx.execute("SET LOCAL hnsw.max_scan_tuples = 20000").await?;
@@ -2068,7 +2159,7 @@ impl Engine {
         &self,
         policy: &CompiledPolicy,
     ) -> anyhow::Result<i64> {
-        if !(policy.has_active_switcher_rules() && policy.policy.legal.noindex_restricted) {
+        if !(policy.is_enabled() && policy.policy.legal.noindex_restricted) {
             return self.sitemap_post_count().await;
         }
         let anon = CallerContext::anonymous();
@@ -2135,7 +2226,7 @@ impl Engine {
         if limit <= 0 || offset < 0 {
             return Ok(Vec::new());
         }
-        if !(policy.has_active_switcher_rules() && policy.policy.legal.noindex_restricted) {
+        if !(policy.is_enabled() && policy.policy.legal.noindex_restricted) {
             return self.sitemap_post_entries(limit, offset).await;
         }
         let anon = CallerContext::anonymous();

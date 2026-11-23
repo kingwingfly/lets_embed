@@ -3,12 +3,11 @@ use std::iter::repeat_with;
 #[cfg(any(feature = "ssr", test))]
 use crate::types::MAX_SEARCH_LIMIT;
 use crate::{
-    components::{LikeButton, LikeVariant, lightbox::Lightbox, viewer::Viewer},
+    components::{BlurredMediaCard, LikeButton, LikeVariant, lightbox::Lightbox, viewer::Viewer},
     types::{
         AdvancedUploads, DEFAULT_SEARCH_LIMIT, GalleryDensity as Density, GalleryDensityState,
-        ImageQuery, Mode, PostItem, SafetyUiState, SearchResponse, UploadedImageSlot,
-        blur_mode_to_ui, mask_to_ui, navigate_external, parse_url_limit, parse_url_min_similarity,
-        unlock_href_for_mask,
+        ImageQuery, Mode, PostItem, SafetyUiState, SearchResponse, UploadedImageSlot, mask_to_ui,
+        navigate_external, parse_url_limit, parse_url_min_similarity, unlock_href_for_mask,
     },
     util::{public_origin, set_document_title},
 };
@@ -27,11 +26,10 @@ use leptos_use_intersection_observer::{
 };
 use leptos_use_signal_debounce_throttle::signal_debounced;
 use lets_embed_ui::{
-    ContentMaskCard, DensityPicker, GalleryMask, GalleryMaskPreset, GalleryMediaKind,
-    MinSimilaritySlider, ReportTargetKind, SpoilerOverlay,
+    ContentMaskCard, DensityPicker, GalleryMask, MinSimilaritySlider, ReportTargetKind,
 };
 use search_types::{
-    ProjectedImage, ProjectedVideo,
+    MediaKind, ProjectedImage, ProjectedVideo,
     query::{AdvancedSort, QueryExpr, SearchField, VectorTier, parse_and_compile},
 };
 
@@ -164,7 +162,6 @@ struct ResultsParams {
     q: String,
     adv: String,
     sort: AdvancedSort,
-    clip_weight: i32,
     /// Optional cosine similarity cutoff encoded in basis points (`0..=1000`).
     min_sim_bps: Option<u16>,
     img_nonce: String,
@@ -199,10 +196,6 @@ fn parse_results_params_with_default(
         q,
         adv: get("adv").unwrap_or_default(),
         sort: AdvancedSort::parse(get("sort").as_deref().unwrap_or("relevance")),
-        clip_weight: get("cw")
-            .and_then(|s| s.parse::<i32>().ok())
-            .unwrap_or(50)
-            .clamp(5, 95),
         min_sim_bps,
         img_nonce: get("img").unwrap_or_default(),
         limit: parse_url_limit(get("limit").as_deref()),
@@ -289,9 +282,9 @@ fn uploads_complete_for_plan(
     slots: &[UploadedImageSlot],
 ) -> bool {
     let mut any_ref = false;
-    for &idx in plan.upload_pos.iter().chain(plan.upload_neg.iter()) {
+    for clause in plan.upload_pos.iter().chain(plan.upload_neg.iter()) {
         any_ref = true;
-        if slots.get(idx).is_none_or(|s| s.b64.is_empty()) {
+        if slots.get(clause.slot).is_none_or(|s| s.b64.is_empty()) {
             return false;
         }
     }
@@ -350,7 +343,6 @@ pub fn Results(
     let qmap = use_query_map();
     let pathname = use_location().pathname;
     let safety = use_context::<SafetyUiState>();
-    let panic_epoch_sig: Option<Signal<u64>> = safety.map(|s| s.panic_epoch.into());
 
     let params = Memo::new(move |_| {
         let fallback_id = default_similar_id.and_then(|sig| sig.get());
@@ -524,13 +516,13 @@ pub fn Results(
         req_id,
     };
 
-    // Panic epoch watcher: immediately discard in-flight fetches, close modals, and clear media.
+    // Invalidation epoch watcher: immediately discard in-flight fetches, close modals, and clear media.
     if let Some(s) = safety {
-        let last_panic = StoredValue::new(s.panic_epoch.get_untracked());
+        let last_inv = StoredValue::new(s.invalidation_epoch.get_untracked());
         Effect::new(move |_| {
-            let cur = s.panic_epoch.get();
-            if cur != last_panic.get_value() {
-                last_panic.set_value(cur);
+            let cur = s.invalidation_epoch.get();
+            if cur != last_inv.get_value() {
+                last_inv.set_value(cur);
                 req_id.set_value(req_id.get_value().wrapping_add(1));
                 lets_embed_ui::browser::wipe_media_elements_in(None);
                 viewer.set(None);
@@ -694,7 +686,7 @@ pub fn Results(
                 let cover_video = p.videos.first().cloned();
                 let cover_details_href = cover
                     .as_ref()
-                    .filter(|c| !c.is_locked())
+                    .filter(|c| !c.is_placeholder())
                     .map(|c| format!("/details/{}", c.id()));
                 let nav = use_navigate();
                 let img_count = p.image_count.max(p.images.len());
@@ -727,60 +719,40 @@ pub fn Results(
                         </button>
                     }
                     .into_any(),
-                    Some(ProjectedImage::Spoiler {
+                    Some(ProjectedImage::Blurred {
                         id,
                         preview_url,
-                        reveal_url,
+                        can_click_reveal,
+                        policy_rev,
                         width: sw,
                         height: sh,
                         label,
                         preset,
-                        blur_mode,
                         ..
                     }) => {
                         let open_cb = Callback::new(move |()| {
                             lightbox.set(Some(post_for_spoiler.clone()));
                         });
-                        let ui_preset = GalleryMaskPreset::parse(&preset);
-                        let ui_blur = blur_mode_to_ui(blur_mode);
                         let alt = title.clone();
-                        match panic_epoch_sig {
-                            Some(epoch) => view! {
-                                <SpoilerOverlay
-                                    id=id
-                                    kind=GalleryMediaKind::Image
-                                    width=sw
-                                    height=sh
-                                    preview_url=preview_url
-                                    reveal_url=reveal_url
-                                    alt=alt
-                                    label=label
-                                    preset=ui_preset
-                                    blur_mode=ui_blur
-                                    panic_epoch=epoch
-                                    on_open=open_cb
-                                />
-                            }
-                            .into_any(),
-                            None => view! {
-                                <SpoilerOverlay
-                                    id=id
-                                    kind=GalleryMediaKind::Image
-                                    width=sw
-                                    height=sh
-                                    preview_url=preview_url
-                                    reveal_url=reveal_url
-                                    alt=alt
-                                    label=label
-                                    preset=ui_preset
-                                    blur_mode=ui_blur
-                                    on_open=open_cb
-                                />
-                            }
-                            .into_any(),
+                        view! {
+                            <BlurredMediaCard
+                                kind=MediaKind::Image
+                                asset_id=id
+                                width=sw
+                                height=sh
+                                preview_url=preview_url.unwrap_or_default()
+                                can_click_reveal=can_click_reveal
+                                policy_rev=policy_rev
+                                label=label
+                                preset=preset
+                                alt=alt
+                                compact=true
+                                on_open=open_cb
+                            />
                         }
+                        .into_any()
                     }
-                    Some(ProjectedImage::Locked {
+                    Some(ProjectedImage::Placeholder {
                         width: lw,
                         height: lh,
                         mask,
@@ -803,7 +775,7 @@ pub fn Results(
                         .into_any()
                     }
                     None => match cover_video {
-                        Some(ProjectedVideo::Locked {
+                        Some(ProjectedVideo::Placeholder {
                             width: vw,
                             height: vh,
                             mask,
@@ -820,6 +792,43 @@ pub fn Results(
                                         dimensions=(vw, vh)
                                         compact=true
                                         on_unlock_click=on_unlock
+                                    />
+                                </div>
+                            }
+                            .into_any()
+                        }
+                        Some(ProjectedVideo::Blurred {
+                            id: vid_id,
+                            preview_url,
+                            can_click_reveal,
+                            policy_rev,
+                            label,
+                            preset,
+                            width: vw,
+                            height: vh,
+                            ..
+                        }) => {
+                            let open_cb = Callback::new(move |()| {
+                                lightbox.set(Some(post_for_spoiler.clone()));
+                            });
+                            view! {
+                                <div
+                                    class="w-full cursor-pointer"
+                                    on:click=move |_| lightbox.set(Some(post_for_open.clone()))
+                                >
+                                    <BlurredMediaCard
+                                        kind=MediaKind::Video
+                                        asset_id=vid_id
+                                        width=vw
+                                        height=vh
+                                        preview_url=preview_url.unwrap_or_default()
+                                        can_click_reveal=can_click_reveal
+                                        policy_rev=policy_rev
+                                        label=label
+                                        preset=preset
+                                        alt=title.clone()
+                                        compact=true
+                                        on_open=open_cb
                                     />
                                 </div>
                             }
@@ -890,7 +899,7 @@ pub fn Results(
             }
             Item::Image(im) => {
                 let id = im.id();
-                let locked = im.is_locked();
+                let is_placeholder = im.is_placeholder();
                 let href = format!("/details/{id}");
                 let click_href = href.clone();
                 let nav = use_navigate();
@@ -923,14 +932,14 @@ pub fn Results(
                         }
                         .into_any()
                     }
-                    ProjectedImage::Spoiler {
+                    ProjectedImage::Blurred {
                         preview_url,
-                        reveal_url,
+                        can_click_reveal,
+                        policy_rev,
                         width: sw,
                         height: sh,
                         label,
                         preset,
-                        blur_mode,
                         ..
                     } => {
                         let open_cb = Callback::new(move |()| {
@@ -938,46 +947,26 @@ pub fn Results(
                                 viewer.set(Some(i));
                             }
                         });
-                        let ui_preset = GalleryMaskPreset::parse(&preset);
-                        let ui_blur = blur_mode_to_ui(blur_mode);
                         let alt = format!("Image #{id}");
-                        match panic_epoch_sig {
-                            Some(epoch) => view! {
-                                <SpoilerOverlay
-                                    id=id
-                                    kind=GalleryMediaKind::Image
-                                    width=sw
-                                    height=sh
-                                    preview_url=preview_url
-                                    reveal_url=reveal_url
-                                    alt=alt
-                                    label=label
-                                    preset=ui_preset
-                                    blur_mode=ui_blur
-                                    panic_epoch=epoch
-                                    on_open=open_cb
-                                />
-                            }
-                            .into_any(),
-                            None => view! {
-                                <SpoilerOverlay
-                                    id=id
-                                    kind=GalleryMediaKind::Image
-                                    width=sw
-                                    height=sh
-                                    preview_url=preview_url
-                                    reveal_url=reveal_url
-                                    alt=alt
-                                    label=label
-                                    preset=ui_preset
-                                    blur_mode=ui_blur
-                                    on_open=open_cb
-                                />
-                            }
-                            .into_any(),
+                        view! {
+                            <BlurredMediaCard
+                                kind=MediaKind::Image
+                                asset_id=id
+                                width=sw
+                                height=sh
+                                preview_url=preview_url.unwrap_or_default()
+                                can_click_reveal=can_click_reveal
+                                policy_rev=policy_rev
+                                label=label
+                                preset=preset
+                                alt=alt
+                                compact=true
+                                on_open=open_cb
+                            />
                         }
+                        .into_any()
                     }
-                    ProjectedImage::Locked {
+                    ProjectedImage::Placeholder {
                         width: lw,
                         height: lh,
                         mask,
@@ -1027,7 +1016,7 @@ pub fn Results(
                                             "Report"
                                         </button>
                                     })}
-                                    {(!locked).then(|| view! {
+                                    {(!is_placeholder).then(|| view! {
                                         <a
                                             href=href
                                             title="Open image details & similar"
@@ -1191,6 +1180,7 @@ pub fn Results(
                 let expr = QueryExpr::Term {
                     field: SearchField::Tag,
                     value: trimmed_q.to_string(),
+                    threshold: None,
                 }
                 .format_query();
                 format!(
@@ -1204,6 +1194,7 @@ pub fn Results(
                 let expr = QueryExpr::Term {
                     field: SearchField::Clip,
                     value: trimmed_q.to_string(),
+                    threshold: None,
                 }
                 .format_query();
                 Some(format!(
@@ -1329,7 +1320,7 @@ pub fn Results(
                                 let aspect = format!("aspect-ratio: {w} / {h}");
                                 let details_href = cover
                                     .as_ref()
-                                    .filter(|c| !c.is_locked())
+                                    .filter(|c| !c.is_placeholder())
                                     .map(|c| format!("/details/{}", c.id()));
                                 let cover_view = match cover {
                                     Some(ProjectedImage::Clear { url, .. }) => {
@@ -1348,32 +1339,33 @@ pub fn Results(
                                         }
                                         .into_any()
                                     }
-                                    Some(ProjectedImage::Spoiler {
+                                    Some(ProjectedImage::Blurred {
                                         id,
                                         preview_url,
-                                        reveal_url,
+                                        can_click_reveal,
+                                        policy_rev,
                                         width: sw,
                                         height: sh,
                                         label,
                                         preset,
-                                        blur_mode,
                                         ..
                                     }) => view! {
-                                        <SpoilerOverlay
-                                            id=id
-                                            kind=GalleryMediaKind::Image
+                                        <BlurredMediaCard
+                                            kind=MediaKind::Image
+                                            asset_id=id
                                             width=sw
                                             height=sh
-                                            preview_url=preview_url
-                                            reveal_url=reveal_url
-                                            alt=title.clone()
+                                            preview_url=preview_url.unwrap_or_default()
+                                            can_click_reveal=can_click_reveal
+                                            policy_rev=policy_rev
                                             label=label
-                                            preset=GalleryMaskPreset::parse(&preset)
-                                            blur_mode=blur_mode_to_ui(blur_mode)
+                                            preset=preset
+                                            alt=title.clone()
+                                            compact=true
                                         />
                                     }
                                     .into_any(),
-                                    Some(ProjectedImage::Locked { mask, .. }) => view! {
+                                    Some(ProjectedImage::Placeholder { mask, .. }) => view! {
                                         <ContentMaskCard
                                             mask=mask_to_ui(&mask)
                                             dimensions=(w, h)
@@ -1382,10 +1374,34 @@ pub fn Results(
                                     }
                                     .into_any(),
                                     None => match cover_video {
-                                        Some(ProjectedVideo::Locked { mask, .. }) => view! {
+                                        Some(ProjectedVideo::Placeholder { mask, .. }) => view! {
                                             <ContentMaskCard
                                                 mask=mask_to_ui(&mask)
                                                 dimensions=(w, h)
+                                                compact=true
+                                            />
+                                        }
+                                        .into_any(),
+                                        Some(ProjectedVideo::Blurred {
+                                            id: vid_id,
+                                            preview_url,
+                                            can_click_reveal,
+                                            policy_rev,
+                                            label,
+                                            preset,
+                                            ..
+                                        }) => view! {
+                                            <BlurredMediaCard
+                                                kind=MediaKind::Video
+                                                asset_id=vid_id
+                                                width=w
+                                                height=h
+                                                preview_url=preview_url.unwrap_or_default()
+                                                can_click_reveal=can_click_reveal
+                                                policy_rev=policy_rev
+                                                label=label
+                                                preset=preset
+                                                alt=title.clone()
                                                 compact=true
                                             />
                                         }
@@ -1593,8 +1609,7 @@ fn load_page(offset_val: i64, ctx: GalleryLoadCtx) {
                         search_advanced_embed(adv_query, p.limit, offset_val, min_sim).await
                     }
                     VectorTier::Clip => {
-                        search_advanced_clip(adv_query, p.clip_weight, p.limit, offset_val, min_sim)
-                            .await
+                        search_advanced_clip(adv_query, p.limit, offset_val, min_sim).await
                     }
                     VectorTier::ImageUpload => {
                         match resolve_advanced_upload_csv(&plan, &p.img_nonce, ctx.adv_uploads) {
@@ -1610,7 +1625,6 @@ fn load_page(offset_val: i64, ctx: GalleryLoadCtx) {
                                 search_advanced_image(
                                     adv_query,
                                     images_csv,
-                                    p.clip_weight,
                                     p.limit,
                                     offset_val,
                                     min_sim,
@@ -1864,7 +1878,6 @@ async fn run_advanced_tier(
     expected_tier: VectorTier,
     uploads: Vec<Vec<u8>>,
     sort: AdvancedSort,
-    clip_weight: i32,
     min_similarity: Option<f32>,
     limit: i64,
     offset: i64,
@@ -1883,7 +1896,8 @@ async fn run_advanced_tier(
             plan.tier
         )));
     }
-    for &idx in plan.upload_pos.iter().chain(plan.upload_neg.iter()) {
+    for clause in plan.upload_pos.iter().chain(plan.upload_neg.iter()) {
+        let idx = clause.slot;
         if idx >= uploads.len() {
             return Err(to_args_err(format!(
                 "Uploaded image #{idx} is missing — re-upload the image and try again"
@@ -1907,7 +1921,6 @@ async fn run_advanced_tier(
         query: q,
         uploads,
         sort,
-        clip_weight: (clip_weight.clamp(5, 95) as f32) / 100.0,
         clip_min_similarity: ctx.effective_siglip2_min(min_similarity),
         dino_min_similarity: ctx.effective_dinov3_min(min_similarity),
         limit,
@@ -2084,7 +2097,6 @@ async fn search_advanced(
         VectorTier::None,
         Vec::new(),
         AdvancedSort::parse(&sort),
-        50,
         None,
         limit,
         offset,
@@ -2104,7 +2116,6 @@ async fn search_advanced_embed(
         VectorTier::EmbedId,
         Vec::new(),
         AdvancedSort::Relevance,
-        50,
         min_similarity,
         limit,
         offset,
@@ -2115,7 +2126,6 @@ async fn search_advanced_embed(
 #[server(endpoint = "search_advanced_clip")]
 async fn search_advanced_clip(
     q: String,
-    clip_weight: i32,
     limit: i64,
     offset: i64,
     min_similarity: Option<f32>,
@@ -2125,7 +2135,6 @@ async fn search_advanced_clip(
         VectorTier::Clip,
         Vec::new(),
         AdvancedSort::Relevance,
-        clip_weight,
         min_similarity,
         limit,
         offset,
@@ -2137,7 +2146,6 @@ async fn search_advanced_clip(
 async fn search_advanced_image(
     q: String,
     images: String,
-    clip_weight: i32,
     limit: i64,
     offset: i64,
     min_similarity: Option<f32>,
@@ -2148,7 +2156,6 @@ async fn search_advanced_image(
         VectorTier::ImageUpload,
         uploads,
         AdvancedSort::Relevance,
-        clip_weight,
         min_similarity,
         limit,
         offset,
@@ -2235,16 +2242,9 @@ async fn search_similar(
     let eff_min = ctx.effective_dinov3_min(min_similarity);
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
-    // Anti-oracle guard (H5): verify seed authorization BEFORE reading details or embedding.
-    engine
-        .ensure_images_unlocked(&[id], &sf)
-        .await
-        .map_err(map_search_err)?;
-
-    let details = engine.image_details(id).await.map_err(to_server_err)?;
-    let exclude_post_id = details.post.as_ref().map(|p| p.id);
+    // Single-snapshot seed authorization + own-post lookup + embedding read + similar search.
     let raw_items = engine
-        .search_similar_images(id, exclude_post_id, limit, offset, eff_min, Some(&sf))
+        .search_similar_images_for_seed(id, limit, offset, eff_min, Some(&sf))
         .await
         .map_err(map_search_err)?;
     let count = raw_items.len() as i64;
@@ -2485,7 +2485,6 @@ fn parse_results_params_defaults_and_clamps() {
     assert_eq!(empty.q, "");
     assert_eq!(empty.adv, "");
     assert_eq!(empty.sort, AdvancedSort::Relevance);
-    assert_eq!(empty.clip_weight, 50);
     assert_eq!(empty.min_sim_bps, None);
     assert_eq!(empty.img_nonce, "");
     assert_eq!(empty.limit, 50);
@@ -2495,7 +2494,6 @@ fn parse_results_params_defaults_and_clamps() {
         "mode" => Some("advanced".into()),
         "adv" => Some("tag:maid AND clip:\"cafe\"".into()),
         "sort" => Some("newest".into()),
-        "cw" => Some("120".into()),
         "min_sim" => Some("0.45".into()),
         "img" => Some("n42".into()),
         "limit" => Some("0".into()),
@@ -2505,7 +2503,6 @@ fn parse_results_params_defaults_and_clamps() {
     assert_eq!(adv.mode, Mode::Advanced);
     assert_eq!(adv.adv, "tag:maid AND clip:\"cafe\"");
     assert_eq!(adv.sort, AdvancedSort::Newest);
-    assert_eq!(adv.clip_weight, 95);
     assert_eq!(adv.min_sim_bps, Some(450));
     assert_eq!(adv.min_similarity(), Some(0.45));
     assert_eq!(adv.img_nonce, "n42");

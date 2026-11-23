@@ -1,19 +1,14 @@
 use leptos::{ev, html, prelude::*};
 use leptos_router::{NavigateOptions, hooks::use_navigate};
 use leptos_use_event_listener::use_event_listener;
-use lets_embed_ui::{
-    ContentMaskCard, GalleryMask, GalleryMaskPreset, GalleryMediaKind, ReportTargetKind,
-    SpoilerOverlay,
-};
-use search_types::ProjectedImage;
+use lets_embed_ui::{ContentMaskCard, GalleryMask, ReportTargetKind};
+use search_types::{MediaKind, ProjectedImage};
 use wasm_bindgen::JsCast;
 use web_sys::TouchEvent;
 
 use crate::{
-    components::{LikeButton, LikeVariant},
-    types::{
-        SafetyUiState, blur_mode_to_ui, mask_to_ui, navigate_external, unlock_href_for_mask,
-    },
+    components::{BlurredMediaCard, LikeButton, LikeVariant},
+    types::{SafetyUiState, mask_to_ui, navigate_external, unlock_href_for_mask},
     util::{lock_body_scroll, navigate_from_modal, push_modal_history, trap_dialog_tab},
 };
 
@@ -58,16 +53,15 @@ pub fn Viewer(
     let navigate = use_navigate();
     let dialog_ref: NodeRef<html::Div> = NodeRef::new();
     let safety = use_context::<SafetyUiState>();
-    let panic_epoch_sig: Option<Signal<u64>> = safety.map(|s| s.panic_epoch.into());
 
     lock_body_scroll();
     push_modal_history(move || index.set(None));
 
-    // Immediately wipe media elements and close Viewer when Safe Mode / Panic triggers.
+    // Immediately wipe media elements and close Viewer on cross-tab safety invalidation.
     if let Some(s) = safety {
-        let last_epoch = StoredValue::new(s.panic_epoch.get_untracked());
+        let last_epoch = StoredValue::new(s.invalidation_epoch.get_untracked());
         Effect::new(move |_| {
-            let cur = s.panic_epoch.get();
+            let cur = s.invalidation_epoch.get();
             if cur != last_epoch.get_value() {
                 last_epoch.set_value(cur);
                 #[cfg(feature = "hydrate")]
@@ -130,7 +124,7 @@ pub fn Viewer(
             }
             "d" | "D" => {
                 if let Some(im) = current_image.get_untracked()
-                    && !im.is_locked()
+                    && !im.is_placeholder()
                 {
                     let href = details_href(im.id());
                     let nav = nav_key.clone();
@@ -285,67 +279,45 @@ pub fn Viewer(
                         }
                         .into_any()
                     }
-                    ProjectedImage::Spoiler {
+                    ProjectedImage::Blurred {
                         id,
                         preview_url,
-                        reveal_url,
+                        can_click_reveal,
+                        policy_rev,
                         width,
                         height,
                         label,
                         preset,
-                        blur_mode,
                         ..
                     } => {
                         let img_id = *id;
                         let w = *width;
                         let h = *height;
-                        let p_url = preview_url.clone();
-                        let r_url = reveal_url.clone();
+                        let p_url = preview_url.clone().unwrap_or_default();
                         let lbl = label.clone();
-                        let ui_preset = GalleryMaskPreset::parse(preset);
-                        let ui_blur = blur_mode_to_ui(*blur_mode);
                         let alt = format!("Image #{img_id}");
                         view! {
                             <div
                                 class="w-full max-w-[min(92vw,760px)] max-h-[calc(100dvh-7rem)] overflow-hidden rounded-2xl"
                                 on:click=|ev| ev.stop_propagation()
                             >
-                                {match panic_epoch_sig {
-                                    Some(epoch) => view! {
-                                        <SpoilerOverlay
-                                            id=img_id
-                                            kind=GalleryMediaKind::Image
-                                            width=w
-                                            height=h
-                                            preview_url=p_url
-                                            reveal_url=r_url
-                                            alt=alt
-                                            label=lbl
-                                            preset=ui_preset
-                                            blur_mode=ui_blur
-                                            panic_epoch=epoch
-                                        />
-                                    }.into_any(),
-                                    None => view! {
-                                        <SpoilerOverlay
-                                            id=img_id
-                                            kind=GalleryMediaKind::Image
-                                            width=w
-                                            height=h
-                                            preview_url=p_url
-                                            reveal_url=r_url
-                                            alt=alt
-                                            label=lbl
-                                            preset=ui_preset
-                                            blur_mode=ui_blur
-                                        />
-                                    }.into_any(),
-                                }}
+                                <BlurredMediaCard
+                                    kind=MediaKind::Image
+                                    asset_id=img_id
+                                    width=w
+                                    height=h
+                                    preview_url=p_url
+                                    can_click_reveal=*can_click_reveal
+                                    policy_rev=*policy_rev
+                                    label=lbl
+                                    preset=*preset
+                                    alt=alt
+                                />
                             </div>
                         }
                         .into_any()
                     }
-                    ProjectedImage::Locked {
+                    ProjectedImage::Placeholder {
                         width,
                         height,
                         mask,
@@ -437,7 +409,7 @@ pub fn Viewer(
                     })}
                     {move || current_image.get().map(|im| {
                         let im_id = im.id();
-                        let locked = im.is_locked();
+                        let is_placeholder = im.is_placeholder();
                         let href = details_href(im_id);
                         let click_href = href.clone();
                         let nav = nav_bar.clone();
@@ -467,7 +439,7 @@ pub fn Viewer(
                                     "Report"
                                 </button>
                             })}
-                            {(!locked).then(|| view! {
+                            {(!is_placeholder).then(|| view! {
                                 <a
                                     href=href
                                     class="inline-flex items-center gap-1 px-2.5 sm:px-3 py-1.5 rounded-full

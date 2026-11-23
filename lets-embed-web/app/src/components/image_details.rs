@@ -1,8 +1,8 @@
 use crate::{
-    components::{Lightbox, LikeButton, LikeVariant, Results, Viewer},
+    components::{BlurredMediaCard, Lightbox, LikeButton, LikeVariant, Results, Viewer},
     types::{
-        ImageQuery, ImageQueryPayload, PostItem, ProjectedImageDetails, SafetyUiState,
-        blur_mode_to_ui, mask_to_ui, navigate_external, unlock_href_for_mask,
+        ImageQuery, ImageQueryPayload, PostItem, ProjectedImageDetails, SafetyUiState, mask_to_ui,
+        navigate_external, unlock_href_for_mask,
     },
     util::{format_duration, layout_image_masonry, public_origin, set_document_title},
 };
@@ -15,12 +15,9 @@ use leptos_router::hooks::{use_location, use_navigate, use_params_map, use_query
 use leptos_use_element_size::{UseElementSizeReturn, use_element_size};
 #[cfg(feature = "hydrate")]
 use leptos_use_event_listener::use_event_listener;
-use lets_embed_ui::{
-    ContentMaskCard, GalleryMask, GalleryMaskPreset, GalleryMediaKind, ReportTargetKind,
-    SpoilerOverlay,
-};
+use lets_embed_ui::{ContentMaskCard, GalleryMask, ReportTargetKind};
 use search_types::{
-    ProjectedImage, ProjectedVideo, Tag,
+    MediaKind, ProjectedImage, ProjectedVideo, Tag,
     query::{QueryExpr, SearchField},
 };
 use wasm_bindgen::{JsCast, JsValue};
@@ -77,6 +74,7 @@ fn tag_search_href(value: &str) -> String {
     let query = QueryExpr::Term {
         field: SearchField::Tag,
         value: value.to_string(),
+        threshold: None,
     }
     .format_query();
     format!("/?mode=advanced&adv={}", urlencoding::encode(&query))
@@ -191,8 +189,6 @@ fn PostAlbumMasonry(
     current_image_id: i64,
     on_zoom: Callback<usize>,
 ) -> impl IntoView {
-    let safety = use_context::<SafetyUiState>();
-    let panic_epoch_sig: Option<Signal<u64>> = safety.map(|s| s.panic_epoch.into());
     let images_store = StoredValue::new(images);
     let container_ref = NodeRef::<html::Div>::new();
     let UseElementSizeReturn {
@@ -279,60 +275,37 @@ fn PostAlbumMasonry(
                                         }
                                         .into_any()
                                     }
-                                    ProjectedImage::Spoiler {
+                                    ProjectedImage::Blurred {
                                         preview_url,
-                                        reveal_url,
+                                        can_click_reveal,
+                                        policy_rev,
                                         label,
                                         preset,
-                                        blur_mode,
                                         ..
                                     } => {
                                         let open_cb = Callback::new(move |()| on_zoom.run(i));
-                                        let ui_preset = GalleryMaskPreset::parse(&preset);
-                                        let ui_blur = blur_mode_to_ui(blur_mode);
                                         let alt = format!("Image #{img_id}");
                                         view! {
                                             <div class=format!("rounded-lg overflow-hidden {ring_cls}")>
-                                                {match panic_epoch_sig {
-                                                    Some(epoch) => view! {
-                                                        <SpoilerOverlay
-                                                            id=img_id
-                                                            kind=GalleryMediaKind::Image
-                                                            width=w
-                                                            height=h
-                                                            preview_url=preview_url
-                                                            reveal_url=reveal_url
-                                                            alt=alt
-                                                            label=label
-                                                            preset=ui_preset
-                                                            blur_mode=ui_blur
-                                                            panic_epoch=epoch
-                                                            on_open=open_cb
-                                                        />
-                                                    }
-                                                    .into_any(),
-                                                    None => view! {
-                                                        <SpoilerOverlay
-                                                            id=img_id
-                                                            kind=GalleryMediaKind::Image
-                                                            width=w
-                                                            height=h
-                                                            preview_url=preview_url
-                                                            reveal_url=reveal_url
-                                                            alt=alt
-                                                            label=label
-                                                            preset=ui_preset
-                                                            blur_mode=ui_blur
-                                                            on_open=open_cb
-                                                        />
-                                                    }
-                                                    .into_any(),
-                                                }}
+                                                <BlurredMediaCard
+                                                    kind=MediaKind::Image
+                                                    asset_id=img_id
+                                                    width=w
+                                                    height=h
+                                                    preview_url=preview_url.unwrap_or_default()
+                                                    can_click_reveal=can_click_reveal
+                                                    policy_rev=policy_rev
+                                                    label=label
+                                                    preset=preset
+                                                    alt=alt
+                                                    compact=true
+                                                    on_open=open_cb
+                                                />
                                             </div>
                                         }
                                         .into_any()
                                     }
-                                    ProjectedImage::Locked { mask, .. } => {
+                                    ProjectedImage::Placeholder { mask, .. } => {
                                         let ui_mask = mask_to_ui(&mask);
                                         view! {
                                             <div class=format!("rounded-lg overflow-hidden {ring_cls}")>
@@ -360,7 +333,6 @@ fn PostAlbumMasonry(
 fn ImageDetailPage(id: String) -> impl IntoView {
     let img_query = expect_context::<ImageQuery>();
     let safety = use_context::<SafetyUiState>();
-    let panic_epoch_sig: Option<Signal<u64>> = safety.map(|s| s.panic_epoch.into());
     let id_stored = StoredValue::new(id);
 
     let details = Resource::new(
@@ -416,11 +388,11 @@ fn ImageDetailPage(id: String) -> impl IntoView {
     let post_videos_store: StoredValue<Vec<ProjectedVideo>> = StoredValue::new(Vec::new());
     let post_videos_count: RwSignal<Option<usize>> = RwSignal::new(None);
 
-    // Immediately wipe media and close modals on Safe Mode / Panic trigger.
+    // Immediately wipe media and close modals on cross-tab safety invalidation.
     if let Some(s) = safety {
-        let last_epoch = StoredValue::new(s.panic_epoch.get_untracked());
+        let last_epoch = StoredValue::new(s.invalidation_epoch.get_untracked());
         Effect::new(move |_| {
-            let cur = s.panic_epoch.get();
+            let cur = s.invalidation_epoch.get();
             if cur != last_epoch.get_value() {
                 last_epoch.set_value(cur);
                 lets_embed_ui::browser::wipe_media_elements_in(None);
@@ -713,7 +685,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
             ProjectedImage::Clear { url, .. } => Some(url.clone()),
             _ => None,
         };
-        let is_locked = image.is_locked();
+        let is_not_clear = !image.is_clear();
         let tag_count = tags.len();
         let any_aliases = tags.iter().any(|t| !t.aliases.is_empty());
 
@@ -1007,65 +979,41 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                 }
                 .into_any()
             }
-            ProjectedImage::Spoiler {
+            ProjectedImage::Blurred {
                 preview_url,
-                reveal_url,
+                can_click_reveal,
+                policy_rev,
                 width: sw,
                 height: sh,
                 label,
                 preset,
-                blur_mode,
                 ..
             } => {
-                let ui_preset = GalleryMaskPreset::parse(&preset);
-                let ui_blur = blur_mode_to_ui(blur_mode);
                 let open_zoom_spoiler = open_zoom_btn.clone();
                 let open_cb = Callback::new(move |()| open_zoom_spoiler(None));
                 let alt = format!("Image #{image_id}");
                 view! {
                     <div class="w-full h-full flex items-center justify-center p-2">
                         <div class="w-full max-w-[min(100%,640px)] max-h-full overflow-hidden rounded-xl">
-                            {match panic_epoch_sig {
-                                Some(epoch) => view! {
-                                    <SpoilerOverlay
-                                        id=image_id
-                                        kind=GalleryMediaKind::Image
-                                        width=sw
-                                        height=sh
-                                        preview_url=preview_url
-                                        reveal_url=reveal_url
-                                        alt=alt
-                                        label=label
-                                        preset=ui_preset
-                                        blur_mode=ui_blur
-                                        panic_epoch=epoch
-                                        on_open=open_cb
-                                    />
-                                }
-                                .into_any(),
-                                None => view! {
-                                    <SpoilerOverlay
-                                        id=image_id
-                                        kind=GalleryMediaKind::Image
-                                        width=sw
-                                        height=sh
-                                        preview_url=preview_url
-                                        reveal_url=reveal_url
-                                        alt=alt
-                                        label=label
-                                        preset=ui_preset
-                                        blur_mode=ui_blur
-                                        on_open=open_cb
-                                    />
-                                }
-                                .into_any(),
-                            }}
+                            <BlurredMediaCard
+                                kind=MediaKind::Image
+                                asset_id=image_id
+                                width=sw
+                                height=sh
+                                preview_url=preview_url.unwrap_or_default()
+                                can_click_reveal=can_click_reveal
+                                policy_rev=policy_rev
+                                label=label
+                                preset=preset
+                                alt=alt
+                                on_open=open_cb
+                            />
                         </div>
                     </div>
                 }
                 .into_any()
             }
-            ProjectedImage::Locked { mask, .. } => {
+            ProjectedImage::Placeholder { mask, .. } => {
                 let ui_mask = mask_to_ui(&mask);
                 view! {
                     <div class="w-full h-full flex items-center justify-center p-4">
@@ -1185,7 +1133,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                     {format!("{image_width} × {image_height}")}
                                 </span>
                             })}
-                            {clear_url.filter(|_| !is_locked).map(|orig_href| view! {
+                            {clear_url.filter(|_| !is_not_clear).map(|orig_href| view! {
                                 <a
                                     href=orig_href
                                     target="_blank"
@@ -1225,9 +1173,9 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                 })}
                             </div>
                         })}
-                        {is_locked.then(|| view! {
+                        {is_not_clear.then(|| view! {
                             <p class="text-xs text-slate-500 px-1 py-0.5 m-0">
-                                "Tag metadata is hidden while this item is locked."
+                                "Tag metadata is hidden while this item is restricted."
                             </p>
                         })}
                         {
@@ -1340,12 +1288,57 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                                                 }
                                                                 .into_any()
                                                             }
-                                                            ProjectedVideo::Locked {
+                                                            ProjectedVideo::Blurred {
+                                                                id: vid_id,
+                                                                preview_url,
+                                                                can_click_reveal,
+                                                                policy_rev,
+                                                                label,
+                                                                preset,
+                                                                width,
+                                                                height,
+                                                                duration,
+                                                                ..
+                                                            } => {
+                                                                let dur = (duration > 0).then(|| format_duration(duration));
+                                                                view! {
+                                                                    <div class="relative group rounded-lg overflow-hidden bg-slate-900">
+                                                                        <BlurredMediaCard
+                                                                            kind=MediaKind::Video
+                                                                            asset_id=vid_id
+                                                                            width=width
+                                                                            height=height
+                                                                            preview_url=preview_url.unwrap_or_default()
+                                                                            can_click_reveal=can_click_reveal
+                                                                            policy_rev=policy_rev
+                                                                            label=label
+                                                                            preset=preset
+                                                                            alt=format!("Video #{vid_id}")
+                                                                            compact=true
+                                                                        />
+                                                                        <div class="absolute top-1.5 right-1.5 z-10">
+                                                                            <LikeButton
+                                                                                kind="video"
+                                                                                target_id=vid_id
+                                                                                variant=LikeVariant::Card
+                                                                            />
+                                                                        </div>
+                                                                        {dur.map(|d| view! {
+                                                                            <span class="absolute top-1.5 left-1.5 z-10 pointer-events-none px-2 py-0.5 rounded-full bg-black/70 text-white text-[11px] font-medium tabular-nums">
+                                                                                {d}
+                                                                            </span>
+                                                                        })}
+                                                                    </div>
+                                                                }
+                                                                .into_any()
+                                                            }
+                                                            ProjectedVideo::Placeholder {
                                                                 id: vid_id,
                                                                 width,
                                                                 height,
                                                                 duration,
                                                                 mask,
+                                                                ..
                                                             } => {
                                                                 let dur = (duration > 0).then(|| format_duration(duration));
                                                                 let ui_mask = mask_to_ui(&mask);
@@ -1547,16 +1540,16 @@ async fn fetch_image_details(id: Option<String>) -> Result<ProjectedImageDetails
     let projected = ctx
         .policy
         .project_image(&details.image, outcome.clone(), &ctx.caller, &ctx.signer);
-    let is_locked = projected.is_locked();
-    let public_safe_clear = !is_locked && outcome.is_public_safe_clear();
+    let is_clear = projected.is_clear();
+    let public_safe_clear = is_clear && outcome.is_public_safe_clear();
     let noindex = !public_safe_clear && ctx.policy.policy.legal.noindex_restricted;
 
     Ok(ProjectedImageDetails {
         image: projected,
         post: details.post,
         authors: details.authors,
-        // Withhold restricted WD-tags & per-tag scores when image is locked (H5).
-        tags: if is_locked { Vec::new() } else { details.tags },
+        // Withhold restricted WD-tags & per-tag scores whenever image is not Clear (Placeholder or Blurred).
+        tags: if is_clear { details.tags } else { Vec::new() },
         og_image_allowed: public_safe_clear,
         noindex,
     })

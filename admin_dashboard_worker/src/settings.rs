@@ -1,38 +1,75 @@
-//! Immutable revisioned site settings (`site_settings` D1 table), access/pricing
-//! validation, safety/age/legal/geo/provider validation, monotonic `min_enforce_rev`
-//! tightening detection, and atomic `SitePolicyDO` publication.
+//! Immutable revisioned site settings (`site_settings` D1 table), Policy v3
+//! validation, conservative `min_enforce_rev` & `grant_generation` computation,
+//! catalog reference collection, and two-phase `SitePolicyDO` activation.
 //!
 //! `site_settings.document` stores the flattened union of [`AccessPolicy`] and
 //! [`PublicSitePolicy`] (whose field names are 100% disjoint, with ZERO secret fields),
-//! keeping backwards-compatibility with `user_worker` billing/deposit lookups and
+//! keeping compatibility with `user_worker` billing/deposit lookups and
 //! `SitePolicyDO` cold-start bootstrapping.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use search_types::{
-    safety::{MAX_RULES_PER_POLICY, validate_policy_rules},
+    WD_VOCAB_DIGEST,
+    safety::{collect_catalog_refs, parse_safety_rule},
     validate_min_similarity,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use site_access::{
     AgeGateTrigger, AgeVerificationPolicy, AuthProviderId, AuthProviderPublicConfig, ChargeKind,
-    PublicSitePolicy, RuleMode, SafetyRuleConfig, UnclassifiedMode, compute_policy_digest,
-    compute_terms_digest, is_eth_address, is_sol_principal,
+    ContentPolicy, GeoPolicy, LegalDocConfig, PublicSitePolicy, SITE_POLICY_SCHEMA_VERSION,
+    SimilarityDefaults, compute_next_grant_generations,
+    compute_next_min_enforce_rev, compute_policy_digest, compute_terms_digest, is_eth_address,
+    is_sol_principal, validate_policy_set_with_mode,
 };
 use worker::{Env, Result};
 
 use crate::{
     D1_BINDING,
-    api::{ProviderUpdateItem, SaveSafetyReq},
-    do_client,
-    security::{validate_and_normalize_geo, validate_oidc_url},
+    api::{ActivationStatus, FieldValidationError, ProviderUpdateItem, SaveSafetyReq},
+    do_client::{self, DoActivationAck},
+    security::{
+        validate_and_normalize_country_list, validate_and_normalize_geo, validate_oidc_url,
+    },
 };
 
 pub const MAX_VALUE: i64 = 1_000_000_000;
 pub const MAX_LEGAL_DOC_BYTES: usize = 100_000;
 pub const MAX_NOTICE_BANNER_BYTES: usize = 8_000;
 
-pub const LEGACY_UNCLASSIFIED_NOTE: &str = "Legacy-ingested or pending images (`images.status != 'completed'`) fail closed to Locked whenever any Switcher rule is enabled (unless Unclassified Mode is set to Allow). Run `embed --retag-safety` against Postgres to backfill WD-Tagger category-9 rating and safety-vocabulary tags on existing media.";
+pub const LEGACY_UNCLASSIFIED_NOTE: &str = "Pending or legacy-ingested images (`images.status != 'completed'` or missing `wd_min_persisted_score` coverage) fail closed to a Placeholder whenever Policy v3 restrictions evaluate to Unknown. Run `embed --retag-safety` against Postgres to backfill full WD-Tagger v3 coverage on existing media.";
+
+pub const LEGACY_UPGRADE_REQUIRED_MSG: &str = "Legacy pre-v3 policy detected; review and publish Content Safety Policy v3 first before updating other settings.";
+
+/// Fail-closed migration guard for all non-safety settings mutations (`access`,
+/// `providers`, `retry-activation`). Rejects writes whenever D1 holds a legacy
+/// pre-v3 `site_settings` row so non-safety saves can NEVER stamp `schema_version = 3`
+/// with empty `policies: []` and silently clear legacy safety enforcement.
+pub fn ensure_v3_ready_for_non_safety_mutation(
+    legacy_upgrade_notice: Option<&str>,
+) -> std::result::Result<(), &'static str> {
+    if legacy_upgrade_notice.is_some() {
+        return Err(LEGACY_UPGRADE_REQUIRED_MSG);
+    }
+    Ok(())
+}
+
+/// Fail-closed migration guard for `POST /admin/api/safety`.
+///
+/// When D1 holds a legacy pre-v3 row, ONLY an explicit Policy v3 publish from the
+/// Content Safety tab (`confirm_policy_v3_migration == true`) is permitted to perform
+/// the upgrade; partial saves from other tabs (`Similarity & Geo`, `Age & Legal`) or
+/// older clients (`confirm_policy_v3_migration == false`) are rejected with `409 Conflict`.
+pub fn ensure_v3_ready_for_safety_mutation(
+    legacy_upgrade_notice: Option<&str>,
+    confirm_policy_v3_migration: bool,
+) -> std::result::Result<(), &'static str> {
+    if legacy_upgrade_notice.is_some() && !confirm_policy_v3_migration {
+        return Err(LEGACY_UPGRADE_REQUIRED_MSG);
+    }
+    Ok(())
+}
 
 // Default pricing / plan constants matching `user_worker/src/config.rs`.
 pub const DEFAULT_POINTS_PER_USD: i64 = 10_000;
@@ -251,7 +288,6 @@ impl AccessPolicy {
 ///
 /// Flattens [`AccessPolicy`] and [`PublicSitePolicy`] (disjoint fields, zero secrets).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct SiteSettingsDocument {
     #[serde(flatten)]
     pub access: AccessPolicy,
@@ -279,227 +315,137 @@ pub const fn secret_field_for_provider(id: AuthProviderId) -> Option<&'static st
 }
 
 // ---------------------------------------------------------------------------
-// Tightening Detection (Fixes H3)
+// Policy v3 Catalog Reference Tracking & Validation Builders (Host-Testable)
 // ---------------------------------------------------------------------------
 
-const fn trigger_rank(trigger: AgeGateTrigger) -> u8 {
-    match trigger {
-        AgeGateTrigger::Off => 0,
-        AgeGateTrigger::JustInTime => 1,
-        AgeGateTrigger::SiteWideSplash => 2,
-    }
+/// Per-policy, per-field (`match_expr` / `except_expr`) catalog references extracted via
+/// [`search_types::safety::collect_catalog_refs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyFieldCatalogRefs {
+    pub policy_id: String,
+    pub field: &'static str,
+    pub post_tags: Vec<String>,
+    pub authors: Vec<String>,
 }
 
-/// Determines whether transitioning from `prev` to `next` tightens safety, age,
-/// Terms, or geographic enforcement — requiring `min_enforce_rev = new_revision`
-/// to immediately invalidate stale edge caches and anonymous media capability tokens.
-pub fn did_policy_tighten(prev: &PublicSitePolicy, next: &PublicSitePolicy) -> bool {
-    // 1. Safety master switch turned on
-    if !prev.safety_enabled && next.safety_enabled {
-        return true;
-    }
-
-    // 2. Safety enforcement parameters tightened while safety is enabled
-    if next.safety_enabled {
-        if prev.unclassified_mode == UnclassifiedMode::Allow
-            && next.unclassified_mode == UnclassifiedMode::LockFailClosed
-        {
-            return true;
-        }
-        if !prev.cloudflare_images_blur && next.cloudflare_images_blur {
-            return true;
-        }
-        if did_rules_tighten(&prev.rules, &next.rules) {
-            return true;
-        }
-    }
-
-    // 3. Age verification policy or gate trigger tightened
-    if next.age_policy.strictness_rank() > prev.age_policy.strictness_rank() {
-        return true;
-    }
-    if trigger_rank(next.age_gate_trigger) > trigger_rank(prev.age_gate_trigger) {
-        return true;
-    }
-
-    // 4. Terms of Service version bumped or digest changed
-    if next.legal.terms_version > prev.legal.terms_version
-        || next.legal.terms_digest != prev.legal.terms_digest
-    {
-        return true;
-    }
-
-    // 5. Geo-blocklist expanded or unknown/Tor blocking turned on
-    if (!prev.geo.block_unknown && next.geo.block_unknown)
-        || (!prev.geo.block_tor && next.geo.block_tor)
-    {
-        return true;
-    }
-    for country in &next.geo.blocked_countries {
-        if !prev
-            .geo
-            .blocked_countries
-            .iter()
-            .any(|old| old.eq_ignore_ascii_case(country))
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn did_rules_tighten(prev_rules: &[SafetyRuleConfig], next_rules: &[SafetyRuleConfig]) -> bool {
-    for next in next_rules.iter().filter(|r| r.enabled) {
-        let Some(prev) = prev_rules.iter().find(|r| r.id == next.id && r.enabled) else {
-            // Newly added or newly enabled rule.
-            return true;
-        };
-        if prev.query.trim() != next.query.trim() {
-            return true;
-        }
-        // Lowering default_min_score causes MORE media to match the rule -> stricter.
-        if next.default_min_score + f32::EPSILON < prev.default_min_score {
-            return true;
-        }
-        // Promoting SpoilerBlur -> Switcher hard-locks media -> stricter.
-        if prev.mode == RuleMode::SpoilerBlur && next.mode == RuleMode::Switcher {
-            return true;
-        }
-        if (!prev.requires_login && next.requires_login)
-            || (!prev.requires_age_18 && next.requires_age_18)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Computes the next monotonic `min_enforce_rev`.
-pub fn compute_next_min_enforce_rev(
-    prev: &PublicSitePolicy,
-    next: &PublicSitePolicy,
-    new_revision: u32,
-) -> (u32, bool) {
-    let tightened = did_policy_tighten(prev, next);
-    let floor = prev.min_enforce_rev;
-    if tightened {
-        (floor.max(new_revision), true)
-    } else {
-        (floor, false)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Pure Policy Mutation Builders (Host-Testable)
-// ---------------------------------------------------------------------------
-
+/// Complete validated Policy v3 update ready for catalog validation and two-phase activation.
 #[derive(Debug, Clone)]
 pub struct ValidatedSafetyUpdate {
     pub next_policy: PublicSitePolicy,
-    pub digest: String,
+    pub policy_digest: String,
     pub tightened: bool,
     pub terms_bumped: bool,
     pub auto_disabled_providers: Vec<AuthProviderId>,
+    pub all_post_tags: Vec<String>,
+    pub all_authors: Vec<String>,
+    pub field_refs: Vec<PolicyFieldCatalogRefs>,
 }
 
-fn is_valid_rule_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+/// Converts unknown `post_tag` and `author` names returned by
+/// `POST {APP_ORIGIN}/internal/validate-safety-catalog` into crisp per-field
+/// validation errors pinpointing every affected `(policy_id, match_expr|except_expr)`.
+pub fn build_catalog_field_errors(
+    field_refs: &[PolicyFieldCatalogRefs],
+    unknown_post_tags: &[String],
+    unknown_authors: &[String],
+) -> Vec<FieldValidationError> {
+    let unknown_tags_set: HashSet<&str> = unknown_post_tags.iter().map(String::as_str).collect();
+    let unknown_authors_set: HashSet<&str> = unknown_authors.iter().map(String::as_str).collect();
+    let mut errors = Vec::new();
+
+    for entry in field_refs {
+        let bad_tags: Vec<&str> = entry
+            .post_tags
+            .iter()
+            .map(String::as_str)
+            .filter(|t| unknown_tags_set.contains(*t))
+            .collect();
+        if !bad_tags.is_empty() {
+            errors.push(FieldValidationError {
+                policy_id: Some(entry.policy_id.clone()),
+                field: entry.field.to_string(),
+                message: format!(
+                    "Policy '{}' {} references unknown post_tag(s): {}",
+                    entry.policy_id,
+                    entry.field,
+                    bad_tags.join(", ")
+                ),
+            });
+        }
+
+        let bad_authors: Vec<&str> = entry
+            .authors
+            .iter()
+            .map(String::as_str)
+            .filter(|a| unknown_authors_set.contains(*a))
+            .collect();
+        if !bad_authors.is_empty() {
+            errors.push(FieldValidationError {
+                policy_id: Some(entry.policy_id.clone()),
+                field: entry.field.to_string(),
+                message: format!(
+                    "Policy '{}' {} references unknown author(s): {}",
+                    entry.policy_id,
+                    entry.field,
+                    bad_authors.join(", ")
+                ),
+            });
+        }
+    }
+
+    // Fallback if origin returned an unknown item not mapped to a specific field entry.
+    if errors.is_empty() && (!unknown_post_tags.is_empty() || !unknown_authors.is_empty()) {
+        if !unknown_post_tags.is_empty() {
+            errors.push(FieldValidationError {
+                policy_id: None,
+                field: "policies".to_string(),
+                message: format!(
+                    "Unknown post_tag(s) in safety policy: {}",
+                    unknown_post_tags.join(", ")
+                ),
+            });
+        }
+        if !unknown_authors.is_empty() {
+            errors.push(FieldValidationError {
+                policy_id: None,
+                field: "policies".to_string(),
+                message: format!(
+                    "Unknown author(s) in safety policy: {}",
+                    unknown_authors.join(", ")
+                ),
+            });
+        }
+    }
+
+    errors
 }
 
-/// Validates and applies a `/admin/api/safety` update against `prev`, computing
-/// `terms_digest`, bumping `terms_version` when `terms_md` changed, enforcing
-/// Strict 18+ provider auto-disablement, and computing monotonic `min_enforce_rev`.
+/// Validates and applies a Policy v3 `/admin/api/safety` update against `prev`:
+/// - Normalizes policy slugs, expressions, and ISO-3166 country exclusions
+/// - Enforces all Policy v3 invariants via [`site_access::validate_policy_set_with_mode`]
+///   (`Block`/`Blur` only, rejects `Block + include_click`, rejects `require_age_18` while
+///   `age_policy == Off`, validates every `tag:<name>` against the 10,861-tag WD-Tagger v3
+///   vocabulary even inside `NOT` and `except_expr`, enforces hundredths `0.01..=1.00`,
+///   16 policies / 32 terms per policy / depth 6 / 128 total terms)
+/// - Computes conservative `grant_generation` (`compute_next_grant_generations`) and
+///   conservative `min_enforce_rev` (`compute_next_min_enforce_rev`)
+/// - Stamps `schema_version = 3`, `vocab_digest = WD_VOCAB_DIGEST`, and canonical `policy_digest`
+/// - Collects all `post_tag:` and `author:` refs via [`search_types::safety::collect_catalog_refs`]
 pub fn prepare_safety_update(
     prev: &PublicSitePolicy,
     req: &SaveSafetyReq,
-    new_revision: u32,
+    new_revision: u64,
 ) -> std::result::Result<ValidatedSafetyUpdate, String> {
-    if req.rules.len() > MAX_RULES_PER_POLICY {
-        return Err(format!(
-            "Policy exceeds maximum of {MAX_RULES_PER_POLICY} safety rules"
-        ));
-    }
-
-    let mut seen_ids = HashSet::new();
-    let mut normalized_rules = Vec::with_capacity(req.rules.len());
-    let mut queries_to_validate: Vec<String> = Vec::new();
-
-    for (idx, rule) in req.rules.iter().enumerate() {
-        let id = rule.id.trim().to_ascii_lowercase();
-        if !is_valid_rule_id(&id) {
-            return Err(format!(
-                "Rule #{} id '{}' must be 1..=64 lowercase ASCII [a-z0-9_-]",
-                idx + 1,
-                rule.id
-            ));
-        }
-        if !seen_ids.insert(id.clone()) {
-            return Err(format!("Duplicate safety rule id '{id}'"));
-        }
-        let name = rule.name.trim().to_string();
-        if name.is_empty() || name.len() > 120 || name.chars().any(char::is_control) {
-            return Err(format!(
-                "Rule '{id}' name must be 1..=120 non-control characters"
-            ));
-        }
-        if !rule.default_min_score.is_finite()
-            || rule.default_min_score <= 0.0
-            || rule.default_min_score > 1.0
-        {
-            return Err(format!(
-                "Rule '{id}' default_min_score must be finite and in (0.0, 1.0]"
-            ));
-        }
-
-        let query = rule.query.trim().to_string();
-        if rule.enabled && query.is_empty() {
-            return Err(format!("Enabled rule '{id}' cannot have an empty query"));
-        }
-        if !query.is_empty() {
-            queries_to_validate.push(query.clone());
-        }
-
-        normalized_rules.push(SafetyRuleConfig {
-            id,
-            name,
-            mode: rule.mode,
-            query,
-            default_min_score: rule.default_min_score,
-            preset: rule.preset,
-            requires_login: rule.requires_login,
-            requires_age_18: rule.requires_age_18,
-            enabled: rule.enabled,
-        });
-    }
-
-    // Validate all non-empty rule queries via shared metadata-only safety grammar.
-    validate_policy_rules(queries_to_validate.iter().map(String::as_str))
-        .map_err(|e| format!("Invalid safety rule: {e}"))?;
-
-    // Validate similarity thresholds via search_types helper.
+    // 1. Validate similarity thresholds via search_types helper.
     validate_min_similarity(Some(req.similarity.dinov3_min))
         .map_err(|e| format!("DINOv3 {e}"))?;
     validate_min_similarity(Some(req.similarity.siglip2_min))
         .map_err(|e| format!("SigLIP2 {e}"))?;
 
-    // Validate and normalize ISO-3166 geo blocklist.
+    // 2. Validate and normalize site-wide ISO-3166 geo blocklist.
     let geo = validate_and_normalize_geo(&req.geo)?;
 
-    // Validate panic shortcut.
-    let panic_shortcut = req.panic_shortcut.trim().to_string();
-    if panic_shortcut.is_empty()
-        || panic_shortcut.len() > 32
-        || panic_shortcut.chars().any(char::is_control)
-    {
-        return Err("Panic shortcut must be 1..=32 non-control characters".into());
-    }
-
-    // Validate legal document lengths and compute canonical terms digest + monotonic version.
+    // 3. Validate legal document lengths and compute canonical terms digest + monotonic version.
     let mut legal = req.legal.clone();
     for (label, doc, limit) in [
         ("Terms of Service", &legal.terms_md, MAX_LEGAL_DOC_BYTES),
@@ -518,7 +464,8 @@ pub fn prepare_safety_update(
     }
     let new_terms_digest = compute_terms_digest(&legal.terms_md);
     let prev_terms_digest = compute_terms_digest(&prev.legal.terms_md);
-    let terms_bumped = new_terms_digest != prev_terms_digest || new_terms_digest != prev.legal.terms_digest;
+    let terms_bumped =
+        new_terms_digest != prev_terms_digest || new_terms_digest != prev.legal.terms_digest;
     legal.terms_digest = new_terms_digest;
     legal.terms_version = if terms_bumped {
         prev.legal.terms_version.max(1).saturating_add(1)
@@ -526,8 +473,45 @@ pub fn prepare_safety_update(
         prev.legal.terms_version.max(1)
     };
 
-    // Enforce Strict 18+ invariant on already-configured providers: automatically
-    // disable any non-age-capable provider when switching into StrictProviderVerified18.
+    // 4. Normalize policies (slug trim/lowercase, expr trim, country normalization).
+    let mut normalized_policies = Vec::with_capacity(req.policies.len());
+    for pol in &req.policies {
+        let id = pol.id.trim().to_ascii_lowercase();
+        let name = pol.name.trim().to_string();
+        let match_expr = pol.match_expr.trim().to_string();
+        let except_expr = pol
+            .except_expr
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let exclude_countries = validate_and_normalize_country_list(
+            &pol.bypass.exclude_countries,
+            "Policy exclude_countries must not list XX (unknown/missing countries are automatically denied whenever exclude_countries is non-empty)",
+            "Policy exclude_countries must not list T1 (Tor exit nodes are automatically denied whenever exclude_countries is non-empty)",
+        )
+        .map_err(|e| format!("Policy '{id}': {e}"))?;
+
+        let mut bypass = pol.bypass.clone();
+        bypass.exclude_countries = exclude_countries;
+
+        normalized_policies.push(ContentPolicy {
+            id,
+            grant_generation: pol.grant_generation.max(1),
+            enabled: pol.enabled,
+            priority: pol.priority,
+            name,
+            preset: pol.preset,
+            match_expr,
+            except_expr,
+            default_tag_min: pol.default_tag_min,
+            action: pol.action,
+            bypass,
+        });
+    }
+
+    // 5. Enforce Strict 18+ invariant on already-configured providers.
     let mut enabled_providers = prev.enabled_providers.clone();
     let mut auto_disabled_providers = Vec::new();
     for prov in &mut enabled_providers {
@@ -540,32 +524,84 @@ pub fn prepare_safety_update(
         }
     }
 
+    // 6. Build candidate Policy v3 document.
     let mut next_policy = PublicSitePolicy {
+        schema_version: SITE_POLICY_SCHEMA_VERSION,
         revision: new_revision,
         min_enforce_rev: prev.min_enforce_rev,
+        policy_digest: String::new(),
+        vocab_digest: WD_VOCAB_DIGEST.to_string(),
         safety_enabled: req.safety_enabled,
-        rules: normalized_rules,
         unclassified_mode: req.unclassified_mode,
-        cloudflare_images_blur: req.cloudflare_images_blur,
+        fixed_blur_enabled: req.fixed_blur_enabled,
+        policies: normalized_policies,
         age_policy: req.age_policy,
         age_gate_trigger: req.age_gate_trigger,
         similarity: req.similarity,
         legal,
         geo,
         enabled_providers,
-        panic_shortcut,
     };
 
+    // 7. Compute conservative `grant_generation` and `min_enforce_rev`, then stamp digest.
+    compute_next_grant_generations(prev, &mut next_policy);
     let (min_enforce_rev, tightened) = compute_next_min_enforce_rev(prev, &next_policy, new_revision);
     next_policy.min_enforce_rev = min_enforce_rev;
-    let digest = compute_policy_digest(&next_policy);
+    next_policy.refresh_policy_digest();
 
+    // 8. Enforce EVERY Policy v3 invariant with strict hundredths precision.
+    validate_policy_set_with_mode(&next_policy, true).map_err(|e| e.to_string())?;
+
+    // 9. Collect per-field `post_tag:` and `author:` refs via `search_types::safety::collect_catalog_refs`.
+    let mut all_post_tags = BTreeSet::new();
+    let mut all_authors = BTreeSet::new();
+    let mut field_refs = Vec::new();
+
+    for pol in &next_policy.policies {
+        if !pol.match_expr.is_empty() {
+            let expr = parse_safety_rule(&pol.match_expr)
+                .map_err(|e| format!("Policy '{}' match_expr: {e}", pol.id))?;
+            let (ptags, auths) = collect_catalog_refs(&expr);
+            if !ptags.is_empty() || !auths.is_empty() {
+                all_post_tags.extend(ptags.iter().cloned());
+                all_authors.extend(auths.iter().cloned());
+                field_refs.push(PolicyFieldCatalogRefs {
+                    policy_id: pol.id.clone(),
+                    field: "match_expr",
+                    post_tags: ptags,
+                    authors: auths,
+                });
+            }
+        }
+        if let Some(ex_raw) = pol.except_expr.as_deref()
+            && !ex_raw.is_empty()
+        {
+            let expr = parse_safety_rule(ex_raw)
+                .map_err(|e| format!("Policy '{}' except_expr: {e}", pol.id))?;
+            let (ptags, auths) = collect_catalog_refs(&expr);
+            if !ptags.is_empty() || !auths.is_empty() {
+                all_post_tags.extend(ptags.iter().cloned());
+                all_authors.extend(auths.iter().cloned());
+                field_refs.push(PolicyFieldCatalogRefs {
+                    policy_id: pol.id.clone(),
+                    field: "except_expr",
+                    post_tags: ptags,
+                    authors: auths,
+                });
+            }
+        }
+    }
+
+    let policy_digest = next_policy.policy_digest.clone();
     Ok(ValidatedSafetyUpdate {
         next_policy,
-        digest,
+        policy_digest,
         tightened,
         terms_bumped,
         auto_disabled_providers,
+        all_post_tags: all_post_tags.into_iter().collect(),
+        all_authors: all_authors.into_iter().collect(),
+        field_refs,
     })
 }
 
@@ -584,7 +620,6 @@ pub fn validate_provider_updates(
             return Err(format!("Duplicate provider entry '{}'", item.id.as_str()));
         }
 
-        // Strict Provider-Verified 18+ enforcement (H7): reject enabling non-age-capable providers.
         if item.enabled && !item.id.is_allowed_under(age_policy) {
             return Err(format!(
                 "Provider '{}' cannot be enabled under Strict Provider-Verified 18+ age policy; only Age-Assurance OIDC is allowed",
@@ -592,7 +627,6 @@ pub fn validate_provider_updates(
             ));
         }
 
-        // Soft birthday convenience check is strictly Google + SelfAttestation only.
         if item.soft_birthday_check {
             if item.id != AuthProviderId::Google {
                 return Err("soft_birthday_check is only supported on the Google provider".into());
@@ -605,7 +639,6 @@ pub fn validate_provider_updates(
             }
         }
 
-        // Normalize & validate display_name and public_client_id.
         let display_name = item
             .display_name
             .as_deref()
@@ -640,7 +673,6 @@ pub fn validate_provider_updates(
             })
             .transpose()?;
 
-        // Validate OIDC / provider HTTPS URLs against SSRF (H11).
         let issuer = match item
             .issuer
             .as_deref()
@@ -661,7 +693,6 @@ pub fn validate_provider_updates(
             }
         };
 
-        // Check write-only secret sanity (never log secret contents!).
         if let Some(secret) = item.secret_value.as_deref() {
             if !secret.is_empty() && secret_field_for_provider(item.id).is_none() {
                 return Err(format!(
@@ -687,66 +718,181 @@ pub fn validate_provider_updates(
         });
     }
 
-    // Deterministic ordering matching AuthProviderId::ALL.
     configs.sort_by_key(|c| c.id);
     Ok(configs)
 }
 
 // ---------------------------------------------------------------------------
-// D1 Persistence + SitePolicyDO Sync
+// D1 Persistence + Two-Phase SitePolicyDO Activation
 // ---------------------------------------------------------------------------
+
+/// Result of Phase-2 `SitePolicyDO` activation after D1 persistence.
+#[derive(Debug, Clone)]
+pub enum ActivationOutcome {
+    Active {
+        ack: DoActivationAck,
+        min_enforce_rev: u64,
+    },
+    PendingDoAck {
+        revision: u64,
+        min_enforce_rev: u64,
+        policy_digest: String,
+        error: String,
+    },
+}
 
 #[derive(Debug, Clone)]
 pub struct LoadedSettings {
-    pub revision: u32,
+    pub revision: u64,
+    pub activation_status: ActivationStatus,
     pub doc: SiteSettingsDocument,
+    pub legacy_upgrade_notice: Option<String>,
+}
+
+/// Decodes a persisted `site_settings.document` JSON string into a Policy v3
+/// [`SiteSettingsDocument`], allowing clean admin-side migration if an existing
+/// deployment holds a pre-v3 row while strictly decoding schema v3 rows.
+pub fn decode_site_settings_document(
+    revision: u64,
+    raw_json: &str,
+    default_doc: SiteSettingsDocument,
+) -> std::result::Result<(SiteSettingsDocument, Option<String>), String> {
+    if revision == 0 && raw_json.trim() == "{}" {
+        return Ok((default_doc, None));
+    }
+
+    let val: Value = serde_json::from_str(raw_json)
+        .map_err(|e| format!("corrupt site_settings JSON: {e}"))?;
+    let Some(obj) = val.as_object() else {
+        return Err("site_settings document must be a JSON object".into());
+    };
+
+    if obj.get("schema_version").and_then(Value::as_u64) == Some(u64::from(SITE_POLICY_SCHEMA_VERSION))
+    {
+        let mut doc: SiteSettingsDocument = serde_json::from_value(val)
+            .map_err(|e| format!("corrupt Policy v3 site_settings document: {e}"))?;
+        doc.public.revision = revision;
+        doc.public.schema_version = SITE_POLICY_SCHEMA_VERSION;
+        if doc.public.vocab_digest.trim().is_empty() {
+            doc.public.vocab_digest = WD_VOCAB_DIGEST.to_string();
+        }
+        doc.public.legal.refresh_terms_digest();
+        if doc.public.policy_digest.trim().is_empty() {
+            doc.public.refresh_policy_digest();
+        }
+        return Ok((doc, None));
+    }
+
+    // Legacy pre-v3 row (missing `schema_version: 3`): preserve access, age, similarity,
+    // legal, geo, and providers so the admin can configure & publish Policy v3 cleanly.
+    let access: AccessPolicy = serde_json::from_value(val.clone()).unwrap_or(default_doc.access);
+    let mut public = PublicSitePolicy::fresh_bootstrap();
+    public.revision = revision;
+    if let Some(min_rev) = obj.get("min_enforce_rev").and_then(Value::as_u64) {
+        public.min_enforce_rev = min_rev.min(revision);
+    }
+    if let Some(enabled) = obj.get("safety_enabled").and_then(Value::as_bool) {
+        public.safety_enabled = enabled;
+    }
+    if let Some(blur) = obj.get("cloudflare_images_blur").and_then(Value::as_bool) {
+        public.fixed_blur_enabled = blur;
+    }
+    if let Some(ap) = obj.get("age_policy")
+        && let Ok(parsed) = serde_json::from_value::<AgeVerificationPolicy>(ap.clone())
+    {
+        public.age_policy = parsed;
+    }
+    if let Some(trig) = obj.get("age_gate_trigger")
+        && let Ok(parsed) = serde_json::from_value::<AgeGateTrigger>(trig.clone())
+    {
+        public.age_gate_trigger = parsed;
+    }
+    if let Some(sim) = obj.get("similarity")
+        && let Ok(parsed) = serde_json::from_value::<SimilarityDefaults>(sim.clone())
+        && parsed.is_valid()
+    {
+        public.similarity = parsed;
+    }
+    if let Some(leg) = obj.get("legal")
+        && let Ok(mut parsed) = serde_json::from_value::<LegalDocConfig>(leg.clone())
+    {
+        parsed.refresh_terms_digest();
+        public.legal = parsed;
+    }
+    if let Some(geo) = obj.get("geo")
+        && let Ok(parsed) = serde_json::from_value::<GeoPolicy>(geo.clone())
+    {
+        public.geo = parsed;
+    }
+    if let Some(provs) = obj.get("enabled_providers")
+        && let Ok(parsed) = serde_json::from_value::<Vec<AuthProviderPublicConfig>>(provs.clone())
+    {
+        public.enabled_providers = parsed;
+    }
+    public.refresh_policy_digest();
+
+    let notice = format!(
+        "Stored revision #{revision} uses legacy pre-v3 schema. Review your Content Safety policies and publish to activate Policy v3."
+    );
+    Ok((SiteSettingsDocument { access, public }, Some(notice)))
 }
 
 impl LoadedSettings {
     pub async fn load(env: &Env) -> Result<Self> {
         #[derive(Deserialize)]
         struct Row {
-            revision: u32,
+            revision: u64,
             document: String,
+            #[serde(default)]
+            activation_status: Option<String>,
         }
         let db = env.d1(D1_BINDING)?;
         let row: Row = db
-            .prepare("SELECT revision, document FROM site_settings ORDER BY revision DESC LIMIT 1")
+            .prepare(
+                "SELECT revision, document, activation_status \
+                 FROM site_settings ORDER BY revision DESC LIMIT 1",
+            )
             .first(None)
             .await?
             .ok_or_else(|| worker::Error::RustError("Missing site_settings migration".into()))?;
 
-        let mut doc = if row.revision == 0 && row.document.trim() == "{}" {
-            initial_document(env)
-        } else {
-            serde_json::from_str::<SiteSettingsDocument>(&row.document)
-                .map_err(|e| worker::Error::RustError(format!("corrupt site_settings JSON: {e}")))?
-        };
-        doc.public.revision = row.revision;
-        doc.public.legal.refresh_terms_digest();
+        let (doc, legacy_upgrade_notice) =
+            decode_site_settings_document(row.revision, &row.document, initial_document(env))
+                .map_err(worker::Error::RustError)?;
+        let activation_status = row
+            .activation_status
+            .as_deref()
+            .map(ActivationStatus::parse)
+            .unwrap_or(ActivationStatus::Active);
+
         Ok(Self {
             revision: row.revision,
+            activation_status,
             doc,
+            legacy_upgrade_notice,
         })
     }
 
-    /// Atomically commits `doc` at `expected_revision + 1` in D1 via CAS
-    /// (`WHERE revision=? AND revision=(SELECT MAX(revision) FROM site_settings)`)
-    /// WITHOUT publishing to `SitePolicyDO` yet (allowing callers with secondary D1
-    /// writes such as `provider_secrets` to commit them before broadcasting policy).
+    /// Phase 1 of Two-Phase Activation:
+    /// Atomically commits `doc` at `expected_revision + 1` in D1 via CAS with
+    /// `activation_status = 'pending_do_ack'` BEFORE notifying `SitePolicyDO`.
     ///
     /// Returns `Ok(Some((new_rev, stored_public_policy, digest)))` on success,
     /// or `Ok(None)` on revision conflict (409).
-    pub async fn save_d1_cas(
+    pub async fn save_d1_cas_pending(
         env: &Env,
-        expected_revision: u32,
+        expected_revision: u64,
         doc: &SiteSettingsDocument,
         editor: &str,
-    ) -> Result<Option<(u32, PublicSitePolicy, String)>> {
+    ) -> Result<Option<(u64, PublicSitePolicy, String)>> {
         let new_revision = expected_revision.saturating_add(1);
         let mut to_store = doc.clone();
+        to_store.public.schema_version = SITE_POLICY_SCHEMA_VERSION;
         to_store.public.revision = new_revision;
-        let digest = compute_policy_digest(&to_store.public);
+        to_store.public.vocab_digest = WD_VOCAB_DIGEST.to_string();
+        to_store.public.legal.refresh_terms_digest();
+        to_store.public.refresh_policy_digest();
+        let digest = to_store.public.policy_digest.clone();
 
         let db = env.d1(D1_BINDING)?;
         let mut writes = Vec::new();
@@ -758,14 +904,14 @@ impl LoadedSettings {
         }
         writes.push(
             db.prepare(
-                "INSERT INTO site_settings (revision, document, updated_at, updated_by) \
-                 SELECT revision+1, ?, unixepoch(), ? FROM site_settings \
+                "INSERT INTO site_settings (revision, document, updated_at, updated_by, activation_status) \
+                 SELECT revision+1, ?, unixepoch(), ?, 'pending_do_ack' FROM site_settings \
                  WHERE revision=? AND revision=(SELECT MAX(revision) FROM site_settings)",
             )
             .bind(&[
                 serde_json::to_string(&to_store)?.into(),
                 editor.into(),
-                f64::from(expected_revision).into(),
+                (expected_revision as f64).into(),
             ])?,
         );
         let results = db.batch(writes).await?;
@@ -783,23 +929,108 @@ impl LoadedSettings {
         Ok(Some((new_revision, to_store.public, digest)))
     }
 
-    /// Atomically publishes `doc` at `expected_revision + 1` via D1 CAS and
-    /// immediately pushes `{ policy, digest }` to `SITE_POLICY` DO `POST /publish`.
+    /// Marks a D1 `site_settings` revision as `'active'` ONLY after exact
+    /// `(revision, policy_digest)` acknowledgement from `SitePolicyDO`.
+    pub async fn mark_revision_active(env: &Env, revision: u64) -> Result<()> {
+        let db = env.d1(D1_BINDING)?;
+        db.prepare(
+            "UPDATE site_settings \
+             SET activation_status = 'active' \
+             WHERE revision = ?",
+        )
+        .bind(&[(revision as f64).into()])?
+        .run()
+        .await?;
+        Ok(())
+    }
+
+    /// Phase 2 of Two-Phase Activation:
+    /// Calls `SitePolicyDO`, verifies exact `(revision, policy_digest)` ACK, and marks
+    /// `activation_status = 'active'` ONLY on exact acknowledgement.
     ///
-    /// Returns `Ok(Some((new_rev, digest)))` on success, `Ok(None)` on revision conflict (409).
-    pub async fn save_and_publish(
+    /// On DO error or ACK mismatch, leaves D1 `activation_status = 'pending_do_ack'`
+    /// and returns `ActivationOutcome::PendingDoAck`.
+    pub async fn activate_saved_revision(
         env: &Env,
-        expected_revision: u32,
+        public: &PublicSitePolicy,
+        digest: &str,
+    ) -> Result<ActivationOutcome> {
+        match do_client::activate_site_policy(env, public, digest).await {
+            Ok(ack) => {
+                if let Err(e) = Self::mark_revision_active(env, ack.revision).await {
+                    worker::console_error!(
+                        "Failed to mark site_settings rev={} active after DO ACK: {e:?}",
+                        ack.revision
+                    );
+                    return Ok(ActivationOutcome::PendingDoAck {
+                        revision: public.revision,
+                        min_enforce_rev: public.min_enforce_rev,
+                        policy_digest: digest.to_string(),
+                        error: format!(
+                            "SitePolicyDO acknowledged rev #{}, but D1 activation_status update failed: {e}",
+                            ack.revision
+                        ),
+                    });
+                }
+                Ok(ActivationOutcome::Active {
+                    ack,
+                    min_enforce_rev: public.min_enforce_rev,
+                })
+            }
+            Err(e) => {
+                worker::console_error!(
+                    "SitePolicyDO activation failed for rev={} digest={digest}: {e:?}",
+                    public.revision
+                );
+                Ok(ActivationOutcome::PendingDoAck {
+                    revision: public.revision,
+                    min_enforce_rev: public.min_enforce_rev,
+                    policy_digest: digest.to_string(),
+                    error: e.to_string(),
+                })
+            }
+        }
+    }
+
+    /// Two-Phase Activation helper:
+    /// 1. Saves D1 CAS revision with `activation_status = 'pending_do_ack'`
+    /// 2. Activates on `SitePolicyDO` and transitions to `'active'` ONLY on exact `(rev, digest)` ACK.
+    pub async fn save_and_activate(
+        env: &Env,
+        expected_revision: u64,
         doc: &SiteSettingsDocument,
         editor: &str,
-    ) -> Result<Option<(u32, String)>> {
-        let Some((new_revision, public, digest)) =
-            Self::save_d1_cas(env, expected_revision, doc, editor).await?
+    ) -> Result<Option<ActivationOutcome>> {
+        let Some((_new_revision, public, digest)) =
+            Self::save_d1_cas_pending(env, expected_revision, doc, editor).await?
         else {
             return Ok(None);
         };
-        do_client::publish_site_policy(env, &public, &digest).await?;
-        Ok(Some((new_revision, digest)))
+        let outcome = Self::activate_saved_revision(env, &public, &digest).await?;
+        Ok(Some(outcome))
+    }
+
+    /// Idempotent retry for an already-loaded Policy v3 revision (`POST /admin/api/policy/retry-activation`).
+    pub async fn retry_loaded_activation(
+        env: &Env,
+        mut loaded: Self,
+    ) -> Result<ActivationOutcome> {
+        ensure_v3_ready_for_non_safety_mutation(loaded.legacy_upgrade_notice.as_deref())
+            .map_err(|msg| worker::Error::RustError(msg.to_string()))?;
+        loaded.doc.public.schema_version = SITE_POLICY_SCHEMA_VERSION;
+        loaded.doc.public.revision = loaded.revision;
+        loaded.doc.public.vocab_digest = WD_VOCAB_DIGEST.to_string();
+        loaded.doc.public.legal.refresh_terms_digest();
+        let digest = compute_policy_digest(&loaded.doc.public);
+        loaded.doc.public.policy_digest = digest.clone();
+
+        Self::activate_saved_revision(env, &loaded.doc.public, &digest).await
+    }
+
+    /// Idempotent retry for the latest saved revision (`POST /admin/api/policy/retry-activation`).
+    pub async fn retry_latest_activation(env: &Env) -> Result<ActivationOutcome> {
+        let loaded = Self::load(env).await?;
+        Self::retry_loaded_activation(env, loaded).await
     }
 }
 
@@ -822,6 +1053,6 @@ fn initial_document(env: &Env) -> SiteSettingsDocument {
             sol_deposit,
             ..AccessPolicy::default()
         },
-        public: PublicSitePolicy::default(),
+        public: PublicSitePolicy::fresh_bootstrap(),
     }
 }

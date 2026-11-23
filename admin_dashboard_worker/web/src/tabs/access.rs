@@ -1,17 +1,25 @@
 //! Access & Pricing tab: login wall, free media folders, per-item pricing/quotas,
 //! 30-day subscription plans, exchange rate, and crypto deposit treasury addresses.
+//!
+//! Uses clean left-aligned radio cards and GCP top-right toasts via `use_toast_store()`.
 
 use leptos::prelude::*;
+use lets_embed_ui::use_toast_store;
 use site_access::ChargeKind;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::api::{AccessPolicy, OverviewResp, SaveAccessReq, SaveAccessResp, post_json};
+use crate::api::{
+    AccessPolicy, ActivationResult, OverviewResp, SaveAccessReq, SaveAccessResp,
+    post_json_activatable,
+};
 
 #[component]
 pub fn AccessTab(
     overview: RwSignal<Option<OverviewResp>>,
     on_saved: Callback<()>,
 ) -> impl IntoView {
+    let toasts = use_toast_store();
+
     let login_required = RwSignal::new(true);
     let free_folders_text = RwSignal::new(String::new());
     let items_prices = RwSignal::new([1i64, 5, 100, 10, 100]);
@@ -24,12 +32,10 @@ pub fn AccessTab(
     let minimum_topup = RwSignal::new(1_000i64);
     let eth_deposit = RwSignal::new(String::new());
     let sol_deposit = RwSignal::new(String::new());
-    let revision = RwSignal::new(0u32);
+    let revision = RwSignal::new(0u64);
 
     let saving = RwSignal::new(false);
-    let status_msg = RwSignal::new(Option::<(bool, String)>::None);
 
-    // Sync local editable signals whenever overview loads/refreshes.
     Effect::new(move |_| {
         if let Some(ov) = overview.get() {
             let a = &ov.access;
@@ -64,7 +70,6 @@ pub fn AccessTab(
             return;
         }
         saving.set(true);
-        status_msg.set(None);
 
         let pr = items_prices.get_untracked();
         let fr = items_free.get_untracked();
@@ -103,20 +108,33 @@ pub fn AccessTab(
         };
 
         spawn_local(async move {
-            match post_json::<_, SaveAccessResp>("/admin/api/settings/access", &req).await {
-                Ok(resp) => {
+            match post_json_activatable::<_, SaveAccessResp>("/admin/api/settings/access", &req)
+                .await
+            {
+                Ok(ActivationResult::Active(resp)) => {
                     revision.set(resp.revision);
-                    status_msg.set(Some((
-                        true,
+                    toasts.success(
+                        format!("Saved Access & Pricing rev #{}", resp.revision),
+                        Some(format!(
+                            "min_enforce_rev #{} · activated on SitePolicyDO",
+                            resp.min_enforce_rev
+                        )),
+                    );
+                    on_saved.run(());
+                }
+                Ok(ActivationResult::PendingActivation(pending)) => {
+                    revision.set(pending.revision);
+                    toasts.warning(
                         format!(
-                            "Published revision #{} (min_enforce_rev={}) to D1 and SitePolicyDO.",
-                            resp.revision, resp.min_enforce_rev
+                            "Saved rev #{} to D1 — awaiting SitePolicyDO activation",
+                            pending.revision
                         ),
-                    )));
+                        Some(pending.error),
+                    );
                     on_saved.run(());
                 }
                 Err(err) => {
-                    status_msg.set(Some((false, err)));
+                    toasts.error("Failed to save Access & Pricing", Some(err.message));
                 }
             }
             saving.set(false);
@@ -125,12 +143,6 @@ pub fn AccessTab(
 
     view! {
         <form class="adm-stack" on:submit=save_action>
-            {move || status_msg.get().map(|(ok, msg)| view! {
-                <div class=if ok { "adm-alert adm-alert--ok" } else { "adm-alert adm-alert--err" } role="status">
-                    {msg}
-                </div>
-            })}
-
             <section class="adm-card">
                 <div class="adm-card-head">
                     <div>
@@ -150,7 +162,7 @@ pub fn AccessTab(
                             prop:checked=move || login_required.get()
                             on:change=move |_| login_required.set(true)
                         />
-                        <span>
+                        <span class="adm-radio-copy">
                             <strong>"Require sign-in"</strong>
                             <small>"Visitors must sign in before opening the gallery."</small>
                         </span>
@@ -162,7 +174,7 @@ pub fn AccessTab(
                             prop:checked=move || !login_required.get()
                             on:change=move |_| login_required.set(false)
                         />
-                        <span>
+                        <span class="adm-radio-copy">
                             <strong>"Public browsing"</strong>
                             <small>"Guests can browse using daily free quotas below."</small>
                         </span>

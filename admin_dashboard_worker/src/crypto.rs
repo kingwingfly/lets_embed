@@ -1,8 +1,12 @@
 //! Dedicated AES-256-GCM encrypted secret storage for D1 `provider_secrets` (Fixes M3).
 //!
 //! Security properties:
-//! - Uses dedicated `SETTINGS_ENCRYPTION_KEY` (and optional `SETTINGS_ENCRYPTION_KEY_PREV`
-//!   for zero-downtime key rotation). NEVER derived from `JWT_SECRET`.
+//! - Resolves the active 32-byte AES-256-GCM key from explicit `PROVIDER_SECRETS_KEY`
+//!   (or legacy `SETTINGS_ENCRYPTION_KEY`), falling back to RFC 5869 HKDF-SHA256
+//!   derivation from `SITE_SECRET` (`KeyDomain::ProviderSecrets`) via
+//!   [`site_access::resolve_provider_aes_key`].
+//! - Supports zero-downtime key rotation via `PROVIDER_SECRETS_KEY_PREV`,
+//!   `SETTINGS_ENCRYPTION_KEY_PREV`, or `SITE_SECRET_PREV`.
 //! - Generates a fresh CSPRNG 96-bit nonce (`getrandom`) on every encryption write.
 //! - Binds explicit AAD = `"{deployment_id}|{provider_id}|{field_name}"` so ciphertext
 //!   cannot be transplanted across deployments, providers, or fields.
@@ -19,6 +23,7 @@ use base64::{
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
 use sha2::{Digest, Sha256};
+use site_access::resolve_provider_aes_key;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const NONCE_LEN: usize = 12;
@@ -134,6 +139,20 @@ impl SecretKey {
         Self { kid, bytes }
     }
 
+    /// Resolves a key from an optional explicit key override (`PROVIDER_SECRETS_KEY` /
+    /// `SETTINGS_ENCRYPTION_KEY`) or HKDF derivation from `SITE_SECRET`.
+    pub fn resolve(
+        explicit_key: Option<&str>,
+        site_secret: Option<&str>,
+    ) -> Result<Self, CryptoError> {
+        if let Some(raw) = explicit_key.map(str::trim).filter(|s| !s.is_empty()) {
+            return Self::parse(raw);
+        }
+        let bytes = resolve_provider_aes_key(None, site_secret)
+            .map_err(CryptoError::InvalidKeyFormat)?;
+        Ok(Self::from_bytes(bytes))
+    }
+
     pub fn kid(&self) -> &str {
         &self.kid
     }
@@ -199,13 +218,17 @@ pub fn build_aad(
     Ok(format!("{deployment_id}|{provider_id}|{field_name}").into_bytes())
 }
 
+fn non_empty(v: Option<&str>) -> Option<&str> {
+    v.map(str::trim).filter(|s| !s.is_empty())
+}
+
 impl KeyRing {
     pub fn from_env_strings(
         current_raw: &str,
         previous_raw: Option<&str>,
     ) -> Result<Self, CryptoError> {
         let current = SecretKey::parse(current_raw)?;
-        let previous = match previous_raw.map(str::trim).filter(|s| !s.is_empty()) {
+        let previous = match non_empty(previous_raw) {
             Some(prev) => {
                 let key = SecretKey::parse(prev)?;
                 if key.bytes == current.bytes {
@@ -216,6 +239,35 @@ impl KeyRing {
             }
             None => None,
         };
+        Ok(Self { current, previous })
+    }
+
+    /// Resolves active & optional previous provider encryption keys with precedence:
+    /// - Current: `PROVIDER_SECRETS_KEY` > `SETTINGS_ENCRYPTION_KEY` > HKDF(`SITE_SECRET`)
+    /// - Previous: `PROVIDER_SECRETS_KEY_PREV` > `SETTINGS_ENCRYPTION_KEY_PREV` > HKDF(`SITE_SECRET_PREV`)
+    pub fn from_resolved_env(
+        provider_secrets_key: Option<&str>,
+        legacy_settings_key: Option<&str>,
+        site_secret: Option<&str>,
+        prev_provider_key: Option<&str>,
+        prev_legacy_key: Option<&str>,
+        prev_site_secret: Option<&str>,
+    ) -> Result<Self, CryptoError> {
+        let explicit_current = non_empty(provider_secrets_key).or_else(|| non_empty(legacy_settings_key));
+        let current = SecretKey::resolve(explicit_current, site_secret)?;
+
+        let explicit_prev = non_empty(prev_provider_key).or_else(|| non_empty(prev_legacy_key));
+        let previous = if explicit_prev.is_some() || non_empty(prev_site_secret).is_some() {
+            let key = SecretKey::resolve(explicit_prev, prev_site_secret)?;
+            if key.bytes == current.bytes {
+                None
+            } else {
+                Some(key)
+            }
+        } else {
+            None
+        };
+
         Ok(Self { current, previous })
     }
 
@@ -354,7 +406,6 @@ mod tests {
         let b64_mat = STANDARD.encode(raw_bytes);
         let b64_url_mat = URL_SAFE_NO_PAD.encode(raw_bytes);
 
-        // Raw hex / base64 / base64url keep deterministic `k1:<16-hex>` kid.
         let k_raw_hex = SecretKey::parse(&hex_mat).expect("raw hex");
         let k_raw_b64 = SecretKey::parse(&b64_mat).expect("raw b64");
         let k_raw_url = SecretKey::parse(&b64_url_mat).expect("raw b64url");
@@ -362,14 +413,12 @@ mod tests {
         assert_eq!(k_raw_hex.kid(), k_raw_b64.kid());
         assert_eq!(k_raw_hex.kid(), k_raw_url.kid());
 
-        // Optional `<kid>:<material>` prefix matches `user_worker/src/secrets.rs`.
         let k_pref_hex = SecretKey::parse(&format!("v1:{hex_mat}")).expect("prefixed hex");
         let k_pref_b64 = SecretKey::parse(&format!("rot-2026_01.a:{b64_url_mat}"))
             .expect("prefixed base64url");
         assert_eq!(k_pref_hex.kid(), "v1");
         assert_eq!(k_pref_b64.kid(), "rot-2026_01.a");
 
-        // Ciphertext encrypted with prefixed key decrypts cleanly under raw key with same material.
         let ring_pref = KeyRing::from_env_strings(&format!("v1:{hex_mat}"), None).unwrap();
         let ring_raw = KeyRing::from_env_strings(&b64_mat, None).unwrap();
         let enc = ring_pref
@@ -388,7 +437,6 @@ mod tests {
             .unwrap();
         assert_eq!(pt, b"secret-value");
 
-        // Key rotation with prefixed keys (`v2` current, `v1` previous).
         let hex_v2 = hex::encode([0x7bu8; 32]);
         let ring_rot =
             KeyRing::from_env_strings(&format!("v2:{hex_v2}"), Some(&format!("v1:{hex_mat}")))
@@ -410,7 +458,6 @@ mod tests {
             b"secret-value"
         );
 
-        // Invalid prefixes and all-zero keys are rejected fail-closed.
         assert!(SecretKey::parse(&format!(":{hex_mat}")).is_err());
         assert!(SecretKey::parse(&format!("bad kid:{hex_mat}")).is_err());
         assert!(SecretKey::parse(&format!("{}:{hex_mat}", "k".repeat(33))).is_err());

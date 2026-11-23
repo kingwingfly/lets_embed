@@ -18,8 +18,8 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use serde::{Deserialize, Serialize};
 use site_access::{
-    AgeVerificationPolicy, AssuranceLevel, AuthProviderId, PublicSitePolicy, SESSION_V2_VERSION,
-    SessionContext, SessionV2Claims, sign_session_v2,
+    AgeVerificationPolicy, AssuranceLevel, AuthProviderId, PolicyRef, PublicSitePolicy,
+    SESSION_V2_VERSION, SessionContext, SessionV2Claims, sign_session_v2,
 };
 use tower_cookies::Cookies;
 use wasm_bindgen::JsValue;
@@ -95,6 +95,7 @@ pub struct ResolvedAccount {
     pub terms_digest_accepted: Option<String>,
     pub terms_accepted_at: Option<u64>,
     pub content_prefs_json: String,
+    pub pref_version: u64,
     pub plan: Option<String>,
     pub banned: bool,
 }
@@ -117,8 +118,7 @@ pub struct IdentityView {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StoredContentPrefs {
-    pub enabled_switchers: Vec<String>,
-    pub safe_mode: bool,
+    pub enabled_switchers: Vec<PolicyRef>,
 }
 
 pub fn assurance_to_str(level: AssuranceLevel) -> &'static str {
@@ -248,9 +248,11 @@ pub async fn require_active_session(
     st: &AppState,
     cookies: &Cookies,
 ) -> Result<ActiveSession, Response> {
-    let Some(verified) =
-        session::verify_cookie_session(cookies, &st.session_v2_secret, Some(&st.jwt_secret))
-    else {
+    let Some(verified) = session::verify_cookie_session(
+        cookies,
+        &st.session_v2_secret,
+        st.legacy_jwt_secret.as_deref().map(Vec::as_slice),
+    ) else {
         return Err(api_err(StatusCode::UNAUTHORIZED, "not signed in"));
     };
 
@@ -266,8 +268,8 @@ pub async fn require_active_session(
         }
     };
 
-    if !ctx.active || ctx.banned {
-        return Err(api_err(StatusCode::FORBIDDEN, "account banned"));
+    if !ctx.active || ctx.banned || ctx.suspended {
+        return Err(api_err(StatusCode::FORBIDDEN, "account banned or suspended"));
     }
     if !ctx.sid_valid {
         cookies.add(session::clear_session_cookie());
@@ -388,8 +390,14 @@ struct UserV2Row {
     terms_digest_accepted: Option<String>,
     terms_accepted_at: Option<i64>,
     content_prefs_json: String,
+    #[serde(default = "default_pref_version_i64")]
+    pref_version: i64,
     plan: Option<String>,
     banned: i64,
+}
+
+fn default_pref_version_i64() -> i64 {
+    1
 }
 
 impl From<UserV2Row> for ResolvedAccount {
@@ -405,6 +413,7 @@ impl From<UserV2Row> for ResolvedAccount {
             terms_digest_accepted: r.terms_digest_accepted,
             terms_accepted_at: r.terms_accepted_at.and_then(|v| u64::try_from(v).ok()),
             content_prefs_json: r.content_prefs_json,
+            pref_version: r.pref_version.max(1) as u64,
             plan: r.plan,
             banned: r.banned != 0,
         }
@@ -422,7 +431,7 @@ pub async fn load_account_by_id(
     let row = db
         .prepare(
             "SELECT id, account_do_key, display_name, email, terms_version_accepted, \
-             terms_digest_accepted, terms_accepted_at, content_prefs_json, plan, banned \
+             terms_digest_accepted, terms_accepted_at, content_prefs_json, pref_version, plan, banned \
              FROM users_v2 WHERE id = ?1",
         )
         .bind(&[user_id.into()])
@@ -708,6 +717,7 @@ pub async fn resolve_or_create_login_account(
         terms_digest_accepted: None,
         terms_accepted_at: None,
         content_prefs_json: "{}".to_string(),
+        pref_version: 1,
         plan,
         banned,
     })

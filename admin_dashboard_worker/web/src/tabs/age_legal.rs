@@ -1,24 +1,28 @@
 //! Age & Legal tab:
-//! - Three-tier Age Verification Policy selector (with clear Strict 18+ explanation)
+//! - Three-tier Age Verification Policy selector (left-aligned radio cards)
 //! - Age Gate Trigger (`Off`, `JustInTime`, `SiteWideSplash`)
 //! - Versioned Markdown editors for `/terms`, `/privacy`, `/dmca`, `/content-policy`
-//! - Dismissible Cookie / Site Notice Banner, RTA adult meta & `noindex_restricted`, Panic shortcut
+//! - Dismissible Cookie / Site Notice Banner, RTA adult meta & `noindex_restricted` with `<ToggleSwitch>`
+//! - GCP top-right toasts via `use_toast_store()`
 
 use leptos::prelude::*;
-use lets_embed_ui::{NoticeBanner, NoticeContent, NoticeTone};
+use lets_embed_ui::{NoticeBanner, NoticeContent, NoticeTone, ToggleSwitch, use_toast_store};
 use site_access::{AgeGateTrigger, AgeVerificationPolicy, LegalDocConfig};
 use wasm_bindgen_futures::spawn_local;
 
-use crate::api::{SafetyConfigResp, SaveSafetyReq, SaveSafetyResp, post_json};
+use crate::api::{
+    ActivationResult, SafetyConfigResp, SaveSafetyReq, SaveSafetyResp, post_json_activatable,
+};
 
 #[component]
 pub fn AgeLegalTab(
     safety: RwSignal<Option<SafetyConfigResp>>,
     on_saved: Callback<()>,
 ) -> impl IntoView {
+    let toasts = use_toast_store();
+
     let age_policy = RwSignal::new(AgeVerificationPolicy::Off);
     let age_gate_trigger = RwSignal::new(AgeGateTrigger::Off);
-    let panic_shortcut = RwSignal::new("Shift+S".to_string());
 
     let terms_version = RwSignal::new(1u32);
     let terms_digest = RwSignal::new(String::new());
@@ -30,17 +34,21 @@ pub fn AgeLegalTab(
     let notice_banner_md = RwSignal::new(String::new());
     let rta_meta_enabled = RwSignal::new(false);
     let noindex_restricted = RwSignal::new(false);
-    let revision = RwSignal::new(0u32);
+    let revision = RwSignal::new(0u64);
 
     let saving = RwSignal::new(false);
-    let feedback = RwSignal::new(Option::<(bool, String)>::None);
+
+    let has_age_gated_policies = Memo::new(move |_| {
+        safety
+            .get()
+            .is_some_and(|cfg| cfg.policies.iter().any(|p| p.bypass.require_age_18))
+    });
 
     Effect::new(move |_| {
         if let Some(cfg) = safety.get() {
             revision.set(cfg.revision);
             age_policy.set(cfg.age_policy);
             age_gate_trigger.set(cfg.age_gate_trigger);
-            panic_shortcut.set(cfg.panic_shortcut.clone());
             terms_version.set(cfg.legal.terms_version);
             terms_digest.set(cfg.legal.terms_digest.clone());
             terms_md.set(cfg.legal.terms_md.clone());
@@ -63,8 +71,21 @@ pub fn AgeLegalTab(
             return;
         };
 
+        let next_age_policy = age_policy.get_untracked();
+        if next_age_policy == AgeVerificationPolicy::Off
+            && current.policies.iter().any(|p| p.bypass.require_age_18)
+        {
+            toasts.error(
+                "Cannot turn Age Verification Off",
+                Some(
+                    "One or more Content Safety policies require Age 18+. Disable require_age_18 on those policies first."
+                        .to_string(),
+                ),
+            );
+            return;
+        }
+
         saving.set(true);
-        feedback.set(None);
 
         let legal = LegalDocConfig {
             terms_version: terms_version.get_untracked(),
@@ -82,40 +103,56 @@ pub fn AgeLegalTab(
         let req = SaveSafetyReq {
             revision: revision.get_untracked(),
             safety_enabled: current.safety_enabled,
-            rules: current.rules,
+            policies: current.policies,
             unclassified_mode: current.unclassified_mode,
-            cloudflare_images_blur: current.cloudflare_images_blur,
-            age_policy: age_policy.get_untracked(),
+            fixed_blur_enabled: current.fixed_blur_enabled,
+            age_policy: next_age_policy,
             age_gate_trigger: age_gate_trigger.get_untracked(),
             similarity: current.similarity,
             geo: current.geo,
             legal,
-            panic_shortcut: panic_shortcut.get_untracked(),
+            confirm_policy_v3_migration: false,
         };
 
         spawn_local(async move {
-            match post_json::<_, SaveSafetyResp>("/admin/api/safety", &req).await {
-                Ok(resp) => {
+            match post_json_activatable::<_, SaveSafetyResp>("/admin/api/safety", &req).await {
+                Ok(ActivationResult::Active(resp)) => {
                     revision.set(resp.revision);
                     terms_version.set(resp.legal.terms_version);
                     terms_digest.set(resp.legal.terms_digest.clone());
-                    let mut msg = format!(
-                        "Published Age & Legal policy rev #{} (Terms v{}, min_enforce_rev={}).",
-                        resp.revision, resp.legal.terms_version, resp.min_enforce_rev
+                    let mut detail = format!(
+                        "Terms v{} · min_enforce_rev #{}",
+                        resp.legal.terms_version, resp.min_enforce_rev
                     );
                     if resp.terms_bumped {
-                        msg.push_str(" Terms version incremented — users must re-accept before unlocking gated categories.");
+                        detail.push_str(" · Terms bumped (users must re-accept)");
                     }
                     if !resp.auto_disabled_providers.is_empty() {
-                        msg.push_str(&format!(
-                            " Automatically disabled {} non-age-verified provider(s) for Strict 18+ compliance.",
+                        detail.push_str(&format!(
+                            " · auto-disabled {} non-18+ provider(s)",
                             resp.auto_disabled_providers.len()
                         ));
                     }
-                    feedback.set(Some((true, msg)));
+                    toasts.success(
+                        format!("Published Age & Legal policy rev #{}", resp.revision),
+                        Some(detail),
+                    );
                     on_saved.run(());
                 }
-                Err(err) => feedback.set(Some((false, err))),
+                Ok(ActivationResult::PendingActivation(pending)) => {
+                    revision.set(pending.revision);
+                    toasts.warning(
+                        format!(
+                            "Saved rev #{} to D1 — awaiting SitePolicyDO activation",
+                            pending.revision
+                        ),
+                        Some(pending.error),
+                    );
+                    on_saved.run(());
+                }
+                Err(err) => {
+                    toasts.error("Failed to save Age & Legal policy", Some(err.message));
+                }
             }
             saving.set(false);
         });
@@ -123,17 +160,11 @@ pub fn AgeLegalTab(
 
     view! {
         <form class="adm-stack" on:submit=on_save>
-            {move || feedback.get().map(|(ok, msg)| view! {
-                <div class=if ok { "adm-alert adm-alert--ok" } else { "adm-alert adm-alert--err" } role="status">
-                    {msg}
-                </div>
-            })}
-
             <section class="adm-card">
                 <div class="adm-card-head">
                     <div>
                         <h2>"Age Verification Policy (3-Tier)"</h2>
-                        <p class="adm-sub">"Controls which authentication providers and age-assurance claims satisfy 18+ rules."</p>
+                        <p class="adm-sub">"Controls which authentication providers and age-assurance claims satisfy `Age 18+` bypass requirements."</p>
                     </div>
                 </div>
 
@@ -145,9 +176,9 @@ pub fn AgeLegalTab(
                             prop:checked=move || age_policy.get() == AgeVerificationPolicy::Off
                             on:change=move |_| age_policy.set(AgeVerificationPolicy::Off)
                         />
-                        <span>
+                        <span class="adm-radio-copy">
                             <strong>"Off"</strong>
-                            <small>"No age verification required; all enabled auth providers allowed."</small>
+                            <small>"No age verification active; policies with Age 18+ requirement cannot be published."</small>
                         </span>
                     </label>
                     <label class="adm-radio-card">
@@ -157,7 +188,7 @@ pub fn AgeLegalTab(
                             prop:checked=move || age_policy.get() == AgeVerificationPolicy::SelfAttestation
                             on:change=move |_| age_policy.set(AgeVerificationPolicy::SelfAttestation)
                         />
-                        <span>
+                        <span class="adm-radio-copy">
                             <strong>"Self-Attestation"</strong>
                             <small>"Users confirm 18+ and accept Terms. Optional Google birthday soft pre-check available."</small>
                         </span>
@@ -169,12 +200,24 @@ pub fn AgeLegalTab(
                             prop:checked=move || age_policy.get() == AgeVerificationPolicy::StrictProviderVerified18
                             on:change=move |_| age_policy.set(AgeVerificationPolicy::StrictProviderVerified18)
                         />
-                        <span>
+                        <span class="adm-radio-copy">
                             <strong>"Strict Provider-Verified 18+"</strong>
                             <small>"ONLY vetted Age-Assurance OIDC providers (e.g. Yoti, Persona OIDC, eID) may grant login or 18+ unlock."</small>
                         </span>
                     </label>
                 </div>
+
+                {move || (age_policy.get() == AgeVerificationPolicy::Off && has_age_gated_policies.get()).then(|| view! {
+                    <NoticeBanner
+                        tone=NoticeTone::Warning
+                        title="Active Policies Require Age 18+"
+                        dismissible=false
+                        content=NoticeContent::Text(
+                            "One or more Content Safety policies have `Age 18+` enabled. Disable `Age 18+` on those policies in the Content Safety tab before setting Age Verification to Off."
+                                .to_string()
+                        )
+                    />
+                })}
 
                 {move || (age_policy.get() == AgeVerificationPolicy::StrictProviderVerified18).then(|| view! {
                     <NoticeBanner
@@ -188,65 +231,42 @@ pub fn AgeLegalTab(
                     />
                 })}
 
-                <div class="adm-grid-2">
-                    <label class="adm-field">
-                        <span>"Age Gate Trigger"</span>
-                        <select
-                            prop:value=move || match age_gate_trigger.get() {
-                                AgeGateTrigger::Off => "off",
-                                AgeGateTrigger::JustInTime => "just_in_time",
-                                AgeGateTrigger::SiteWideSplash => "site_wide_splash",
-                            }
-                            on:change=move |ev| {
-                                let v = match event_target_value(&ev).as_str() {
-                                    "just_in_time" => AgeGateTrigger::JustInTime,
-                                    "site_wide_splash" => AgeGateTrigger::SiteWideSplash,
-                                    _ => AgeGateTrigger::Off,
-                                };
-                                age_gate_trigger.set(v);
-                            }
-                        >
-                            <option value="off">"Off"</option>
-                            <option value="just_in_time">"Just-in-time (Recommended for SEO — never blocks /)"</option>
-                            <option value="site_wide_splash">"Site-wide entry splash (/terms, /privacy, /dmca, /user/login stay open)"</option>
-                        </select>
-                    </label>
-
-                    <label class="adm-field">
-                        <span>"Quick Safe Mode / Panic Shortcut"</span>
-                        <input
-                            type="text"
-                            maxlength="32"
-                            placeholder="Shift+S"
-                            prop:value=move || panic_shortcut.get()
-                            on:input=move |ev| panic_shortcut.set(event_target_value(&ev))
-                        />
-                    </label>
-                </div>
+                <label class="adm-field">
+                    <span>"Age Gate Trigger"</span>
+                    <select
+                        prop:value=move || match age_gate_trigger.get() {
+                            AgeGateTrigger::Off => "off",
+                            AgeGateTrigger::JustInTime => "just_in_time",
+                            AgeGateTrigger::SiteWideSplash => "site_wide_splash",
+                        }
+                        on:change=move |ev| {
+                            let v = match event_target_value(&ev).as_str() {
+                                "just_in_time" => AgeGateTrigger::JustInTime,
+                                "site_wide_splash" => AgeGateTrigger::SiteWideSplash,
+                                _ => AgeGateTrigger::Off,
+                            };
+                            age_gate_trigger.set(v);
+                        }
+                    >
+                        <option value="off">"Off"</option>
+                        <option value="just_in_time">"Just-in-time (Recommended for SEO — never blocks /)"</option>
+                        <option value="site_wide_splash">"Site-wide entry splash (/terms, /privacy, /dmca, /user/login stay open)"</option>
+                    </select>
+                </label>
 
                 <div class="adm-toggle-grid">
-                    <label class="adm-switch-row">
-                        <input
-                            type="checkbox"
-                            prop:checked=move || rta_meta_enabled.get()
-                            on:change=move |ev| rta_meta_enabled.set(event_target_checked(&ev))
-                        />
-                        <span>
-                            <strong>"Emit RTA Adult Rating Meta Tags"</strong>
-                            <small>"Adds RTA-5042-1996-1400-1577-RTA and `rating=adult` meta tags on public pages."</small>
-                        </span>
-                    </label>
-                    <label class="adm-switch-row">
-                        <input
-                            type="checkbox"
-                            prop:checked=move || noindex_restricted.get()
-                            on:change=move |ev| noindex_restricted.set(event_target_checked(&ev))
-                        />
-                        <span>
-                            <strong>"`noindex` Restricted Pages"</strong>
-                            <small>"Adds `noindex` robots directive to pages containing locked adult/restricted items."</small>
-                        </span>
-                    </label>
+                    <ToggleSwitch
+                        checked=Signal::derive(move || rta_meta_enabled.get())
+                        on_change=Callback::new(move |v| rta_meta_enabled.set(v))
+                        label="Emit RTA Adult Rating Meta Tags"
+                        description="Adds RTA-5042-1996-1400-1577-RTA and `rating=adult` meta tags on public pages."
+                    />
+                    <ToggleSwitch
+                        checked=Signal::derive(move || noindex_restricted.get())
+                        on_change=Callback::new(move |v| noindex_restricted.set(v))
+                        label="`noindex` Restricted Pages"
+                        description="Adds `noindex` robots directive to pages containing blocked adult/restricted items."
+                    />
                 </div>
             </section>
 
@@ -257,17 +277,12 @@ pub fn AgeLegalTab(
                         <p class="adm-sub">"Sanitized server-side via strict HTML allowlist before rendering."</p>
                     </div>
                 </div>
-                <label class="adm-switch-row">
-                    <input
-                        type="checkbox"
-                        prop:checked=move || notice_banner_enabled.get()
-                        on:change=move |ev| notice_banner_enabled.set(event_target_checked(&ev))
-                    />
-                    <span>
-                        <strong>"Show dismissible site notice banner"</strong>
-                        <small>"Displayed across gallery pages with localStorage dismissal."</small>
-                    </span>
-                </label>
+                <ToggleSwitch
+                    checked=Signal::derive(move || notice_banner_enabled.get())
+                    on_change=Callback::new(move |v| notice_banner_enabled.set(v))
+                    label="Show dismissible site notice banner"
+                    description="Displayed across gallery pages with localStorage dismissal."
+                />
                 <label class="adm-field">
                     <span>"Notice Banner Markdown"</span>
                     <textarea
@@ -283,7 +298,7 @@ pub fn AgeLegalTab(
                 <div class="adm-card-head">
                     <div>
                         <h2>"Versioned Legal & Policy Markdown Documents"</h2>
-                        <p class="adm-sub">"Editing Terms of Service automatically computes a new SHA-256 digest, bumps `terms_version`, and triggers re-acceptance."</p>
+                        <p class="adm-sub">"Editing Terms of Service automatically computes a new SHA-256 digest, bumps `terms_version`, and requires re-acceptance."</p>
                     </div>
                     <span class="adm-pill">
                         {move || {

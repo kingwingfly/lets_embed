@@ -8,14 +8,16 @@ use axum::{
 };
 use serde::Serialize;
 use site_access::{
-    AssuranceLevel, AuthProviderId, AuthProviderPublicConfig, PublicSitePolicy,
+    AssuranceLevel, AuthProviderId, AuthProviderPublicConfig, PolicyRef, PublicSitePolicy,
 };
 use tower_cookies::Cookies;
 
 use crate::{
     AppState, challenge_do, config, do_client,
     identity::{self, IdentityView, VerifiedExternalIdentity},
-    policy_do, session, settings, siwe, solana_link,
+    policy_do,
+    safety_api::{self, SwitcherEligibility},
+    session, settings, siwe, solana_link,
     types::{ApiError, NonceResp, SiwsReq, VerifyReq, VerifyResp},
 };
 
@@ -356,9 +358,11 @@ pub async fn logout(State(st): State<AppState>, headers: HeaderMap, cookies: Coo
         return r;
     }
     // Revoke active `sid` in `UserAccount` DO immediately (H8).
-    if let Some(verified) =
-        session::verify_cookie_session(&cookies, &st.session_v2_secret, Some(&st.jwt_secret))
-        && let Some(sid) = verified.sid()
+    if let Some(verified) = session::verify_cookie_session(
+        &cookies,
+        &st.session_v2_secret,
+        st.legacy_jwt_secret.as_deref().map(Vec::as_slice),
+    ) && let Some(sid) = verified.sid()
     {
         let _ = do_client::do_session_revoke(&st.env, verified.do_key(), sid).await;
     }
@@ -415,13 +419,15 @@ struct MeResp {
     identities: Vec<IdentityView>,
     linked_eth_address: Option<String>,
     linked_solana_address: Option<String>,
-    enabled_switchers: Vec<String>,
-    effective_switchers: Vec<String>,
-    safe_mode: bool,
+    enabled_switchers: Vec<PolicyRef>,
+    effective_switchers: Vec<PolicyRef>,
+    switcher_statuses: Vec<SwitcherEligibility>,
+    pref_version: u64,
     terms_version_accepted: Option<u32>,
     terms_digest_accepted: Option<String>,
     terms_accepted_at: Option<u64>,
     terms_up_to_date: bool,
+    accepted_current_terms: bool,
     assurance_level: AssuranceLevel,
     strict_age_ok: bool,
     session_auth_time: Option<u64>,
@@ -431,29 +437,21 @@ struct MeResp {
     pricing: PricingSummary,
 }
 
-/// Compute `(enabled_switchers, effective_switchers)` for `GET /user/api/me`.
-///
-/// - `enabled_switchers` reflects the user's saved switchers from D1
-///   `users_v2.content_prefs_json` (filtered against live `policy`), so UI pages
-///   loaded while Safe Mode is ON do not wipe saved preferences on subsequent saves.
-/// - `effective_switchers` stays strictly fail-closed via `ctx.effective_switchers(policy)`
-///   (`[]` during Safe Mode or when age/Terms gates are unsatisfied).
+/// Compute `(enabled_switchers, effective_switchers, switcher_statuses)` for `GET /user/api/me`
+/// from authoritative live Policy v3 and `SessionContext` (post-Safe-Mode wipe migration).
 pub(crate) fn compute_me_switchers(
     policy: &PublicSitePolicy,
-    content_prefs_json: Option<&str>,
     ctx: &site_access::SessionContext,
-) -> (Vec<String>, Vec<String>) {
-    let enabled_switchers = crate::safety_api::resolve_saved_switchers(
-        policy,
-        content_prefs_json,
-        &ctx.enabled_switchers,
-    );
-    let effective_switchers = ctx.effective_switchers(policy);
-    (enabled_switchers, effective_switchers)
+    country: Option<&str>,
+) -> (Vec<PolicyRef>, Vec<PolicyRef>, Vec<SwitcherEligibility>) {
+    let enabled_switchers = safety_api::filter_active_policy_refs(policy, &ctx.enabled_switchers);
+    let (effective_switchers, switcher_statuses) =
+        safety_api::evaluate_switcher_eligibilities(policy, ctx, country);
+    (enabled_switchers, effective_switchers, switcher_statuses)
 }
 
 #[worker::send]
-pub async fn me(State(st): State<AppState>, cookies: Cookies) -> Response {
+pub async fn me(State(st): State<AppState>, headers: HeaderMap, cookies: Cookies) -> Response {
     let active = match identity::require_active_session(&st, &cookies).await {
         Ok(a) => a,
         Err(r) => return r,
@@ -504,11 +502,9 @@ pub async fn me(State(st): State<AppState>, cookies: Cookies) -> Response {
     let can_link_identity_now =
         session_auth_time.is_some_and(|t| identity::is_recent_auth(t, now));
 
-    let (enabled_switchers, effective_switchers) = compute_me_switchers(
-        &policy,
-        account.as_ref().map(|a| a.content_prefs_json.as_str()),
-        &active.ctx,
-    );
+    let country = safety_api::extract_cf_country(&headers);
+    let (enabled_switchers, effective_switchers, switcher_statuses) =
+        compute_me_switchers(&policy, &active.ctx, country.as_deref());
     let terms_up_to_date = active.ctx.satisfies_terms(&policy.legal);
     let available_providers: Vec<AuthProviderPublicConfig> = policy
         .effective_login_providers()
@@ -588,11 +584,13 @@ pub async fn me(State(st): State<AppState>, cookies: Cookies) -> Response {
             linked_solana_address: linked_sol,
             enabled_switchers,
             effective_switchers,
-            safe_mode: active.ctx.safe_mode,
+            switcher_statuses,
+            pref_version: active.ctx.pref_version.max(1),
             terms_version_accepted: active.ctx.terms_version_accepted,
             terms_digest_accepted: active.ctx.terms_digest_accepted,
             terms_accepted_at: account.as_ref().and_then(|a| a.terms_accepted_at),
             terms_up_to_date,
+            accepted_current_terms: terms_up_to_date,
             assurance_level: active.ctx.assurance_level,
             strict_age_ok: active.ctx.strict_age_ok,
             session_auth_time,
@@ -668,48 +666,75 @@ mod tests {
     }
 
     #[test]
-    fn me_switchers_return_saved_from_d1_while_keeping_effective_fail_closed_in_safe_mode() {
+    fn me_switchers_enforce_policy_v3_grant_generation_and_eligibility() {
         let mut policy = PublicSitePolicy {
+            revision: 2,
+            min_enforce_rev: 2,
             safety_enabled: true,
             age_policy: site_access::AgeVerificationPolicy::SelfAttestation,
-            rules: vec![site_access::SafetyRuleConfig {
+            policies: vec![site_access::ContentPolicy {
                 id: "r18".into(),
-                name: "R-18".into(),
-                mode: site_access::RuleMode::Switcher,
-                query: "tag:explicit".into(),
-                default_min_score: 0.5,
-                preset: site_access::PlaceholderPreset::R18,
-                requires_login: true,
-                requires_age_18: true,
+                grant_generation: 2,
                 enabled: true,
+                priority: 10,
+                name: "R-18".into(),
+                preset: site_access::PlaceholderPreset::R18,
+                match_expr: "tag:explicit".into(),
+                except_expr: None,
+                default_tag_min: 0.45,
+                action: site_access::PolicyAction::Block,
+                bypass: site_access::PolicyBypass {
+                    include_switcher: true,
+                    require_gallery_login: true,
+                    require_age_18: true,
+                    require_current_terms: true,
+                    exclude_anonymous: true,
+                    exclude_countries: vec!["GB".into()],
+                    ..Default::default()
+                },
             }],
-            ..Default::default()
+            ..PublicSitePolicy::fresh_bootstrap()
         };
         policy.legal.terms_version = 1;
+        policy.refresh_policy_digest();
 
-        let prefs_json = r#"{"enabled_switchers":["r18","removed_rule"],"safe_mode":true}"#;
-        let ctx_safe = site_access::SessionContext {
+        // Stale grant_generation (gen 1) is automatically invalidated when policy bumped to gen 2!
+        let ctx_stale = site_access::SessionContext {
             active: true,
             banned: false,
+            suspended: false,
             sid_valid: true,
             assurance_level: AssuranceLevel::SelfAttestation,
             strict_age_ok: false,
             terms_version_accepted: Some(1),
             terms_digest_accepted: Some(policy.legal.terms_digest.clone()),
-            enabled_switchers: Vec::new(), // fail-closed in Safe Mode
-            safe_mode: true,
+            enabled_switchers: vec![PolicyRef::new("r18", 1)],
+            pref_version: 2,
         };
-        let (saved, effective) = compute_me_switchers(&policy, Some(prefs_json), &ctx_safe);
-        assert_eq!(saved, vec!["r18"]);
-        assert!(effective.is_empty());
+        let (saved_stale, eff_stale, statuses_stale) =
+            compute_me_switchers(&policy, &ctx_stale, Some("US"));
+        assert!(saved_stale.is_empty());
+        assert!(eff_stale.is_empty());
+        assert_eq!(statuses_stale.len(), 1);
+        assert!(!statuses_stale[0].opted_in);
+        assert!(!statuses_stale[0].effective);
 
-        let ctx_off = site_access::SessionContext {
-            enabled_switchers: vec!["r18".into()],
-            safe_mode: false,
-            ..ctx_safe
+        // Current gen 2 in US succeeds; same gen 2 in excluded country GB is denied with reason!
+        let ctx_cur = site_access::SessionContext {
+            enabled_switchers: vec![PolicyRef::new("r18", 2)],
+            ..ctx_stale
         };
-        let (saved_off, effective_off) = compute_me_switchers(&policy, Some(prefs_json), &ctx_off);
-        assert_eq!(saved_off, vec!["r18"]);
-        assert_eq!(effective_off, vec!["r18"]);
+        let (saved_us, eff_us, statuses_us) = compute_me_switchers(&policy, &ctx_cur, Some("US"));
+        assert_eq!(saved_us, vec![PolicyRef::new("r18", 2)]);
+        assert_eq!(eff_us, vec![PolicyRef::new("r18", 2)]);
+        assert!(statuses_us[0].effective);
+        assert!(statuses_us[0].missing_requirements.is_empty());
+
+        let (saved_gb, eff_gb, statuses_gb) = compute_me_switchers(&policy, &ctx_cur, Some("GB"));
+        assert_eq!(saved_gb, vec![PolicyRef::new("r18", 2)]);
+        assert!(eff_gb.is_empty());
+        assert!(statuses_gb[0].country_excluded);
+        assert!(!statuses_gb[0].effective);
+        assert!(!statuses_gb[0].missing_requirements.is_empty());
     }
 }

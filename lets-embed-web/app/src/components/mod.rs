@@ -1,6 +1,7 @@
 mod account_widget;
 mod advanced_search;
 mod back2top;
+mod blurred_card;
 mod image_details;
 mod lightbox;
 mod like_button;
@@ -12,6 +13,7 @@ mod viewer;
 pub use account_widget::AccountWidget;
 pub use advanced_search::AdvancedSearchPanel;
 pub use back2top::BackToTop;
+pub use blurred_card::BlurredMediaCard;
 pub use image_details::ImageDetails;
 pub use lightbox::Lightbox;
 pub use like_button::{LikeButton, LikeStore, LikeVariant};
