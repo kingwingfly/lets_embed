@@ -8,7 +8,8 @@ repository.workspace = true
 documentation.workspace = true
 
 [lib]
-crate-type = ["cdylib"]
+# rlib in addition to cdylib so `cargo test -p gateway_worker` runs host unit tests
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 site_access = { path = "../site_access" }
@@ -18,10 +19,4 @@ tower-service = "0.3"
 tower-cookies = "0.11"
 serde.workspace = true
 serde_json.workspace = true
-hmac = "0.13"
 sha2 = "0.11"
-base64 = "0.23"
-bs58 = "0.5"
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.4", features = ["wasm_js"] }
