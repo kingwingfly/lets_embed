@@ -352,6 +352,37 @@ impl SimilarityDefaults {
     }
 }
 
+/// Curated ISO-3166 alpha-2 preset of countries with nationwide legal
+/// prohibitions or blocks on online adult / R-18 content.
+///
+/// Operators should review and customize this list with legal counsel for their
+/// specific jurisdiction and content profile. Always sorted & deduplicated.
+pub const R18_PROHIBITED_COUNTRIES: &[&str] = &[
+    "AE", "AF", "BD", "BH", "BN", "BT", "BY", "CN", "CU", "DZ", "EG", "ER", "ET", "ID", "IN",
+    "IQ", "IR", "JO", "KH", "KP", "KR", "KW", "LA", "LK", "LY", "MA", "MM", "MV", "MY", "NP",
+    "OM", "PK", "PS", "QA", "SA", "SD", "SG", "SO", "SY", "TH", "TM", "TN", "TR", "TZ", "UA",
+    "UG", "UZ", "VN", "YE",
+];
+
+/// Merges existing ISO-3166 alpha-2 codes with additional preset codes into a
+/// sorted, uppercase, deduplicated list (ignoring blank entries).
+pub fn merge_country_codes(existing: &[String], additions: &[&str]) -> Vec<String> {
+    let mut set = BTreeSet::new();
+    for raw in existing {
+        let code = raw.trim().to_ascii_uppercase();
+        if !code.is_empty() {
+            set.insert(code);
+        }
+    }
+    for raw in additions {
+        let code = raw.trim().to_ascii_uppercase();
+        if !code.is_empty() {
+            set.insert(code);
+        }
+    }
+    set.into_iter().collect()
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GeoPolicy {
@@ -379,6 +410,52 @@ impl GeoPolicy {
         self.blocked_countries
             .iter()
             .any(|blocked| blocked.trim().eq_ignore_ascii_case(raw))
+    }
+
+    /// Returns the sorted, deduplicated Cloudflare `ip.src.country` code list
+    /// represented by this [`GeoPolicy`], including `"T1"` when `block_tor` is
+    /// enabled and `"XX"` when `block_unknown` is enabled.
+    ///
+    /// Invalid or malformed country entries are omitted so generated WAF
+    /// expressions remain syntactically valid while editing a draft.
+    pub fn cloudflare_waf_codes(&self) -> Vec<String> {
+        let mut codes = BTreeSet::new();
+        for raw in &self.blocked_countries {
+            let code = raw.trim().to_ascii_uppercase();
+            if is_valid_iso_country_code(&code) {
+                codes.insert(code);
+            }
+        }
+        if self.block_tor {
+            codes.insert("T1".to_string());
+        }
+        if self.block_unknown {
+            codes.insert("XX".to_string());
+        }
+        codes.into_iter().collect()
+    }
+
+    /// Formats the equivalent Cloudflare WAF Custom Rule expression matching
+    /// `gateway_worker`'s Step 0 geo enforcement (blocking the configured
+    /// countries, optional Tor `T1`, and optional unknown `XX`, while keeping
+    /// `/admin` and `/admin/*` exempt).
+    ///
+    /// Returns `None` when no countries, unknown (`XX`), or Tor (`T1`) are
+    /// blocked.
+    pub fn to_cloudflare_waf_expression(&self) -> Option<String> {
+        let codes = self.cloudflare_waf_codes();
+        if codes.is_empty() {
+            return None;
+        }
+        let country_clause = if codes.len() == 1 {
+            format!(r#"ip.src.country eq "{}""#, codes[0])
+        } else {
+            let quoted: Vec<String> = codes.iter().map(|c| format!(r#""{c}""#)).collect();
+            format!("ip.src.country in {{{}}}", quoted.join(" "))
+        };
+        Some(format!(
+            r#"({country_clause}) and not (http.request.uri.path eq "/admin" or starts_with(http.request.uri.path, "/admin/"))"#
+        ))
     }
 }
 
@@ -1704,5 +1781,78 @@ mod tests {
         let mut bad = p.clone();
         bad.policies[0].match_expr = "tag NOT IN (general, bad_wd_typo) >= 0.45".into();
         assert!(validate_policy_set(&bad).is_err());
+    }
+
+    #[test]
+    fn r18_prohibited_countries_preset_is_valid_sorted_and_generates_waf_rule() {
+        assert!(!R18_PROHIBITED_COUNTRIES.is_empty());
+        for w in R18_PROHIBITED_COUNTRIES.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "R18_PROHIBITED_COUNTRIES must be strictly sorted & deduplicated: {} vs {}",
+                w[0],
+                w[1]
+            );
+        }
+        for &code in R18_PROHIBITED_COUNTRIES {
+            assert!(
+                is_valid_iso_country_code(code),
+                "preset country code '{code}' must be valid ISO-3166 alpha-2 (excluding XX/T1)"
+            );
+        }
+
+        // Empty GeoPolicy produces None
+        assert_eq!(GeoPolicy::default().to_cloudflare_waf_expression(), None);
+
+        // Single country uses `eq` + `/admin` exemption
+        let single = GeoPolicy {
+            blocked_countries: vec![" kp ".into()],
+            block_unknown: false,
+            block_tor: false,
+        };
+        assert_eq!(
+            single.to_cloudflare_waf_expression().as_deref(),
+            Some(
+                r#"(ip.src.country eq "KP") and not (http.request.uri.path eq "/admin" or starts_with(http.request.uri.path, "/admin/"))"#
+            )
+        );
+
+        // Multiple countries + Tor + Unknown deduplicates, ignores invalid tokens, and includes T1/XX
+        let mixed = GeoPolicy {
+            blocked_countries: vec!["cn".into(), "AE".into(), "INVALID".into(), "XX".into()],
+            block_unknown: true,
+            block_tor: true,
+        };
+        assert_eq!(
+            mixed.to_cloudflare_waf_expression().as_deref(),
+            Some(
+                r#"(ip.src.country in {"AE" "CN" "T1" "XX"}) and not (http.request.uri.path eq "/admin" or starts_with(http.request.uri.path, "/admin/"))"#
+            )
+        );
+
+        // Merging preset preserves custom additions and validates inside PublicSitePolicy
+        let merged = merge_country_codes(&["us".into(), "CN".into()], R18_PROHIBITED_COUNTRIES);
+        assert_eq!(merged.len(), R18_PROHIBITED_COUNTRIES.len() + 1);
+        assert!(merged.iter().any(|c| c == "US"));
+
+        let mut pol = PublicSitePolicy {
+            revision: 1,
+            min_enforce_rev: 1,
+            geo: GeoPolicy {
+                blocked_countries: merged,
+                block_unknown: false,
+                block_tor: true,
+            },
+            ..PublicSitePolicy::default()
+        };
+        pol.refresh_policy_digest();
+        validate_policy_set(&pol).expect("R-18 geo preset must pass validate_policy_set");
+        let waf = pol
+            .geo
+            .to_cloudflare_waf_expression()
+            .expect("non-empty WAF rule");
+        assert!(waf.starts_with(r#"(ip.src.country in {"AE" "AF" "#));
+        assert!(waf.contains(r#""T1""#));
+        assert!(waf.contains(r#"starts_with(http.request.uri.path, "/admin/")"#));
     }
 }

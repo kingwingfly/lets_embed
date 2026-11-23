@@ -418,10 +418,85 @@ body {
 }
 
 .adm-field-label-inline {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+}
+
+.adm-field-label-actions {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
+}
+
+/* Geo preset bar & Cloudflare WAF rule copy card */
+.adm-geo-preset-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+}
+
+.adm-waf-box {
+  padding: 14px 16px;
+  border-radius: 14px;
+  background: #f4f9fe;
+  border: 1px solid #c9e2f5;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  text-align: left;
+}
+
+.adm-waf-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.adm-waf-head-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.adm-waf-head-meta h3 {
+  margin: 0;
+  font-size: 14.5px;
+  font-weight: 700;
+  color: var(--adm-ink);
+}
+
+.adm-waf-code {
+  margin: 0;
+  padding: 12px 14px;
+  border-radius: 11px;
+  background: #0f2438;
+  border: 1px solid #1e3d59;
+  color: #e2f1ff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: all;
+  overflow-x: auto;
+}
+
+.adm-waf-empty {
+  padding: 11px 13px;
+  border-radius: 11px;
+  background: #ffffff;
+  border: 1px dashed var(--adm-line-strong);
+  color: var(--adm-muted);
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 .adm-field-hint {

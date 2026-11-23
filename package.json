@@ -1,7 +1,11 @@
 {
     "scripts": {
         "dev": "wrangler dev",
-        "deploy": "wrangler deploy"
+        "dev:workers": "node tests/e2e/local-workers.mjs",
+        "deploy": "wrangler deploy",
+        "test:worker-policy": "node --test gateway_worker/tests/site-policy.cjs",
+        "test:e2e": "node tests/e2e/run.mjs",
+        "test:e2e:attach": "node tests/e2e/run.mjs --attach"
     },
     "devDependencies": {
         "wrangler": "^4.165.0"

@@ -999,8 +999,39 @@ pub fn SafetyTab(
                                                                                     label="Anonymous Visitors"
                                                                                     description="Always deny bypass for visitors without a gallery session or live staff identity."
                                                                                 />
-                                                                                <label class="adm-field">
-                                                                                    <span>"Exclude Countries (ISO-3166 alpha-2 deny list)"</span>
+                                                                                <div class="adm-field">
+                                                                                    <div class="adm-field-label-inline">
+                                                                                        <span>"Exclude Countries (ISO-3166 alpha-2 deny list)"</span>
+                                                                                        <div class="adm-field-label-actions">
+                                                                                            <button
+                                                                                                type="button"
+                                                                                                class="adm-btn adm-btn--sm adm-btn--preset-r18"
+                                                                                                on:click=move |_| {
+                                                                                                    let existing = crate::drafts::parse_country_codes(&exclude_countries_text.get_untracked());
+                                                                                                    let merged = site_access::merge_country_codes(
+                                                                                                        &existing,
+                                                                                                        site_access::R18_PROHIBITED_COUNTRIES,
+                                                                                                    );
+                                                                                                    exclude_countries_text.set(merged.join(", "));
+                                                                                                    draft.dirty.set(true);
+                                                                                                }
+                                                                                            >
+                                                                                                {format!("+ R-18 Prohibited ({})", site_access::R18_PROHIBITED_COUNTRIES.len())}
+                                                                                            </button>
+                                                                                            {move || (!exclude_countries_text.get().trim().is_empty()).then(|| view! {
+                                                                                                <button
+                                                                                                    type="button"
+                                                                                                    class="adm-btn adm-btn--sm"
+                                                                                                    on:click=move |_| {
+                                                                                                        exclude_countries_text.set(String::new());
+                                                                                                        draft.dirty.set(true);
+                                                                                                    }
+                                                                                                >
+                                                                                                    "Clear"
+                                                                                                </button>
+                                                                                            })}
+                                                                                        </div>
+                                                                                    </div>
                                                                                     <input
                                                                                         type="text"
                                                                                         class="adm-mono"
@@ -1014,7 +1045,7 @@ pub fn SafetyTab(
                                                                                     <small class="adm-field-hint">
                                                                                         "Comma-separated 2-letter codes. When non-empty, missing / unknown (XX) / Tor (T1) countries are automatically denied."
                                                                                     </small>
-                                                                                </label>
+                                                                                </div>
                                                                             </div>
                                                                         </div>
                                                                     </div>

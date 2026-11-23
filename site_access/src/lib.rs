@@ -28,11 +28,12 @@ pub use policy::{
     AuthProviderPublicConfig, BUILTIN_SAFETY_VOCABULARY_TAGS, ContentPolicy,
     DEFAULT_POLICY_TAG_MIN, GeoPolicy, PlaceholderPreset, PolicyAccessResult, PolicyAction,
     PolicyBypass, PolicyCallerContext, PolicyRef, PolicyValidationError, PublicSitePolicy,
-    SITE_POLICY_SCHEMA_VERSION, SessionContext, SimilarityDefaults, UnclassifiedMode,
-    ValidatedPolicySetInfo, builtin_safety_presets, canonical_policy_json,
+    R18_PROHIBITED_COUNTRIES, SITE_POLICY_SCHEMA_VERSION, SessionContext, SimilarityDefaults,
+    UnclassifiedMode, ValidatedPolicySetInfo, builtin_safety_presets, canonical_policy_json,
     compute_next_grant_generations, compute_next_min_enforce_rev, compute_policy_access,
     compute_policy_digest, decode_active_policy_v3, is_valid_iso_country_code, is_valid_policy_id,
-    should_bump_min_enforce_rev, validate_policy_set, validate_policy_set_with_mode,
+    merge_country_codes, should_bump_min_enforce_rev, validate_policy_set,
+    validate_policy_set_with_mode,
 };
 pub use tokens::{
     ADMIN_ASSERTION_AUDIENCE, ADMIN_ASSERTION_HEADER, ADMIN_ASSERTION_TTL,
