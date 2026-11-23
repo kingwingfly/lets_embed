@@ -11,16 +11,30 @@
 
   if (window.PerformanceObserver) {
     const observer = new PerformanceObserver((list) => {
+      const onDetails = (location.pathname || "").startsWith("/details/");
       if (
         list
           .getEntries()
-          .some(
-            (entry) =>
-              entry.name.startsWith(location.origin + "/") &&
-              entry.serverTiming?.some(
+          .some((entry) => {
+            if (
+              !entry.name.startsWith(location.origin + "/") ||
+              !entry.serverTiming?.some(
                 (metric) => metric.name === "gallery-allowance",
-              ),
-          )
+              )
+            ) {
+              return false;
+            }
+            // Background "Similar" widget on /details/:id handles 402 inline so
+            // visitors and crawlers are not bounced off an accessible details page.
+            if (onDetails) {
+              try {
+                if (new URL(entry.name).pathname === "/api/search_similar") {
+                  return false;
+                }
+              } catch {}
+            }
+            return true;
+          })
       )
         openPayment();
     });

@@ -31,6 +31,12 @@ pub struct Cli {
     #[arg(alias = "it", long)]
     pub idle_timeout: Option<u64>,
 
+    /// Canonical public origin (e.g. `https://lets-embed.louisfly.icu`) for
+    /// robots.txt, sitemap.xml, and canonical/OpenGraph tags. Falls back to
+    /// `X-Forwarded-Host` / `Host` headers when unset.
+    #[arg(long)]
+    pub public_url: Option<String>,
+
     /// images path prefix
     pub prefix: Option<PathBuf>,
 }

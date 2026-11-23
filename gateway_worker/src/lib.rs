@@ -418,6 +418,21 @@ async fn gateway(
         return method_not_allowed(GALLERY_ALLOWED_METHODS);
     };
 
+    // Always serve `/robots.txt` publicly so search engines never hit a login
+    // redirect when probing crawler rules.
+    if matches!(method, Method::GET | Method::HEAD) && path == "/robots.txt" {
+        return proxy(
+            uri,
+            worker_method,
+            headers,
+            body,
+            &st.upstreams,
+            &st.client_id,
+            &st.client_secret,
+        )
+        .await;
+    }
+
     let browse = browse_route(&method, path);
     let now = now_secs();
     let pass = cookies
@@ -581,8 +596,8 @@ fn login_response(uri: &Uri, method: &Method) -> Response {
 
 fn browse_route(method: &Method, path: &str) -> bool {
     if matches!(*method, Method::GET | Method::HEAD) {
-        return matches!(path, "/" | "/favicon.ico")
-            || ["/pkg", "/images", "/videos", "/details"]
+        return matches!(path, "/" | "/favicon.ico" | "/robots.txt" | "/sitemap.xml")
+            || ["/pkg", "/images", "/videos", "/details", "/sitemap"]
                 .iter()
                 .any(|p| is_segment_prefix(path, p));
     }
@@ -1186,6 +1201,9 @@ async fn proxy(
         let name = k.as_str();
         if is_hop_by_hop(name)
             || name == "cookie"
+            || name.eq_ignore_ascii_case("x-forwarded-host")
+            || name.eq_ignore_ascii_case("x-forwarded-proto")
+            || name.eq_ignore_ascii_case("forwarded")
             || name.eq_ignore_ascii_case(site_access::ADMIN_HEADER)
             || name.eq_ignore_ascii_case("cf-access-jwt-assertion")
             || name.eq_ignore_ascii_case("cf-access-authenticated-user-email")
@@ -1197,6 +1215,18 @@ async fn proxy(
         if let Ok(v) = v.to_str() {
             let _ = req_init.headers.set(name, v);
         }
+    }
+    if let Some(host) = request_host(&uri, &headers) {
+        let proto = if uri
+            .scheme_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("http"))
+        {
+            "http"
+        } else {
+            "https"
+        };
+        let _ = req_init.headers.set("x-forwarded-host", host);
+        let _ = req_init.headers.set("x-forwarded-proto", proto);
     }
     if let Some(c) = sanitize_cookie(&headers) {
         let _ = req_init.headers.set("cookie", &c);
@@ -1219,7 +1249,7 @@ async fn proxy(
     match Fetch::Request(request).send().await {
         Ok(resp) => {
             let mut response = Response::from(resp);
-            if !is_segment_prefix(uri.path(), "/pkg") {
+            if !is_segment_prefix(uri.path(), "/pkg") && uri.path() != "/robots.txt" {
                 response
                     .headers_mut()
                     .insert("cache-control", "private, no-store".parse().unwrap());

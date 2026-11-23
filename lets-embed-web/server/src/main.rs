@@ -2,6 +2,7 @@
 
 mod cli;
 mod previews;
+mod seo;
 
 use app::*;
 use axum::Router;
@@ -39,16 +40,22 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     tracing::info!("search engine loaded");
 
+    let public_url = args
+        .public_url
+        .or_else(|| std::env::var("PUBLIC_URL").ok())
+        .as_deref()
+        .and_then(app::util::normalize_public_origin);
     let app_state = state::AppState {
         leptos_options: leptos_options.clone(),
         engine: Arc::new(engine),
         prefix: Arc::new(args.prefix.clone()),
+        public_url: Arc::new(public_url),
     };
 
     let routes = generate_route_list(App);
 
     // Search is served by Leptos server functions (auto-registered under /api),
-    // so no manual routes are needed here beyond static assets + leptos routes.
+    // so no manual routes are needed here beyond static assets, SEO, and leptos routes.
     let mut app = Router::new();
     if let Some(prefix) = args.prefix {
         app = app
@@ -56,6 +63,9 @@ async fn main() -> anyhow::Result<()> {
             .nest_service("/videos", ServeDir::new(&prefix))
     }
     let app = app
+        .route("/robots.txt", axum::routing::get(seo::robots_txt))
+        .route("/sitemap.xml", axum::routing::get(seo::sitemap_root))
+        .route("/sitemap/{page}", axum::routing::get(seo::sitemap_page))
         .route(
             "/api/like_previews",
             axum::routing::get(previews::like_previews),

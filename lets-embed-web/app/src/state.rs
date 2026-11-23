@@ -9,4 +9,5 @@ pub struct AppState {
     pub leptos_options: LeptosOptions,
     pub engine: Arc<Engine>,
     pub prefix: Arc<Option<PathBuf>>,
+    pub public_url: Arc<Option<String>>,
 }

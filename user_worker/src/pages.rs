@@ -93,6 +93,10 @@ fn html_page(html: String) -> Response {
             (header::REFERRER_POLICY, "same-origin"),
             (header::X_FRAME_OPTIONS, "DENY"),
             (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+            (
+                header::HeaderName::from_static("x-robots-tag"),
+                "noindex, nofollow",
+            ),
         ],
         Html(html),
     )

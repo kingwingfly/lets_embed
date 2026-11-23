@@ -5,6 +5,99 @@ pub fn encode_path(path: &str) -> String {
         .join("/")
 }
 
+/// Validate and normalize an `http://` or `https://` origin (no trailing slash,
+/// path, query, fragment, or userinfo).
+pub fn normalize_public_origin(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let (scheme, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
+        ("https", r)
+    } else {
+        ("http", trimmed.strip_prefix("http://")?)
+    };
+    let host = valid_host_authority(rest)?;
+    Some(format!("{scheme}://{host}"))
+}
+
+fn valid_host_authority(raw: &str) -> Option<&str> {
+    let host = raw.trim();
+    if host.is_empty()
+        || host.len() > 255
+        || host.bytes().any(|b| {
+            b <= 0x20
+                || b == 0x7f
+                || matches!(
+                    b,
+                    b'/' | b'\\' | b'@' | b'?' | b'#' | b'<' | b'>' | b'"' | b'\''
+                )
+        })
+    {
+        return None;
+    }
+    Some(host)
+}
+
+#[cfg(feature = "ssr")]
+fn single_header<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+    let mut all = headers.get_all(name).iter();
+    let first = all.next()?.to_str().ok()?;
+    if all.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
+/// Resolve the public origin (`https://host` or `http://localhost:port`) from
+/// reverse-proxy forwarding headers (`X-Forwarded-Host` / `X-Forwarded-Proto`)
+/// or the direct `Host` header.
+#[cfg(feature = "ssr")]
+pub fn origin_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    if let Some(xfh) = single_header(headers, "x-forwarded-host")
+        .and_then(|v| v.split(',').next())
+        .and_then(valid_host_authority)
+    {
+        let proto = single_header(headers, "x-forwarded-proto")
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|p| p.eq_ignore_ascii_case("http") || p.eq_ignore_ascii_case("https"))
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| "https".to_string());
+        return Some(format!("{proto}://{xfh}"));
+    }
+    let host = single_header(headers, "host").and_then(valid_host_authority)?;
+    let bare = host.split(':').next().unwrap_or(host);
+    let proto = if bare.eq_ignore_ascii_case("localhost") || bare == "127.0.0.1" {
+        "http"
+    } else {
+        "https"
+    };
+    Some(format!("{proto}://{host}"))
+}
+
+/// Resolve the canonical public origin for `<link rel="canonical">` and OpenGraph
+/// URLs on both SSR and client hydration.
+pub fn public_origin() -> Option<String> {
+    #[cfg(feature = "ssr")]
+    {
+        use leptos::prelude::use_context;
+        if let Some(origin) = use_context::<crate::state::AppState>()
+            .and_then(|st| st.public_url.as_deref().and_then(normalize_public_origin))
+        {
+            return Some(origin);
+        }
+        use_context::<axum::http::request::Parts>().and_then(|p| origin_from_headers(&p.headers))
+    }
+    #[cfg(all(feature = "hydrate", not(feature = "ssr")))]
+    {
+        web_sys::window()
+            .and_then(|w| w.location().origin().ok())
+            .and_then(|o| normalize_public_origin(&o))
+    }
+    #[cfg(not(any(feature = "ssr", feature = "hydrate")))]
+    {
+        None
+    }
+}
+
 /// Format a video duration in seconds as `M:SS` or `H:MM:SS`.
 pub fn format_duration(seconds: i32) -> String {
     let s = seconds.max(0) as u64;
@@ -531,8 +624,50 @@ pub fn layout_image_masonry(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_duration, layout_image_masonry};
+    use super::{format_duration, layout_image_masonry, normalize_public_origin};
     use search_types::Image;
+
+    #[test]
+    fn normalizes_valid_public_origins_and_rejects_malformed_values() {
+        assert_eq!(
+            normalize_public_origin("https://lets-embed.louisfly.icu/").as_deref(),
+            Some("https://lets-embed.louisfly.icu")
+        );
+        assert_eq!(
+            normalize_public_origin("http://127.0.0.1:3000").as_deref(),
+            Some("http://127.0.0.1:3000")
+        );
+        assert_eq!(normalize_public_origin("https://example.com/path"), None);
+        assert_eq!(normalize_public_origin("javascript:alert(1)"), None);
+        assert_eq!(normalize_public_origin("https://user@example.com"), None);
+        assert_eq!(normalize_public_origin(""), None);
+    }
+
+    #[cfg(feature = "ssr")]
+    #[test]
+    fn resolves_origin_from_forwarded_or_host_headers() {
+        use super::origin_from_headers;
+        use axum::http::HeaderMap;
+
+        let mut h = HeaderMap::new();
+        h.insert("host", "lets-embed-web.louisfly.icu".parse().unwrap());
+        h.insert(
+            "x-forwarded-host",
+            "lets-embed.louisfly.icu".parse().unwrap(),
+        );
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert_eq!(
+            origin_from_headers(&h).as_deref(),
+            Some("https://lets-embed.louisfly.icu")
+        );
+
+        let mut local = HeaderMap::new();
+        local.insert("host", "127.0.0.1:3000".parse().unwrap());
+        assert_eq!(
+            origin_from_headers(&local).as_deref(),
+            Some("http://127.0.0.1:3000")
+        );
+    }
 
     #[test]
     fn formats_seconds_minutes_and_hours() {

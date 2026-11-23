@@ -354,7 +354,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                                         let img_id = im.id;
                                         let url = format!("/images/{}.webp", encode_path(&im.name));
                                         let alt = im.name.clone();
-                                        let href = format!("/details/{img_id}?mode=similar&q={img_id}&limit=50");
+                                        let href = format!("/details/{img_id}");
                                         let click_href = href.clone();
                                         let nav = use_navigate();
                                         let (w, h) = if im.width > 0 && im.height > 0 {

@@ -5,14 +5,15 @@ use crate::types::MAX_SEARCH_LIMIT;
 use crate::{
     components::{LikeButton, LikeVariant, lightbox::Lightbox, viewer::Viewer},
     types::{
-        AdvancedUploads, GalleryDensity as Density, GalleryDensityState, ImageQuery, Mode,
-        PostItem, SearchResponse, UploadedImageSlot, parse_url_limit,
+        AdvancedUploads, DEFAULT_SEARCH_LIMIT, GalleryDensity as Density, GalleryDensityState,
+        ImageQuery, Mode, PostItem, SearchResponse, UploadedImageSlot, parse_url_limit,
         save_gallery_density as save_density,
     },
-    util::{encode_path, set_document_title},
+    util::{encode_path, public_origin, set_document_title},
 };
 
 use leptos::{ev, prelude::*, task::spawn_local};
+use leptos_meta::{Link, Meta, Title};
 use leptos_router::{
     NavigateOptions,
     hooks::{use_location, use_navigate, use_query_map},
@@ -488,8 +489,66 @@ pub fn Results(
         req_id,
     };
 
+    let initial_is_default_home = !embedded
+        && pathname.with_untracked(|p| p == "/")
+        && params.with_untracked(|p| {
+            p.mode == Mode::All
+                && p.q.trim().is_empty()
+                && p.adv.trim().is_empty()
+                && p.limit == DEFAULT_SEARCH_LIMIT
+        });
+    let ssr_home = initial_is_default_home.then(|| {
+        OnceResource::new(async move {
+            search_query("all".to_string(), String::new(), 0, DEFAULT_SEARCH_LIMIT, 0)
+                .await
+                .ok()
+        })
+    });
+    let ssr_consumed: StoredValue<bool> = StoredValue::new(false);
+
     Effect::new(move |_| {
-        let _ = params.get();
+        let p = params.get();
+        let is_default_home = !embedded
+            && p.mode == Mode::All
+            && p.q.trim().is_empty()
+            && p.adv.trim().is_empty()
+            && p.limit == DEFAULT_SEARCH_LIMIT;
+        if is_default_home
+            && !ssr_consumed.get_value()
+            && let Some(res) = ssr_home
+        {
+            match res.get() {
+                None => {
+                    loading.set(true);
+                    return;
+                }
+                Some(Some(resp)) if !resp.posts.is_empty() => {
+                    ssr_consumed.set_value(true);
+                    viewer.set(None);
+                    lightbox.set(None);
+                    columns.update(|cs| {
+                        cs.iter_mut().for_each(|c| {
+                            c.items.clear();
+                            c.height = 0;
+                        })
+                    });
+                    images.update_value(|v| v.clear());
+                    next_order.set_value(0);
+                    offset.set(0);
+                    error.set(None);
+                    apply_page_response(resp, load_ctx);
+                    loaded_first.set(true);
+                    loading.set(false);
+                    return;
+                }
+                Some(_) => {
+                    ssr_consumed.set_value(true);
+                }
+            }
+        } else if ssr_home.is_some() {
+            ssr_consumed.set_value(true);
+        }
+
         viewer.set(None);
         lightbox.set(None);
         columns.update(|cs| {
@@ -562,6 +621,8 @@ pub fn Results(
                 let title = p.title.clone();
                 let open_label = format!("Open post: {title}");
                 let cover = p.images.first().cloned();
+                let cover_details_href = cover.as_ref().map(|c| format!("/details/{}", c.id));
+                let nav = use_navigate();
                 let img_count = p.image_count.max(p.images.len());
                 let video_count = p.video_count.max(p.videos.len());
                 let media_badge = match (img_count > 0, video_count > 0) {
@@ -612,6 +673,25 @@ pub fn Results(
                             </div>
                             <div class="gallery-overlay">
                                 <span class="gallery-overlay-meta">{title}</span>
+                                {cover_details_href.map(|href| {
+                                    let click_href = href.clone();
+                                    view! {
+                                        <a
+                                            href=href
+                                            title="Open cover details & similar"
+                                            class="gallery-overlay-link"
+                                            on:click=move |ev: ev::MouseEvent| {
+                                                ev.stop_propagation();
+                                                if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
+                                                    ev.prevent_default();
+                                                    nav(&click_href, NavigateOptions::default());
+                                                }
+                                            }
+                                        >
+                                            "Details \u{2197}"
+                                        </a>
+                                    }
+                                })}
                             </div>
                         </div>
                     </article>
@@ -622,7 +702,7 @@ pub fn Results(
                 let url = format!("/images/{}.webp", encode_path(&im.name));
                 let alt = im.name.clone();
                 let id = im.id;
-                let href = format!("/details/{id}?mode=similar&q={id}&limit=50");
+                let href = format!("/details/{id}");
                 let click_href = href.clone();
                 let nav = use_navigate();
                 view! {
@@ -681,6 +761,33 @@ pub fn Results(
 
     let error_view = move || {
         error.get().map(|e| {
+            let lower = e.to_ascii_lowercase();
+            let is_allowance = embedded
+                && (lower.contains("402")
+                    || lower.contains("payment")
+                    || lower.contains("allowance")
+                    || lower.contains("out of points")
+                    || lower.contains("/user/upgrade"));
+            if is_allowance {
+                return view! {
+                    <div class="w-full max-w-md mx-auto my-6 px-5 py-4 rounded-2xl bg-sky-50/90 ring-1 ring-sky-200
+                                text-center text-slate-600 shadow-sm flex flex-col items-center gap-2.5">
+                        <p class="text-sm font-medium text-sky-800">
+                            "Sign in or upgrade to explore visually similar images."
+                        </p>
+                        <a
+                            href="/user/upgrade"
+                            rel="external"
+                            class="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-full text-sm font-medium
+                                   bg-gradient-to-r from-sky-400 to-blue-500 text-white shadow-sm
+                                   hover:from-sky-500 hover:to-blue-600 transition-all"
+                        >
+                            "Continue exploring \u{2192}"
+                        </a>
+                    </div>
+                }
+                .into_any();
+            }
             view! {
                 <div class="w-full max-w-md mx-auto my-4 px-5 py-4 rounded-2xl bg-rose-50/90 ring-1 ring-rose-200
                             text-center text-rose-600 shadow-sm flex flex-col items-center gap-2.5">
@@ -699,6 +806,7 @@ pub fn Results(
                     </button>
                 </div>
             }
+            .into_any()
         })
     };
 
@@ -888,7 +996,112 @@ pub fn Results(
         }
     };
 
+    let has_masonry_items =
+        Memo::new(move |_| columns.with(|cs| cs.iter().any(|c| !c.items.is_empty())));
+    let is_ephemeral_search = Memo::new(move |_| {
+        params.with(|p| p.mode != Mode::All || !p.q.trim().is_empty() || !p.adv.trim().is_empty())
+    });
+    let home_canonical = (!embedded)
+        .then(|| public_origin().map(|o| format!("{o}/")))
+        .flatten();
+
+    let ssr_fallback_view = ssr_home.map(|res| {
+        view! {
+            <Transition fallback=|| ()>
+                {move || {
+                    if has_masonry_items.get() {
+                        return None;
+                    }
+                    let resp = res.get().flatten()?;
+                    if resp.posts.is_empty() {
+                        return None;
+                    }
+                    Some(view! {
+                        <div class="gallery-ssr-grid">
+                            {resp.posts.into_iter().map(|p| {
+                                let title = p.title;
+                                let cover = p.images.first().cloned();
+                                let img_count = p.image_count.max(p.images.len());
+                                let video_count = p.video_count.max(p.videos.len());
+                                let media_badge = match (img_count > 0, video_count > 0) {
+                                    (true, true) => Some(format!("{img_count}p {video_count}v")),
+                                    (true, false) => Some(format!("{img_count}p")),
+                                    (false, true) => Some(format!("{video_count}v")),
+                                    (false, false) => None,
+                                };
+                                let (w, h) = cover
+                                    .as_ref()
+                                    .filter(|c| c.width > 0 && c.height > 0)
+                                    .map(|c| (c.width, c.height))
+                                    .unwrap_or((4, 3));
+                                let aspect = format!("aspect-ratio: {w} / {h}");
+                                let details_href = cover.as_ref().map(|c| format!("/details/{}", c.id));
+                                view! {
+                                    <article class="gallery-tile gallery-post group">
+                                        <div class="gallery-frame">
+                                            {match (cover, details_href.clone()) {
+                                                (Some(c), Some(href)) => view! {
+                                                    <a href=href class="block w-full">
+                                                        <img
+                                                            loading="lazy"
+                                                            decoding="async"
+                                                            alt=title.clone()
+                                                            style=aspect
+                                                            class="gallery-img"
+                                                            src=format!("/images/{}.webp", encode_path(&c.name))
+                                                        />
+                                                    </a>
+                                                }.into_any(),
+                                                _ => view! {
+                                                    <div class="w-full grid place-items-center text-sky-700 text-3xl bg-[#e4f3fc]"
+                                                        style=aspect>
+                                                        <span aria-hidden="true">"▶"</span>
+                                                    </div>
+                                                }.into_any(),
+                                            }}
+                                            {media_badge.map(|badge| view! {
+                                                <div class="gallery-top-left">
+                                                    <span class="gallery-post-pill">
+                                                        <span class="star" aria-hidden="true">"\u{2605}"</span>
+                                                        <span>{badge}</span>
+                                                    </span>
+                                                </div>
+                                            })}
+                                            <div class="gallery-overlay">
+                                                <span class="gallery-overlay-meta">{title}</span>
+                                                {details_href.map(|href| view! {
+                                                    <a href=href class="gallery-overlay-link">
+                                                        "Details \u{2197}"
+                                                    </a>
+                                                })}
+                                            </div>
+                                        </div>
+                                    </article>
+                                }
+                            }).collect_view()}
+                        </div>
+                    })
+                }}
+            </Transition>
+        }
+    });
+
     view! {
+        {(!embedded).then(|| view! {
+            <Title text="Let's Embed"/>
+            <Meta name="description" content=crate::SITE_DESCRIPTION/>
+            <Meta property="og:type" content="website"/>
+            <Meta property="og:title" content="Let's Embed"/>
+            <Meta property="og:description" content=crate::SITE_DESCRIPTION/>
+            <h1 class="sr-only">"Let\u{2019}s Embed \u{2014} Visual & Semantic Image Gallery"</h1>
+            {home_canonical.clone().map(|url| view! {
+                <Link rel="canonical" href=url.clone()/>
+                <Meta property="og:url" content=url/>
+            })}
+            {move || is_ephemeral_search.get().then(|| view! {
+                <Meta name="robots" content="noindex, follow"/>
+            })}
+        })}
         <div node_ref=size_el class=wrap_cls>
             {embedded.then(|| view! {
                 <div class="gallery-floating-bar">
@@ -904,6 +1117,7 @@ pub fn Results(
                     </div>
                 </div>
             })}
+            {ssr_fallback_view}
             <div class="gallery-masonry">
                 <For
                     each=move || 0..col_count.get()
@@ -1105,39 +1319,7 @@ fn load_page(offset_val: i64, ctx: GalleryLoadCtx) {
 
         match result {
             Ok(resp) => {
-                ctx.images
-                    .update_value(|v| v.extend(resp.images.iter().cloned()));
-                ctx.columns.update(|cs| {
-                    let vp_w = {
-                        let v = ctx.viewport_w.get_untracked();
-                        #[cfg(feature = "hydrate")]
-                        {
-                            if v <= 0.0 { read_window_width() } else { v }
-                        }
-                        #[cfg(not(feature = "hydrate"))]
-                        {
-                            v
-                        }
-                    };
-                    if cs.is_empty() {
-                        let el_w = ctx.elem_width.get_untracked();
-                        let w = resolve_gallery_width(ctx.size_el, el_w, vp_w, ctx.embedded);
-                        let fallback_w = if w > 0.0 { w } else { 1120.0 };
-                        *cs = make_empty_columns(fallback_w, vp_w, ctx.density.get_untracked());
-                    }
-                    let gap = column_gap_for(vp_w);
-                    let mut order = ctx.next_order.get_value();
-                    for post in resp.posts {
-                        place_item(cs, Item::Post(post), order, gap);
-                        order += 1;
-                    }
-                    for image in resp.images {
-                        place_item(cs, Item::Image(image), order, gap);
-                        order += 1;
-                    }
-                    ctx.next_order.set_value(order);
-                });
-                ctx.has_more.set(resp.has_more);
+                apply_page_response(resp, ctx);
             }
             Err(e) => {
                 ctx.error.set(Some(e.to_string()));
@@ -1147,6 +1329,42 @@ fn load_page(offset_val: i64, ctx: GalleryLoadCtx) {
         ctx.loaded_first.set(true);
         ctx.loading.set(false);
     });
+}
+
+fn apply_page_response(resp: SearchResponse, ctx: GalleryLoadCtx) {
+    ctx.images
+        .update_value(|v| v.extend(resp.images.iter().cloned()));
+    ctx.columns.update(|cs| {
+        let vp_w = {
+            let v = ctx.viewport_w.get_untracked();
+            #[cfg(feature = "hydrate")]
+            {
+                if v <= 0.0 { read_window_width() } else { v }
+            }
+            #[cfg(not(feature = "hydrate"))]
+            {
+                v
+            }
+        };
+        if cs.is_empty() {
+            let el_w = ctx.elem_width.get_untracked();
+            let w = resolve_gallery_width(ctx.size_el, el_w, vp_w, ctx.embedded);
+            let fallback_w = if w > 0.0 { w } else { 1120.0 };
+            *cs = make_empty_columns(fallback_w, vp_w, ctx.density.get_untracked());
+        }
+        let gap = column_gap_for(vp_w);
+        let mut order = ctx.next_order.get_value();
+        for post in resp.posts {
+            place_item(cs, Item::Post(post), order, gap);
+            order += 1;
+        }
+        for image in resp.images {
+            place_item(cs, Item::Image(image), order, gap);
+            order += 1;
+        }
+        ctx.next_order.set_value(order);
+    });
+    ctx.has_more.set(resp.has_more);
 }
 
 #[cfg(feature = "ssr")]
@@ -1288,7 +1506,9 @@ async fn run_advanced_tier(
     if offset >= MAX_SEARCH_OFFSET {
         return Ok(SearchResponse::default());
     }
-    let state = expect_context::<AppState>();
+    let Some(state) = use_context::<AppState>() else {
+        return Ok(SearchResponse::default());
+    };
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
     let req = AdvancedSearchRequest {
@@ -1365,7 +1585,9 @@ async fn search_query(
         return Ok(SearchResponse::default());
     }
 
-    let state = expect_context::<AppState>();
+    let Some(state) = use_context::<AppState>() else {
+        return Ok(SearchResponse::default());
+    };
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
     // Random images mode.
@@ -1542,7 +1764,9 @@ async fn search_by_image(
         return Ok(SearchResponse::default());
     }
 
-    let state = expect_context::<AppState>();
+    let Some(state) = use_context::<AppState>() else {
+        return Ok(SearchResponse::default());
+    };
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
     let items = engine
@@ -1581,7 +1805,9 @@ async fn search_similar(
         return Ok(SearchResponse::default());
     }
 
-    let state = expect_context::<AppState>();
+    let Some(state) = use_context::<AppState>() else {
+        return Ok(SearchResponse::default());
+    };
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
     let details = engine.image_details(id).await.map_err(to_server_err)?;
@@ -1629,7 +1855,9 @@ async fn search_by_desc(
         return Ok(SearchResponse::default());
     }
 
-    let state = expect_context::<AppState>();
+    let Some(state) = use_context::<AppState>() else {
+        return Ok(SearchResponse::default());
+    };
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
     let items = engine

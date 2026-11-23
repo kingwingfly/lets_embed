@@ -2,19 +2,21 @@
 
 pub mod components;
 pub mod types;
-
-mod util;
+pub mod util;
 
 #[cfg(feature = "ssr")]
 pub mod state;
 
 use crate::components::{ImageDetails, LikeStore, Results, SearchBar};
 use leptos::prelude::*;
-use leptos_meta::{HashedStylesheet, Link, MetaTags, Title, provide_meta_context};
+use leptos_meta::{HashedStylesheet, Link, Meta, MetaTags, provide_meta_context};
 use leptos_router::{
+    SsrMode,
     components::{ParentRoute, Route, Router, Routes},
     path,
 };
+
+pub const SITE_DESCRIPTION: &str = "Explore and search curated artwork and photo albums by title, artist, tags, CLIP descriptions, and visual similarity on Let's Embed.";
 
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
@@ -61,13 +63,14 @@ pub fn App() -> impl IntoView {
     provide_context(density);
     provide_context(LikeStore::new());
     view! {
-        <Title text="Let's Embed"/>
+        <Meta property="og:site_name" content="Let's Embed"/>
+        <Meta name="twitter:card" content="summary_large_image"/>
         <Router>
             <main class="min-h-screen w-full overflow-x-clip bg-gradient-to-b from-sky-50 via-white to-sky-100">
                 <Routes fallback=|| "Page not found.".into_view()>
                     <ParentRoute path=path!("") view=SearchBar>
-                        <Route path=path!("/details/:id") view=ImageDetails/>
-                        <Route path=path!("") view=|| view! { <Results /> }/>
+                        <Route path=path!("/details/:id") view=ImageDetails ssr=SsrMode::Async/>
+                        <Route path=path!("") view=|| view! { <Results /> } ssr=SsrMode::Async/>
                     </ParentRoute>
                 </Routes>
             </main>

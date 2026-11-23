@@ -148,6 +148,31 @@ test('embedded resources navigate only for a same-origin gallery allowance denia
   await mediaError(failedVideo);
   assert.deepEqual(probes, Array(2).fill([failedVideo.target.currentSrc, 'HEAD']));
   assert.deepEqual(destinations, ['/user/upgrade', '/user/upgrade']);
+
+  // On /details/:id, background /api/search_similar allowance denial must not hijack the page.
+  const detailsDestinations = [];
+  let detailsObserve;
+  class DetailsObserver {
+    constructor(callback) { detailsObserve = callback; }
+    observe() {}
+    disconnect() {}
+  }
+  require('node:vm').runInNewContext(fs.readFileSync(path.join(root, 'assets/gallery-allowance.js'), 'utf8'), {
+    PerformanceObserver: DetailsObserver,
+    URL,
+    window: { PerformanceObserver: DetailsObserver, addEventListener: () => {} },
+    document: { addEventListener: () => {} },
+    location: { origin, pathname: '/details/42', href: origin + '/details/42', assign: url => detailsDestinations.push(url) },
+    fetch: async () => new Response(null, { status: 404 }),
+  });
+  detailsObserve({
+    getEntries: () => [{ name: origin + '/api/search_similar', serverTiming: [{ name: 'gallery-allowance' }] }],
+  });
+  assert.deepEqual(detailsDestinations, []);
+  detailsObserve({
+    getEntries: () => [{ name: origin + '/videos/a.mp4', serverTiming: [{ name: 'gallery-allowance' }] }],
+  });
+  assert.deepEqual(detailsDestinations, ['/user/upgrade']);
 });
 
 test('gallery access, billing and administrator controls use the published policy', async (t) => {
@@ -289,6 +314,14 @@ test('gallery access, billing and administrator controls use the published polic
     assert.equal(r.status, status, (await r.text()).slice(0, 250));
   };
   await check(site('/'), 303);
+  // /robots.txt is always public even when login_required=yes, while /sitemap.xml stays gated.
+  const robotsClosed = await site('/robots.txt');
+  assert.equal(robotsClosed.status, 200);
+  assert.equal(robotsClosed.headers.get('x-test-upstream'), apiUpstream + '/robots.txt');
+  await check(site('/sitemap.xml'), 303);
+  const loginPageResp = await site('/user/login');
+  assert.equal(loginPageResp.status, 200);
+  assert.equal(loginPageResp.headers.get('x-robots-tag'), 'noindex, nofollow');
   const login = await site('/?q=C++');
   assert.equal(new URL(login.headers.get('location'), 'https://' + appHost).searchParams.get('next'), '/?q=C++');
   await check(site('/images/one.webp'), 401);
@@ -377,6 +410,13 @@ test('gallery access, billing and administrator controls use the published polic
   assert.equal(listing.status, 200);
   assert.equal(listing.headers.get('cache-control'), 'private, no-store');
   assert.equal(listing.headers.get('x-test-upstream'), apiUpstream + '/');
+  // When guest browsing is open, /sitemap.xml and /sitemap/1.xml are reachable by crawlers.
+  const sitemapRoot = await site('/sitemap.xml');
+  assert.equal(sitemapRoot.status, 200);
+  assert.equal(sitemapRoot.headers.get('x-test-upstream'), apiUpstream + '/sitemap.xml');
+  const sitemapPage = await site('/sitemap/1.xml');
+  assert.equal(sitemapPage.status, 200);
+  assert.equal(sitemapPage.headers.get('x-test-upstream'), apiUpstream + '/sitemap/1.xml');
   const media = ['/images/a.webp', '/images/b.webp'];
   for (const url of media) await check(site(url, { method: 'HEAD' }), 200);
   const concurrent = await Promise.all(media.map((url) => site(url)));
@@ -1570,7 +1610,7 @@ test('favorites gallery splits images and posts, supports masonry viewer, unfavo
   assert.equal(env.ids.get('count-post').textContent, '1');
   const postTriggers = env.findAll(env.ids.get('fav-grid'), (n) => n.className === 'fav-media-trigger');
   assert.equal(postTriggers[0].tagName, 'A');
-  assert.equal(postTriggers[0].href, '/details/501?mode=similar&q=501&limit=50');
+  assert.equal(postTriggers[0].href, '/details/501');
   const postPills = env.findAll(env.ids.get('fav-grid'), (n) => n.className === 'fav-post-pill');
   assert.match(postPills[0].children.join(''), /9p/);
 

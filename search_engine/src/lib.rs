@@ -46,6 +46,13 @@ pub struct PostGalleryCover {
     pub video_count: usize,
 }
 
+/// Canonical post entry for XML sitemap generation (one cover image URL per post).
+#[derive(Debug, Clone)]
+pub struct SitemapPostEntry {
+    pub cover_image_id: i64,
+    pub lastmod: Option<String>,
+}
+
 /// Escape `%`, `_`, and `\` so user input is treated as a literal substring in `ILIKE`.
 fn escape_like(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -1712,6 +1719,58 @@ impl Engine {
             authors,
             tags: vec![], // TODO: tag video
         })
+    }
+
+    /// Count distinct posts that have at least one image (for XML sitemap sizing).
+    pub async fn sitemap_post_count(&self) -> anyhow::Result<i64> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(DISTINCT post_id)::BIGINT FROM post_images")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count)
+    }
+
+    /// Return a page of canonical post cover image IDs + UTC `YYYY-MM-DD` dates
+    /// ordered newest-first for XML sitemap generation.
+    pub async fn sitemap_post_entries(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<SitemapPostEntry>> {
+        if limit <= 0 || offset < 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                (SELECT pi.image_id
+                 FROM post_images pi
+                 WHERE pi.post_id = p.id
+                 ORDER BY pi.image_id ASC
+                 LIMIT 1) AS cover_id,
+                to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS lastmod
+            FROM posts p
+            WHERE EXISTS (SELECT 1 FROM post_images pi WHERE pi.post_id = p.id)
+            ORDER BY p.id DESC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(cover_image_id) = row.try_get::<Option<i64>, _>("cover_id")? {
+                let lastmod: Option<String> = row.try_get("lastmod")?;
+                out.push(SitemapPostEntry {
+                    cover_image_id,
+                    lastmod,
+                });
+            }
+        }
+        Ok(out)
     }
 }
 

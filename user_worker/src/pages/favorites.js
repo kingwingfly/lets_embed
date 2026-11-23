@@ -106,7 +106,7 @@ function imageUrl(name) {
 
 function detailsHref(imageId) {
   const id = encodeURIComponent(imageId);
-  return "/details/" + id + "?mode=similar&q=" + id + "&limit=50";
+  return "/details/" + id;
 }
 
 function formatShortDate(epochSecs) {

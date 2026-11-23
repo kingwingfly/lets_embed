@@ -1,12 +1,13 @@
 use crate::{
     components::{Lightbox, LikeButton, LikeVariant, Results, Viewer},
     types::{ImageQuery, ImageQueryPayload, PostItem},
-    util::{encode_path, format_duration, layout_image_masonry, set_document_title},
+    util::{encode_path, format_duration, layout_image_masonry, public_origin, set_document_title},
 };
 
 #[cfg(feature = "hydrate")]
 use leptos::{ev, task::spawn_local};
 use leptos::{ev::PointerEvent, html, prelude::*};
+use leptos_meta::{Link, Meta, Title};
 use leptos_router::hooks::{use_location, use_navigate, use_params_map, use_query_map};
 use leptos_use_element_size::{UseElementSizeReturn, use_element_size};
 #[cfg(feature = "hydrate")]
@@ -20,6 +21,49 @@ use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement};
 
 /// Maximum number of aliases joined inline when "Show aliases" is toggled on.
 const MAX_INLINE_ALIASES: usize = 6;
+
+/// Build a concise meta description (~155 chars) from DB-backed post title,
+/// authors, top tags, and image dimensions.
+fn build_detail_description(
+    title: &str,
+    authors: &[search_types::Author],
+    tags: &[Tag],
+    width: i32,
+    height: i32,
+) -> String {
+    let mut parts = Vec::new();
+    if !authors.is_empty() {
+        let names = authors
+            .iter()
+            .take(3)
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("{title} by {names}"));
+    } else {
+        parts.push(title.to_string());
+    }
+    if !tags.is_empty() {
+        let tag_list = tags
+            .iter()
+            .take(8)
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("Tags: {tag_list}"));
+    }
+    if width > 0 && height > 0 {
+        parts.push(format!("{width}×{height}"));
+    }
+    parts.push("Explore the full album and visually similar images on Let's Embed.".to_string());
+    let joined = parts.join(" · ");
+    if joined.chars().count() <= 165 {
+        joined
+    } else {
+        let truncated: String = joined.chars().take(162).collect();
+        format!("{truncated}…")
+    }
+}
 
 /// Build an Advanced Search URL targeting a single WD tag or multilingual alias.
 fn tag_search_href(value: &str) -> String {
@@ -748,7 +792,32 @@ fn ImageDetailPage(id: String) -> impl IntoView {
             }
         };
 
+        let seo_title = post
+            .as_ref()
+            .map(|p| p.title.clone())
+            .unwrap_or_else(|| format!("Image #{image_id}"));
+        let full_title = format!("{seo_title} \u{00B7} Let's Embed");
+        let seo_description =
+            build_detail_description(&seo_title, &authors, &tags, image_width, image_height);
+        let origin = public_origin();
+        let canonical_url = origin.as_ref().map(|o| format!("{o}/details/{image_id}"));
+        let og_image_url = origin.as_ref().map(|o| format!("{o}{original_src}"));
+
         view! {
+            <Title text=full_title.clone()/>
+            <Meta name="description" content=seo_description.clone()/>
+            <Meta property="og:type" content="article"/>
+            <Meta property="og:title" content=full_title/>
+            <Meta property="og:description" content=seo_description/>
+            {canonical_url.map(|url| view! {
+                <Link rel="canonical" href=url.clone()/>
+                <Meta property="og:url" content=url/>
+            })}
+            {og_image_url.map(|img_url| view! {
+                <Meta property="og:image" content=img_url/>
+                <Meta property="og:image:width" content=image_width.to_string()/>
+                <Meta property="og:image:height" content=image_height.to_string()/>
+            })}
             <div class="flex flex-col md:flex-row w-full gap-3 md:gap-4 p-3 md:p-4 md:h-[72vh]">
                 <div
                     node_ref=container_ref
@@ -840,7 +909,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                 title="Open full post album"
                                 on:click=move |_| open_lightbox()
                             >
-                                <span class="line-clamp-2 min-w-0">{ p.title }</span>
+                                <h1 class="line-clamp-2 min-w-0 m-0 text-inherit font-inherit">{ p.title }</h1>
                                 <span class="shrink-0 text-xs font-semibold px-2.5 py-1 rounded-full bg-sky-100 text-sky-700 whitespace-nowrap">
                                     {album_badge}
                                 </span>
@@ -1146,9 +1215,17 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                 move || {
                     details.get().map(|details| match details {
                         Ok(details) => render_details(details).into_any(),
-                        Err(e) => view! {
-                            <div class="text-rose-500 p-4">{ e.to_string() }</div>
-                        }.into_any(),
+                        Err(e) => {
+                            #[cfg(feature = "ssr")]
+                            if let Some(resp) = use_context::<leptos_axum::ResponseOptions>() {
+                                resp.set_status(axum::http::StatusCode::NOT_FOUND);
+                            }
+                            view! {
+                                <Title text="Not Found · Let's Embed"/>
+                                <Meta name="robots" content="noindex"/>
+                                <div class="text-rose-500 p-4">{ e.to_string() }</div>
+                            }.into_any()
+                        }
                     })
                 }
             }
