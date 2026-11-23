@@ -15,7 +15,7 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use hmac::{Hmac, KeyInit as _, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use site_access::{AssuranceLevel, AuthProviderId};
 use tower_cookies::Cookies;
 use worker::Method;
@@ -333,14 +333,14 @@ pub async fn start(
         &[
             ("authorization", &auth_header),
             ("content-type", "application/json"),
+            ("user-agent", "lets-embed-user-worker"),
         ],
         Some(mail_body.to_string()),
     )
     .await
     {
         // Log without revealing email or secret!
-        let _ = Sha256::digest(email.as_bytes());
-        worker::console_error!("email send failed: {e}");
+        worker::console_error!("email send failed (endpoint={mail_endpoint}): {e}");
     }
 
     uniform_sent_response()

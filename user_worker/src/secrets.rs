@@ -179,13 +179,31 @@ impl KeyRing {
     /// Resolve the active provider-secrets AES-256-GCM keyring via `site_access::kdf`:
     /// - Defaults to `SITE_SECRET` (HKDF `KeyDomain::ProviderSecrets`), with optional
     ///   explicit `PROVIDER_SECRETS_KEY` override (and silent legacy alias compatibility).
-    /// - Optional `PROVIDER_SECRETS_KEY_PREV` rotation key.
+    /// - Optional `PROVIDER_SECRETS_KEY_PREV` or `SITE_SECRET_PREV` rotation key.
     pub fn resolve(
         provider_secrets_key: Option<&str>,
         settings_encryption_key: Option<&str>,
         site_secret: Option<&str>,
         provider_secrets_key_prev: Option<&str>,
         settings_encryption_key_prev: Option<&str>,
+    ) -> Result<Self, SecretError> {
+        Self::resolve_with_site_prev(
+            provider_secrets_key,
+            settings_encryption_key,
+            site_secret,
+            provider_secrets_key_prev,
+            settings_encryption_key_prev,
+            None,
+        )
+    }
+
+    pub fn resolve_with_site_prev(
+        provider_secrets_key: Option<&str>,
+        settings_encryption_key: Option<&str>,
+        site_secret: Option<&str>,
+        provider_secrets_key_prev: Option<&str>,
+        settings_encryption_key_prev: Option<&str>,
+        site_secret_prev: Option<&str>,
     ) -> Result<Self, SecretError> {
         let current = if let Some(explicit) =
             first_non_empty(&[provider_secrets_key, settings_encryption_key])
@@ -199,10 +217,16 @@ impl KeyRing {
             return Err(SecretError::MissingEncryptionKey);
         };
 
-        let prev = match first_non_empty(&[provider_secrets_key_prev, settings_encryption_key_prev])
+        let prev = if let Some(raw) =
+            first_non_empty(&[provider_secrets_key_prev, settings_encryption_key_prev])
         {
-            Some(raw) => Some(EncryptionKey::parse(raw)?),
-            None => None,
+            Some(EncryptionKey::parse(raw)?)
+        } else if let Some(prev_master) = first_non_empty(&[site_secret_prev]) {
+            let derived = resolve_provider_aes_key(None, Some(prev_master))
+                .map_err(SecretError::InvalidEncryptionKey)?;
+            Some(EncryptionKey::from_bytes(derived)?)
+        } else {
+            None
         };
         Ok(Self { current, prev })
     }
@@ -213,12 +237,14 @@ impl KeyRing {
         let site_secret = read_env_secret_or_var(env, SITE_SECRET_ENV);
         let provider_prev = read_env_secret_or_var(env, PROVIDER_SECRETS_KEY_PREV_ENV);
         let legacy_prev = read_env_secret_or_var(env, ENCRYPTION_KEY_PREV_SECRET);
-        Self::resolve(
+        let site_prev = read_env_secret_or_var(env, "SITE_SECRET_PREV");
+        Self::resolve_with_site_prev(
             provider_key.as_deref(),
             legacy_key.as_deref(),
             site_secret.as_deref(),
             provider_prev.as_deref(),
             legacy_prev.as_deref(),
+            site_prev.as_deref(),
         )
     }
 }
@@ -386,14 +412,14 @@ pub async fn load_provider_secret(
 
     for &var_name in fallback_env_vars {
         if let Ok(sec) = env.secret(var_name) {
-            let val = sec.to_string();
-            if !val.trim().is_empty() {
+            let val = sec.to_string().trim().to_string();
+            if !val.is_empty() {
                 return Ok(Some(SecretString::new(val)));
             }
         }
         if let Ok(var) = env.var(var_name) {
-            let val = var.to_string();
-            if !val.trim().is_empty() {
+            let val = var.to_string().trim().to_string();
+            if !val.is_empty() {
                 return Ok(Some(SecretString::new(val)));
             }
         }
@@ -582,7 +608,30 @@ mod tests {
             "gh-tok"
         );
 
-        // 5. Missing all keys fails closed
+        // 5. Zero-downtime SITE_SECRET -> SITE_SECRET_PREV rotation succeeds
+        let master_new = "new-master-site-secret-0123456789abcdef0123456789abcdef";
+        let ring_old_master =
+            KeyRing::resolve_with_site_prev(None, None, Some(master), None, None, None)
+                .expect("old master ring");
+        let enc_old = encrypt_secret(&ring_old_master, "prod", "discord", "client_secret", "dc-s")
+            .expect("encrypt with old master");
+        let ring_rotated = KeyRing::resolve_with_site_prev(
+            None,
+            None,
+            Some(master_new),
+            None,
+            None,
+            Some(master),
+        )
+        .expect("rotated master ring");
+        assert_eq!(
+            decrypt_secret(&ring_rotated, "prod", "discord", "client_secret", &enc_old)
+                .unwrap()
+                .expose(),
+            "dc-s"
+        );
+
+        // 6. Missing all keys fails closed
         assert_eq!(
             KeyRing::resolve(None, None, None, None, None).unwrap_err(),
             SecretError::MissingEncryptionKey

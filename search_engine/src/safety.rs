@@ -152,6 +152,7 @@ impl CompiledExpr {
     pub fn eval_tribool(
         &self,
         is_completed: bool,
+        wd_vocab_matches: bool,
         wd_min_persisted_score: Option<f32>,
         wd_tag_scores: &HashMap<String, f32>,
         post_tags: &HashSet<String>,
@@ -165,7 +166,9 @@ impl CompiledExpr {
                     }
                     if let Some(&score) = wd_tag_scores.get(name) {
                         TriBool::from_bool(score >= *min_score)
-                    } else if wd_min_persisted_score.is_some_and(|floor| floor <= *min_score) {
+                    } else if wd_vocab_matches
+                        && wd_min_persisted_score.is_some_and(|floor| floor <= *min_score)
+                    {
                         TriBool::False
                     } else {
                         TriBool::Unknown
@@ -178,6 +181,7 @@ impl CompiledExpr {
             Self::Not(inner) => inner
                 .eval_tribool(
                     is_completed,
+                    wd_vocab_matches,
                     wd_min_persisted_score,
                     wd_tag_scores,
                     post_tags,
@@ -187,6 +191,7 @@ impl CompiledExpr {
             Self::And(items) => items.iter().fold(TriBool::True, |acc, item| {
                 acc.and(item.eval_tribool(
                     is_completed,
+                    wd_vocab_matches,
                     wd_min_persisted_score,
                     wd_tag_scores,
                     post_tags,
@@ -196,6 +201,7 @@ impl CompiledExpr {
             Self::Or(items) => items.iter().fold(TriBool::False, |acc, item| {
                 acc.or(item.eval_tribool(
                     is_completed,
+                    wd_vocab_matches,
                     wd_min_persisted_score,
                     wd_tag_scores,
                     post_tags,
@@ -234,6 +240,7 @@ impl CompiledExpr {
         qb: &mut QueryBuilder<Postgres>,
         img_alias: &'static str,
         post_id_expr: Option<&'static str>,
+        expected_vocab_digest: &str,
     ) {
         match self {
             Self::Predicate(pred) => match pred {
@@ -253,6 +260,10 @@ impl CompiledExpr {
                     qb.push(".id AND wt.name = ");
                     qb.push_bind(name.clone());
                     qb.push(") OR (");
+                    qb.push(img_alias);
+                    qb.push(".wd_vocab_digest = ");
+                    qb.push_bind(expected_vocab_digest.to_string());
+                    qb.push(" AND ");
                     qb.push(img_alias);
                     qb.push(".wd_min_persisted_score IS NOT NULL AND ");
                     qb.push(img_alias);
@@ -290,7 +301,7 @@ impl CompiledExpr {
             },
             Self::Not(inner) => {
                 qb.push("(NOT ");
-                inner.push_tribool_sql(qb, img_alias, post_id_expr);
+                inner.push_tribool_sql(qb, img_alias, post_id_expr, expected_vocab_digest);
                 qb.push(")");
             }
             Self::And(items) => {
@@ -299,7 +310,7 @@ impl CompiledExpr {
                     if idx > 0 {
                         qb.push(" AND ");
                     }
-                    item.push_tribool_sql(qb, img_alias, post_id_expr);
+                    item.push_tribool_sql(qb, img_alias, post_id_expr, expected_vocab_digest);
                 }
                 qb.push(")");
             }
@@ -309,7 +320,7 @@ impl CompiledExpr {
                     if idx > 0 {
                         qb.push(" OR ");
                     }
-                    item.push_tribool_sql(qb, img_alias, post_id_expr);
+                    item.push_tribool_sql(qb, img_alias, post_id_expr, expected_vocab_digest);
                 }
                 qb.push(")");
             }
@@ -339,6 +350,7 @@ impl CompiledPolicyItem {
     pub fn eval_context(
         &self,
         is_completed: bool,
+        wd_vocab_matches: bool,
         wd_min_persisted_score: Option<f32>,
         wd_tag_scores: &HashMap<String, f32>,
         post_tags: &HashSet<String>,
@@ -346,6 +358,7 @@ impl CompiledPolicyItem {
     ) -> TriBool {
         let matched = self.match_expr.eval_tribool(
             is_completed,
+            wd_vocab_matches,
             wd_min_persisted_score,
             wd_tag_scores,
             post_tags,
@@ -356,6 +369,7 @@ impl CompiledPolicyItem {
             Some(ex) => matched.and(
                 ex.eval_tribool(
                     is_completed,
+                    wd_vocab_matches,
                     wd_min_persisted_score,
                     wd_tag_scores,
                     post_tags,
@@ -372,14 +386,25 @@ impl CompiledPolicyItem {
         qb: &mut QueryBuilder<Postgres>,
         img_alias: &'static str,
         post_id_expr: Option<&'static str>,
+        expected_vocab_digest: &str,
     ) {
         match &self.except_expr {
-            None => self.match_expr.push_tribool_sql(qb, img_alias, post_id_expr),
+            None => self.match_expr.push_tribool_sql(
+                qb,
+                img_alias,
+                post_id_expr,
+                expected_vocab_digest,
+            ),
             Some(ex) => {
                 qb.push("(");
-                self.match_expr.push_tribool_sql(qb, img_alias, post_id_expr);
+                self.match_expr.push_tribool_sql(
+                    qb,
+                    img_alias,
+                    post_id_expr,
+                    expected_vocab_digest,
+                );
                 qb.push(" AND NOT ");
-                ex.push_tribool_sql(qb, img_alias, post_id_expr);
+                ex.push_tribool_sql(qb, img_alias, post_id_expr, expected_vocab_digest);
                 qb.push(")");
             }
         }
@@ -542,9 +567,11 @@ impl CompiledPolicy {
             agg.general_unclassified = true;
         }
 
+        let wd_vocab_matches = facts.wd_vocab_digest.as_deref() == Some(self.policy.vocab_digest.as_str());
         if facts.parent_posts.is_empty() {
             self.eval_single_context(
                 facts.is_completed,
+                wd_vocab_matches,
                 facts.wd_min_persisted_score,
                 &facts.wd_tag_scores,
                 &empty_set,
@@ -555,6 +582,7 @@ impl CompiledPolicy {
             for parent in &facts.parent_posts {
                 self.eval_single_context(
                     facts.is_completed,
+                    wd_vocab_matches,
                     facts.wd_min_persisted_score,
                     &facts.wd_tag_scores,
                     &parent.post_tags,
@@ -575,11 +603,14 @@ impl CompiledPolicy {
         video_facts_rev: u64,
         caller: &CallerContext,
     ) -> MediaOutcome {
+        // Match `lookup_facts_rev(MediaKind::Video)` exactly:
+        // GREATEST(v.facts_rev, MAX(p.facts_rev), MAX(si.facts_rev)) — never rolling in
+        // unrelated posts that happen to share a sibling image!
         let mut authoritative_rev = video_facts_rev.max(1);
         for post in posts {
             authoritative_rev = authoritative_rev.max(post.post_facts_rev);
             for img in &post.images {
-                authoritative_rev = authoritative_rev.max(img.facts_rev);
+                authoritative_rev = authoritative_rev.max(img.image_own_facts_rev.max(1));
             }
         }
 
@@ -602,6 +633,7 @@ impl CompiledPolicy {
             }
             self.eval_single_context(
                 false,
+                false,
                 None,
                 &empty_scores,
                 &empty_set,
@@ -618,6 +650,7 @@ impl CompiledPolicy {
                     }
                     self.eval_single_context(
                         false,
+                        false,
                         None,
                         &empty_scores,
                         &post.post_tags,
@@ -631,8 +664,11 @@ impl CompiledPolicy {
                         {
                             agg.general_unclassified = true;
                         }
+                        let wd_vocab_matches =
+                            img.wd_vocab_digest.as_deref() == Some(self.policy.vocab_digest.as_str());
                         self.eval_single_context(
                             img.exists && img.is_completed,
+                            wd_vocab_matches,
                             img.wd_min_persisted_score,
                             &img.wd_tag_scores,
                             &post.post_tags,
@@ -647,9 +683,11 @@ impl CompiledPolicy {
         self.finalize_outcome(agg, authoritative_rev, caller)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn eval_single_context<'a>(
         &'a self,
         is_completed: bool,
+        wd_vocab_matches: bool,
         wd_min_persisted_score: Option<f32>,
         wd_tag_scores: &HashMap<String, f32>,
         post_tags: &HashSet<String>,
@@ -659,6 +697,7 @@ impl CompiledPolicy {
         for item in &self.policies {
             match item.eval_context(
                 is_completed,
+                wd_vocab_matches,
                 wd_min_persisted_score,
                 wd_tag_scores,
                 post_tags,
@@ -1041,6 +1080,7 @@ impl CompiledPolicy {
             emitted = true;
         }
 
+        let expected_vocab = self.policy.vocab_digest.as_str();
         for item in &self.policies {
             let has_grant = caller.has_direct_grant(&item.policy_ref);
             if has_grant && !item.references_wd_tags {
@@ -1050,11 +1090,11 @@ impl CompiledPolicy {
             if has_grant {
                 // Directly granted policy referencing WD tags must still not evaluate to Unknown (NULL).
                 qb.push(" AND ");
-                push_policy_not_unknown_sql(qb, item, img_alias);
+                push_policy_not_unknown_sql(qb, item, img_alias, expected_vocab);
             } else {
                 // Unsatisfied Block OR Blur policy MUST evaluate strictly to FALSE across all contexts.
                 qb.push(" AND ");
-                push_policy_strictly_false_sql(qb, item, img_alias);
+                push_policy_strictly_false_sql(qb, item, img_alias, expected_vocab);
             }
             emitted = true;
         }
@@ -1067,10 +1107,11 @@ fn push_policy_strictly_false_sql(
     qb: &mut QueryBuilder<Postgres>,
     item: &CompiledPolicyItem,
     img_alias: &'static str,
+    expected_vocab_digest: &str,
 ) {
     if !item.uses_post_context {
         qb.push("((");
-        item.push_policy_match_sql(qb, img_alias, None);
+        item.push_policy_match_sql(qb, img_alias, None, expected_vocab_digest);
         qb.push(") IS FALSE)");
     } else {
         // Multi-parent invariant: EVERY parent post must evaluate strictly to FALSE,
@@ -1078,11 +1119,11 @@ fn push_policy_strictly_false_sql(
         qb.push("(NOT EXISTS (SELECT 1 FROM post_images pi WHERE pi.image_id = ");
         qb.push(img_alias);
         qb.push(".id AND ((");
-        item.push_policy_match_sql(qb, img_alias, Some("pi.post_id"));
+        item.push_policy_match_sql(qb, img_alias, Some("pi.post_id"), expected_vocab_digest);
         qb.push(") IS NOT FALSE)) AND (EXISTS (SELECT 1 FROM post_images pi WHERE pi.image_id = ");
         qb.push(img_alias);
         qb.push(".id) OR ((");
-        item.push_policy_match_sql(qb, img_alias, None);
+        item.push_policy_match_sql(qb, img_alias, None, expected_vocab_digest);
         qb.push(") IS FALSE)))");
     }
 }
@@ -1091,20 +1132,21 @@ fn push_policy_not_unknown_sql(
     qb: &mut QueryBuilder<Postgres>,
     item: &CompiledPolicyItem,
     img_alias: &'static str,
+    expected_vocab_digest: &str,
 ) {
     if !item.uses_post_context {
         qb.push("((");
-        item.push_policy_match_sql(qb, img_alias, None);
+        item.push_policy_match_sql(qb, img_alias, None, expected_vocab_digest);
         qb.push(") IS NOT NULL)");
     } else {
         qb.push("(NOT EXISTS (SELECT 1 FROM post_images pi WHERE pi.image_id = ");
         qb.push(img_alias);
         qb.push(".id AND ((");
-        item.push_policy_match_sql(qb, img_alias, Some("pi.post_id"));
+        item.push_policy_match_sql(qb, img_alias, Some("pi.post_id"), expected_vocab_digest);
         qb.push(") IS NULL)) AND (EXISTS (SELECT 1 FROM post_images pi WHERE pi.image_id = ");
         qb.push(img_alias);
         qb.push(".id) OR ((");
-        item.push_policy_match_sql(qb, img_alias, None);
+        item.push_policy_match_sql(qb, img_alias, None, expected_vocab_digest);
         qb.push(") IS NOT NULL)))");
     }
 }
@@ -1150,6 +1192,11 @@ pub struct ImageFacts {
     pub exists: bool,
     pub is_completed: bool,
     pub wd_min_persisted_score: Option<f32>,
+    /// Canonical WD-Tagger v3 vocabulary digest stamped on `images.wd_vocab_digest`.
+    /// Must equal `policy.vocab_digest` for absent WD tags to evaluate `False` instead of `Unknown`.
+    pub wd_vocab_digest: Option<String>,
+    /// Image row's own `images.facts_rev` (used by `evaluate_video_posts` to match `lookup_facts_rev(Video)`).
+    pub image_own_facts_rev: u64,
     /// Authoritative image `facts_rev = GREATEST(i.facts_rev, COALESCE(MAX(p.facts_rev), 1))`.
     pub facts_rev: u64,
     /// Canonical `wd_tags.name -> score` pairs present on this image.
@@ -1164,6 +1211,8 @@ impl Default for ImageFacts {
             exists: false,
             is_completed: false,
             wd_min_persisted_score: None,
+            wd_vocab_digest: None,
+            image_own_facts_rev: 1,
             facts_rev: 1,
             wd_tag_scores: HashMap::new(),
             parent_posts: Vec::new(),
@@ -1181,6 +1230,8 @@ impl ImageFacts {
             exists: true,
             is_completed: true,
             wd_min_persisted_score: min_persisted_score,
+            wd_vocab_digest: Some(search_types::wd_vocab::WD_VOCAB_DIGEST.to_string()),
+            image_own_facts_rev: 1,
             facts_rev: 1,
             wd_tag_scores,
             parent_posts: Vec::new(),
@@ -1633,6 +1684,7 @@ pub(crate) async fn load_image_facts_in_tx(
         SELECT id,
                (status = 'completed'::process_status) AS is_completed,
                wd_min_persisted_score,
+               wd_vocab_digest,
                facts_rev
         FROM images
         WHERE id = ANY($1::BIGINT[])
@@ -1647,14 +1699,18 @@ pub(crate) async fn load_image_facts_in_tx(
         let id: i64 = row.try_get("id")?;
         let is_completed: bool = row.try_get("is_completed")?;
         let wd_min_persisted_score: Option<f32> = row.try_get("wd_min_persisted_score")?;
+        let wd_vocab_digest: Option<String> = row.try_get("wd_vocab_digest")?;
         let facts_rev: i64 = row.try_get("facts_rev")?;
+        let own_rev = facts_rev.max(1) as u64;
         map.insert(
             id,
             ImageFacts {
                 exists: true,
                 is_completed,
                 wd_min_persisted_score,
-                facts_rev: facts_rev.max(1) as u64,
+                wd_vocab_digest,
+                image_own_facts_rev: own_rev,
+                facts_rev: own_rev,
                 wd_tag_scores: HashMap::new(),
                 parent_posts: Vec::new(),
             },
@@ -2354,11 +2410,31 @@ mod tests {
             exists: true,
             is_completed: true,
             wd_min_persisted_score: None,
+            wd_vocab_digest: Some(search_types::wd_vocab::WD_VOCAB_DIGEST.to_string()),
+            image_own_facts_rev: 3,
             facts_rev: 3,
             wd_tag_scores: HashMap::new(),
             parent_posts: Vec::new(),
         };
         assert!(compiled.evaluate_image(&legacy_uncovered, &anon).is_placeholder());
+
+        // 1b. Image with wd_min_persisted_score <= threshold BUT mismatched/NULL wd_vocab_digest -> Unknown -> Placeholder (fail-closed H1)!
+        let stale_vocab_img = ImageFacts {
+            exists: true,
+            is_completed: true,
+            wd_min_persisted_score: Some(0.05),
+            wd_vocab_digest: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+            image_own_facts_rev: 3,
+            facts_rev: 3,
+            wd_tag_scores: HashMap::new(),
+            parent_posts: Vec::new(),
+        };
+        assert!(compiled.evaluate_image(&stale_vocab_img, &anon).is_placeholder());
+        let null_vocab_img = ImageFacts {
+            wd_vocab_digest: None,
+            ..stale_vocab_img
+        };
+        assert!(compiled.evaluate_image(&null_vocab_img, &anon).is_placeholder());
 
         // 2. Covered image with wd_min_persisted_score = 0.05 (<= 0.45) and no matching rows -> False -> Clear!
         let covered_clean = ImageFacts::completed_with_floor(Some(0.05), HashMap::new());
@@ -2404,6 +2480,8 @@ mod tests {
             exists: true,
             is_completed: false,
             wd_min_persisted_score: None,
+            wd_vocab_digest: None,
+            image_own_facts_rev: 2,
             facts_rev: 2,
             wd_tag_scores: HashMap::new(),
             parent_posts: vec![ImageParentPostFacts {
@@ -2437,6 +2515,8 @@ mod tests {
             exists: true,
             is_completed: true,
             wd_min_persisted_score: Some(0.05),
+            wd_vocab_digest: Some(search_types::wd_vocab::WD_VOCAB_DIGEST.to_string()),
+            image_own_facts_rev: 9,
             facts_rev: 9,
             wd_tag_scores: HashMap::from([("nude".into(), 0.90)]),
             parent_posts: vec![ImageParentPostFacts {
@@ -2476,11 +2556,15 @@ mod tests {
             terms_accepted: false,
         };
 
+        // Sibling image has own facts_rev = 15, while another unrelated post bumped its effective facts_rev to 99.
+        // Video MUST aggregate `image_own_facts_rev = 15` (matching `lookup_facts_rev(Video)`), NOT 99!
         let blur_img = ImageFacts {
             exists: true,
             is_completed: true,
             wd_min_persisted_score: Some(0.05),
-            facts_rev: 15,
+            wd_vocab_digest: Some(search_types::wd_vocab::WD_VOCAB_DIGEST.to_string()),
+            image_own_facts_rev: 15,
+            facts_rev: 99,
             wd_tag_scores: HashMap::from([("lingerie".into(), 0.85)]),
             parent_posts: Vec::new(),
         };

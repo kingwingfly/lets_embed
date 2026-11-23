@@ -22,11 +22,17 @@
     window.dispatchEvent(new Event("eip6963:requestProvider"));
   } catch (_) {}
 
-  // Solana Wallet Standard discovery
+  // Solana Wallet Standard discovery (strictly filter out non-Solana extensions!)
   function registerSolWallet(wallet) {
     if (!wallet || !wallet.name) return;
     const features = wallet.features || {};
-    if (!features["standard:connect"]) return;
+    if (!features["standard:connect"] || !features["solana:signMessage"]) return;
+    if (Array.isArray(wallet.chains) && wallet.chains.length > 0) {
+      const hasSolanaChain = wallet.chains.some(
+        (c) => typeof c === "string" && c.startsWith("solana:")
+      );
+      if (!hasSolanaChain) return;
+    }
     const id = "ws:" + wallet.name;
     solProviders.set(id, { id, name: wallet.name, wallet, isStandard: true });
   }
@@ -266,24 +272,20 @@
     );
   }
 
-  function mountTelegramWidget(containerId, botUsername, onAuthCallback) {
+  function mountTelegramWidget(containerId, botUsername, authUrl) {
     const el = document.getElementById(containerId);
-    if (!el || !botUsername) return;
+    const cleanBot = typeof botUsername === "string" ? botUsername.trim().replace(/^@+/, "") : "";
+    if (!el || !cleanBot || !authUrl) return;
     el.innerHTML = "";
-    const cbName = "__leTelegramAuthCb";
-    window[cbName] = function (user) {
-      if (typeof onAuthCallback === "function") {
-        onAuthCallback(JSON.stringify(user));
-      }
-    };
     const script = document.createElement("script");
     script.async = true;
     script.src = "https://telegram.org/js/telegram-widget.js?22";
-    script.setAttribute("data-telegram-login", botUsername);
+    script.setAttribute("data-telegram-login", cleanBot);
     script.setAttribute("data-size", "large");
     script.setAttribute("data-radius", "10");
-    script.setAttribute("data-onauth", cbName + "(user)");
-    script.setAttribute("data-request-access", "write");
+    // Use redirect callback (`data-auth-url`) instead of `data-onauth` so strict CSP
+    // without 'unsafe-eval' never blocks Telegram login.
+    script.setAttribute("data-auth-url", authUrl);
     el.appendChild(script);
   }
 

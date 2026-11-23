@@ -459,14 +459,26 @@ pub async fn safety_and_auth_middleware(
 
     let ok = resp.status() == StatusCode::OK;
     let has_set_cookie = resp.headers().contains_key(header::SET_COOKIE);
+    let is_pkg = is_safe_pkg_path(&path);
     let allow_public_cache = ok
         && !has_set_cookie
-        && ((is_safe_pkg_path(&path))
+        && (is_pkg
             || path == "/robots.txt"
             || (is_sitemap_path(&path) && is_anonymous));
 
-    if !allow_public_cache {
+    if is_pkg && ok && !has_set_cookie && !resp.headers().contains_key(header::CACHE_CONTROL) {
         resp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+    } else if !allow_public_cache {
+        let headers = resp.headers_mut();
+        headers.remove("cdn-cache-control");
+        headers.remove("cloudflare-cdn-cache-control");
+        headers.remove("surrogate-control");
+        headers.remove(header::EXPIRES);
+        headers.remove(header::PRAGMA);
+        headers.insert(
             header::CACHE_CONTROL,
             HeaderValue::from_static("private, no-store"),
         );

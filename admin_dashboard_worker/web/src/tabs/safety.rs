@@ -327,22 +327,36 @@ pub fn SafetyTab(
                             draft.fixed_blur_enabled.set(v);
                             draft.dirty.set(true);
                         })
-                        label="Fixed server-side blurred previews"
-                        description="Serves locked Cloudflare Images previews (blur=80, width=360, webp) on /media/preview/* for Blur policies."
+                        label="Fixed server-side blurred previews (Paid Cloudflare Images)"
+                        description="Serves Cloudflare Images previews (blur=80, width=360, webp) on /media/preview/*. Billed by Cloudflare at $0.50 / 1,000 unique blurred images per month (after 5,000 free/mo) — leave OFF to use zero-cost Placeholders."
                     />
                 </div>
 
-                {move || (!draft.fixed_blur_enabled.get()).then(|| view! {
-                    <NoticeBanner
-                        tone=NoticeTone::Info
-                        title="Fixed Server Preview Disabled"
-                        dismissible=false
-                        content=NoticeContent::Text(
-                            "Server-side blurred previews are OFF. Any policy set to Blur safely degrades to a hard Placeholder until fixed server previews are enabled — clear media bytes are never sent before reveal."
-                                .to_string()
-                        )
-                    />
-                })}
+                {move || if draft.fixed_blur_enabled.get() {
+                    view! {
+                        <NoticeBanner
+                            tone=NoticeTone::Warning
+                            title="Cloudflare Images Billing Active ($0.50 / 1,000 Unique Blurred Images / Month)"
+                            dismissible=false
+                            content=NoticeContent::Text(
+                                "Each unique image requested via /media/preview/* counts as 1 Cloudflare Images transformation per calendar month beyond the 5,000 free/mo tier (e.g., 200,000 blurred images/mo ≈ $97.50/mo; 600,000 ≈ $297.50/mo). Turn this OFF and use Block (Placeholder) rules if you want $0 transformation cost."
+                                    .to_string()
+                            )
+                        />
+                    }.into_any()
+                } else {
+                    view! {
+                        <NoticeBanner
+                            tone=NoticeTone::Info
+                            title="Fixed Server Preview Disabled ($0 Transformation Cost — Recommended)"
+                            dismissible=false
+                            content=NoticeContent::Text(
+                                "Server-side blurred previews are OFF. Any policy set to Blur safely degrades to a zero-cost hard Placeholder until fixed server previews are enabled (Cloudflare Images costs $0.50 / 1,000 unique blurred images/mo beyond 5,000 free/mo). Clear media bytes are never sent before reveal."
+                                    .to_string()
+                            )
+                        />
+                    }.into_any()
+                }}
 
                 <div class="adm-field">
                     <span>"Unclassified media policy (`images.status != 'completed'`)"</span>
@@ -864,7 +878,7 @@ pub fn SafetyTab(
                                                                             }
                                                                         >
                                                                             <strong>"Blur"</strong>
-                                                                            <small>"Fixed Server Preview — supports optional Click to Reveal"</small>
+                                                                            <small>"Cloudflare Images preview ($0.50/1k unique imgs/mo) + optional Click to Reveal; degrades to free Placeholder when preview is OFF"</small>
                                                                         </button>
                                                                     </div>
 

@@ -192,9 +192,9 @@ async fn router(env: Env, _ctx: Context) -> Result<Router> {
     let deployment_id = env
         .var("DEPLOYMENT_ID")
         .ok()
-        .map(|v| v.to_string())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| siwe_domain.clone());
+        .map(|v| v.to_string().trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| siwe_domain.trim().to_string());
     let chain_id = env
         .var("CHAIN_ID")?
         .to_string()
@@ -244,6 +244,10 @@ async fn router(env: Env, _ctx: Context) -> Result<Router> {
         .route("/user/auth/email/start", post(providers::email::start))
         .route("/user/auth/email/verify", post(providers::email::verify))
         .route("/user/auth/telegram/verify", post(providers::telegram::verify))
+        .route(
+            "/user/auth/telegram/callback",
+            get(providers::telegram::callback),
+        )
         .route("/user/auth/{provider}/start", get(providers::oauth::start))
         .route(
             "/user/auth/{provider}/callback",

@@ -670,10 +670,35 @@ impl PublicSitePolicy {
     }
 
     /// Returns enabled providers filtered by the active [`AgeVerificationPolicy`].
-    pub fn effective_login_providers(&self) -> Vec<&AuthProviderPublicConfig> {
+    ///
+    /// Mirrors `user_worker::identity::is_provider_enabled_in_policy`: on a fresh
+    /// zero-config deployment (`enabled_providers` empty and `age_policy == Off`),
+    /// defaults to Ethereum (SIWE) and Solana (SIWS) so `/user/login` stays usable.
+    pub fn effective_login_providers(&self) -> Vec<AuthProviderPublicConfig> {
+        if self.enabled_providers.is_empty() && self.age_policy == AgeVerificationPolicy::Off {
+            return vec![
+                AuthProviderPublicConfig {
+                    id: AuthProviderId::Siwe,
+                    enabled: true,
+                    display_name: None,
+                    issuer: None,
+                    public_client_id: None,
+                    soft_birthday_check: false,
+                },
+                AuthProviderPublicConfig {
+                    id: AuthProviderId::Siws,
+                    enabled: true,
+                    display_name: None,
+                    issuer: None,
+                    public_client_id: None,
+                    soft_birthday_check: false,
+                },
+            ];
+        }
         self.enabled_providers
             .iter()
             .filter(|p| p.enabled && p.id.is_allowed_under(self.age_policy))
+            .cloned()
             .collect()
     }
 }
@@ -1175,7 +1200,11 @@ pub fn compute_next_grant_generations(old: &PublicSitePolicy, new: &mut PublicSi
 
     for next_p in &mut new.policies {
         let Some(&prev_p) = prev_by_id.get(next_p.id.as_str()) else {
-            next_p.grant_generation = next_p.grant_generation.max(1);
+            // Monotonic floor using `new.revision`: if an admin deletes a policy slug
+            // and later recreates the same slug, its `grant_generation` jumps above any
+            // previously issued generation so stale user DO opt-ins never reactivate.
+            let fresh_floor = new.revision.max(1);
+            next_p.grant_generation = next_p.grant_generation.max(fresh_floor);
             continue;
         };
 
@@ -1854,5 +1883,52 @@ mod tests {
         assert!(waf.starts_with(r#"(ip.src.country in {"AE" "AF" "#));
         assert!(waf.contains(r#""T1""#));
         assert!(waf.contains(r#"starts_with(http.request.uri.path, "/admin/")"#));
+    }
+
+    #[test]
+    fn zero_config_effective_providers_and_monotonic_recreated_grant_generation() {
+        // Fresh zero-config policy (empty providers, Age Off) exposes SIWE + SIWS
+        let fresh = PublicSitePolicy::default();
+        let ids: Vec<AuthProviderId> = fresh
+            .effective_login_providers()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(ids, vec![AuthProviderId::Siwe, AuthProviderId::Siws]);
+
+        // Under StrictProviderVerified18, zero-config does NOT expose SIWE/SIWS
+        let strict = PublicSitePolicy {
+            age_policy: AgeVerificationPolicy::StrictProviderVerified18,
+            ..PublicSitePolicy::default()
+        };
+        assert!(strict.effective_login_providers().is_empty());
+
+        // Deleting a policy at rev 5 and recreating the same slug at rev 6 assigns grant_generation >= 6
+        let after_delete = PublicSitePolicy {
+            revision: 5,
+            min_enforce_rev: 5,
+            policies: Vec::new(),
+            ..PublicSitePolicy::default()
+        };
+        let mut recreated = PublicSitePolicy {
+            revision: 6,
+            min_enforce_rev: 5,
+            policies: vec![ContentPolicy {
+                id: "r18".into(),
+                grant_generation: 1,
+                enabled: true,
+                priority: 10,
+                name: "Recreated R-18".into(),
+                preset: PlaceholderPreset::R18,
+                match_expr: "tag:explicit >= 0.45".into(),
+                except_expr: None,
+                default_tag_min: 0.45,
+                action: PolicyAction::Block,
+                bypass: PolicyBypass::default(),
+            }],
+            ..PublicSitePolicy::default()
+        };
+        compute_next_grant_generations(&after_delete, &mut recreated);
+        assert_eq!(recreated.policies[0].grant_generation, 6);
     }
 }

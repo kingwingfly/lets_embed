@@ -148,7 +148,7 @@ pub fn LoginView(
         });
     });
 
-    // Mount Telegram Login Widget when Telegram is an eligible enabled provider.
+    // Mount Telegram Login Widget using CSP-safe redirect callback (`data-auth-url`).
     Effect::new(move |_| {
         let Some(b) = boot.get() else {
             return;
@@ -162,34 +162,14 @@ pub fn LoginView(
             && let Some(bot) = cfg
                 .public_client_id
                 .as_deref()
-                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().trim_start_matches('@'))
+                .filter(|s| !s.is_empty())
         {
-            let bot = bot.to_string();
-            let dest = next_url.get_value();
-            wallet::mount_telegram_widget("le-telegram-login-mount", &bot, move |payload_json| {
-                let dest = dest.clone();
-                busy.set(true);
-                spawn_local(async move {
-                    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&payload_json);
-                    match parsed {
-                        Ok(val) => {
-                            match api::post_json_empty("/user/auth/telegram/verify", &val).await {
-                                Ok(()) => {
-                                    api::broadcast_safety_invalidation("account_change");
-                                    api::navigate_hard(&dest);
-                                }
-                                Err(e) => {
-                                    toasts.error("Telegram sign-in failed", Some(e.display()));
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            toasts.error("Telegram sign-in failed", Some("Invalid Telegram payload.".into()));
-                        }
-                    }
-                    busy.set(false);
-                });
-            });
+            let auth_url = format!(
+                "/user/auth/telegram/callback?next={}",
+                urlencoding::encode(&next_url.get_value())
+            );
+            wallet::mount_telegram_widget("le-telegram-login-mount", bot, &auth_url);
         }
     });
 
@@ -442,12 +422,7 @@ pub fn LoginView(
 
     let render_providers = move |b: BootstrapResp| {
         let strict_18 = b.policy.age_policy == AgeVerificationPolicy::StrictProviderVerified18;
-        let effective: Vec<AuthProviderPublicConfig> = b
-            .policy
-            .effective_login_providers()
-            .into_iter()
-            .cloned()
-            .collect();
+        let effective: Vec<AuthProviderPublicConfig> = b.policy.effective_login_providers();
 
         let oauth_list: Vec<AuthProviderPublicConfig> = effective
             .iter()
@@ -591,7 +566,7 @@ pub fn LoginView(
                             })}
                         </div>
 
-                        <div class="u-divider">"Other Device"</div>
+                        <div class="u-divider">"Mobile Wallet QR"</div>
                         <div class="u-stack">
                             {move || match handoff.get() {
                                 None => view! {
@@ -626,21 +601,26 @@ pub fn LoginView(
                                     }.into_any()
                                 }
                             }}
-
-                            <form on:submit=on_claim_transfer class="u-row">
-                                <input
-                                    type="text"
-                                    class="u-input"
-                                    style="flex: 1;"
-                                    placeholder="8-character transfer code (e.g. ABCD-EFGH)"
-                                    prop:value=move || transfer_code.get()
-                                    on:input=move |ev| transfer_code.set(event_target_value(&ev))
-                                />
-                                <button type="submit" class="u-btn u-btn--secondary" disabled=move || busy.get()>
-                                    "Claim"
-                                </button>
-                            </form>
                         </div>
+                    </div>
+                })}
+
+                {(!effective.is_empty()).then(|| view! {
+                    <div>
+                        <div class="u-divider">"Other Device Transfer Code"</div>
+                        <form on:submit=on_claim_transfer class="u-row">
+                            <input
+                                type="text"
+                                class="u-input"
+                                style="flex: 1;"
+                                placeholder="8-character transfer code (e.g. ABCD-EFGH)"
+                                prop:value=move || transfer_code.get()
+                                on:input=move |ev| transfer_code.set(event_target_value(&ev))
+                            />
+                            <button type="submit" class="u-btn u-btn--secondary" disabled=move || busy.get()>
+                                "Claim"
+                            </button>
+                        </form>
                     </div>
                 })}
             </div>

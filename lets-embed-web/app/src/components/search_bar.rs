@@ -1245,9 +1245,11 @@ async fn suggest_search(mode: String, q: String) -> Result<Vec<SearchSuggestion>
 
     let items = match parsed_mode {
         Mode::All => {
-            let (authors, titles) =
-                tokio::try_join!(engine.suggest_authors(&q, 5), engine.suggest_titles(&q, 5))
-                    .map_err(to_err)?;
+            let (authors, titles) = tokio::try_join!(
+                engine.suggest_authors_with_safety(&q, 5, Some(&safety_filter)),
+                engine.suggest_titles_with_safety(&q, 5, Some(&safety_filter)),
+            )
+            .map_err(to_err)?;
             let mut out = Vec::with_capacity(authors.len() + titles.len());
             for a in authors {
                 out.push(SearchSuggestion {
@@ -1277,7 +1279,7 @@ async fn suggest_search(mode: String, q: String) -> Result<Vec<SearchSuggestion>
             })
             .collect(),
         Mode::Author => engine
-            .suggest_authors(&q, 10)
+            .suggest_authors_with_safety(&q, 10, Some(&safety_filter))
             .await
             .map_err(to_err)?
             .into_iter()
@@ -1288,7 +1290,7 @@ async fn suggest_search(mode: String, q: String) -> Result<Vec<SearchSuggestion>
             })
             .collect(),
         Mode::Title => engine
-            .suggest_titles(&q, 8)
+            .suggest_titles_with_safety(&q, 8, Some(&safety_filter))
             .await
             .map_err(to_err)?
             .into_iter()

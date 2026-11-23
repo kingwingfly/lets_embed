@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 
 use axum::{
     Json,
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    extract::{Query, State},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use hmac::{Hmac, KeyInit as _, Mac};
@@ -23,8 +23,8 @@ use subtle::ConstantTimeEq;
 use tower_cookies::Cookies;
 
 use crate::{
-    AppState, auth, challenge_do, identity, policy_do, secrets, session,
-    types::ApiError,
+    AppState, auth, challenge_do, identity, policy_do, providers::sanitize_next_url, secrets,
+    session, types::ApiError,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -308,6 +308,153 @@ pub async fn verify(
         action: "login",
     })
     .into_response()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramCallbackQuery {
+    pub id: i64,
+    #[serde(default)]
+    pub first_name: Option<String>,
+    #[serde(default)]
+    pub last_name: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub photo_url: Option<String>,
+    pub auth_date: u64,
+    pub hash: String,
+    #[serde(default)]
+    pub next: Option<String>,
+}
+
+fn redirect_no_store(location: &str) -> Response {
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, location.to_string()),
+            (header::CACHE_CONTROL, "private, no-store".to_string()),
+        ],
+    )
+        .into_response()
+}
+
+fn telegram_error_redirect(msg: &str) -> Response {
+    let encoded = urlencoding::encode(msg);
+    redirect_no_store(&format!("/user/login?error={encoded}"))
+}
+
+/// CSP-safe Telegram Login Widget redirect callback (`data-auth-url="/user/auth/telegram/callback?next=..."`).
+///
+/// Avoids Telegram's `eval()`-based `data-onauth` handler so strict `SPA_CSP` stays intact
+/// without `'unsafe-eval'`.
+#[worker::send]
+pub async fn callback(
+    State(st): State<AppState>,
+    cookies: Cookies,
+    Query(q): Query<TelegramCallbackQuery>,
+) -> Response {
+    let policy = match policy_do::load_site_policy(&st.env).await {
+        Ok(env) => env.policy,
+        Err(e) => {
+            worker::console_error!("telegram callback: policy load failed: {e:?}");
+            return telegram_error_redirect("Service temporarily unavailable");
+        }
+    };
+
+    if let Err(msg) =
+        identity::check_login_provider_eligibility(&policy, AuthProviderId::Telegram, None)
+    {
+        return telegram_error_redirect(msg);
+    }
+
+    let bot_token = match secrets::load_provider_secret(
+        &st.env,
+        &st.deployment_id,
+        AuthProviderId::Telegram.as_str(),
+        "bot_token",
+        &["TELEGRAM_BOT_TOKEN"],
+    )
+    .await
+    {
+        Ok(Some(tok)) => tok,
+        Ok(None) => return telegram_error_redirect("Telegram login is not configured"),
+        Err(e) => {
+            worker::console_error!("telegram callback secret decrypt failed: {e}");
+            return telegram_error_redirect("Telegram credentials unavailable");
+        }
+    };
+
+    let payload = TelegramAuthPayload {
+        id: q.id,
+        first_name: q.first_name,
+        last_name: q.last_name,
+        username: q.username,
+        photo_url: q.photo_url,
+        auth_date: q.auth_date,
+        hash: q.hash,
+        action: None,
+    };
+
+    let now = session::now_secs();
+    let verified = match verify_telegram_payload(&payload, bot_token.expose(), now) {
+        Ok(v) => v,
+        Err(TelegramAuthError::ExpiredAuthDate) => {
+            return telegram_error_redirect("Telegram login expired. Please try again.");
+        }
+        Err(TelegramAuthError::FutureAuthDate) => {
+            return telegram_error_redirect("Invalid Telegram timestamp.");
+        }
+        Err(_) => return telegram_error_redirect("Invalid Telegram signature."),
+    };
+
+    match challenge_do::consume_telegram_digest(
+        &st.env,
+        &verified.assertion_digest,
+        verified.replay_expires_at,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) => return telegram_error_redirect("Telegram login payload was already used."),
+        Err(e) => {
+            worker::console_error!("telegram callback replay guard failed: {e:?}");
+            return telegram_error_redirect("Telegram verification failed.");
+        }
+    }
+
+    let ident = identity::VerifiedExternalIdentity {
+        provider_id: AuthProviderId::Telegram,
+        issuer: "https://telegram.org".to_string(),
+        subject: verified.telegram_id.to_string(),
+        label: Some(verified.label),
+        verified_email: None,
+        assurance_level: AssuranceLevel::None,
+        assurance_method: None,
+        assurance_verified_at: None,
+        assurance_expires_at: None,
+    };
+
+    let account = match identity::resolve_or_create_login_account(&st, &policy, &ident).await {
+        Ok(a) => a,
+        Err(_) => return telegram_error_redirect("Could not sign in with Telegram."),
+    };
+    if identity::issue_v2_session(
+        &st,
+        &cookies,
+        &account,
+        AuthProviderId::Telegram.as_str(),
+        &ident.identity_key(),
+        AssuranceLevel::None,
+        false,
+    )
+    .await
+    .is_err()
+    {
+        return telegram_error_redirect("Could not create session.");
+    }
+
+    let dest = sanitize_next_url(q.next.as_deref());
+    redirect_no_store(&dest)
 }
 
 #[cfg(test)]

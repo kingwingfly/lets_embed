@@ -282,15 +282,19 @@ fn optional_cf_access_service_token(env: &Env) -> Result<Option<(String, String)
 
 fn build_cf_object(
     no_cache: bool,
+    cache_everything: bool,
     blur: Option<PreviewBlurConfig>,
 ) -> Option<worker::js_sys::Object> {
-    if !no_cache && blur.is_none() {
+    if !no_cache && !cache_everything && blur.is_none() {
         return None;
     }
     let cf = worker::js_sys::Object::new();
     if no_cache {
         let _ = worker::js_sys::Reflect::set(&cf, &"cacheTtl".into(), &JsValue::from_f64(0.0));
         let _ = worker::js_sys::Reflect::set(&cf, &"cacheEverything".into(), &JsValue::FALSE);
+    } else if cache_everything {
+        // Explicitly allow Cloudflare edge caching for public `.wasm`, `.txt`, and `.xml` assets.
+        let _ = worker::js_sys::Reflect::set(&cf, &"cacheEverything".into(), &JsValue::TRUE);
     }
     if let Some(cfg) = blur {
         let img = worker::js_sys::Object::new();
@@ -329,7 +333,7 @@ fn build_worker_upstream_request(
         let _ = init.headers.append(name, val);
     }
     let js_init: worker::web_sys::RequestInit = (&init).into();
-    if let Some(cf) = build_cf_object(req.no_cache, req.preview_blur) {
+    if let Some(cf) = build_cf_object(req.no_cache, !req.no_cache, req.preview_blur) {
         let _ = worker::js_sys::Reflect::set(js_init.as_ref(), &"cf".into(), &cf);
     }
     let web_req = worker::web_sys::Request::new_with_str_and_init(req.url.as_str(), &js_init)
@@ -1544,7 +1548,19 @@ async fn handle_gateway_request(
             body,
         };
         return match backend.forward_service(ServiceTarget::UserWorker, req).await {
-            Ok(resp) => private_no_store(resp),
+            Ok(resp) => {
+                // Preserve public Cache-Control on immutable/static `/user/assets/*` files
+                // while forcing `private, no-store` on all auth/account/API responses.
+                if matches!(method, Method::GET | Method::HEAD)
+                    && is_segment_prefix(path, "/user/assets")
+                    && resp.status().is_success()
+                    && !resp.headers().contains_key("set-cookie")
+                {
+                    resp
+                } else {
+                    private_no_store(resp)
+                }
+            }
             Err(err) => {
                 log_backend_error("lets-embed-user-worker fetch failed", &err);
                 private_no_store(

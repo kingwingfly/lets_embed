@@ -2,7 +2,7 @@
 
 use js_sys::{Function, Promise, Reflect};
 use serde::Deserialize;
-use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -115,12 +115,9 @@ pub async fn send_sol_tx(provider_id: &str, base64_wire_tx: &str) -> Result<Stri
     .await
 }
 
-/// Mount the official Telegram Login Widget inside `container_id` and deliver
-/// the signed payload JSON to `on_payload`.
-pub fn mount_telegram_widget<F>(container_id: &str, bot_username: &str, on_payload: F)
-where
-    F: Fn(String) + 'static,
-{
+/// Mount the official Telegram Login Widget inside `container_id` using the
+/// CSP-safe redirect callback `auth_url` (`/user/auth/telegram/callback?next=...`).
+pub fn mount_telegram_widget(container_id: &str, bot_username: &str, auth_url: &str) {
     let Ok(b) = bridge() else {
         return;
     };
@@ -129,13 +126,10 @@ where
     else {
         return;
     };
-    let cb = Closure::<dyn Fn(String)>::new(on_payload);
     let _ = func.call3(
         &b,
         &JsValue::from_str(container_id),
         &JsValue::from_str(bot_username),
-        cb.as_ref().unchecked_ref(),
+        &JsValue::from_str(auth_url),
     );
-    // Retained for the lifetime of the login page view.
-    cb.forget();
 }

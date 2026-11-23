@@ -1975,6 +1975,17 @@ impl Engine {
     /// Suggest authors matching `query`, ranked by exact > prefix > substring.
     /// Uses prefix-only matching when `< 3` characters so `pg_trgm` GIN indexes stay active.
     pub async fn suggest_authors(&self, query: &str, limit: i64) -> anyhow::Result<Vec<Author>> {
+        self.suggest_authors_with_safety(query, limit, None).await
+    }
+
+    /// Safety-aware author autocomplete: when `safety` filtering is active, only
+    /// suggests authors that have at least one caller-allowed Clear image.
+    pub async fn suggest_authors_with_safety(
+        &self,
+        query: &str,
+        limit: i64,
+        safety: Option<&SafetyFilter<'_>>,
+    ) -> anyhow::Result<Vec<Author>> {
         let raw = query.trim();
         if raw.is_empty() {
             return Ok(vec![]);
@@ -1984,28 +1995,31 @@ impl Engine {
         let pat = autocomplete_like_pattern(raw, &esc);
         let prefix = format!("{esc}%");
 
-        let rows = sqlx::query(
-            r#"
-            SELECT id, name::TEXT AS name
-            FROM authors
-            WHERE name ILIKE $2 ESCAPE '\'
-            ORDER BY
-                CASE
-                    WHEN lower(name) = lower($1) THEN 0
-                    WHEN name ILIKE $3 ESCAPE '\' THEN 1
-                    ELSE 2
-                END ASC,
-                length(name) ASC,
-                name ASC
-            LIMIT $4
-            "#,
-        )
-        .bind(raw)
-        .bind(&pat)
-        .bind(&prefix)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut qb = QueryBuilder::<Postgres>::new(
+            r#"SELECT a.id, a.name::TEXT AS name FROM authors a WHERE a.name ILIKE "#,
+        );
+        qb.push_bind(pat);
+        qb.push(r#" ESCAPE '\'"#);
+
+        if let Some(sf) = safety.filter(|s| s.is_filtering_active()) {
+            qb.push(
+                " AND EXISTS (SELECT 1 FROM author_posts ap \
+                 JOIN post_images pi ON pi.post_id = ap.post_id \
+                 JOIN images i ON i.id = pi.image_id \
+                 WHERE ap.author_id = a.id",
+            );
+            sf.push_allowed_image_sql(&mut qb, "i");
+            qb.push(")");
+        }
+
+        qb.push(" ORDER BY CASE WHEN lower(a.name) = lower(");
+        qb.push_bind(raw.to_string());
+        qb.push(") THEN 0 WHEN a.name ILIKE ");
+        qb.push_bind(prefix);
+        qb.push(r#" ESCAPE '\' THEN 1 ELSE 2 END ASC, length(a.name) ASC, a.name ASC LIMIT "#);
+        qb.push_bind(limit);
+
+        let rows = qb.build().fetch_all(&self.pool).await?;
 
         rows.into_iter()
             .map(|r| -> sqlx::Result<Author> {
@@ -2021,6 +2035,17 @@ impl Engine {
     /// Suggest post titles matching `query`, ranked by exact > prefix > newest.
     /// Uses prefix-only matching when `< 3` characters so `pg_trgm` GIN indexes stay active.
     pub async fn suggest_titles(&self, query: &str, limit: i64) -> anyhow::Result<Vec<Post>> {
+        self.suggest_titles_with_safety(query, limit, None).await
+    }
+
+    /// Safety-aware post title autocomplete: when `safety` filtering is active, only
+    /// suggests posts that contain at least one caller-allowed Clear image.
+    pub async fn suggest_titles_with_safety(
+        &self,
+        query: &str,
+        limit: i64,
+        safety: Option<&SafetyFilter<'_>>,
+    ) -> anyhow::Result<Vec<Post>> {
         let raw = query.trim();
         if raw.is_empty() {
             return Ok(vec![]);
@@ -2030,27 +2055,30 @@ impl Engine {
         let pat = autocomplete_like_pattern(raw, &esc);
         let prefix = format!("{esc}%");
 
-        let rows = sqlx::query(
-            r#"
-            SELECT id, title::TEXT AS title
-            FROM posts
-            WHERE title ILIKE $2 ESCAPE '\'
-            ORDER BY
-                CASE
-                    WHEN lower(title) = lower($1) THEN 0
-                    WHEN title ILIKE $3 ESCAPE '\' THEN 1
-                    ELSE 2
-                END ASC,
-                id DESC
-            LIMIT $4
-            "#,
-        )
-        .bind(raw)
-        .bind(&pat)
-        .bind(&prefix)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut qb = QueryBuilder::<Postgres>::new(
+            r#"SELECT p.id, p.title::TEXT AS title FROM posts p WHERE p.title ILIKE "#,
+        );
+        qb.push_bind(pat);
+        qb.push(r#" ESCAPE '\'"#);
+
+        if let Some(sf) = safety.filter(|s| s.is_filtering_active()) {
+            qb.push(
+                " AND EXISTS (SELECT 1 FROM post_images pi \
+                 JOIN images i ON i.id = pi.image_id \
+                 WHERE pi.post_id = p.id",
+            );
+            sf.push_allowed_image_sql(&mut qb, "i");
+            qb.push(")");
+        }
+
+        qb.push(" ORDER BY CASE WHEN lower(p.title) = lower(");
+        qb.push_bind(raw.to_string());
+        qb.push(") THEN 0 WHEN p.title ILIKE ");
+        qb.push_bind(prefix);
+        qb.push(r#" ESCAPE '\' THEN 1 ELSE 2 END ASC, p.id DESC LIMIT "#);
+        qb.push_bind(limit);
+
+        let rows = qb.build().fetch_all(&self.pool).await?;
 
         rows.into_iter()
             .map(|r| -> sqlx::Result<Post> {

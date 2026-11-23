@@ -193,7 +193,7 @@ pub async fn begin_oauth_flow(
             "users.read tweet.read".to_string(),
         ),
         AuthProviderId::Discord => (
-            "https://discord.com/api/oauth2/authorize".to_string(),
+            "https://discord.com/api/v10/oauth2/authorize".to_string(),
             "identify".to_string(),
         ),
         _ => {
@@ -628,6 +628,7 @@ async fn exchange_oidc_age_assurance(
         &[
             ("content-type", "application/x-www-form-urlencoded"),
             ("accept", "application/json"),
+            ("user-agent", "lets-embed-user-worker"),
         ],
         Some(form_encode(&form_fields)),
     )
@@ -940,10 +941,14 @@ async fn exchange_x(
     let mut hdrs: Vec<(&str, String)> = vec![
         ("content-type", "application/x-www-form-urlencoded".into()),
         ("accept", "application/json".into()),
+        ("user-agent", "lets-embed-user-worker".into()),
     ];
     if let Some(secret) = client_secret {
+        // RFC 6749 §2.3.1 requires application/x-www-form-urlencoded encoding before Base64.
+        let enc_id = urlencoding::encode(client_id);
+        let enc_secret = urlencoding::encode(secret);
         let basic = base64::engine::general_purpose::STANDARD
-            .encode(format!("{client_id}:{secret}").as_bytes());
+            .encode(format!("{enc_id}:{enc_secret}").as_bytes());
         hdrs.push(("authorization", format!("Basic {basic}")));
     }
     let hdr_refs: Vec<(&str, &str)> = hdrs.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -968,7 +973,11 @@ async fn exchange_x(
     let mut user_resp = fetch_https_no_redirect(
         "https://api.x.com/2/users/me",
         Method::Get,
-        &[("authorization", &auth_hdr), ("accept", "application/json")],
+        &[
+            ("authorization", &auth_hdr),
+            ("accept", "application/json"),
+            ("user-agent", "lets-embed-user-worker"),
+        ],
         None,
     )
     .await
@@ -1020,11 +1029,12 @@ async fn exchange_discord(
         ("code_verifier", pkce_verifier),
     ]);
     let mut token_resp = fetch_https_no_redirect(
-        "https://discord.com/api/oauth2/token",
+        "https://discord.com/api/v10/oauth2/token",
         Method::Post,
         &[
             ("content-type", "application/x-www-form-urlencoded"),
             ("accept", "application/json"),
+            ("user-agent", "lets-embed-user-worker"),
         ],
         Some(body),
     )
@@ -1041,9 +1051,13 @@ async fn exchange_discord(
 
     let auth_hdr = format!("Bearer {access_token}");
     let mut user_resp = fetch_https_no_redirect(
-        "https://discord.com/api/users/@me",
+        "https://discord.com/api/v10/users/@me",
         Method::Get,
-        &[("authorization", &auth_hdr), ("accept", "application/json")],
+        &[
+            ("authorization", &auth_hdr),
+            ("accept", "application/json"),
+            ("user-agent", "lets-embed-user-worker"),
+        ],
         None,
     )
     .await

@@ -506,11 +506,7 @@ pub async fn me(State(st): State<AppState>, headers: HeaderMap, cookies: Cookies
     let (enabled_switchers, effective_switchers, switcher_statuses) =
         compute_me_switchers(&policy, &active.ctx, country.as_deref());
     let terms_up_to_date = active.ctx.satisfies_terms(&policy.legal);
-    let available_providers: Vec<AuthProviderPublicConfig> = policy
-        .effective_login_providers()
-        .into_iter()
-        .cloned()
-        .collect();
+    let available_providers: Vec<AuthProviderPublicConfig> = policy.effective_login_providers();
 
     let display_addr = if !status.address.is_empty() && session::is_valid_principal(&status.address)
     {

@@ -80,9 +80,15 @@ impl Upstreams {
 }
 
 pub(crate) fn private_no_store(mut response: Response) -> Response {
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, "private, no-store".parse().unwrap());
+    let headers = response.headers_mut();
+    // Strip CDN-specific override headers that take precedence over `Cache-Control`
+    // at Cloudflare / downstream CDNs so private responses can never be edge-cached.
+    headers.remove("cdn-cache-control");
+    headers.remove("cloudflare-cdn-cache-control");
+    headers.remove("surrogate-control");
+    headers.remove("expires");
+    headers.remove("pragma");
+    headers.insert(CACHE_CONTROL, "private, no-store".parse().unwrap());
     response
 }
 
