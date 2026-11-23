@@ -60,7 +60,7 @@ pub fn NoticeBanner(
                     }
                     .into_any(),
                     NoticeContent::PreSanitizedHtml(html) => view! {
-                        <span class="le-notice-html" inner_html=html />
+                        <div class="le-notice-html" inner_html=html />
                     }
                     .into_any(),
                 };

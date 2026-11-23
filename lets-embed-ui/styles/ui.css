@@ -1714,6 +1714,10 @@
   font-weight: 700;
 }
 
+.le-notice-html p {
+  margin: 0;
+}
+
 .le-notice-dismiss {
   flex: none;
   width: 28px;

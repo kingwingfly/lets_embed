@@ -23,8 +23,8 @@ fn parse_optional_score(raw: &str) -> Option<f32> {
     trimmed
         .parse::<f32>()
         .ok()
-        .filter(|v| v.is_finite())
-        .map(|v| v.clamp(0.0, 1.0))
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|v| v.min(1.0))
 }
 
 /// Visual boolean rule builder for metadata-only content safety rules.
@@ -47,6 +47,7 @@ pub fn QueryRuleBuilder(
     let preset_list = presets.unwrap_or_else(PresetTemplate::builtins);
     let raw_parse_error: RwSignal<Option<String>> = RwSignal::new(None);
     let field_options = Signal::derive(RuleField::select_options);
+    let raw_input_id = format!("le-rule-raw-input-{}", alloc_node_id());
 
     let emit_change = move || {
         if let Some(cb) = on_change {
@@ -363,13 +364,13 @@ pub fn QueryRuleBuilder(
                                         }}
 
                                         {move || (field_sig.get() == RuleField::Tag).then(|| view! {
-                                            <label class="le-score-box" title="Minimum WD-Tagger confidence score (0.00–1.00)">
+                                            <label class="le-score-box" title="Minimum WD-Tagger confidence score (0.01–1.00)">
                                                 <span class="le-score-prefix">">="</span>
                                                 <input
                                                     type="number"
                                                     class="le-score-input"
                                                     aria-label="Minimum tag confidence score"
-                                                    min="0"
+                                                    min="0.01"
                                                     max="1"
                                                     step="0.05"
                                                     placeholder="0.45"
@@ -707,13 +708,13 @@ pub fn QueryRuleBuilder(
                                                             }}
 
                                                             {move || (c_field.get() == RuleField::Tag).then(|| view! {
-                                                                <label class="le-score-box" title="Minimum WD-Tagger confidence score (0.00–1.00)">
+                                                                <label class="le-score-box" title="Minimum WD-Tagger confidence score (0.01–1.00)">
                                                                     <span class="le-score-prefix">">="</span>
                                                                     <input
                                                                         type="number"
                                                                         class="le-score-input"
                                                                         aria-label="Minimum tag confidence score"
-                                                                        min="0"
+                                                                        min="0.01"
                                                                         max="1"
                                                                         step="0.05"
                                                                         placeholder="0.45"
@@ -769,16 +770,19 @@ pub fn QueryRuleBuilder(
             </div>
 
             // Live query expression editor / preview
-            {show_raw_editor.then(|| view! {
+            {show_raw_editor.then(|| {
+                let raw_for_id = raw_input_id.clone();
+                let raw_el_id = raw_input_id.clone();
+                view! {
                 <div class="le-rule-raw">
-                    <label class="le-field-label" for="le-rule-raw-input">
+                    <label class="le-field-label" for=raw_for_id>
                         "Safety Rule Expression (metadata-only: tag:, post_tag:, author:, unclassified)"
                     </label>
                     <input
-                        id="le-rule-raw-input"
+                        id=raw_el_id
                         type="text"
                         class="le-rule-raw-input"
-                        placeholder="e.g. (tag:explicit>=0.45 OR tag:nude) NOT post_tag:safe"
+                        placeholder="e.g. (tag:explicit>=0.45 OR tag:nude) AND NOT post_tag:safe"
                         value=move || draft.with(|d| d.query.clone())
                         prop:value=move || draft.with(|d| d.query.clone())
                         on:input=move |ev| {
@@ -803,7 +807,7 @@ pub fn QueryRuleBuilder(
                         }
                     />
                 </div>
-            })}
+            }})}
 
             {move || combined_error().map(|err| view! {
                 <div class="le-rule-error" role="alert">{err}</div>

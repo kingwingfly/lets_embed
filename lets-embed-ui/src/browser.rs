@@ -536,8 +536,18 @@ pub fn wipe_media_elements_in(container: Option<&web_sys::Element>) {
                     .and_then(|n| n.dyn_into::<web_sys::HtmlVideoElement>().ok())
                 {
                     let _ = v.pause();
+                    if let Ok(sources) = v.query_selector_all("source") {
+                        for j in 0..sources.length() {
+                            if let Some(src_el) = sources
+                                .item(j)
+                                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+                            {
+                                src_el.remove();
+                            }
+                        }
+                    }
                     let _ = v.remove_attribute("src");
-                    v.set_src("");
+                    let _ = v.remove_attribute("poster");
                     v.load();
                 }
             }
@@ -556,7 +566,7 @@ pub fn wipe_media_elements_in(container: Option<&web_sys::Element>) {
                     .and_then(|n| n.dyn_into::<web_sys::HtmlImageElement>().ok())
                 {
                     let _ = img.remove_attribute("src");
-                    img.set_src("");
+                    let _ = img.remove_attribute("srcset");
                 }
             }
         }
