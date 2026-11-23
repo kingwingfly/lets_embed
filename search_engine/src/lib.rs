@@ -1,11 +1,17 @@
 #![feature(iterator_try_collect, portable_simd)]
 
 mod advanced;
+pub mod safety;
 
 pub use advanced::{AdvancedSearchRequest, AdvancedSearchResult};
+pub use safety::{
+    CallerContext, CompiledPolicy, ImageFacts, MediaOutcome, MediaSigner, SafetyFilter,
+    SeedLockedError,
+};
 
 use std::{
     borrow::Borrow,
+    collections::HashMap,
     fmt,
     future::ready,
     hash::{DefaultHasher, Hash, Hasher},
@@ -21,9 +27,22 @@ use futures::{Stream, StreamExt as _};
 use moka::future::Cache;
 use ort::session::Session;
 use pgvector::HalfVector;
-use search_types::{Author, Image, ImageDetails, Post, PostMeta, Tag, Video, VideoDetails};
-use sqlx::{Executor as _, PgPool, Row as _, postgres::PgPoolOptions};
+use search_types::{
+    Author, Image, ImageDetails, Post, PostMeta, ProjectedImage, ProjectedVideo, Tag, Video,
+    VideoDetails, validate_min_similarity,
+};
+use site_access::PublicSitePolicy;
+use sqlx::{Executor as _, PgPool, Postgres, QueryBuilder, Row as _, postgres::PgPoolOptions};
 use tokenizers::{EncodeInput, Tokenizer};
+
+/// Maximum concurrent ONNX inference tasks permitted across CLIP + DINOv3 (DoS guard M2).
+pub const DEFAULT_MAX_CONCURRENT_INFERENCE: usize = 4;
+/// Maximum time a request will wait to acquire an ONNX inference slot before failing fast.
+pub const INFERENCE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Default Postgres statement timeout for metadata queries (DoS guard M2: 5s).
+pub const METADATA_STATEMENT_TIMEOUT_SQL: &str = "SET statement_timeout = '5s'";
+/// Transaction-local Postgres statement timeout for vector HNSW queries (DoS guard M2: 15s).
+pub const VECTOR_STATEMENT_TIMEOUT_SQL: &str = "SET LOCAL statement_timeout = '15s'";
 
 /// Compact post summary returned by batch preview lookups.
 #[derive(Debug, Clone)]
@@ -212,6 +231,7 @@ pub struct Engine {
     clip_text_session: Option<LazyModel>,
     tokenizer: Option<Arc<Tokenizer>>,
     dinov3_session: Option<LazyModel>,
+    inference_sem: Arc<tokio::sync::Semaphore>,
 }
 
 impl Engine {
@@ -228,6 +248,7 @@ impl Engine {
         let pool = PgPoolOptions::new()
             .after_connect(|conn, _meta| {
                 Box::pin(async move {
+                    conn.execute(METADATA_STATEMENT_TIMEOUT_SQL).await?;
                     conn.execute("SET hnsw.ef_search = 1000").await?;
                     conn.execute("SET hnsw.iterative_scan = strict_order")
                         .await?;
@@ -275,7 +296,141 @@ impl Engine {
             clip_text_session,
             tokenizer,
             dinov3_session,
+            inference_sem: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_MAX_CONCURRENT_INFERENCE,
+            )),
         })
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Construct a lightweight `Engine` backed by a lazy `PgPool` with no ONNX models.
+    /// Useful for offline/HTTP router tests that do not execute database queries.
+    pub fn connect_lazy_without_models(database_url: &str) -> anyhow::Result<Self> {
+        let pool = PgPoolOptions::new().connect_lazy(database_url)?;
+        Ok(Self {
+            pool,
+            clip_text_session: None,
+            tokenizer: None,
+            dinov3_session: None,
+            inference_sem: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_MAX_CONCURRENT_INFERENCE,
+            )),
+        })
+    }
+
+    /// Compile a [`PublicSitePolicy`] against exact canonical Postgres IDs.
+    pub async fn compile_policy(&self, policy: PublicSitePolicy) -> anyhow::Result<CompiledPolicy> {
+        CompiledPolicy::compile(policy, &self.pool).await
+    }
+
+    /// Verify that every requested seed image ID is unlocked for the caller
+    /// BEFORE loading its embedding vector (anti-oracle defense H5).
+    pub async fn ensure_images_unlocked(
+        &self,
+        image_ids: &[i64],
+        safety: &SafetyFilter<'_>,
+    ) -> anyhow::Result<()> {
+        if image_ids.is_empty() || !safety.is_filtering_active() {
+            return Ok(());
+        }
+        let facts_map = safety::load_image_facts(&self.pool, image_ids, safety.policy).await?;
+        for &id in image_ids {
+            if let Some(facts) = facts_map.get(&id)
+                && let MediaOutcome::Locked { mask } =
+                    safety.policy.evaluate_image(facts, safety.caller)
+            {
+                return Err(anyhow::Error::new(SeedLockedError {
+                    image_id: id,
+                    rule_id: mask.rule_id,
+                    label: mask.label,
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluate safety outcomes for a batch of image IDs.
+    pub async fn evaluate_images(
+        &self,
+        image_ids: &[i64],
+        policy: &CompiledPolicy,
+        caller: &CallerContext,
+    ) -> anyhow::Result<HashMap<i64, MediaOutcome>> {
+        let mut out = HashMap::with_capacity(image_ids.len());
+        if image_ids.is_empty() {
+            return Ok(out);
+        }
+        if !policy.is_enabled() {
+            for &id in image_ids {
+                out.insert(
+                    id,
+                    MediaOutcome::Clear {
+                        req_switchers: Vec::new(),
+                    },
+                );
+            }
+            return Ok(out);
+        }
+        let facts_map = safety::load_image_facts(&self.pool, image_ids, policy).await?;
+        for &id in image_ids {
+            let outcome = match facts_map.get(&id) {
+                Some(facts) => policy.evaluate_image(facts, caller),
+                None => policy.evaluate_image(&ImageFacts::default(), caller),
+            };
+            out.insert(id, outcome);
+        }
+        Ok(out)
+    }
+
+    /// Project a slice of images into typed [`ProjectedImage`] values before serialization.
+    pub async fn project_images(
+        &self,
+        images: &[Image],
+        policy: &CompiledPolicy,
+        caller: &CallerContext,
+        signer: &MediaSigner,
+    ) -> anyhow::Result<Vec<ProjectedImage>> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i64> = images.iter().map(|i| i.id).collect();
+        let outcomes = self.evaluate_images(&ids, policy, caller).await?;
+        let mut out = Vec::with_capacity(images.len());
+        for img in images {
+            let outcome = outcomes
+                .get(&img.id)
+                .cloned()
+                .unwrap_or_else(|| policy.evaluate_image(&ImageFacts::default(), caller));
+            out.push(policy.project_image(img, outcome, caller, signer));
+        }
+        Ok(out)
+    }
+
+    /// Project a slice of videos into typed [`ProjectedVideo`] values before serialization,
+    /// inheriting the strictest rule outcome of each video's parent post(s).
+    pub async fn project_videos(
+        &self,
+        videos: &[Video],
+        policy: &CompiledPolicy,
+        caller: &CallerContext,
+        signer: &MediaSigner,
+    ) -> anyhow::Result<Vec<ProjectedVideo>> {
+        if videos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i64> = videos.iter().map(|v| v.id).collect();
+        let outcomes = safety::evaluate_videos_batch(&self.pool, &ids, policy, caller).await?;
+        let mut out = Vec::with_capacity(videos.len());
+        for vid in videos {
+            let outcome = outcomes.get(&vid.id).cloned().unwrap_or_else(|| {
+                policy.evaluate_video(&[], &Default::default(), &Default::default(), caller)
+            });
+            out.push(policy.project_video(vid, outcome, caller, signer));
+        }
+        Ok(out)
     }
 
     pub async fn newest_posts<'a>(
@@ -560,8 +715,16 @@ impl Engine {
         let Some(clip_text_lazy) = self.clip_text_session.clone() else {
             bail!("clip_text_session not enabled")
         };
+        let permit = tokio::time::timeout(
+            INFERENCE_ACQUIRE_TIMEOUT,
+            Arc::clone(&self.inference_sem).acquire_owned(),
+        )
+        .await
+        .map_err(|_| anyhow!("inference queue busy; please retry"))?
+        .map_err(|e| anyhow!("{e}"))?;
         let clip_text_session = clip_text_lazy.session().await?;
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let mut clip_text_session = clip_text_session.blocking_lock();
             let embeddings = siglip2::infer_text(&tokenizer, &mut clip_text_session, describes)?
                 .into_iter()
@@ -586,7 +749,7 @@ impl Engine {
             anyhow::Ok(embedding)
         })
         .await
-        .unwrap()
+        .map_err(|e| anyhow!("clip inference task panicked: {e}"))?
     }
 
     async fn search_clip_inner<'a>(
@@ -668,12 +831,23 @@ impl Engine {
         let Some(dinov3_lazy) = self.dinov3_session.as_ref() else {
             bail!("dinov3_session not enabled")
         };
+        let inf_permit = tokio::time::timeout(
+            INFERENCE_ACQUIRE_TIMEOUT,
+            Arc::clone(&self.inference_sem).acquire_owned(),
+        )
+        .await
+        .map_err(|_| anyhow!("inference queue busy; please retry"))?
+        .map_err(|e| anyhow!("{e}"))?;
         let dinov3_session = dinov3_lazy.session().await?;
-        let permit = Arc::clone(&PREPROCESS_SEM)
-            .acquire_owned()
-            .await
-            .map_err(|e| anyhow!("{e}"))?;
+        let permit = tokio::time::timeout(
+            INFERENCE_ACQUIRE_TIMEOUT,
+            Arc::clone(&PREPROCESS_SEM).acquire_owned(),
+        )
+        .await
+        .map_err(|_| anyhow!("image preprocess queue busy; please retry"))?
+        .map_err(|e| anyhow!("{e}"))?;
         tokio::task::spawn_blocking(move || {
+            let _inf_permit = inf_permit;
             let _permit = permit;
             let converted = images
                 .into_iter()
@@ -1315,6 +1489,17 @@ impl Engine {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<Image>> {
+        self.search_images_by_tag_vec_with_safety(tag, limit, offset, None)
+            .await
+    }
+
+    pub async fn search_images_by_tag_vec_with_safety(
+        &self,
+        tag: impl AsRef<str>,
+        limit: i64,
+        offset: i64,
+        safety: Option<&SafetyFilter<'_>>,
+    ) -> anyhow::Result<Vec<Image>> {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
         }
@@ -1326,18 +1511,29 @@ impl Engine {
         let pat_raw = format!("%{}%", escape_like(raw));
         let pat_under = format!("%{}%", escape_like(&underscored));
 
-        let rows = sqlx::query(
-            r#"
-            WITH
-            pos_tags AS (
+        let mut qb = QueryBuilder::<Postgres>::new(
+            r#"WITH pos_tags AS (
                 SELECT wt.id AS tag_id
                 FROM wd_tags wt
-                WHERE wt.name ILIKE $1 ESCAPE '\'
-                   OR ($2 <> $1 AND wt.name ILIKE $2 ESCAPE '\')
+                WHERE wt.name ILIKE "#,
+        );
+        qb.push_bind(pat_raw.clone());
+        qb.push(r" ESCAPE '\' OR (");
+        qb.push_bind(pat_under.clone());
+        qb.push(" <> ");
+        qb.push_bind(pat_raw.clone());
+        qb.push(" AND wt.name ILIKE ");
+        qb.push_bind(pat_under);
+        qb.push(
+            r#" ESCAPE '\')
                 UNION
                 SELECT tt.tag_id
                 FROM wd_tag_translations tt
-                WHERE tt.translation ILIKE $1 ESCAPE '\'
+                WHERE tt.translation ILIKE "#,
+        );
+        qb.push_bind(pat_raw);
+        qb.push(
+            r#" ESCAPE '\'
             ),
             img_match AS (
                 SELECT wti.image_id, MAX(wti.score) AS max_score
@@ -1348,17 +1544,17 @@ impl Engine {
             SELECT i.id, i.name::TEXT AS name, i.width, i.height
             FROM img_match im
             JOIN images i ON i.id = im.image_id
-            ORDER BY im.max_score DESC, im.image_id DESC
-            LIMIT $3 OFFSET $4
-            "#,
-        )
-        .bind(pat_raw)
-        .bind(pat_under)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+            WHERE TRUE"#,
+        );
+        if let Some(sf) = safety {
+            sf.push_allowed_image_sql(&mut qb, "i");
+        }
+        qb.push(" ORDER BY im.max_score DESC, im.image_id DESC LIMIT ");
+        qb.push_bind(limit);
+        qb.push(" OFFSET ");
+        qb.push_bind(offset);
 
+        let rows = qb.build().fetch_all(&self.pool).await?;
         advanced::map_image_rows(rows)
     }
 
@@ -1367,10 +1563,13 @@ impl Engine {
         describe: &str,
         limit: i64,
         offset: i64,
+        min_similarity: Option<f32>,
+        safety: Option<&SafetyFilter<'_>>,
     ) -> anyhow::Result<Vec<Image>> {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
         }
+        let min_sim = validate_min_similarity(min_similarity).map_err(|e| anyhow!("{e}"))?;
         let raw = describe.trim();
         if raw.is_empty() {
             bail!("description should not be empty")
@@ -1382,6 +1581,8 @@ impl Engine {
             hv,
             None,
             &std::collections::HashMap::new(),
+            min_sim,
+            safety,
             limit,
             offset,
         )
@@ -1393,10 +1594,13 @@ impl Engine {
         bytes: Vec<u8>,
         limit: i64,
         offset: i64,
+        min_similarity: Option<f32>,
+        safety: Option<&SafetyFilter<'_>>,
     ) -> anyhow::Result<Vec<Image>> {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
         }
+        let min_sim = validate_min_similarity(min_similarity).map_err(|e| anyhow!("{e}"))?;
         if bytes.is_empty() {
             bail!("uploaded image is empty")
         }
@@ -1407,6 +1611,8 @@ impl Engine {
             hv,
             None,
             &std::collections::HashMap::new(),
+            min_sim,
+            safety,
             limit,
             offset,
         )
@@ -1419,34 +1625,42 @@ impl Engine {
         exclude_post_id: Option<i64>,
         limit: i64,
         offset: i64,
+        min_similarity: Option<f32>,
+        safety: Option<&SafetyFilter<'_>>,
     ) -> anyhow::Result<Vec<Image>> {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
         }
+        let min_sim = validate_min_similarity(min_similarity).map_err(|e| anyhow!("{e}"))?;
         if image_id <= 0 {
             bail!("Image #{image_id} not found or has no visual embedding")
+        }
+        // Anti-oracle seed check BEFORE loading `dinov3_embedding` (H5).
+        if let Some(sf) = safety {
+            self.ensure_images_unlocked(&[image_id], sf).await?;
         }
         let id_vecs = self.fetch_dino_id_vectors(&[image_id]).await?;
         let seed_vec =
             advanced::combine_unit_vectors(&[id_vecs[&image_id].clone()], &[], dinov3::EMBED_DIM)?;
+        let safety_active = safety.is_some_and(SafetyFilter::is_filtering_active);
         let mut qb = advanced::build_similar_images_query(
             seed_vec,
             image_id,
             exclude_post_id,
+            min_sim,
+            safety,
             limit,
             offset,
         );
-        if exclude_post_id.is_some() {
-            let mut tx = self.pool.begin().await?;
-            tx.execute("SET TRANSACTION READ ONLY").await?;
+        let mut tx = self.pool.begin().await?;
+        tx.execute("SET TRANSACTION READ ONLY").await?;
+        tx.execute(VECTOR_STATEMENT_TIMEOUT_SQL).await?;
+        if exclude_post_id.is_some() || safety_active {
             tx.execute("SET LOCAL hnsw.max_scan_tuples = 20000").await?;
-            let rows = qb.build().fetch_all(&mut *tx).await?;
-            tx.commit().await?;
-            advanced::map_image_rows(rows)
-        } else {
-            let rows = qb.build().fetch_all(&self.pool).await?;
-            advanced::map_image_rows(rows)
         }
+        let rows = qb.build().fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        advanced::map_image_rows(rows)
     }
 
     /// Fetch authors attached to a post (for Lightbox headers).
@@ -1479,6 +1693,17 @@ impl Engine {
     /// ranked by exact > prefix > substring match, with aliases attached.
     /// Uses prefix-only matching when `< 3` characters so `pg_trgm` GIN indexes stay active.
     pub async fn suggest_tags(&self, query: &str, limit: i64) -> anyhow::Result<Vec<Tag>> {
+        self.suggest_tags_with_safety(query, limit, None).await
+    }
+
+    /// Suggest WD tags while omitting tags that appear ONLY on images locked for the caller
+    /// when safety rules are active (anti-oracle defense H5).
+    pub async fn suggest_tags_with_safety(
+        &self,
+        query: &str,
+        limit: i64,
+        safety: Option<&SafetyFilter<'_>>,
+    ) -> anyhow::Result<Vec<Tag>> {
         let raw = query.trim();
         if raw.is_empty() {
             return Ok(vec![]);
@@ -1492,60 +1717,119 @@ impl Engine {
         let prefix_raw = format!("{esc_raw}%");
         let prefix_under = format!("{esc_under}%");
 
-        let rows = sqlx::query(
-            r#"
-            WITH matched AS (
-                SELECT wt.id, wt.name::TEXT AS name,
-                       CASE
-                           WHEN lower(wt.name) = lower($1) OR lower(wt.name) = lower($2) THEN 0
-                           WHEN wt.name ILIKE $5 ESCAPE '\' OR ($6 <> $5 AND wt.name ILIKE $6 ESCAPE '\') THEN 1
-                           ELSE 2
-                       END AS rank
-                FROM wd_tags wt
-                WHERE wt.name ILIKE $3 ESCAPE '\'
-                   OR ($4 <> $3 AND wt.name ILIKE $4 ESCAPE '\')
-                UNION ALL
-                SELECT wt.id, wt.name::TEXT AS name,
-                       CASE
-                           WHEN lower(tt.translation) = lower($1) THEN 0
-                           WHEN tt.translation ILIKE $5 ESCAPE '\' THEN 1
-                           ELSE 2
-                       END AS rank
-                FROM wd_tag_translations tt
-                JOIN wd_tags wt ON wt.id = tt.tag_id
-                WHERE tt.translation ILIKE $3 ESCAPE '\'
-            ),
-            best AS (
-                SELECT id, name, MIN(rank) AS best_rank
-                FROM matched
-                GROUP BY id, name
-                ORDER BY best_rank ASC, length(name) ASC, name ASC
-                LIMIT $7
+        if !safety.is_some_and(SafetyFilter::is_filtering_active) {
+            let rows = sqlx::query(
+                r#"
+                WITH matched AS (
+                    SELECT wt.id, wt.name::TEXT AS name,
+                           CASE
+                               WHEN lower(wt.name) = lower($1) OR lower(wt.name) = lower($2) THEN 0
+                               WHEN wt.name ILIKE $5 ESCAPE '\' OR ($6 <> $5 AND wt.name ILIKE $6 ESCAPE '\') THEN 1
+                               ELSE 2
+                           END AS rank
+                    FROM wd_tags wt
+                    WHERE wt.name ILIKE $3 ESCAPE '\'
+                       OR ($4 <> $3 AND wt.name ILIKE $4 ESCAPE '\')
+                    UNION ALL
+                    SELECT wt.id, wt.name::TEXT AS name,
+                           CASE
+                               WHEN lower(tt.translation) = lower($1) THEN 0
+                               WHEN tt.translation ILIKE $5 ESCAPE '\' THEN 1
+                               ELSE 2
+                           END AS rank
+                    FROM wd_tag_translations tt
+                    JOIN wd_tags wt ON wt.id = tt.tag_id
+                    WHERE tt.translation ILIKE $3 ESCAPE '\'
+                ),
+                best AS (
+                    SELECT id, name, MIN(rank) AS best_rank
+                    FROM matched
+                    GROUP BY id, name
+                    ORDER BY best_rank ASC, length(name) ASC, name ASC
+                    LIMIT $7
+                )
+                SELECT
+                    b.id,
+                    b.name,
+                    COALESCE(
+                        array_agg(DISTINCT tt.translation::TEXT ORDER BY tt.translation::TEXT)
+                            FILTER (WHERE tt.translation IS NOT NULL),
+                        ARRAY[]::TEXT[]
+                    ) AS aliases
+                FROM best b
+                LEFT JOIN wd_tag_translations tt ON tt.tag_id = b.id
+                GROUP BY b.id, b.name, b.best_rank
+                ORDER BY b.best_rank ASC, length(b.name) ASC, b.name ASC
+                "#,
             )
-            SELECT
-                b.id,
-                b.name,
-                COALESCE(
-                    array_agg(DISTINCT tt.translation::TEXT ORDER BY tt.translation::TEXT)
-                        FILTER (WHERE tt.translation IS NOT NULL),
-                    ARRAY[]::TEXT[]
-                ) AS aliases
-            FROM best b
-            LEFT JOIN wd_tag_translations tt ON tt.tag_id = b.id
-            GROUP BY b.id, b.name, b.best_rank
-            ORDER BY b.best_rank ASC, length(b.name) ASC, b.name ASC
-            "#,
-        )
-        .bind(raw)
-        .bind(&underscored)
-        .bind(&pat_raw)
-        .bind(&pat_under)
-        .bind(&prefix_raw)
-        .bind(&prefix_under)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+            .bind(raw)
+            .bind(&underscored)
+            .bind(&pat_raw)
+            .bind(&pat_under)
+            .bind(&prefix_raw)
+            .bind(&prefix_under)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
 
+            return rows
+                .into_iter()
+                .map(|r| -> sqlx::Result<Tag> {
+                    Ok(Tag {
+                        id: r.try_get("id")?,
+                        name: r.try_get("name")?,
+                        aliases: r.try_get("aliases")?,
+                        score: None,
+                    })
+                })
+                .try_collect()
+                .map_err(Into::into);
+        }
+
+        let sf = safety.expect("checked active above");
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "WITH matched AS (SELECT wt.id, wt.name::TEXT AS name, CASE WHEN lower(wt.name) = lower(",
+        );
+        qb.push_bind(raw.to_string());
+        qb.push(") OR lower(wt.name) = lower(");
+        qb.push_bind(underscored.clone());
+        qb.push(") THEN 0 WHEN wt.name ILIKE ");
+        qb.push_bind(prefix_raw.clone());
+        qb.push(r" ESCAPE '\' OR (");
+        qb.push_bind(prefix_under.clone());
+        qb.push(" <> ");
+        qb.push_bind(prefix_raw.clone());
+        qb.push(" AND wt.name ILIKE ");
+        qb.push_bind(prefix_under);
+        qb.push(r" ESCAPE '\') THEN 1 ELSE 2 END AS rank FROM wd_tags wt WHERE (wt.name ILIKE ");
+        qb.push_bind(pat_raw.clone());
+        qb.push(r" ESCAPE '\' OR (");
+        qb.push_bind(pat_under.clone());
+        qb.push(" <> ");
+        qb.push_bind(pat_raw.clone());
+        qb.push(" AND wt.name ILIKE ");
+        qb.push_bind(pat_under);
+        qb.push(
+            r" ESCAPE '\')) UNION ALL SELECT wt.id, wt.name::TEXT AS name, CASE WHEN lower(tt.translation) = lower(",
+        );
+        qb.push_bind(raw.to_string());
+        qb.push(") THEN 0 WHEN tt.translation ILIKE ");
+        qb.push_bind(prefix_raw);
+        qb.push(
+            r" ESCAPE '\' THEN 1 ELSE 2 END AS rank FROM wd_tag_translations tt JOIN wd_tags wt ON wt.id = tt.tag_id WHERE tt.translation ILIKE ",
+        );
+        qb.push_bind(pat_raw);
+        qb.push(
+            r" ESCAPE '\'), dedup AS (SELECT id, name, MIN(rank) AS best_rank FROM matched GROUP BY id, name), visible AS (SELECT d.id, d.name, d.best_rank FROM dedup d WHERE EXISTS (SELECT 1 FROM wd_tag_images wti JOIN images i ON i.id = wti.image_id WHERE wti.wd_tag_id = d.id",
+        );
+        sf.push_allowed_image_sql(&mut qb, "i");
+        qb.push(") ORDER BY d.best_rank ASC, length(d.name) ASC, d.name ASC LIMIT ");
+        qb.push_bind(limit);
+        qb.push(
+            ") SELECT b.id, b.name, COALESCE(array_agg(DISTINCT tt.translation::TEXT ORDER BY tt.translation::TEXT) FILTER (WHERE tt.translation IS NOT NULL), ARRAY[]::TEXT[]) AS aliases FROM visible b LEFT JOIN wd_tag_translations tt ON tt.tag_id = b.id GROUP BY b.id, b.name, b.best_rank ORDER BY b.best_rank ASC, length(b.name) ASC, b.name ASC",
+        );
+
+        let rows = qb.build().fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|r| -> sqlx::Result<Tag> {
                 Ok(Tag {
@@ -1730,6 +2014,25 @@ impl Engine {
         Ok(count)
     }
 
+    /// Count distinct posts eligible for anonymous sitemap indexing, honoring
+    /// `policy.legal.noindex_restricted` when safety rules are enabled.
+    pub async fn sitemap_post_count_with_policy(
+        &self,
+        policy: &CompiledPolicy,
+    ) -> anyhow::Result<i64> {
+        if !(policy.has_active_switcher_rules() && policy.policy.legal.noindex_restricted) {
+            return self.sitemap_post_count().await;
+        }
+        let anon = CallerContext::anonymous();
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "WITH covers AS (SELECT DISTINCT ON (pi.post_id) pi.post_id, pi.image_id FROM post_images pi ORDER BY pi.post_id, pi.image_id ASC) SELECT COUNT(*)::BIGINT FROM covers c JOIN images i ON i.id = c.image_id WHERE TRUE",
+        );
+        policy.push_caller_allowed_image_sql(&mut qb, &anon, "i");
+        let row = qb.build().fetch_one(&self.pool).await?;
+        let count: i64 = row.try_get(0)?;
+        Ok(count)
+    }
+
     /// Return a page of canonical post cover image IDs + UTC `YYYY-MM-DD` dates
     /// ordered newest-first for XML sitemap generation.
     pub async fn sitemap_post_entries(
@@ -1769,6 +2072,43 @@ impl Engine {
                     lastmod,
                 });
             }
+        }
+        Ok(out)
+    }
+
+    /// Return a page of canonical post cover image IDs strictly under the anonymous safe view,
+    /// omitting restricted covers when `policy.legal.noindex_restricted` is enabled.
+    pub async fn sitemap_post_entries_with_policy(
+        &self,
+        policy: &CompiledPolicy,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<SitemapPostEntry>> {
+        if limit <= 0 || offset < 0 {
+            return Ok(Vec::new());
+        }
+        if !(policy.has_active_switcher_rules() && policy.policy.legal.noindex_restricted) {
+            return self.sitemap_post_entries(limit, offset).await;
+        }
+        let anon = CallerContext::anonymous();
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "WITH covers AS (SELECT DISTINCT ON (pi.post_id) pi.post_id, pi.image_id FROM post_images pi ORDER BY pi.post_id, pi.image_id ASC) SELECT c.image_id AS cover_id, to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS lastmod FROM covers c JOIN posts p ON p.id = c.post_id JOIN images i ON i.id = c.image_id WHERE TRUE",
+        );
+        policy.push_caller_allowed_image_sql(&mut qb, &anon, "i");
+        qb.push(" ORDER BY p.id DESC LIMIT ");
+        qb.push_bind(limit);
+        qb.push(" OFFSET ");
+        qb.push_bind(offset);
+
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let cover_image_id: i64 = row.try_get("cover_id")?;
+            let lastmod: Option<String> = row.try_get("lastmod")?;
+            out.push(SitemapPostEntry {
+                cover_image_id,
+                lastmod,
+            });
         }
         Ok(out)
     }

@@ -6,10 +6,11 @@ use crate::{
     components::{LikeButton, LikeVariant, lightbox::Lightbox, viewer::Viewer},
     types::{
         AdvancedUploads, DEFAULT_SEARCH_LIMIT, GalleryDensity as Density, GalleryDensityState,
-        ImageQuery, Mode, PostItem, SearchResponse, UploadedImageSlot, parse_url_limit,
-        save_gallery_density as save_density,
+        ImageQuery, Mode, PostItem, SafetyUiState, SearchResponse, UploadedImageSlot,
+        blur_mode_to_ui, mask_to_ui, navigate_external, parse_url_limit, parse_url_min_similarity,
+        unlock_href_for_mask,
     },
-    util::{encode_path, public_origin, set_document_title},
+    util::{public_origin, set_document_title},
 };
 
 use leptos::{ev, prelude::*, task::spawn_local};
@@ -25,8 +26,12 @@ use leptos_use_intersection_observer::{
     UseIntersectionObserverOptions, use_intersection_observer_with_options,
 };
 use leptos_use_signal_debounce_throttle::signal_debounced;
+use lets_embed_ui::{
+    ContentMaskCard, DensityPicker, GalleryMask, GalleryMaskPreset, GalleryMediaKind,
+    MinSimilaritySlider, ReportTargetKind, SpoilerOverlay,
+};
 use search_types::{
-    Image,
+    ProjectedImage, ProjectedVideo,
     query::{AdvancedSort, QueryExpr, SearchField, VectorTier, parse_and_compile},
 };
 
@@ -160,9 +165,17 @@ struct ResultsParams {
     adv: String,
     sort: AdvancedSort,
     clip_weight: i32,
+    /// Optional cosine similarity cutoff encoded in basis points (`0..=1000`).
+    min_sim_bps: Option<u16>,
     img_nonce: String,
     limit: i64,
     seed: i64,
+}
+
+impl ResultsParams {
+    fn min_similarity(&self) -> Option<f32> {
+        self.min_sim_bps.map(|b| f32::from(b) / 1000.0)
+    }
 }
 
 fn parse_results_params_with_default(
@@ -179,6 +192,8 @@ fn parse_results_params_with_default(
         },
         None => (Mode::All, get("q").unwrap_or_default()),
     };
+    let min_sim_bps = parse_url_min_similarity(get("min_sim").as_deref())
+        .map(|v| (v * 1000.0).round().clamp(0.0, 1000.0) as u16);
     ResultsParams {
         mode,
         q,
@@ -188,6 +203,7 @@ fn parse_results_params_with_default(
             .and_then(|s| s.parse::<i32>().ok())
             .unwrap_or(50)
             .clamp(5, 95),
+        min_sim_bps,
         img_nonce: get("img").unwrap_or_default(),
         limit: parse_url_limit(get("limit").as_deref()),
         seed: get("seed").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
@@ -202,18 +218,18 @@ fn parse_results_params(get: impl Fn(&str) -> Option<String>) -> ResultsParams {
 #[derive(Debug, Clone)]
 enum Item {
     Post(PostItem),
-    Image(Image),
+    Image(ProjectedImage),
 }
 
 impl Item {
     fn cover_dimensions(&self) -> Option<(i32, i32)> {
         let (w, h) = match self {
-            Self::Image(im) => (im.width, im.height),
+            Self::Image(im) => (im.width(), im.height()),
             Self::Post(post) => post
                 .images
                 .first()
-                .map(|im| (im.width, im.height))
-                .or_else(|| post.videos.first().map(|v| (v.width, v.height)))?,
+                .map(|im| (im.width(), im.height()))
+                .or_else(|| post.videos.first().map(|v| (v.width(), v.height())))?,
         };
         Some(if w > 0 && h > 0 { (w, h) } else { (16, 9) })
     }
@@ -247,13 +263,25 @@ struct GalleryLoadCtx {
     elem_width: Signal<f64>,
     viewport_w: RwSignal<f64>,
     embedded: bool,
-    images: StoredValue<Vec<Image>>,
+    embedded_min_sim: Option<(RwSignal<f32>, RwSignal<bool>)>,
+    images: StoredValue<Vec<ProjectedImage>>,
     next_order: StoredValue<usize>,
     has_more: RwSignal<bool>,
     loading: RwSignal<bool>,
     loaded_first: RwSignal<bool>,
     error: RwSignal<Option<String>>,
     req_id: StoredValue<u64>,
+}
+
+impl GalleryLoadCtx {
+    fn effective_min_similarity(&self, p: &ResultsParams) -> Option<f32> {
+        if let Some((slider, touched)) = self.embedded_min_sim
+            && touched.get_untracked()
+        {
+            return Some(slider.get_untracked().clamp(0.0, 1.0));
+        }
+        p.min_similarity()
+    }
 }
 
 fn uploads_complete_for_plan(
@@ -321,6 +349,8 @@ pub fn Results(
 ) -> impl IntoView {
     let qmap = use_query_map();
     let pathname = use_location().pathname;
+    let safety = use_context::<SafetyUiState>();
+    let panic_epoch_sig: Option<Signal<u64>> = safety.map(|s| s.panic_epoch.into());
 
     let params = Memo::new(move |_| {
         let fallback_id = default_similar_id.and_then(|sig| sig.get());
@@ -328,6 +358,20 @@ pub fn Results(
             parse_results_params_with_default(|k| m.get(k), embedded, fallback_id.as_deref())
         })
     });
+
+    // Embedded `/details/:id` Similar floating bar similarity cutoff slider.
+    let sim_slider = RwSignal::new(0.0_f32);
+    let sim_slider_touched = RwSignal::new(false);
+    if embedded && let Some(s) = safety {
+        Effect::new(move |_| {
+            let pol_default = s.default_dinov3_min.get();
+            if !sim_slider_touched.get_untracked() && (sim_slider.get_untracked() - pol_default).abs() > 0.001 {
+                sim_slider.set(pol_default);
+            }
+        });
+    }
+    let sim_slider_sig: Signal<f32> = Signal::derive(move || sim_slider.get());
+    let debounced_sim_slider: Signal<f32> = signal_debounced(sim_slider_sig, 220.0);
 
     // Update browser tab title strictly on the client (never via SSR `<Title>`).
     Effect::new(move |_| {
@@ -376,8 +420,6 @@ pub fn Results(
     } = use_element_size(size_el);
     let viewport_w = RwSignal::new(0.0f64);
 
-    // Measure viewport strictly on the client after hydration so SSR and
-    // initial hydrate markup stay 100% identical.
     #[cfg(feature = "hydrate")]
     {
         let _ = use_event_listener(window(), ev::resize, move |_| {
@@ -395,17 +437,11 @@ pub fn Results(
     });
     let debounced_width: Signal<f64> = signal_debounced(measured_width, 120.0);
 
-    // Start identically empty on both SSR and initial hydrate so Leptos `<For>`
-    // hydration never mismatches DOM nodes between server and client viewports.
     let columns: RwSignal<Vec<Column>> = RwSignal::new(Vec::new());
     let col_count = Memo::new(move |_| columns.with(Vec::len));
     let col_width_sig =
         Memo::new(move |_| columns.with(|cs| cs.first().map(|c| c.width).unwrap_or(0)));
 
-    // Reflow existing columns when column count changes (from viewport
-    // breakpoint changes or switching Compact / Medium / Large). When column
-    // count stays constant across resize but `column_width` changes by > 2px,
-    // recompute every placed item's `(w, h)` and column height totals in place.
     Effect::new(move || {
         let cur_density = density.get();
         let dw = debounced_width.get();
@@ -459,15 +495,13 @@ pub fn Results(
     let error = RwSignal::new(None::<String>);
     let lightbox: RwSignal<Option<PostItem>> = RwSignal::new(None);
     let viewer: RwSignal<Option<usize>> = RwSignal::new(None);
-    let images: StoredValue<Vec<Image>> = StoredValue::new(Vec::new());
+    let images: StoredValue<Vec<ProjectedImage>> = StoredValue::new(Vec::new());
     let next_order: StoredValue<usize> = StoredValue::new(0);
 
     let viewer_open = Memo::new(move |_| viewer.get().is_some());
 
     let img_query = expect_context::<ImageQuery>();
     let adv_uploads = expect_context::<AdvancedUploads>();
-    // Monotonic id used to discard responses from superseded requests: a new
-    // search or the next page bumps it, and stale in-flight calls return early.
     let req_id: StoredValue<u64> = StoredValue::new(0);
 
     let load_ctx = GalleryLoadCtx {
@@ -480,6 +514,7 @@ pub fn Results(
         elem_width,
         viewport_w,
         embedded,
+        embedded_min_sim: embedded.then_some((sim_slider, sim_slider_touched)),
         images,
         next_order,
         has_more,
@@ -488,6 +523,31 @@ pub fn Results(
         error,
         req_id,
     };
+
+    // Panic epoch watcher: immediately discard in-flight fetches, close modals, and clear media.
+    if let Some(s) = safety {
+        let last_panic = StoredValue::new(s.panic_epoch.get_untracked());
+        Effect::new(move |_| {
+            let cur = s.panic_epoch.get();
+            if cur != last_panic.get_value() {
+                last_panic.set_value(cur);
+                req_id.set_value(req_id.get_value().wrapping_add(1));
+                lets_embed_ui::browser::wipe_media_elements_in(None);
+                viewer.set(None);
+                lightbox.set(None);
+                columns.update(|cs| {
+                    cs.iter_mut().for_each(|c| {
+                        c.items.clear();
+                        c.height = 0;
+                    })
+                });
+                images.update_value(|v| v.clear());
+                next_order.set_value(0);
+                offset.set(0);
+                loading.set(false);
+            }
+        });
+    }
 
     let initial_is_default_home = !embedded
         && pathname.with_untracked(|p| p == "/")
@@ -508,7 +568,16 @@ pub fn Results(
 
     Effect::new(move |_| {
         let p = params.get();
+        let reload_epoch = safety.map(|s| s.reload_epoch.get()).unwrap_or(0);
+        let embedded_sim_trigger = if embedded {
+            (debounced_sim_slider.get() * 1000.0).round() as i32
+        } else {
+            0
+        };
+        let _ = embedded_sim_trigger;
+
         let is_default_home = !embedded
+            && reload_epoch == 0
             && p.mode == Mode::All
             && p.q.trim().is_empty()
             && p.adv.trim().is_empty()
@@ -594,6 +663,10 @@ pub fn Results(
         }
     });
 
+    let on_unlock = Callback::new(move |mask: GalleryMask| {
+        navigate_external(unlock_href_for_mask(&mask));
+    });
+
     let render_item = move |placed: Placed| -> AnyView {
         let (width, height) = placed
             .item
@@ -601,9 +674,6 @@ pub fn Results(
             .expect("placed item has media");
         let init_w = placed.w;
         let init_h = placed.h;
-        // Off-screen items skip render/decode; put `content-visibility:auto` on
-        // `.gallery-frame` (which already clips via `overflow:hidden`) so
-        // `contain:paint` never clips `.gallery-post::before` or tile shadows.
         let cv = move || {
             let w = col_width_sig.get();
             let (rw, rh) = if w > 0 {
@@ -621,7 +691,11 @@ pub fn Results(
                 let title = p.title.clone();
                 let open_label = format!("Open post: {title}");
                 let cover = p.images.first().cloned();
-                let cover_details_href = cover.as_ref().map(|c| format!("/details/{}", c.id));
+                let cover_video = p.videos.first().cloned();
+                let cover_details_href = cover
+                    .as_ref()
+                    .filter(|c| !c.is_locked())
+                    .map(|c| format!("/details/{}", c.id()));
                 let nav = use_navigate();
                 let img_count = p.image_count.max(p.images.len());
                 let video_count = p.video_count.max(p.videos.len());
@@ -631,31 +705,147 @@ pub fn Results(
                     (false, true) => Some(format!("{video_count}v")),
                     (false, false) => None,
                 };
-                view! {
-                    <article class="gallery-tile gallery-post group">
-                        <div class="gallery-frame" style=cv>
+
+                let post_for_open = p.clone();
+                let post_for_spoiler = p.clone();
+                let cover_view = match cover {
+                    Some(ProjectedImage::Clear { url, .. }) => view! {
+                        <button
+                            type="button"
+                            aria-label=open_label
+                            class="block w-full p-0 border-0 bg-transparent text-left cursor-pointer focus-visible:outline-2 focus-visible:outline-sky-500"
+                            on:click=move |_| lightbox.set(Some(post_for_open.clone()))
+                        >
+                            <img
+                                loading="lazy"
+                                decoding="async"
+                                alt=title.clone()
+                                style=aspect.clone()
+                                class="gallery-img"
+                                src=url
+                            />
+                        </button>
+                    }
+                    .into_any(),
+                    Some(ProjectedImage::Spoiler {
+                        id,
+                        preview_url,
+                        reveal_url,
+                        width: sw,
+                        height: sh,
+                        label,
+                        preset,
+                        blur_mode,
+                        ..
+                    }) => {
+                        let open_cb = Callback::new(move |()| {
+                            lightbox.set(Some(post_for_spoiler.clone()));
+                        });
+                        let ui_preset = GalleryMaskPreset::parse(&preset);
+                        let ui_blur = blur_mode_to_ui(blur_mode);
+                        let alt = title.clone();
+                        match panic_epoch_sig {
+                            Some(epoch) => view! {
+                                <SpoilerOverlay
+                                    id=id
+                                    kind=GalleryMediaKind::Image
+                                    width=sw
+                                    height=sh
+                                    preview_url=preview_url
+                                    reveal_url=reveal_url
+                                    alt=alt
+                                    label=label
+                                    preset=ui_preset
+                                    blur_mode=ui_blur
+                                    panic_epoch=epoch
+                                    on_open=open_cb
+                                />
+                            }
+                            .into_any(),
+                            None => view! {
+                                <SpoilerOverlay
+                                    id=id
+                                    kind=GalleryMediaKind::Image
+                                    width=sw
+                                    height=sh
+                                    preview_url=preview_url
+                                    reveal_url=reveal_url
+                                    alt=alt
+                                    label=label
+                                    preset=ui_preset
+                                    blur_mode=ui_blur
+                                    on_open=open_cb
+                                />
+                            }
+                            .into_any(),
+                        }
+                    }
+                    Some(ProjectedImage::Locked {
+                        width: lw,
+                        height: lh,
+                        mask,
+                        ..
+                    }) => {
+                        let ui_mask = mask_to_ui(&mask);
+                        view! {
+                            <div
+                                class="w-full cursor-pointer"
+                                on:click=move |_| lightbox.set(Some(post_for_open.clone()))
+                            >
+                                <ContentMaskCard
+                                    mask=ui_mask
+                                    dimensions=(lw, lh)
+                                    compact=true
+                                    on_unlock_click=on_unlock
+                                />
+                            </div>
+                        }
+                        .into_any()
+                    }
+                    None => match cover_video {
+                        Some(ProjectedVideo::Locked {
+                            width: vw,
+                            height: vh,
+                            mask,
+                            ..
+                        }) => {
+                            let ui_mask = mask_to_ui(&mask);
+                            view! {
+                                <div
+                                    class="w-full cursor-pointer"
+                                    on:click=move |_| lightbox.set(Some(post_for_open.clone()))
+                                >
+                                    <ContentMaskCard
+                                        mask=ui_mask
+                                        dimensions=(vw, vh)
+                                        compact=true
+                                        on_unlock_click=on_unlock
+                                    />
+                                </div>
+                            }
+                            .into_any()
+                        }
+                        _ => view! {
                             <button
                                 type="button"
                                 aria-label=open_label
                                 class="block w-full p-0 border-0 bg-transparent text-left cursor-pointer focus-visible:outline-2 focus-visible:outline-sky-500"
-                                on:click=move |_| lightbox.set(Some(p.clone()))
+                                on:click=move |_| lightbox.set(Some(post_for_open.clone()))
                             >
-                                {cover.map(|c| view! {
-                                    <img
-                                        loading="lazy"
-                                        decoding="async"
-                                        alt=title.clone()
-                                        style=aspect.clone()
-                                        class="gallery-img"
-                                        src=format!("/images/{}.webp", encode_path(&c.name))
-                                    />
-                                }.into_any()).unwrap_or_else(|| view! {
-                                    <div class="w-full grid place-items-center text-sky-700 text-3xl bg-[#e4f3fc]"
-                                        style=aspect>
-                                        <span aria-hidden="true">"▶"</span>
-                                    </div>
-                                }.into_any())}
+                                <div class="w-full grid place-items-center text-sky-700 text-3xl bg-[#e4f3fc]"
+                                    style=aspect>
+                                    <span aria-hidden="true">"▶"</span>
+                                </div>
                             </button>
+                        }
+                        .into_any(),
+                    },
+                };
+
+                view! {
+                    <article class="gallery-tile gallery-post group">
+                        <div class="gallery-frame" style=cv>
+                            {cover_view}
                             {media_badge.map(|badge| view! {
                                 <div class="gallery-top-left">
                                     <span class="gallery-post-pill">
@@ -699,21 +889,24 @@ pub fn Results(
                 .into_any()
             }
             Item::Image(im) => {
-                let url = format!("/images/{}.webp", encode_path(&im.name));
-                let alt = im.name.clone();
-                let id = im.id;
+                let id = im.id();
+                let locked = im.is_locked();
                 let href = format!("/details/{id}");
                 let click_href = href.clone();
                 let nav = use_navigate();
-                view! {
-                    <article class="gallery-tile group">
-                        <div class="gallery-frame" style=cv>
+
+                let media_view = match im {
+                    ProjectedImage::Clear { url, name, .. } => {
+                        let alt = name
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| format!("Image #{id}"));
+                        view! {
                             <button
                                 type="button"
                                 aria-label=format!("Zoom image #{id}")
                                 class="block w-full p-0 border-0 bg-transparent cursor-zoom-in focus-visible:outline-2 focus-visible:outline-sky-500"
                                 on:click=move |_| {
-                                    if let Some(i) = images.with_value(|v| v.iter().position(|x| x.id == id)) {
+                                    if let Some(i) = images.with_value(|v| v.iter().position(|x| x.id() == id)) {
                                         viewer.set(Some(i));
                                     }
                                 }
@@ -727,6 +920,86 @@ pub fn Results(
                                     src=url
                                 />
                             </button>
+                        }
+                        .into_any()
+                    }
+                    ProjectedImage::Spoiler {
+                        preview_url,
+                        reveal_url,
+                        width: sw,
+                        height: sh,
+                        label,
+                        preset,
+                        blur_mode,
+                        ..
+                    } => {
+                        let open_cb = Callback::new(move |()| {
+                            if let Some(i) = images.with_value(|v| v.iter().position(|x| x.id() == id)) {
+                                viewer.set(Some(i));
+                            }
+                        });
+                        let ui_preset = GalleryMaskPreset::parse(&preset);
+                        let ui_blur = blur_mode_to_ui(blur_mode);
+                        let alt = format!("Image #{id}");
+                        match panic_epoch_sig {
+                            Some(epoch) => view! {
+                                <SpoilerOverlay
+                                    id=id
+                                    kind=GalleryMediaKind::Image
+                                    width=sw
+                                    height=sh
+                                    preview_url=preview_url
+                                    reveal_url=reveal_url
+                                    alt=alt
+                                    label=label
+                                    preset=ui_preset
+                                    blur_mode=ui_blur
+                                    panic_epoch=epoch
+                                    on_open=open_cb
+                                />
+                            }
+                            .into_any(),
+                            None => view! {
+                                <SpoilerOverlay
+                                    id=id
+                                    kind=GalleryMediaKind::Image
+                                    width=sw
+                                    height=sh
+                                    preview_url=preview_url
+                                    reveal_url=reveal_url
+                                    alt=alt
+                                    label=label
+                                    preset=ui_preset
+                                    blur_mode=ui_blur
+                                    on_open=open_cb
+                                />
+                            }
+                            .into_any(),
+                        }
+                    }
+                    ProjectedImage::Locked {
+                        width: lw,
+                        height: lh,
+                        mask,
+                        ..
+                    } => {
+                        let ui_mask = mask_to_ui(&mask);
+                        view! {
+                            <ContentMaskCard
+                                mask=ui_mask
+                                dimensions=(lw, lh)
+                                compact=true
+                                on_unlock_click=on_unlock
+                            />
+                        }
+                        .into_any()
+                    }
+                };
+
+                view! {
+                    <article class="gallery-tile group">
+                        <div class="gallery-frame" style=cv>
+                            {media_view}
                             <div class="gallery-top-right">
                                 <LikeButton
                                     kind="image"
@@ -736,20 +1009,41 @@ pub fn Results(
                             </div>
                             <div class="gallery-overlay">
                                 <span class="gallery-overlay-meta">{format!("#{id}")}</span>
-                                <a
-                                    href=href
-                                    title="Open image details & similar"
-                                    class="gallery-overlay-link"
-                                    on:click=move |ev: ev::MouseEvent| {
-                                        ev.stop_propagation();
-                                        if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
-                                            ev.prevent_default();
-                                            nav(&click_href, NavigateOptions::default());
-                                        }
-                                    }
-                                >
-                                    "Details \u{2197}"
-                                </a>
+                                <div class="flex items-center gap-1">
+                                    {move || safety.filter(|s| s.is_managed.get()).map(|s| view! {
+                                        <button
+                                            type="button"
+                                            title="Report image"
+                                            class="gallery-overlay-link bg-slate-900/60 hover:bg-rose-500 cursor-pointer"
+                                            on:click=move |ev: ev::MouseEvent| {
+                                                ev.stop_propagation();
+                                                s.open_report(
+                                                    ReportTargetKind::Image,
+                                                    id,
+                                                    format!("Image #{id}"),
+                                                );
+                                            }
+                                        >
+                                            "Report"
+                                        </button>
+                                    })}
+                                    {(!locked).then(|| view! {
+                                        <a
+                                            href=href
+                                            title="Open image details & similar"
+                                            class="gallery-overlay-link"
+                                            on:click=move |ev: ev::MouseEvent| {
+                                                ev.stop_propagation();
+                                                if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
+                                                    ev.prevent_default();
+                                                    nav(&click_href, NavigateOptions::default());
+                                                }
+                                            }
+                                        >
+                                            "Details \u{2197}"
+                                        </a>
+                                    })}
+                                </div>
                             </div>
                         </div>
                     </article>
@@ -762,6 +1056,18 @@ pub fn Results(
     let error_view = move || {
         error.get().map(|e| {
             let lower = e.to_ascii_lowercase();
+            let is_locked = lower.contains("locked") || lower.contains("403");
+            if is_locked {
+                return view! {
+                    <div class="w-full max-w-md mx-auto my-6 px-5 py-4 rounded-2xl bg-sky-50/90 ring-1 ring-sky-200
+                                text-center text-slate-600 shadow-sm flex flex-col items-center gap-2">
+                        <p class="text-sm font-medium text-sky-800">
+                            "Visual similarity is unavailable while this item is locked under your current safety settings."
+                        </p>
+                    </div>
+                }
+                .into_any();
+            }
             let is_allowance = embedded
                 && (lower.contains("402")
                     || lower.contains("payment")
@@ -870,7 +1176,7 @@ pub fn Results(
                 Mode::Advanced if trimmed_adv.is_empty() => "Open Advanced Search above to combine tags, authors, titles, CLIP text, and visually similar images.",
                 Mode::Advanced => match parse_and_compile(trimmed_adv) {
                     Ok((_, plan)) if plan.meta_filter.is_some() && plan.has_vectors() => {
-                        "Try relaxing one of your metadata filters (AND / NOT) or broadening the tag/author conditions."
+                        "Try relaxing one of your metadata filters (AND / NOT) or lowering the minimum similarity threshold."
                     }
                     Ok((_, plan)) if !plan.positive_tags.is_empty() => {
                         "Try fewer AND conditions, check tag spelling or aliases (EN / 中文 / 日本語), or combine alternatives with OR."
@@ -878,7 +1184,7 @@ pub fn Results(
                     _ => "Try fewer AND / NOT conditions, shorter keywords, or broaden your query with OR.",
                 },
                 Mode::Tag => "Try a shorter keyword, a tag alias (EN / 中文 / 日本語), or describe the scene with CLIP.",
-                _ => "Try a different query or open Advanced Search above.",
+                _ => "Try a different query, lower the similarity cutoff, or open Advanced Search above.",
             };
 
             let tag_cta_href = (p.mode == Mode::All && !trimmed_q.is_empty()).then(|| {
@@ -980,22 +1286,6 @@ pub fn Results(
         "gallery-wrap flex flex-col"
     };
 
-    let render_density_btn = move |d: Density, label: &'static str| {
-        view! {
-            <button
-                type="button"
-                class="gallery-density-btn"
-                aria-pressed=move || (density.get() == d).to_string()
-                on:click=move |_| {
-                    density.set(d);
-                    save_density(d);
-                }
-            >
-                {label}
-            </button>
-        }
-    };
-
     let has_masonry_items =
         Memo::new(move |_| columns.with(|cs| cs.iter().any(|c| !c.items.is_empty())));
     let is_ephemeral_search = Memo::new(move |_| {
@@ -1021,6 +1311,7 @@ pub fn Results(
                             {resp.posts.into_iter().map(|p| {
                                 let title = p.title;
                                 let cover = p.images.first().cloned();
+                                let cover_video = p.videos.first().cloned();
                                 let img_count = p.image_count.max(p.images.len());
                                 let video_count = p.video_count.max(p.videos.len());
                                 let media_badge = match (img_count > 0, video_count > 0) {
@@ -1031,34 +1322,87 @@ pub fn Results(
                                 };
                                 let (w, h) = cover
                                     .as_ref()
-                                    .filter(|c| c.width > 0 && c.height > 0)
-                                    .map(|c| (c.width, c.height))
+                                    .map(|c| (c.width(), c.height()))
+                                    .or_else(|| cover_video.as_ref().map(|v| (v.width(), v.height())))
+                                    .filter(|&(w, h)| w > 0 && h > 0)
                                     .unwrap_or((4, 3));
                                 let aspect = format!("aspect-ratio: {w} / {h}");
-                                let details_href = cover.as_ref().map(|c| format!("/details/{}", c.id));
+                                let details_href = cover
+                                    .as_ref()
+                                    .filter(|c| !c.is_locked())
+                                    .map(|c| format!("/details/{}", c.id()));
+                                let cover_view = match cover {
+                                    Some(ProjectedImage::Clear { url, .. }) => {
+                                        let href = details_href.clone().unwrap_or_default();
+                                        view! {
+                                            <a href=href class="block w-full">
+                                                <img
+                                                    loading="lazy"
+                                                    decoding="async"
+                                                    alt=title.clone()
+                                                    style=aspect.clone()
+                                                    class="gallery-img"
+                                                    src=url
+                                                />
+                                            </a>
+                                        }
+                                        .into_any()
+                                    }
+                                    Some(ProjectedImage::Spoiler {
+                                        id,
+                                        preview_url,
+                                        reveal_url,
+                                        width: sw,
+                                        height: sh,
+                                        label,
+                                        preset,
+                                        blur_mode,
+                                        ..
+                                    }) => view! {
+                                        <SpoilerOverlay
+                                            id=id
+                                            kind=GalleryMediaKind::Image
+                                            width=sw
+                                            height=sh
+                                            preview_url=preview_url
+                                            reveal_url=reveal_url
+                                            alt=title.clone()
+                                            label=label
+                                            preset=GalleryMaskPreset::parse(&preset)
+                                            blur_mode=blur_mode_to_ui(blur_mode)
+                                        />
+                                    }
+                                    .into_any(),
+                                    Some(ProjectedImage::Locked { mask, .. }) => view! {
+                                        <ContentMaskCard
+                                            mask=mask_to_ui(&mask)
+                                            dimensions=(w, h)
+                                            compact=true
+                                        />
+                                    }
+                                    .into_any(),
+                                    None => match cover_video {
+                                        Some(ProjectedVideo::Locked { mask, .. }) => view! {
+                                            <ContentMaskCard
+                                                mask=mask_to_ui(&mask)
+                                                dimensions=(w, h)
+                                                compact=true
+                                            />
+                                        }
+                                        .into_any(),
+                                        _ => view! {
+                                            <div class="w-full grid place-items-center text-sky-700 text-3xl bg-[#e4f3fc]"
+                                                style=aspect>
+                                                <span aria-hidden="true">"▶"</span>
+                                            </div>
+                                        }
+                                        .into_any(),
+                                    },
+                                };
                                 view! {
                                     <article class="gallery-tile gallery-post group">
                                         <div class="gallery-frame">
-                                            {match (cover, details_href.clone()) {
-                                                (Some(c), Some(href)) => view! {
-                                                    <a href=href class="block w-full">
-                                                        <img
-                                                            loading="lazy"
-                                                            decoding="async"
-                                                            alt=title.clone()
-                                                            style=aspect
-                                                            class="gallery-img"
-                                                            src=format!("/images/{}.webp", encode_path(&c.name))
-                                                        />
-                                                    </a>
-                                                }.into_any(),
-                                                _ => view! {
-                                                    <div class="w-full grid place-items-center text-sky-700 text-3xl bg-[#e4f3fc]"
-                                                        style=aspect>
-                                                        <span aria-hidden="true">"▶"</span>
-                                                    </div>
-                                                }.into_any(),
-                                            }}
+                                            {cover_view}
                                             {media_badge.map(|badge| view! {
                                                 <div class="gallery-top-left">
                                                     <span class="gallery-post-pill">
@@ -1104,16 +1448,23 @@ pub fn Results(
         })}
         <div node_ref=size_el class=wrap_cls>
             {embedded.then(|| view! {
-                <div class="gallery-floating-bar">
+                <div class="gallery-floating-bar flex-wrap gap-2">
                     {heading.map(|h| view! {
                         <h2 class="text-sky-700 text-base sm:text-lg md:text-xl font-semibold leading-tight m-0">
                             {h}
                         </h2>
                     })}
-                    <div class="gallery-density ml-auto" role="group" aria-label="Grid size">
-                        {render_density_btn(Density::Compact, "Compact")}
-                        {render_density_btn(Density::Medium, "Medium")}
-                        {render_density_btn(Density::Large, "Large")}
+                    <div class="ml-auto flex flex-wrap items-center gap-2 sm:gap-3">
+                        <MinSimilaritySlider
+                            value=sim_slider
+                            label="Min sim"
+                            model_badge="DINOv3"
+                            compact=true
+                            on_change=Callback::new(move |_: f32| {
+                                sim_slider_touched.set(true);
+                            })
+                        />
+                        <DensityPicker density=density persist=true />
                     </div>
                 </div>
             })}
@@ -1135,7 +1486,7 @@ pub fn Results(
                                     placed.order,
                                     match &placed.item {
                                         Item::Post(p) => (0u8, p.id),
-                                        Item::Image(im) => (1u8, im.id),
+                                        Item::Image(im) => (1u8, im.id()),
                                     },
                                 )
                             }
@@ -1165,8 +1516,6 @@ fn item_rendered_height(item: &Item, col_width: u32) -> Option<u32> {
     Some((ratio * f64::from(col_width)).round().max(1.0) as u32)
 }
 
-/// Recompute every placed item's `(w, h)` and each column's height total in place
-/// when column count stays constant across a resize.
 fn resize_columns_in_place(columns: &mut [Column], new_width: u32, gap: u32) {
     for col in columns.iter_mut() {
         col.width = new_width;
@@ -1187,7 +1536,6 @@ fn resize_columns_in_place(columns: &mut [Column], new_width: u32, gap: u32) {
     }
 }
 
-/// Use the same cover and aspect ratio when loading a page and when reflowing it.
 fn place_item(columns: &mut [Column], item: Item, order: usize, gap: u32) {
     let Some(column) = columns.iter_mut().min_by_key(|c| c.height) else {
         return;
@@ -1201,13 +1549,10 @@ fn place_item(columns: &mut [Column], item: Item, order: usize, gap: u32) {
     column.items.push(Placed { item, w, h, order });
 }
 
-/// Fetch one page of results through the REST search endpoints and merge it into
-/// the columns. Superseded requests (a new search or an earlier page) are dropped
-/// via `req_id` so their late responses can't corrupt the current view.
 fn load_page(offset_val: i64, ctx: GalleryLoadCtx) {
     let p = ctx.params.get_untracked();
+    let min_sim = ctx.effective_min_similarity(&p);
 
-    // Claim the newest request id; any in-flight call becomes stale.
     let this_id = ctx.req_id.get_value() + 1;
     ctx.req_id.set_value(this_id);
 
@@ -1245,16 +1590,15 @@ fn load_page(offset_val: i64, ctx: GalleryLoadCtx) {
                             .await
                     }
                     VectorTier::EmbedId => {
-                        search_advanced_embed(adv_query, p.limit, offset_val).await
+                        search_advanced_embed(adv_query, p.limit, offset_val, min_sim).await
                     }
                     VectorTier::Clip => {
-                        search_advanced_clip(adv_query, p.clip_weight, p.limit, offset_val).await
+                        search_advanced_clip(adv_query, p.clip_weight, p.limit, offset_val, min_sim)
+                            .await
                     }
                     VectorTier::ImageUpload => {
                         match resolve_advanced_upload_csv(&plan, &p.img_nonce, ctx.adv_uploads) {
                             None => {
-                                // Uploaded image bytes live only in client memory bound to
-                                // their navigation nonce; reloaded URLs degrade cleanly.
                                 if ctx.req_id.try_get_value() == Some(this_id) {
                                     ctx.has_more.set(false);
                                     ctx.loaded_first.set(true);
@@ -1269,6 +1613,7 @@ fn load_page(offset_val: i64, ctx: GalleryLoadCtx) {
                                     p.clip_weight,
                                     p.limit,
                                     offset_val,
+                                    min_sim,
                                 )
                                 .await
                             }
@@ -1284,9 +1629,6 @@ fn load_page(offset_val: i64, ctx: GalleryLoadCtx) {
                         .map(|x| x.b64.clone())
                 });
                 match matching_b64 {
-                    // The image bytes live only in client memory and are bound to their
-                    // navigation nonce, so a reloaded or Back-navigated `search_image` URL
-                    // degrades cleanly instead of running with stale bytes.
                     None => {
                         if ctx.req_id.try_get_value() == Some(this_id) {
                             ctx.has_more.set(false);
@@ -1295,11 +1637,11 @@ fn load_page(offset_val: i64, ctx: GalleryLoadCtx) {
                         }
                         return;
                     }
-                    Some(b64) => search_by_image(b64, p.limit, offset_val).await,
+                    Some(b64) => search_by_image(b64, p.limit, offset_val, min_sim).await,
                 }
             }
-            Mode::Similar => search_similar(p.q, p.limit, offset_val).await,
-            Mode::Clip => search_by_desc(p.q, p.limit, offset_val).await,
+            Mode::Similar => search_similar(p.q, p.limit, offset_val, min_sim).await,
+            Mode::Clip => search_by_desc(p.q, p.limit, offset_val, min_sim).await,
             _ => {
                 search_query(
                     p.mode.as_str().to_string(),
@@ -1312,7 +1654,6 @@ fn load_page(offset_val: i64, ctx: GalleryLoadCtx) {
             }
         };
 
-        // A newer request started while we were awaiting: discard this response.
         if ctx.req_id.try_get_value() != Some(this_id) {
             return;
         }
@@ -1373,6 +1714,19 @@ fn to_server_err(e: impl std::fmt::Display) -> ServerFnError {
 }
 
 #[cfg(feature = "ssr")]
+fn map_search_err(err: anyhow::Error) -> ServerFnError {
+    if err.downcast_ref::<search_engine::SeedLockedError>().is_some() {
+        if let Some(resp) = use_context::<leptos_axum::ResponseOptions>() {
+            resp.set_status(axum::http::StatusCode::FORBIDDEN);
+        }
+        return ServerFnError::Response(
+            "Seed image is locked under current safety settings".to_string(),
+        );
+    }
+    ServerFnError::Response(err.to_string())
+}
+
+#[cfg(feature = "ssr")]
 fn to_args_err(msg: impl Into<String>) -> ServerFnError {
     ServerFnError::Args(msg.into())
 }
@@ -1380,8 +1734,11 @@ fn to_args_err(msg: impl Into<String>) -> ServerFnError {
 #[cfg(feature = "ssr")]
 async fn hydrate_posts(
     engine: &search_engine::Engine,
+    ctx: &crate::state::RequestSafetyContext,
     posts: Vec<search_engine::search_types::Post>,
 ) -> Result<Vec<PostItem>, ServerFnError> {
+    use std::collections::HashMap;
+
     if posts.is_empty() {
         return Ok(Vec::new());
     }
@@ -1390,11 +1747,42 @@ async fn hydrate_posts(
         .post_gallery_covers_by_ids(&post_ids)
         .await
         .map_err(to_server_err)?;
-    let mut by_id: std::collections::HashMap<i64, search_engine::PostGalleryCover> =
+
+    let cover_images: Vec<search_types::Image> = covers
+        .iter()
+        .filter_map(|c| c.cover_image.clone())
+        .collect();
+    let cover_videos: Vec<search_types::Video> = covers
+        .iter()
+        .filter_map(|c| c.cover_video.clone())
+        .collect();
+
+    let (proj_imgs, proj_vids) = tokio::try_join!(
+        engine.project_images(&cover_images, &ctx.policy, &ctx.caller, &ctx.signer),
+        engine.project_videos(&cover_videos, &ctx.policy, &ctx.caller, &ctx.signer),
+    )
+    .map_err(to_server_err)?;
+
+    let mut proj_img_map: HashMap<i64, ProjectedImage> =
+        proj_imgs.into_iter().map(|im| (im.id(), im)).collect();
+    let mut proj_vid_map: HashMap<i64, ProjectedVideo> =
+        proj_vids.into_iter().map(|v| (v.id(), v)).collect();
+    let mut by_id: HashMap<i64, search_engine::PostGalleryCover> =
         covers.into_iter().map(|c| (c.post_id, c)).collect();
+
     let mut items = Vec::with_capacity(posts.len());
     for post in posts {
         if let Some(cover) = by_id.remove(&post.id) {
+            let images = cover
+                .cover_image
+                .and_then(|im| proj_img_map.remove(&im.id))
+                .into_iter()
+                .collect();
+            let videos = cover
+                .cover_video
+                .and_then(|v| proj_vid_map.remove(&v.id))
+                .into_iter()
+                .collect();
             items.push(PostItem {
                 id: post.id,
                 title: if post.title.is_empty() {
@@ -1402,8 +1790,8 @@ async fn hydrate_posts(
                 } else {
                     post.title
                 },
-                images: cover.cover_image.into_iter().collect(),
-                videos: cover.cover_video.into_iter().collect(),
+                images,
+                videos,
                 image_count: cover.image_count,
                 video_count: cover.video_count,
             });
@@ -1470,16 +1858,18 @@ fn decode_upload_images(images: &str) -> Result<Vec<Vec<u8>>, ServerFnError> {
 }
 
 #[cfg(feature = "ssr")]
+#[allow(clippy::too_many_arguments)]
 async fn run_advanced_tier(
     q: String,
     expected_tier: VectorTier,
     uploads: Vec<Vec<u8>>,
     sort: AdvancedSort,
     clip_weight: i32,
+    min_similarity: Option<f32>,
     limit: i64,
     offset: i64,
 ) -> Result<SearchResponse, ServerFnError> {
-    use crate::state::AppState;
+    use crate::state::{AppState, RequestSafetyContext};
     use std::sync::Arc;
 
     use axum::extract::State;
@@ -1509,6 +1899,8 @@ async fn run_advanced_tier(
     let Some(state) = use_context::<AppState>() else {
         return Ok(SearchResponse::default());
     };
+    let ctx = RequestSafetyContext::from_leptos_context(&state)?;
+    let sf = ctx.safety_filter();
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
     let req = AdvancedSearchRequest {
@@ -1516,27 +1908,33 @@ async fn run_advanced_tier(
         uploads,
         sort,
         clip_weight: (clip_weight.clamp(5, 95) as f32) / 100.0,
+        clip_min_similarity: ctx.effective_siglip2_min(min_similarity),
+        dino_min_similarity: ctx.effective_dinov3_min(min_similarity),
         limit,
         offset,
     };
 
     let res = engine
-        .execute_advanced_plan(&plan, &req)
+        .execute_advanced_plan_with_safety(&plan, &req, Some(&sf))
         .await
-        .map_err(to_server_err)?;
+        .map_err(map_search_err)?;
 
     match res {
         AdvancedSearchResult::Posts(posts) => {
             let count = posts.len() as i64;
-            let items = hydrate_posts(&engine, posts).await?;
+            let items = hydrate_posts(&engine, &ctx, posts).await?;
             Ok(SearchResponse {
                 has_more: count >= limit,
                 posts: items,
                 images: vec![],
             })
         }
-        AdvancedSearchResult::Images(images) => {
-            let count = images.len() as i64;
+        AdvancedSearchResult::Images(raw_images) => {
+            let count = raw_images.len() as i64;
+            let images = engine
+                .project_images(&raw_images, &ctx.policy, &ctx.caller, &ctx.signer)
+                .await
+                .map_err(to_server_err)?;
             Ok(SearchResponse {
                 has_more: count >= limit,
                 posts: vec![],
@@ -1554,8 +1952,7 @@ async fn search_query(
     limit: i64,
     offset: i64,
 ) -> Result<SearchResponse, ServerFnError> {
-    use crate::state::AppState;
-
+    use crate::state::{AppState, RequestSafetyContext};
     use std::sync::Arc;
 
     use axum::extract::State;
@@ -1588,18 +1985,24 @@ async fn search_query(
     let Some(state) = use_context::<AppState>() else {
         return Ok(SearchResponse::default());
     };
+    let ctx = RequestSafetyContext::from_leptos_context(&state)?;
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
-    // Random images mode.
+    // Random images mode (browse feed: project each image so locked placeholders appear cleanly).
     if mode == Mode::Random && q_trimmed == "images" {
-        let items = engine
+        let raw_items = engine
             .random_images_vec(seed, limit, offset)
             .await
             .map_err(to_server_err)?;
+        let has_more = !raw_items.is_empty();
+        let images = engine
+            .project_images(&raw_items, &ctx.policy, &ctx.caller, &ctx.signer)
+            .await
+            .map_err(to_server_err)?;
         return Ok(SearchResponse {
-            has_more: !items.is_empty(),
+            has_more,
             posts: vec![],
-            images: items,
+            images,
         });
     }
 
@@ -1634,9 +2037,7 @@ async fn search_query(
         };
 
         let count = raw_posts.len() as i64;
-        let items = hydrate_posts(&engine, raw_posts).await?;
-        // Random pages skip ids with no row, so `count < limit` is normal; keep
-        // paging (endless reshuffle) until a whole window resolves to nothing.
+        let items = hydrate_posts(&engine, &ctx, raw_posts).await?;
         let has_more = if mode == Mode::Random {
             count > 0
         } else {
@@ -1649,19 +2050,25 @@ async fn search_query(
         });
     }
 
-    // Legacy image-oriented modes.
-    let items = match mode {
+    // Legacy image-oriented modes (anti-oracle safety filter applied).
+    let sf = ctx.safety_filter();
+    let raw_items = match mode {
         Mode::Tag => engine
-            .search_images_by_tag_vec(q_trimmed, limit, offset)
+            .search_images_by_tag_vec_with_safety(q_trimmed, limit, offset, Some(&sf))
             .await
             .map_err(to_server_err)?,
         _ => return Ok(SearchResponse::default()),
     };
+    let count = raw_items.len() as i64;
+    let images = engine
+        .project_images(&raw_items, &ctx.policy, &ctx.caller, &ctx.signer)
+        .await
+        .map_err(to_server_err)?;
 
     Ok(SearchResponse {
-        has_more: (items.len() as i64) >= limit,
+        has_more: count >= limit,
         posts: vec![],
-        images: items,
+        images,
     })
 }
 
@@ -1678,6 +2085,7 @@ async fn search_advanced(
         Vec::new(),
         AdvancedSort::parse(&sort),
         50,
+        None,
         limit,
         offset,
     )
@@ -1689,6 +2097,7 @@ async fn search_advanced_embed(
     q: String,
     limit: i64,
     offset: i64,
+    min_similarity: Option<f32>,
 ) -> Result<SearchResponse, ServerFnError> {
     run_advanced_tier(
         q,
@@ -1696,6 +2105,7 @@ async fn search_advanced_embed(
         Vec::new(),
         AdvancedSort::Relevance,
         50,
+        min_similarity,
         limit,
         offset,
     )
@@ -1708,6 +2118,7 @@ async fn search_advanced_clip(
     clip_weight: i32,
     limit: i64,
     offset: i64,
+    min_similarity: Option<f32>,
 ) -> Result<SearchResponse, ServerFnError> {
     run_advanced_tier(
         q,
@@ -1715,6 +2126,7 @@ async fn search_advanced_clip(
         Vec::new(),
         AdvancedSort::Relevance,
         clip_weight,
+        min_similarity,
         limit,
         offset,
     )
@@ -1728,6 +2140,7 @@ async fn search_advanced_image(
     clip_weight: i32,
     limit: i64,
     offset: i64,
+    min_similarity: Option<f32>,
 ) -> Result<SearchResponse, ServerFnError> {
     let uploads = decode_upload_images(&images)?;
     run_advanced_tier(
@@ -1736,6 +2149,7 @@ async fn search_advanced_image(
         uploads,
         AdvancedSort::Relevance,
         clip_weight,
+        min_similarity,
         limit,
         offset,
     )
@@ -1747,9 +2161,9 @@ async fn search_by_image(
     image: String,
     limit: i64,
     offset: i64,
+    min_similarity: Option<f32>,
 ) -> Result<SearchResponse, ServerFnError> {
-    use crate::state::AppState;
-
+    use crate::state::{AppState, RequestSafetyContext};
     use std::sync::Arc;
 
     use axum::extract::State;
@@ -1767,17 +2181,25 @@ async fn search_by_image(
     let Some(state) = use_context::<AppState>() else {
         return Ok(SearchResponse::default());
     };
+    let ctx = RequestSafetyContext::from_leptos_context(&state)?;
+    let sf = ctx.safety_filter();
+    let eff_min = ctx.effective_dinov3_min(min_similarity);
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
-    let items = engine
-        .search_dinov3_upload_vec(bytes, limit, offset)
+    let raw_items = engine
+        .search_dinov3_upload_vec(bytes, limit, offset, eff_min, Some(&sf))
+        .await
+        .map_err(map_search_err)?;
+    let count = raw_items.len() as i64;
+    let images = engine
+        .project_images(&raw_items, &ctx.policy, &ctx.caller, &ctx.signer)
         .await
         .map_err(to_server_err)?;
 
     Ok(SearchResponse {
-        has_more: (items.len() as i64) >= limit,
+        has_more: count >= limit,
         posts: vec![],
-        images: items,
+        images,
     })
 }
 
@@ -1786,9 +2208,9 @@ async fn search_similar(
     q: String,
     limit: i64,
     offset: i64,
+    min_similarity: Option<f32>,
 ) -> Result<SearchResponse, ServerFnError> {
-    use crate::state::AppState;
-
+    use crate::state::{AppState, RequestSafetyContext};
     use std::sync::Arc;
 
     use axum::extract::State;
@@ -1808,19 +2230,33 @@ async fn search_similar(
     let Some(state) = use_context::<AppState>() else {
         return Ok(SearchResponse::default());
     };
+    let ctx = RequestSafetyContext::from_leptos_context(&state)?;
+    let sf = ctx.safety_filter();
+    let eff_min = ctx.effective_dinov3_min(min_similarity);
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
+
+    // Anti-oracle guard (H5): verify seed authorization BEFORE reading details or embedding.
+    engine
+        .ensure_images_unlocked(&[id], &sf)
+        .await
+        .map_err(map_search_err)?;
 
     let details = engine.image_details(id).await.map_err(to_server_err)?;
     let exclude_post_id = details.post.as_ref().map(|p| p.id);
-    let items = engine
-        .search_similar_images(id, exclude_post_id, limit, offset)
+    let raw_items = engine
+        .search_similar_images(id, exclude_post_id, limit, offset, eff_min, Some(&sf))
+        .await
+        .map_err(map_search_err)?;
+    let count = raw_items.len() as i64;
+    let images = engine
+        .project_images(&raw_items, &ctx.policy, &ctx.caller, &ctx.signer)
         .await
         .map_err(to_server_err)?;
 
     Ok(SearchResponse {
-        has_more: (items.len() as i64) >= limit,
+        has_more: count >= limit,
         posts: vec![],
-        images: items,
+        images,
     })
 }
 
@@ -1829,9 +2265,9 @@ async fn search_by_desc(
     q: String,
     limit: i64,
     offset: i64,
+    min_similarity: Option<f32>,
 ) -> Result<SearchResponse, ServerFnError> {
-    use crate::state::AppState;
-
+    use crate::state::{AppState, RequestSafetyContext};
     use std::sync::Arc;
 
     use axum::extract::State;
@@ -1858,17 +2294,25 @@ async fn search_by_desc(
     let Some(state) = use_context::<AppState>() else {
         return Ok(SearchResponse::default());
     };
+    let ctx = RequestSafetyContext::from_leptos_context(&state)?;
+    let sf = ctx.safety_filter();
+    let eff_min = ctx.effective_siglip2_min(min_similarity);
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
-    let items = engine
-        .search_clip_cached_vec(q_trimmed, limit, offset)
+    let raw_items = engine
+        .search_clip_cached_vec(q_trimmed, limit, offset, eff_min, Some(&sf))
+        .await
+        .map_err(map_search_err)?;
+    let count = raw_items.len() as i64;
+    let images = engine
+        .project_images(&raw_items, &ctx.policy, &ctx.caller, &ctx.signer)
         .await
         .map_err(to_server_err)?;
 
     Ok(SearchResponse {
-        has_more: (items.len() as i64) >= limit,
+        has_more: count >= limit,
         posts: vec![],
-        images: items,
+        images,
     })
 }
 
@@ -1899,11 +2343,9 @@ fn decode_upload_images_validates_slots_and_limits() {
     assert!(decode_upload_images("").is_err());
     assert!(decode_upload_images(&format!("{a},")).is_err());
     assert!(decode_upload_images("!!!not-base64!!!").is_err());
-    // More than 4 slots rejected (including huge comma-spam without unbounded allocation).
     assert!(decode_upload_images(&format!("{a},{a},{a},{a},{a}")).is_err());
     let comma_spam = format!("{a}{}", ",x".repeat(10_000));
     assert!(decode_upload_images(&comma_spam).is_err());
-    // Oversized (> 512KB) rejected for both multi-slot and single-image endpoints.
     let huge = URL_SAFE_NO_PAD.encode(vec![0u8; MAX_UPLOAD_DECODED_BYTES + 1]);
     assert!(decode_upload_images(&huge).is_err());
     assert!(decode_single_upload_image(&huge, "uploaded image").is_err());
@@ -1920,10 +2362,13 @@ fn video_only_post_keeps_its_place_at_different_widths() {
         id: 42,
         title: "Video album".into(),
         images: vec![],
-        videos: vec![search_types::Video {
+        videos: vec![ProjectedVideo::Clear {
+            id: 1,
+            url: "/videos/v.mp4".into(),
+            name: Some("v.mp4".into()),
             width: 0,
             height: 0,
-            ..Default::default()
+            duration: 10,
         }],
         image_count: 0,
         video_count: 1,
@@ -1945,14 +2390,13 @@ fn responsive_gap_and_resize_recomputes_placed_boxes_and_heights() {
     assert_eq!(column_gap_for(375.0), 8);
     assert_eq!(column_gap_for(640.0), 8);
     assert_eq!(column_gap_for(641.0), 12);
-    // 3 compact cols at 359px with 8px gap -> (359 - 16) / 3 = 114px (not clamped to 120).
     assert_eq!(column_pixel_width(359.0, 3, 8), 114);
-    // Very narrow fallback floors at 80px.
     assert_eq!(column_pixel_width(150.0, 3, 8), 80);
 
-    let img = Item::Image(Image {
+    let img = Item::Image(ProjectedImage::Clear {
         id: 7,
-        name: "a".into(),
+        url: "/images/a.webp".into(),
+        name: Some("a".into()),
         width: 1000,
         height: 2000,
     });
@@ -2002,7 +2446,6 @@ fn uploads_complete_validates_referenced_slots() {
 fn masonry_column_count_breakpoints_are_distinct_across_widths() {
     assert_eq!(target_column_count(0.0, Density::Medium), 1);
 
-    // Narrow phone (320px viewport minus 16px horizontal padding = 304px inner width).
     assert_eq!(target_column_count(304.0, Density::Compact), 2);
     assert_eq!(target_column_count(304.0, Density::Medium), 2);
     assert_eq!(target_column_count(304.0, Density::Large), 1);
@@ -2010,7 +2453,6 @@ fn masonry_column_count_breakpoints_are_distinct_across_widths() {
     assert_eq!(target_column_count(320.0, Density::Medium), 2);
     assert_eq!(target_column_count(320.0, Density::Large), 1);
 
-    // Standard phones (375px viewport minus 16px horizontal padding = 359px inner width): all 3 densities distinct.
     assert_eq!(target_column_count(359.0, Density::Compact), 3);
     assert_eq!(target_column_count(359.0, Density::Medium), 2);
     assert_eq!(target_column_count(359.0, Density::Large), 1);
@@ -2021,7 +2463,6 @@ fn masonry_column_count_breakpoints_are_distinct_across_widths() {
     assert_eq!(target_column_count(540.0, Density::Medium), 2);
     assert_eq!(target_column_count(540.0, Density::Large), 1);
 
-    // Desktop & laptop widths.
     assert_eq!(target_column_count(1120.0, Density::Compact), 6);
     assert_eq!(target_column_count(1120.0, Density::Medium), 4);
     assert_eq!(target_column_count(1120.0, Density::Large), 3);
@@ -2029,7 +2470,6 @@ fn masonry_column_count_breakpoints_are_distinct_across_widths() {
     assert_eq!(target_column_count(1440.0, Density::Medium), 5);
     assert_eq!(target_column_count(1440.0, Density::Large), 3);
 
-    // Ultrawide scaling (up to 12 / 8 / 6).
     assert_eq!(target_column_count(2400.0, Density::Compact), 12);
     assert_eq!(target_column_count(2400.0, Density::Medium), 8);
     assert_eq!(target_column_count(2400.0, Density::Large), 5);
@@ -2046,6 +2486,7 @@ fn parse_results_params_defaults_and_clamps() {
     assert_eq!(empty.adv, "");
     assert_eq!(empty.sort, AdvancedSort::Relevance);
     assert_eq!(empty.clip_weight, 50);
+    assert_eq!(empty.min_sim_bps, None);
     assert_eq!(empty.img_nonce, "");
     assert_eq!(empty.limit, 50);
     assert_eq!(empty.seed, 0);
@@ -2055,6 +2496,7 @@ fn parse_results_params_defaults_and_clamps() {
         "adv" => Some("tag:maid AND clip:\"cafe\"".into()),
         "sort" => Some("newest".into()),
         "cw" => Some("120".into()),
+        "min_sim" => Some("0.45".into()),
         "img" => Some("n42".into()),
         "limit" => Some("0".into()),
         "seed" => Some("99".into()),
@@ -2064,6 +2506,8 @@ fn parse_results_params_defaults_and_clamps() {
     assert_eq!(adv.adv, "tag:maid AND clip:\"cafe\"");
     assert_eq!(adv.sort, AdvancedSort::Newest);
     assert_eq!(adv.clip_weight, 95);
+    assert_eq!(adv.min_sim_bps, Some(450));
+    assert_eq!(adv.min_similarity(), Some(0.45));
     assert_eq!(adv.img_nonce, "n42");
     assert_eq!(adv.limit, crate::types::DEFAULT_SEARCH_LIMIT);
     assert_eq!(adv.seed, 99);
@@ -2074,12 +2518,10 @@ fn parse_results_params_defaults_and_clamps() {
     });
     assert_eq!(capped.limit, MAX_SEARCH_LIMIT);
 
-    // Direct `/details/:id` without `?mode=similar` defaults to Similar for `:id`.
     let embedded_default = parse_results_params_with_default(|_| None, true, Some("2286979"));
     assert_eq!(embedded_default.mode, Mode::Similar);
     assert_eq!(embedded_default.q, "2286979");
 
-    // Explicit crop-search mode overrides embedded default.
     let embedded_crop = parse_results_params_with_default(
         |k| match k {
             "mode" => Some("search_image".into()),

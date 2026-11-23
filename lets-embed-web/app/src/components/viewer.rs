@@ -1,15 +1,20 @@
 use leptos::{ev, html, prelude::*};
 use leptos_router::{NavigateOptions, hooks::use_navigate};
 use leptos_use_event_listener::use_event_listener;
-use search_types::Image;
+use lets_embed_ui::{
+    ContentMaskCard, GalleryMask, GalleryMaskPreset, GalleryMediaKind, ReportTargetKind,
+    SpoilerOverlay,
+};
+use search_types::ProjectedImage;
 use wasm_bindgen::JsCast;
 use web_sys::TouchEvent;
 
 use crate::{
     components::{LikeButton, LikeVariant},
-    util::{
-        encode_path, lock_body_scroll, navigate_from_modal, push_modal_history, trap_dialog_tab,
+    types::{
+        SafetyUiState, blur_mode_to_ui, mask_to_ui, navigate_external, unlock_href_for_mask,
     },
+    util::{lock_body_scroll, navigate_from_modal, push_modal_history, trap_dialog_tab},
 };
 
 const SWIPE_RATIO: f64 = 0.05;
@@ -42,7 +47,7 @@ fn is_interactive_target(target: Option<web_sys::EventTarget>) -> bool {
 
 #[component]
 pub fn Viewer(
-    images: StoredValue<Vec<Image>>,
+    images: StoredValue<Vec<ProjectedImage>>,
     index: RwSignal<Option<usize>>,
     #[prop(optional)] post_id: Option<i64>,
     #[prop(optional)] on_navigate: Option<Callback<()>>,
@@ -52,8 +57,27 @@ pub fn Viewer(
     let drag = RwSignal::new(0.0_f64);
     let navigate = use_navigate();
     let dialog_ref: NodeRef<html::Div> = NodeRef::new();
+    let safety = use_context::<SafetyUiState>();
+    let panic_epoch_sig: Option<Signal<u64>> = safety.map(|s| s.panic_epoch.into());
+
     lock_body_scroll();
     push_modal_history(move || index.set(None));
+
+    // Immediately wipe media elements and close Viewer when Safe Mode / Panic triggers.
+    if let Some(s) = safety {
+        let last_epoch = StoredValue::new(s.panic_epoch.get_untracked());
+        Effect::new(move |_| {
+            let cur = s.panic_epoch.get();
+            if cur != last_epoch.get_value() {
+                last_epoch.set_value(cur);
+                #[cfg(feature = "hydrate")]
+                if let Some(el) = dialog_ref.get_untracked() {
+                    lets_embed_ui::browser::wipe_media_elements_in(Some(el.as_ref()));
+                }
+                index.set(None);
+            }
+        });
+    }
 
     // Move keyboard focus into the dialog on mount so shortcuts and Tab stay inside.
     #[cfg(feature = "hydrate")]
@@ -105,8 +129,10 @@ pub fn Viewer(
                 index.set(None);
             }
             "d" | "D" => {
-                if let Some(im) = current_image.get_untracked() {
-                    let href = details_href(im.id);
+                if let Some(im) = current_image.get_untracked()
+                    && !im.is_locked()
+                {
+                    let href = details_href(im.id());
                     let nav = nav_key.clone();
                     navigate_from_modal(
                         href,
@@ -137,7 +163,6 @@ pub fn Viewer(
     let start_x = StoredValue::new(0.0_f64);
     let width = StoredValue::new(1.0_f64);
     let on_touch_start = move |ev: TouchEvent| {
-        // Ignore multi-touch (e.g. pinch-zoom gestures).
         if ev.touches().length() != 1 {
             dragging.set(false);
             drag.set(0.0);
@@ -203,52 +228,152 @@ pub fn Viewer(
         )
     };
 
+    let on_unlock = Callback::new(move |mask: GalleryMask| {
+        navigate_external(unlock_href_for_mask(&mask));
+    });
+
     let nav_slide = navigate.clone();
     let slides = images.with_value(|v| {
         v.iter()
             .enumerate()
             .map(|(slide_idx, im)| {
-                let src = format!("/images/{}.webp", encode_path(&im.name));
-                let href = details_href(im.id);
-                let click_href = href.clone();
-                let nav = nav_slide.clone();
-                let alt = im.name.clone();
+                let content = match im {
+                    ProjectedImage::Clear {
+                        id, url, name, ..
+                    } => {
+                        let href = details_href(*id);
+                        let click_href = href.clone();
+                        let nav = nav_slide.clone();
+                        let src = url.clone();
+                        let alt = name
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| format!("Image #{id}"));
+                        view! {
+                            <a
+                                href=href
+                                title="Open image details & similar"
+                                class="max-h-full max-w-full flex items-center justify-center"
+                                on:click=move |ev: ev::MouseEvent| {
+                                    ev.stop_propagation();
+                                    if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
+                                        ev.prevent_default();
+                                        let nav = nav.clone();
+                                        navigate_from_modal(
+                                            click_href.clone(),
+                                            move || {
+                                                index.set(None);
+                                                if let Some(cb) = on_navigate {
+                                                    cb.run(());
+                                                }
+                                            },
+                                            move |dest, replace| {
+                                                nav(dest, NavigateOptions { replace, ..Default::default() });
+                                            },
+                                        );
+                                    }
+                                }
+                            >
+                                <img
+                                    src=src
+                                    alt=alt
+                                    loading="lazy"
+                                    class="max-h-[calc(100dvh-6.5rem)] max-w-[96vw] object-contain select-none cursor-pointer"
+                                />
+                            </a>
+                        }
+                        .into_any()
+                    }
+                    ProjectedImage::Spoiler {
+                        id,
+                        preview_url,
+                        reveal_url,
+                        width,
+                        height,
+                        label,
+                        preset,
+                        blur_mode,
+                        ..
+                    } => {
+                        let img_id = *id;
+                        let w = *width;
+                        let h = *height;
+                        let p_url = preview_url.clone();
+                        let r_url = reveal_url.clone();
+                        let lbl = label.clone();
+                        let ui_preset = GalleryMaskPreset::parse(preset);
+                        let ui_blur = blur_mode_to_ui(*blur_mode);
+                        let alt = format!("Image #{img_id}");
+                        view! {
+                            <div
+                                class="w-full max-w-[min(92vw,760px)] max-h-[calc(100dvh-7rem)] overflow-hidden rounded-2xl"
+                                on:click=|ev| ev.stop_propagation()
+                            >
+                                {match panic_epoch_sig {
+                                    Some(epoch) => view! {
+                                        <SpoilerOverlay
+                                            id=img_id
+                                            kind=GalleryMediaKind::Image
+                                            width=w
+                                            height=h
+                                            preview_url=p_url
+                                            reveal_url=r_url
+                                            alt=alt
+                                            label=lbl
+                                            preset=ui_preset
+                                            blur_mode=ui_blur
+                                            panic_epoch=epoch
+                                        />
+                                    }.into_any(),
+                                    None => view! {
+                                        <SpoilerOverlay
+                                            id=img_id
+                                            kind=GalleryMediaKind::Image
+                                            width=w
+                                            height=h
+                                            preview_url=p_url
+                                            reveal_url=r_url
+                                            alt=alt
+                                            label=lbl
+                                            preset=ui_preset
+                                            blur_mode=ui_blur
+                                        />
+                                    }.into_any(),
+                                }}
+                            </div>
+                        }
+                        .into_any()
+                    }
+                    ProjectedImage::Locked {
+                        width,
+                        height,
+                        mask,
+                        ..
+                    } => {
+                        let ui_mask = mask_to_ui(mask);
+                        let dims = (*width, *height);
+                        view! {
+                            <div
+                                class="w-full max-w-md"
+                                on:click=|ev| ev.stop_propagation()
+                            >
+                                <ContentMaskCard
+                                    mask=ui_mask
+                                    dimensions=dims
+                                    on_unlock_click=on_unlock
+                                />
+                            </div>
+                        }
+                        .into_any()
+                    }
+                };
                 view! {
                     <div
                         class="flex-none w-screen h-full grid place-items-center px-2 py-2"
                         inert=move || index.get() != Some(slide_idx)
                     >
-                        <a
-                            href=href
-                            title="Open image details & similar"
-                            class="max-h-full max-w-full flex items-center justify-center"
-                            on:click=move |ev: ev::MouseEvent| {
-                                ev.stop_propagation();
-                                if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
-                                    ev.prevent_default();
-                                    let nav = nav.clone();
-                                    navigate_from_modal(
-                                        click_href.clone(),
-                                        move || {
-                                            index.set(None);
-                                            if let Some(cb) = on_navigate {
-                                                cb.run(());
-                                            }
-                                        },
-                                        move |dest, replace| {
-                                            nav(dest, NavigateOptions { replace, ..Default::default() });
-                                        },
-                                    );
-                                }
-                            }
-                        >
-                            <img
-                                src=src
-                                alt=alt
-                                loading="lazy"
-                                class="max-h-[calc(100dvh-6.5rem)] max-w-[96vw] object-contain select-none cursor-pointer"
-                            />
-                        </a>
+                        {content}
                     </div>
                 }
             })
@@ -279,7 +404,6 @@ pub fn Viewer(
                 drag.set(0.0);
             }
         >
-            // Non-overlapping flex header bar: counter, dimensions, favorite buttons, Details CTA, Close
             <div
                 class="shrink-0 z-20 flex items-center justify-between gap-1.5 sm:gap-2
                        px-2.5 sm:px-3 py-2 bg-black/85 border-b border-white/10 cursor-default"
@@ -292,9 +416,10 @@ pub fn Viewer(
                         {move || index.get().map(|i| format!("{} / {}", i + 1, total)).unwrap_or_default()}
                     </div>
                     {move || current_image.get().and_then(|im| {
-                        (im.width > 0 && im.height > 0).then(|| view! {
+                        let (w, h) = (im.width(), im.height());
+                        (w > 0 && h > 0).then(|| view! {
                             <span class="hidden sm:inline-block text-xs text-sky-200/75 bg-white/5 px-2.5 py-1 rounded-full tabular-nums">
-                                {format!("{} × {}", im.width, im.height)}
+                                {format!("{w} × {h}")}
                             </span>
                         })
                     })}
@@ -311,45 +436,67 @@ pub fn Viewer(
                         />
                     })}
                     {move || current_image.get().map(|im| {
-                        let href = details_href(im.id);
+                        let im_id = im.id();
+                        let locked = im.is_locked();
+                        let href = details_href(im_id);
                         let click_href = href.clone();
                         let nav = nav_bar.clone();
                         view! {
                             <LikeButton
                                 kind="image"
-                                target_id=im.id
+                                target_id=im_id
                                 variant=LikeVariant::Overlay
                                 show_label=true
                                 hide_label_mobile=true
                             />
-                            <a
-                                href=href
-                                class="inline-flex items-center gap-1 px-2.5 sm:px-3 py-1.5 rounded-full
-                                       bg-sky-500 hover:bg-sky-400 text-white text-xs sm:text-sm
-                                       font-semibold shadow-sm transition-colors whitespace-nowrap"
-                                on:click=move |ev: ev::MouseEvent| {
-                                    ev.stop_propagation();
-                                    if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
-                                        ev.prevent_default();
-                                        let nav = nav.clone();
-                                        navigate_from_modal(
-                                            click_href.clone(),
-                                            move || {
-                                                index.set(None);
-                                                if let Some(cb) = on_navigate {
-                                                    cb.run(());
-                                                }
-                                            },
-                                            move |dest, replace| {
-                                                nav(dest, NavigateOptions { replace, ..Default::default() });
-                                            },
+                            {safety.filter(|s| s.is_managed.get()).map(|s| view! {
+                                <button
+                                    type="button"
+                                    title="Report image"
+                                    class="px-2.5 py-1.5 rounded-full bg-white/10 hover:bg-rose-500/70
+                                           text-sky-100 text-xs font-medium transition-colors cursor-pointer whitespace-nowrap"
+                                    on:click=move |ev: ev::MouseEvent| {
+                                        ev.stop_propagation();
+                                        s.open_report(
+                                            ReportTargetKind::Image,
+                                            im_id,
+                                            format!("Image #{im_id}"),
                                         );
                                     }
-                                }
-                            >
-                                <span class="sm:hidden">"Details \u{2197}"</span>
-                                <span class="hidden sm:inline">"Details & similar \u{2197}"</span>
-                            </a>
+                                >
+                                    "Report"
+                                </button>
+                            })}
+                            {(!locked).then(|| view! {
+                                <a
+                                    href=href
+                                    class="inline-flex items-center gap-1 px-2.5 sm:px-3 py-1.5 rounded-full
+                                           bg-sky-500 hover:bg-sky-400 text-white text-xs sm:text-sm
+                                           font-semibold shadow-sm transition-colors whitespace-nowrap"
+                                    on:click=move |ev: ev::MouseEvent| {
+                                        ev.stop_propagation();
+                                        if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
+                                            ev.prevent_default();
+                                            let nav = nav.clone();
+                                            navigate_from_modal(
+                                                click_href.clone(),
+                                                move || {
+                                                    index.set(None);
+                                                    if let Some(cb) = on_navigate {
+                                                        cb.run(());
+                                                    }
+                                                },
+                                                move |dest, replace| {
+                                                    nav(dest, NavigateOptions { replace, ..Default::default() });
+                                                },
+                                            );
+                                        }
+                                    }
+                                >
+                                    <span class="sm:hidden">"Details \u{2197}"</span>
+                                    <span class="hidden sm:inline">"Details & similar \u{2197}"</span>
+                                </a>
+                            })}
                         }
                     })}
                     <button
@@ -362,7 +509,6 @@ pub fn Viewer(
                 </div>
             </div>
 
-            // Flex stage so images never collide with top toolbar or bottom hint
             <div class="relative flex-1 min-h-0 overflow-hidden">
                 <div class="flex h-full will-change-transform" style=track_style>
                     {slides}
