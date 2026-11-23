@@ -1746,7 +1746,8 @@ pub fn AdvancedSearchPanel(
 
             view! {
                 <div class="flex flex-col gap-1 p-2.5 rounded-2xl bg-sky-50/55 ring-1 ring-sky-200/75">
-                    <div class="flex flex-wrap sm:flex-nowrap items-center gap-2">
+                    <div class="flex items-center gap-1.5 sm:gap-2">
+                        <div class="flex-1 min-w-0 flex flex-wrap sm:flex-nowrap items-center gap-2">
                         // Connector select (row 0: Match / NOT; rows 1+: AND / OR / NOT)
                         <SkySelect
                             aria_label="Boolean connector"
@@ -1853,8 +1854,9 @@ pub fn AdvancedSearchPanel(
                                 />
                             }.into_any()
                         }}
+                        </div>
 
-                        // Remove row button
+                        // Remove row button (always vertically centered on the right, even when controls wrap)
                         <button
                             type="button"
                             title="Remove condition"
@@ -1941,7 +1943,7 @@ pub fn AdvancedSearchPanel(
                 <div class="flex flex-col gap-2 p-3 rounded-2xl bg-indigo-50/45 ring-1 ring-indigo-200/80">
                     // Group header bar
                     <div class="flex flex-wrap items-center justify-between gap-2">
-                        <div class="flex items-center gap-2">
+                        <div class="flex flex-wrap items-center gap-2 min-w-0">
                             <SkySelect
                                 aria_label="Group boolean connector"
                                 variant=SelectVariant::IndigoBox
@@ -1981,15 +1983,15 @@ pub fn AdvancedSearchPanel(
                                 })
                             />
 
-                            <span class="text-xs font-mono font-semibold text-indigo-500">"( ... )"</span>
+                            <span class="text-xs font-mono font-semibold text-indigo-500 whitespace-nowrap shrink-0">"( ... )"</span>
 
-                            <div class="inline-flex items-center p-0.5 rounded-full bg-white ring-1 ring-indigo-200/80 text-[11px]">
+                            <div class="inline-flex items-center p-0.5 rounded-full bg-white ring-1 ring-indigo-200/80 text-[11px] shrink-0">
                                 <button
                                     type="button"
                                     class=move || if comb_sig.get() == GroupCombinator::Or {
-                                        "px-2.5 py-0.5 rounded-full font-semibold bg-indigo-500 text-white cursor-pointer transition-colors"
+                                        "px-2.5 py-0.5 rounded-full font-semibold bg-indigo-500 text-white cursor-pointer transition-colors whitespace-nowrap"
                                     } else {
-                                        "px-2.5 py-0.5 rounded-full font-medium text-indigo-700 hover:bg-indigo-50 cursor-pointer transition-colors"
+                                        "px-2.5 py-0.5 rounded-full font-medium text-indigo-700 hover:bg-indigo-50 cursor-pointer transition-colors whitespace-nowrap"
                                     }
                                     on:click=move |_| set_combinator(GroupCombinator::Or)
                                 >
@@ -1998,9 +2000,9 @@ pub fn AdvancedSearchPanel(
                                 <button
                                     type="button"
                                     class=move || if comb_sig.get() == GroupCombinator::And {
-                                        "px-2.5 py-0.5 rounded-full font-semibold bg-indigo-500 text-white cursor-pointer transition-colors"
+                                        "px-2.5 py-0.5 rounded-full font-semibold bg-indigo-500 text-white cursor-pointer transition-colors whitespace-nowrap"
                                     } else {
-                                        "px-2.5 py-0.5 rounded-full font-medium text-indigo-700 hover:bg-indigo-50 cursor-pointer transition-colors"
+                                        "px-2.5 py-0.5 rounded-full font-medium text-indigo-700 hover:bg-indigo-50 cursor-pointer transition-colors whitespace-nowrap"
                                     }
                                     on:click=move |_| set_combinator(GroupCombinator::And)
                                 >
@@ -2009,11 +2011,11 @@ pub fn AdvancedSearchPanel(
                             </div>
                         </div>
 
-                        <div class="flex items-center gap-1.5">
+                        <div class="flex items-center gap-1.5 shrink-0 ml-auto">
                             <button
                                 type="button"
                                 class="px-2.5 py-1 rounded-full text-xs font-medium text-indigo-700 bg-white
-                                       hover:bg-indigo-100 ring-1 ring-indigo-200 transition-colors cursor-pointer"
+                                       hover:bg-indigo-100 ring-1 ring-indigo-200 transition-colors cursor-pointer whitespace-nowrap"
                                 on:click=add_inner_row
                             >
                                 "+ Row"
@@ -2101,7 +2103,8 @@ pub fn AdvancedSearchPanel(
                                 });
 
                                 view! {
-                                    <div class="flex flex-wrap sm:flex-nowrap items-center gap-1.5">
+                                    <div class="flex items-center gap-1.5">
+                                        <div class="flex-1 min-w-0 flex flex-wrap sm:flex-nowrap items-center gap-1.5">
                                         <span class="w-10 shrink-0 text-center text-[11px] font-semibold uppercase text-indigo-500">
                                             {move || if r_idx.get() == 0 {
                                                 ""
@@ -2176,6 +2179,7 @@ pub fn AdvancedSearchPanel(
                                             on_change=on_inner_change
                                             input_id=format!("adv-grp-{item_id}-{r_id}")
                                         />
+                                        </div>
 
                                         <button
                                             type="button"
@@ -2292,13 +2296,13 @@ pub fn AdvancedSearchPanel(
                                 "Visual Query Builder"
                             </span>
                             {move || (!custom_nested_memo.get()).then(|| view! {
-                                <div class="flex items-center gap-1.5">
+                                <div class="flex flex-wrap items-center gap-1.5">
                                     <button
                                         type="button"
                                         prop:disabled=move || raw_syntax_error.get()
                                         class="px-3 py-1 rounded-full text-xs font-semibold text-sky-700 bg-sky-50
                                                hover:bg-sky-100 ring-1 ring-sky-200 transition-colors cursor-pointer
-                                               disabled:opacity-45 disabled:cursor-not-allowed"
+                                               whitespace-nowrap disabled:opacity-45 disabled:cursor-not-allowed"
                                         on:click=add_condition
                                     >
                                         "+ Add condition"
@@ -2308,7 +2312,7 @@ pub fn AdvancedSearchPanel(
                                         prop:disabled=move || raw_syntax_error.get()
                                         class="px-3 py-1 rounded-full text-xs font-semibold text-indigo-700 bg-indigo-50
                                                hover:bg-indigo-100 ring-1 ring-indigo-200 transition-colors cursor-pointer
-                                               disabled:opacity-45 disabled:cursor-not-allowed"
+                                               whitespace-nowrap disabled:opacity-45 disabled:cursor-not-allowed"
                                         on:click=add_or_group
                                     >
                                         "+ Add OR group ( ... )"

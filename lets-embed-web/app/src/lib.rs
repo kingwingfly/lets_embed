@@ -51,6 +51,14 @@ pub fn App() -> impl IntoView {
     provide_meta_context();
     provide_context(crate::types::ImageQuery(RwSignal::new(None)));
     provide_context(crate::types::AdvancedUploads(RwSignal::new(None)));
+    let density = crate::types::GalleryDensityState::new();
+    #[cfg(feature = "hydrate")]
+    Effect::new(move |_| {
+        if let Some(saved) = crate::types::load_gallery_density() {
+            density.0.set(saved);
+        }
+    });
+    provide_context(density);
     provide_context(LikeStore::new());
     view! {
         <Title text="Let's Embed"/>

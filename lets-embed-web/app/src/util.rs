@@ -501,9 +501,38 @@ pub async fn copy_to_clipboard(text: &str) -> bool {
     JsFuture::from(promise).await.is_ok()
 }
 
+/// Distribute images into `col_count` masonry columns by picking the shortest
+/// running column height (using each image's natural `height / width` ratio),
+/// preserving each image's original index for `<Viewer>` navigation.
+pub fn layout_image_masonry(
+    images: &[search_types::Image],
+    col_count: usize,
+) -> Vec<Vec<(usize, search_types::Image)>> {
+    let n = col_count.max(1);
+    let mut cols: Vec<Vec<(usize, search_types::Image)>> = (0..n).map(|_| Vec::new()).collect();
+    let mut heights = vec![0.0f64; n];
+    for (idx, im) in images.iter().enumerate() {
+        let shortest = heights
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let ratio = if im.width > 0 && im.height > 0 {
+            f64::from(im.height) / f64::from(im.width)
+        } else {
+            0.75
+        };
+        heights[shortest] += ratio + 0.05;
+        cols[shortest].push((idx, im.clone()));
+    }
+    cols
+}
+
 #[cfg(test)]
 mod tests {
-    use super::format_duration;
+    use super::{format_duration, layout_image_masonry};
+    use search_types::Image;
 
     #[test]
     fn formats_seconds_minutes_and_hours() {
@@ -512,5 +541,43 @@ mod tests {
         assert_eq!(format_duration(84), "1:24");
         assert_eq!(format_duration(3665), "1:01:05");
         assert_eq!(format_duration(-5), "0:00");
+    }
+
+    #[test]
+    fn layout_image_masonry_balances_column_heights_and_preserves_indices() {
+        let imgs = vec![
+            Image {
+                id: 1,
+                name: "tall".into(),
+                width: 500,
+                height: 1500,
+            },
+            Image {
+                id: 2,
+                name: "wide1".into(),
+                width: 1000,
+                height: 500,
+            },
+            Image {
+                id: 3,
+                name: "wide2".into(),
+                width: 1000,
+                height: 500,
+            },
+            Image {
+                id: 4,
+                name: "sq".into(),
+                width: 800,
+                height: 800,
+            },
+        ];
+        let cols = layout_image_masonry(&imgs, 2);
+        assert_eq!(cols.len(), 2);
+        // Col 0 gets tall (ratio 3.0); Col 1 gets wide1 (0.5), wide2 (0.5), sq (1.0) -> balanced!
+        assert_eq!(cols[0].iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0]);
+        assert_eq!(
+            cols[1].iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 }

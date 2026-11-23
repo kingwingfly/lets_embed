@@ -49,6 +49,127 @@ pub struct AdvancedUploadsPayload {
 #[derive(Clone, Copy)]
 pub struct AdvancedUploads(pub RwSignal<Option<AdvancedUploadsPayload>>);
 
+#[cfg(feature = "hydrate")]
+const GALLERY_DENSITY_KEY: &str = "lets-embed:gallery-density";
+#[cfg(feature = "hydrate")]
+const FAV_DENSITY_KEY: &str = "lets-embed:fav-density";
+
+/// Masonry column density shared between the floating home header and embedded
+/// Similar galleries, matching `/user/favorites`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GalleryDensity {
+    Compact,
+    Medium,
+    Large,
+}
+
+impl GalleryDensity {
+    pub const fn target_width(self) -> f64 {
+        match self {
+            Self::Compact => 200.0,
+            Self::Medium => 300.0,
+            Self::Large => 440.0,
+        }
+    }
+
+    pub const fn desktop_bounds(self) -> (usize, usize) {
+        match self {
+            Self::Compact => (2, 12),
+            Self::Medium => (1, 8),
+            Self::Large => (1, 6),
+        }
+    }
+
+    /// Responsive masonry column count matching `Results` across mobile and desktop widths.
+    pub fn column_count(self, width: f64) -> usize {
+        if width <= 0.0 {
+            return match self {
+                Self::Compact => 3,
+                Self::Medium => 2,
+                Self::Large => 1,
+            };
+        }
+        if width <= 540.0 {
+            return match self {
+                Self::Compact => {
+                    if width >= 340.0 {
+                        3
+                    } else {
+                        2
+                    }
+                }
+                Self::Medium => 2,
+                Self::Large => 1,
+            };
+        }
+        let (min_cols, max_cols) = self.desktop_bounds();
+        ((width / self.target_width()).round() as usize).clamp(min_cols, max_cols)
+    }
+
+    #[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+
+    #[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "compact" => Some(Self::Compact),
+            "medium" => Some(Self::Medium),
+            "large" => Some(Self::Large),
+            _ => None,
+        }
+    }
+}
+
+/// App-root context carrying the active masonry density across `SearchBar` and `Results`.
+#[derive(Clone, Copy)]
+pub struct GalleryDensityState(pub RwSignal<GalleryDensity>);
+
+impl GalleryDensityState {
+    pub fn new() -> Self {
+        Self(RwSignal::new(GalleryDensity::Medium))
+    }
+}
+
+impl Default for GalleryDensityState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "hydrate")]
+pub fn load_gallery_density() -> Option<GalleryDensity> {
+    let storage = web_sys::window()?.local_storage().ok()??;
+    storage
+        .get_item(GALLERY_DENSITY_KEY)
+        .ok()
+        .flatten()
+        .and_then(|s| GalleryDensity::parse(&s))
+        .or_else(|| {
+            storage
+                .get_item(FAV_DENSITY_KEY)
+                .ok()
+                .flatten()
+                .and_then(|s| GalleryDensity::parse(&s))
+        })
+}
+
+#[cfg(feature = "hydrate")]
+pub fn save_gallery_density(density: GalleryDensity) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(GALLERY_DENSITY_KEY, density.as_str());
+        let _ = storage.set_item(FAV_DENSITY_KEY, density.as_str());
+    }
+}
+
+#[cfg(not(feature = "hydrate"))]
+pub fn save_gallery_density(_density: GalleryDensity) {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Mode {

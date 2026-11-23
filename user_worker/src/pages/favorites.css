@@ -546,6 +546,10 @@
   }
 }
 @media (max-width: 720px) {
+  .bar,
+  .wrap {
+    width: calc(100% - 16px);
+  }
   .fav-header {
     position: static;
     padding: 10px 12px;
@@ -557,6 +561,34 @@
   .fav-masonry,
   .fav-col {
     gap: 8px;
+  }
+  .fav-top-left {
+    top: 6px;
+    left: 6px;
+    gap: 4px;
+  }
+  .fav-top-right {
+    top: 6px;
+    right: 6px;
+    gap: 4px;
+  }
+  .fav-icon-btn {
+    width: 30px;
+    height: 30px;
+    font-size: 14px;
+  }
+  .fav-post-pill {
+    padding: 3px 7px;
+    font-size: 11px;
+  }
+  .fav-overlay {
+    padding: 18px 8px 7px;
+    font-size: 11px;
+    gap: 4px;
+  }
+  .fav-overlay-link {
+    padding: 3px 7px;
+    font-size: 11px;
   }
   .fav-viewer-stage {
     padding: 10px 10px 56px;

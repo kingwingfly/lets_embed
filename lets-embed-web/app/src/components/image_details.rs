@@ -1,13 +1,14 @@
 use crate::{
     components::{Lightbox, LikeButton, LikeVariant, Results, Viewer},
     types::{ImageQuery, ImageQueryPayload, PostItem},
-    util::{encode_path, format_duration, set_document_title},
+    util::{encode_path, format_duration, layout_image_masonry, set_document_title},
 };
 
 #[cfg(feature = "hydrate")]
 use leptos::{ev, task::spawn_local};
 use leptos::{ev::PointerEvent, html, prelude::*};
 use leptos_router::hooks::{use_location, use_navigate, use_params_map, use_query_map};
+use leptos_use_element_size::{UseElementSizeReturn, use_element_size};
 #[cfg(feature = "hydrate")]
 use leptos_use_event_listener::use_event_listener;
 use search_types::{
@@ -127,13 +128,104 @@ pub fn ImageDetails() -> impl IntoView {
     let params = use_params_map();
     let id_sig: Signal<Option<String>> = Memo::new(move |_| params.with(|p| p.get("id"))).into();
     view! {
-        <div class="w-full min-h-full flex flex-col pt-12">
+        <div class="w-full min-h-full flex flex-col pt-2 sm:pt-3">
             <For each=move || params.with(|p| p.get("id")) key=String::clone let(id)>
                 <ImageDetailPage id />
             </For>
             <div class="w-full px-3 md:px-4 pb-4 mt-2">
-                <h2 class="text-sky-700 text-lg md:text-xl font-semibold mb-3">"Similar \u{1f49e}"</h2>
-                <Results embedded=true default_similar_id=id_sig />
+                <Results embedded=true default_similar_id=id_sig heading="Similar \u{1f49e}" />
+            </div>
+        </div>
+    }
+}
+
+/// Aspect-ratio masonry for the post album sidebar on `/details/:id`, arranging
+/// each image by its natural dimensions just like the home gallery.
+#[component]
+fn PostAlbumMasonry(
+    images: Vec<Image>,
+    current_image_id: i64,
+    on_zoom: Callback<usize>,
+) -> impl IntoView {
+    let images_store = StoredValue::new(images);
+    let container_ref = NodeRef::<html::Div>::new();
+    let UseElementSizeReturn {
+        width: container_w, ..
+    } = use_element_size(container_ref);
+    let col_count = Memo::new(move |_| {
+        let w = container_w.get();
+        if w <= 0.0 || w < 340.0 {
+            2
+        } else if w < 560.0 {
+            3
+        } else {
+            4
+        }
+    });
+    let cols = Memo::new(move |_| {
+        let count = col_count.get();
+        images_store.with_value(|imgs| layout_image_masonry(imgs, count))
+    });
+
+    view! {
+        <div
+            node_ref=container_ref
+            class="flex-[2] min-w-0 max-h-[40vh] overflow-y-auto md:max-h-none md:min-h-0 p-0.5 pr-1.5"
+        >
+            <div class="flex items-start gap-2 w-full">
+                <For
+                    each=move || 0..col_count.get()
+                    key=|col_idx| *col_idx
+                    let(col_idx)
+                >
+                    <div class="flex-1 min-w-0 flex flex-col gap-2">
+                        <For
+                            each=move || {
+                                cols.with(|c| c.get(col_idx).cloned().unwrap_or_default())
+                            }
+                            key=|(_, im)| im.id
+                            let((i, image))
+                        >
+                            {
+                                let is_current = image.id == current_image_id;
+                                let (w, h) = if image.width > 0 && image.height > 0 {
+                                    (image.width, image.height)
+                                } else {
+                                    (4, 3)
+                                };
+                                let aspect_style = format!("aspect-ratio:{w}/{h};");
+                                let cls = if is_current {
+                                    "relative block w-full p-0 border-0 rounded-lg overflow-hidden bg-sky-100 \
+                                     cursor-zoom-in ring-2 ring-sky-400 hover:opacity-85 \
+                                     hover:scale-[1.02] transition-all focus-visible:outline-2 focus-visible:outline-sky-500"
+                                } else {
+                                    "relative block w-full p-0 border-0 rounded-lg overflow-hidden bg-sky-100 \
+                                     cursor-zoom-in hover:opacity-85 hover:scale-[1.02] \
+                                     transition-all focus-visible:outline-2 focus-visible:outline-sky-500"
+                                };
+                                view! {
+                                    <button
+                                        type="button"
+                                        aria-label=format!("Zoom album image {}", i + 1)
+                                        class=cls
+                                        style=aspect_style
+                                        on:click=move |_| on_zoom.run(i)
+                                    >
+                                        <img
+                                            loading="lazy"
+                                            decoding="async"
+                                            width=w
+                                            height=h
+                                            class="block w-full h-full object-cover select-none"
+                                            src=format!("/images/{}.webp", encode_path(&image.name))
+                                            alt=image.name.clone()
+                                        />
+                                    </button>
+                                }
+                            }
+                        </For>
+                    </div>
+                </For>
             </div>
         </div>
     }
@@ -879,42 +971,11 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                     let open_thumb = open_thumb.clone();
                                     post_images.get().and_then(|images| match images {
                                         Ok(images) if !images.is_empty() => Some(view! {
-                                            <div class="flex-[2] min-w-0 max-h-[40vh] overflow-y-auto md:max-h-none md:min-h-0 p-0.5 pr-1.5">
-                                                <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-2 lg:grid-cols-3 gap-2 content-start">
-                                                    {
-                                                        images.into_iter().enumerate().map(|(i, image)| {
-                                                            let open_thumb = open_thumb.clone();
-                                                            let is_current = image.id == image_id;
-                                                            let cls = if is_current {
-                                                                "relative block w-full aspect-square p-0 border-0 rounded-lg overflow-hidden bg-sky-100 \
-                                                                 cursor-zoom-in ring-2 ring-sky-400 hover:opacity-85 \
-                                                                 hover:scale-[1.02] transition-all focus-visible:outline-2 focus-visible:outline-sky-500"
-                                                            } else {
-                                                                "relative block w-full aspect-square p-0 border-0 rounded-lg overflow-hidden bg-sky-100 \
-                                                                 cursor-zoom-in hover:opacity-85 hover:scale-[1.02] \
-                                                                 transition-all focus-visible:outline-2 focus-visible:outline-sky-500"
-                                                            };
-                                                            view! {
-                                                                <button
-                                                                    type="button"
-                                                                    aria-label=format!("Zoom album image {}", i + 1)
-                                                                    class=cls
-                                                                    on:click=move |_| open_thumb(Some(i))
-                                                                >
-                                                                    <img
-                                                                        loading="lazy"
-                                                                        decoding="async"
-                                                                        class="absolute inset-0 w-full h-full object-cover select-none"
-                                                                        src=format!("/images/{}.webp", encode_path(&image.name))
-                                                                        alt=image.name.clone()
-                                                                    />
-                                                                </button>
-                                                            }
-                                                        })
-                                                        .collect_view()
-                                                    }
-                                                </div>
-                                            </div>
+                                            <PostAlbumMasonry
+                                                images=images
+                                                current_image_id=image_id
+                                                on_zoom=Callback::new(move |i| open_thumb(Some(i)))
+                                            />
                                         }.into_any()),
                                         Ok(_) => None,
                                         Err(e) => Some(e.to_string().into_any()),

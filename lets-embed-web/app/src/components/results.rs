@@ -5,8 +5,9 @@ use crate::types::MAX_SEARCH_LIMIT;
 use crate::{
     components::{LikeButton, LikeVariant, lightbox::Lightbox, viewer::Viewer},
     types::{
-        AdvancedUploads, ImageQuery, Mode, PostItem, SearchResponse, UploadedImageSlot,
-        parse_url_limit,
+        AdvancedUploads, GalleryDensity as Density, GalleryDensityState, ImageQuery, Mode,
+        PostItem, SearchResponse, UploadedImageSlot, parse_url_limit,
+        save_gallery_density as save_density,
     },
     util::{encode_path, set_document_title},
 };
@@ -33,83 +34,8 @@ const MOBILE_COLUMN_GAP: u32 = 8;
 const INTERSECTION_ROOT_MARGIN: &str = "600px 0px";
 #[cfg(feature = "ssr")]
 const MAX_SEARCH_OFFSET: i64 = 10_000;
-#[cfg(feature = "hydrate")]
-const GALLERY_DENSITY_KEY: &str = "lets-embed:gallery-density";
-#[cfg(feature = "hydrate")]
-const FAV_DENSITY_KEY: &str = "lets-embed:fav-density";
 #[cfg(feature = "ssr")]
 const MAX_UPLOAD_DECODED_BYTES: usize = 512 * 1024;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Density {
-    Compact,
-    Medium,
-    Large,
-}
-
-impl Density {
-    const fn target_width(self) -> f64 {
-        match self {
-            Self::Compact => 200.0,
-            Self::Medium => 300.0,
-            Self::Large => 440.0,
-        }
-    }
-
-    const fn desktop_bounds(self) -> (usize, usize) {
-        match self {
-            Self::Compact => (2, 12),
-            Self::Medium => (1, 8),
-            Self::Large => (1, 6),
-        }
-    }
-
-    #[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Compact => "compact",
-            Self::Medium => "medium",
-            Self::Large => "large",
-        }
-    }
-
-    #[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
-    fn parse(s: &str) -> Option<Self> {
-        match s {
-            "compact" => Some(Self::Compact),
-            "medium" => Some(Self::Medium),
-            "large" => Some(Self::Large),
-            _ => None,
-        }
-    }
-}
-
-#[cfg(feature = "hydrate")]
-fn load_density() -> Option<Density> {
-    let storage = web_sys::window()?.local_storage().ok()??;
-    storage
-        .get_item(GALLERY_DENSITY_KEY)
-        .ok()
-        .flatten()
-        .and_then(|s| Density::parse(&s))
-        .or_else(|| {
-            storage
-                .get_item(FAV_DENSITY_KEY)
-                .ok()
-                .flatten()
-                .and_then(|s| Density::parse(&s))
-        })
-}
-
-#[cfg(feature = "hydrate")]
-fn save_density(density: Density) {
-    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
-        let _ = storage.set_item(GALLERY_DENSITY_KEY, density.as_str());
-    }
-}
-
-#[cfg(not(feature = "hydrate"))]
-fn save_density(_density: Density) {}
 
 #[cfg(feature = "hydrate")]
 fn read_window_width() -> f64 {
@@ -390,6 +316,7 @@ fn is_missing_advanced_uploads(p: &ResultsParams, adv_uploads: AdvancedUploads) 
 pub fn Results(
     #[prop(default = false)] embedded: bool,
     #[prop(optional)] default_similar_id: Option<Signal<Option<String>>>,
+    #[prop(optional)] heading: Option<&'static str>,
 ) -> impl IntoView {
     let qmap = use_query_map();
     let pathname = use_location().pathname;
@@ -441,24 +368,21 @@ pub fn Results(
         set_document_title(&text);
     });
 
-    let density = RwSignal::new(Density::Medium);
+    let density = use_context::<GalleryDensityState>().unwrap_or_default().0;
     let size_el = NodeRef::<leptos::html::Div>::new();
     let UseElementSizeReturn {
         width: elem_width, ..
     } = use_element_size(size_el);
     let viewport_w = RwSignal::new(0.0f64);
 
-    // Restore saved density and measure viewport strictly on the client after
-    // hydration so SSR and initial hydrate markup stay 100% identical.
+    // Measure viewport strictly on the client after hydration so SSR and
+    // initial hydrate markup stay 100% identical.
     #[cfg(feature = "hydrate")]
     {
         let _ = use_event_listener(window(), ev::resize, move |_| {
             viewport_w.set(read_window_width());
         });
         Effect::new(move |_| {
-            if let Some(saved) = load_density() {
-                density.set(saved);
-            }
             viewport_w.set(read_window_width());
         });
     }
@@ -966,9 +890,14 @@ pub fn Results(
 
     view! {
         <div node_ref=size_el class=wrap_cls>
-            {(!embedded).then(|| view! {
-                <div class="gallery-toolbar">
-                    <div class="gallery-density" role="group" aria-label="Grid size">
+            {embedded.then(|| view! {
+                <div class="gallery-floating-bar">
+                    {heading.map(|h| view! {
+                        <h2 class="text-sky-700 text-base sm:text-lg md:text-xl font-semibold leading-tight m-0">
+                            {h}
+                        </h2>
+                    })}
+                    <div class="gallery-density ml-auto" role="group" aria-label="Grid size">
                         {render_density_btn(Density::Compact, "Compact")}
                         {render_density_btn(Density::Medium, "Medium")}
                         {render_density_btn(Density::Large, "Large")}

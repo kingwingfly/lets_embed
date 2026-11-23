@@ -1,8 +1,10 @@
 "use strict";
 
 const PAGE_LIMIT = 40;
-const DENSITY_WIDTHS = { compact: 220, medium: 320, large: 440 };
+const DENSITY_WIDTHS = { compact: 200, medium: 300, large: 440 };
+const DENSITY_BOUNDS = { compact: [2, 12], medium: [1, 8], large: [1, 6] };
 const DENSITY_KEY = "lets-embed:fav-density";
+const GALLERY_DENSITY_KEY = "lets-embed:gallery-density";
 
 const grid = document.getElementById("fav-grid");
 const panel = document.getElementById("fav-panel");
@@ -71,7 +73,7 @@ function initialKind() {
 
 function loadDensity() {
   try {
-    const saved = localStorage.getItem(DENSITY_KEY);
+    const saved = localStorage.getItem(DENSITY_KEY) || localStorage.getItem(GALLERY_DENSITY_KEY);
     if (saved && Object.hasOwn(DENSITY_WIDTHS, saved)) return saved;
   } catch (_) {}
   return "medium";
@@ -79,7 +81,10 @@ function loadDensity() {
 
 function saveDensity(next) {
   density = Object.hasOwn(DENSITY_WIDTHS, next) ? next : "medium";
-  try { localStorage.setItem(DENSITY_KEY, density); } catch (_) {}
+  try {
+    localStorage.setItem(DENSITY_KEY, density);
+    localStorage.setItem(GALLERY_DENSITY_KEY, density);
+  } catch (_) {}
   for (const btn of document.querySelectorAll(".density-btn")) {
     btn.setAttribute("aria-pressed", String(btn.dataset.size === density));
   }
@@ -175,10 +180,14 @@ function syncTabSelection() {
 }
 
 function getColumnCount() {
-  const target = DENSITY_WIDTHS[density] || 320;
-  const width = grid.clientWidth || (typeof window !== "undefined" ? window.innerWidth - 28 : 1120);
-  if (width <= 540) return density === "large" ? 1 : 2;
-  return Math.max(1, Math.min(6, Math.round(width / target)));
+  const width = grid.clientWidth || (typeof window !== "undefined" ? window.innerWidth - 16 : 1120);
+  if (width <= 540) {
+    if (density === "compact") return width >= 300 ? 3 : 2;
+    return density === "large" ? 1 : 2;
+  }
+  const target = DENSITY_WIDTHS[density] || 300;
+  const [minCols, maxCols] = DENSITY_BOUNDS[density] || [1, 8];
+  return Math.max(minCols, Math.min(maxCols, Math.round(width / target)));
 }
 
 function aspectRatioFor(item) {

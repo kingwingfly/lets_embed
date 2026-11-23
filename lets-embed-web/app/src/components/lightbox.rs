@@ -3,14 +3,15 @@ use crate::{
         LikeButton, LikeVariant, Viewer,
         image_details::{list_post_images, list_post_videos},
     },
-    types::PostItem,
+    types::{GalleryDensity, GalleryDensityState, PostItem, save_gallery_density},
     util::{
-        encode_path, format_duration, lock_body_scroll, navigate_from_modal, push_modal_history,
-        trap_dialog_tab,
+        encode_path, format_duration, layout_image_masonry, lock_body_scroll, navigate_from_modal,
+        push_modal_history, trap_dialog_tab,
     },
 };
 use leptos::{ev, html, prelude::*};
 use leptos_router::{NavigateOptions, hooks::use_navigate};
+use leptos_use_element_size::{UseElementSizeReturn, use_element_size};
 use leptos_use_event_listener::use_event_listener;
 use leptos_use_intersection_observer::use_intersection_observer;
 use search_types::{Image, PostMeta, Video};
@@ -236,6 +237,46 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
         })
     };
 
+    let density = use_context::<GalleryDensityState>().unwrap_or_default().0;
+    let render_density_btn = move |d: GalleryDensity, label: &'static str| {
+        view! {
+            <button
+                type="button"
+                class="gallery-density-btn"
+                aria-pressed=move || (density.get() == d).to_string()
+                on:click=move |_| {
+                    density.set(d);
+                    save_gallery_density(d);
+                }
+            >
+                {label}
+            </button>
+        }
+    };
+
+    let album_scroll_el = NodeRef::<html::Div>::new();
+    let UseElementSizeReturn {
+        width: album_width, ..
+    } = use_element_size(album_scroll_el);
+    let col_count = Memo::new(move |_| {
+        let cur_density = density.get();
+        let measured = album_width.get();
+        let w = if measured > 0.0 {
+            measured
+        } else {
+            album_scroll_el
+                .get_untracked()
+                .map(|el| el.client_width() as f64)
+                .unwrap_or(0.0)
+        };
+        cur_density.column_count(w)
+    });
+    let masonry_cols = Memo::new(move |_| {
+        let v = visible.get();
+        let cols = col_count.get();
+        images_sig.with(|imgs| layout_image_masonry(&imgs[..v.min(imgs.len())], cols))
+    });
+
     view! {
         <div
             node_ref=dialog_ref
@@ -247,14 +288,23 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
             on:click=move |ev| { ev.stop_propagation(); lightbox.set(None); }
         >
             <div
-                class="sticky top-0 z-10 flex items-center justify-between gap-3 px-4 py-2 bg-black/85 backdrop-blur text-white shrink-0 border-b border-sky-400/30 cursor-default"
+                class="sticky top-0 z-10 flex flex-wrap items-center justify-between gap-x-3 gap-y-2 px-3 sm:px-4 py-2 bg-black/85 backdrop-blur text-white shrink-0 border-b border-sky-400/30 cursor-default"
                 on:click=|ev| ev.stop_propagation()
             >
-                <div class="min-w-0 flex-1">
+                <div class="order-1 min-w-0 flex-1">
                     <div class="font-semibold truncate text-sky-100">{title}</div>
                     {header_meta}
                 </div>
-                <div class="flex items-center gap-2 sm:gap-3 shrink-0">
+                {move || (total_images() > 0).then(|| view! {
+                    <div class="order-3 md:order-2 w-full md:w-auto flex items-center justify-start md:justify-end">
+                        <div class="gallery-density gallery-density-dark" role="group" aria-label="Grid size">
+                            {render_density_btn(GalleryDensity::Compact, "Compact")}
+                            {render_density_btn(GalleryDensity::Medium, "Medium")}
+                            {render_density_btn(GalleryDensity::Large, "Large")}
+                        </div>
+                    </div>
+                })}
+                <div class="order-2 md:order-3 flex items-center gap-2 sm:gap-3 shrink-0">
                     <LikeButton
                         kind="post"
                         target_id=post_id
@@ -281,81 +331,96 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                 class="flex-1 min-h-0 flex flex-col md:flex-row gap-2 p-2 cursor-default"
                 on:click=move |ev| ev.stop_propagation()
             >
-                <div class="flex-[2] min-w-0 overflow-y-auto overscroll-contain">
-                    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-3 lg:grid-cols-4 gap-2">
+                <div
+                    node_ref=album_scroll_el
+                    class="flex-[2] min-w-0 overflow-y-auto overscroll-contain"
+                >
+                    <div class="flex items-start gap-2 w-full">
                         <For
-                            each=move || {
-                                let v = visible.get();
-                                images_sig.with(|imgs| {
-                                    imgs.iter().take(v).cloned().enumerate().collect::<Vec<_>>()
-                                })
-                            }
-                            key=|(_, im)| im.id
-                            let((i, im))
+                            each=move || 0..col_count.get()
+                            key=|col_idx| *col_idx
+                            let(col_idx)
                         >
-                            {
-                                let img_id = im.id;
-                                let url = format!("/images/{}.webp", encode_path(&im.name));
-                                let alt = im.name.clone();
-                                let href = format!("/details/{img_id}?mode=similar&q={img_id}&limit=50");
-                                let click_href = href.clone();
-                                let nav = use_navigate();
-                                view! {
-                                    <div
-                                        class="relative group aspect-square overflow-hidden rounded-xl bg-white/10 ring-1 ring-white/10"
-                                        style="content-visibility:auto;contain-intrinsic-size:240px 240px;"
-                                    >
-                                        <button
-                                            type="button"
-                                            aria-label=move || format!("Zoom image {} of {}", i + 1, total_images())
-                                            class="absolute inset-0 w-full h-full p-0 border-0 bg-transparent cursor-zoom-in focus-visible:outline-2 focus-visible:outline-sky-400"
-                                            on:click=move |_| {
-                                                viewer_images.set_value(images_sig.get_untracked());
-                                                viewer.set(Some(i));
-                                            }
-                                        >
-                                            <img
-                                                loading="lazy"
-                                                decoding="async"
-                                                alt=alt
-                                                class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                                                src=url
-                                            />
-                                        </button>
-                                        <div class="absolute top-1.5 right-1.5 z-10">
-                                            <LikeButton
-                                                kind="image"
-                                                target_id=img_id
-                                                variant=LikeVariant::Card
-                                            />
-                                        </div>
-                                        <a
-                                            href=href
-                                            title="Open image details & similar"
-                                            class="absolute bottom-1.5 right-1.5 z-10 px-2 py-0.5 rounded-full
-                                                   text-[11px] font-semibold bg-slate-900/75 hover:bg-sky-500
-                                                   text-white backdrop-blur-xs opacity-0 group-hover:opacity-100
-                                                   group-focus-within:opacity-100 touch-visible transition-opacity"
-                                            on:click=move |ev: ev::MouseEvent| {
-                                                ev.stop_propagation();
-                                                if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
-                                                    ev.prevent_default();
-                                                    let nav = nav.clone();
-                                                    navigate_from_modal(
-                                                        click_href.clone(),
-                                                        move || lightbox.set(None),
-                                                        move |dest, replace| {
-                                                            nav(dest, NavigateOptions { replace, ..Default::default() });
-                                                        },
-                                                    );
-                                                }
-                                            }
-                                        >
-                                            "Details \u{2197}"
-                                        </a>
-                                    </div>
-                                }
-                            }
+                            <div class="flex-1 min-w-0 flex flex-col gap-2">
+                                <For
+                                    each=move || {
+                                        masonry_cols
+                                            .with(|cols| cols.get(col_idx).cloned().unwrap_or_default())
+                                    }
+                                    key=|(_, im)| im.id
+                                    let((i, im))
+                                >
+                                    {
+                                        let img_id = im.id;
+                                        let url = format!("/images/{}.webp", encode_path(&im.name));
+                                        let alt = im.name.clone();
+                                        let href = format!("/details/{img_id}?mode=similar&q={img_id}&limit=50");
+                                        let click_href = href.clone();
+                                        let nav = use_navigate();
+                                        let (w, h) = if im.width > 0 && im.height > 0 {
+                                            (im.width, im.height)
+                                        } else {
+                                            (4, 3)
+                                        };
+                                        let aspect_style = format!("aspect-ratio:{w}/{h};");
+                                        view! {
+                                            <div class="relative group w-full overflow-hidden rounded-xl bg-white/10 ring-1 ring-white/10">
+                                                <button
+                                                    type="button"
+                                                    aria-label=move || format!("Zoom image {} of {}", i + 1, total_images())
+                                                    class="block w-full p-0 border-0 bg-transparent cursor-zoom-in focus-visible:outline-2 focus-visible:outline-sky-400"
+                                                    style=aspect_style
+                                                    on:click=move |_| {
+                                                        viewer_images.set_value(images_sig.get_untracked());
+                                                        viewer.set(Some(i));
+                                                    }
+                                                >
+                                                    <img
+                                                        loading="lazy"
+                                                        decoding="async"
+                                                        width=w
+                                                        height=h
+                                                        alt=alt
+                                                        class="block w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-300"
+                                                        src=url
+                                                    />
+                                                </button>
+                                                <div class="absolute top-1.5 right-1.5 z-10">
+                                                    <LikeButton
+                                                        kind="image"
+                                                        target_id=img_id
+                                                        variant=LikeVariant::Card
+                                                    />
+                                                </div>
+                                                <a
+                                                    href=href
+                                                    title="Open image details & similar"
+                                                    class="absolute bottom-1.5 right-1.5 z-10 px-2 py-0.5 rounded-full
+                                                           text-[11px] font-semibold bg-slate-900/75 hover:bg-sky-500
+                                                           text-white backdrop-blur-xs opacity-0 group-hover:opacity-100
+                                                           group-focus-within:opacity-100 touch-visible transition-opacity"
+                                                    on:click=move |ev: ev::MouseEvent| {
+                                                        ev.stop_propagation();
+                                                        if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
+                                                            ev.prevent_default();
+                                                            let nav = nav.clone();
+                                                            navigate_from_modal(
+                                                                click_href.clone(),
+                                                                move || lightbox.set(None),
+                                                                move |dest, replace| {
+                                                                    nav(dest, NavigateOptions { replace, ..Default::default() });
+                                                                },
+                                                            );
+                                                        }
+                                                    }
+                                                >
+                                                    "Details \u{2197}"
+                                                </a>
+                                            </div>
+                                        }
+                                    }
+                                </For>
+                            </div>
                         </For>
                     </div>
 
