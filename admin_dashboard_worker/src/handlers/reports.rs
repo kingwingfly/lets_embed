@@ -176,16 +176,16 @@ pub async fn resolve_report(
     };
 
     let now = (worker::Date::now().as_millis() / 1000) as i64;
-    let resolved_at_val: JsValue = if next_status == "reviewing" {
-        JsValue::NULL
-    } else {
-        (now as f64).into()
-    };
-    let resolved_by_val: JsValue = if next_status == "reviewing" {
-        JsValue::NULL
-    } else {
-        admin.into()
-    };
+    let is_reviewing = next_status == "reviewing";
+    let resolved_at = (!is_reviewing).then_some(now);
+    let resolved_by = (!is_reviewing).then(|| admin.to_string());
+    let resolved_at_val: JsValue = resolved_at
+        .map(|ts| (ts as f64).into())
+        .unwrap_or(JsValue::NULL);
+    let resolved_by_val: JsValue = resolved_by
+        .as_deref()
+        .map(Into::into)
+        .unwrap_or(JsValue::NULL);
 
     let updated = match db
         .prepare(
@@ -222,8 +222,8 @@ pub async fn resolve_report(
     Json(ResolveReportResp {
         id: id.to_string(),
         status: next_status.to_string(),
-        resolved_at: now,
-        resolved_by: admin.to_string(),
+        resolved_at,
+        resolved_by,
     })
     .into_response()
 }

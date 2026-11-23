@@ -52,13 +52,14 @@ pub fn ReportsTab(on_resolved: Callback<()>) -> impl IntoView {
         spawn_local(async move {
             match post_json::<_, ResolveReportResp>(&url, &req).await {
                 Ok(resp) => {
-                    feedback.set(Some((
-                        true,
-                        format!(
+                    let msg = match resp.resolved_by {
+                        Some(by) => format!(
                             "Report {} marked as '{}' by {}.",
-                            resp.id, resp.status, resp.resolved_by
+                            resp.id, resp.status, by
                         ),
-                    )));
+                        None => format!("Report {} marked as '{}'.", resp.id, resp.status),
+                    };
+                    feedback.set(Some((true, msg)));
                     load_reports();
                     on_resolved.run(());
                 }

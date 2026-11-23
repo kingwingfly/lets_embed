@@ -730,17 +730,19 @@ impl LoadedSettings {
         })
     }
 
-    /// Atomically publishes `doc` at `expected_revision + 1` via D1 CAS
+    /// Atomically commits `doc` at `expected_revision + 1` in D1 via CAS
     /// (`WHERE revision=? AND revision=(SELECT MAX(revision) FROM site_settings)`)
-    /// and immediately pushes `{ policy, digest }` to `SITE_POLICY` DO `POST /publish`.
+    /// WITHOUT publishing to `SitePolicyDO` yet (allowing callers with secondary D1
+    /// writes such as `provider_secrets` to commit them before broadcasting policy).
     ///
-    /// Returns `Ok(Some((new_rev, digest)))` on success, `Ok(None)` on revision conflict (409).
-    pub async fn save_and_publish(
+    /// Returns `Ok(Some((new_rev, stored_public_policy, digest)))` on success,
+    /// or `Ok(None)` on revision conflict (409).
+    pub async fn save_d1_cas(
         env: &Env,
         expected_revision: u32,
         doc: &SiteSettingsDocument,
         editor: &str,
-    ) -> Result<Option<(u32, String)>> {
+    ) -> Result<Option<(u32, PublicSitePolicy, String)>> {
         let new_revision = expected_revision.saturating_add(1);
         let mut to_store = doc.clone();
         to_store.public.revision = new_revision;
@@ -778,9 +780,25 @@ impl LoadedSettings {
             return Ok(None);
         }
 
-        // Immediately notify SitePolicyDO so gateway_worker observes tightened revisions
-        // without waiting for edge caches.
-        do_client::publish_site_policy(env, &to_store.public, &digest).await?;
+        Ok(Some((new_revision, to_store.public, digest)))
+    }
+
+    /// Atomically publishes `doc` at `expected_revision + 1` via D1 CAS and
+    /// immediately pushes `{ policy, digest }` to `SITE_POLICY` DO `POST /publish`.
+    ///
+    /// Returns `Ok(Some((new_rev, digest)))` on success, `Ok(None)` on revision conflict (409).
+    pub async fn save_and_publish(
+        env: &Env,
+        expected_revision: u32,
+        doc: &SiteSettingsDocument,
+        editor: &str,
+    ) -> Result<Option<(u32, String)>> {
+        let Some((new_revision, public, digest)) =
+            Self::save_d1_cas(env, expected_revision, doc, editor).await?
+        else {
+            return Ok(None);
+        };
+        do_client::publish_site_policy(env, &public, &digest).await?;
         Ok(Some((new_revision, digest)))
     }
 }

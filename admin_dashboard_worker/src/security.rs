@@ -98,17 +98,36 @@ pub fn is_mutation_method(method: &Method) -> bool {
     )
 }
 
-/// Derives allowed canonical origins from `PUBLIC_URL` and `SIWE_DOMAIN`.
+/// Derives allowed canonical origins for `/admin/api/*` CSRF validation.
 ///
-/// Local development origins (`http://localhost[:port]`, `http://127.0.0.1[:port]`)
-/// are permitted ONLY when the configured domain/URL itself targets localhost or 127.0.0.1.
-pub fn allowed_origins(public_url: Option<&str>, siwe_domain: &str) -> Vec<String> {
+/// - When `admin_domain` (`ADMIN_DOMAIN`) is configured and non-empty (split-host
+///   deployments), ONLY `https://{ADMIN_DOMAIN}` (plus `http://{ADMIN_DOMAIN}` when
+///   targeting `localhost` or `127.0.0.1`) is trusted; `PUBLIC_URL` and `SIWE_DOMAIN`
+///   are intentionally NOT trusted as admin mutation origins.
+/// - Otherwise (single-host deployments), falls back to `PUBLIC_URL` and `SIWE_DOMAIN`.
+pub fn allowed_origins(
+    admin_domain: Option<&str>,
+    public_url: Option<&str>,
+    siwe_domain: &str,
+) -> Vec<String> {
     let mut out = Vec::new();
     let mut push_unique = |origin: String| {
-        if !out.iter().any(|existing: &String| existing.eq_ignore_ascii_case(&origin)) {
+        if !out
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(&origin))
+        {
             out.push(origin);
         }
     };
+
+    if let Some(domain) = admin_domain.map(str::trim).filter(|s| !s.is_empty()) {
+        push_unique(format!("https://{domain}"));
+        let host_only = domain.split(':').next().unwrap_or("");
+        if is_local_dev_host(host_only) {
+            push_unique(format!("http://{domain}"));
+        }
+        return out;
+    }
 
     if let Some(raw_url) = public_url.map(str::trim).filter(|s| !s.is_empty())
         && let Ok(parsed) = Url::parse(raw_url)
@@ -154,12 +173,13 @@ fn format_origin(scheme: &str, host: &str, port: Option<u16>) -> String {
 
 /// Validates every CSRF invariant required on admin mutations (`POST`/`PUT`/`PATCH`/`DELETE`):
 /// 1. `gallery_admin == true` binding prop + non-empty `ADMIN_HEADER`
-/// 2. Exact `Origin` matching configured `PUBLIC_URL` / `https://{SIWE_DOMAIN}` (plus local dev `http://localhost` / `http://127.0.0.1` when configured)
+/// 2. Exact `Origin` matching configured `ADMIN_DOMAIN` (when set) or `PUBLIC_URL` / `https://{SIWE_DOMAIN}` (plus local dev `http://localhost` / `http://127.0.0.1` when configured)
 /// 3. `Sec-Fetch-Site: same-origin` (if the header is present)
 /// 4. Custom header `X-Admin-CSRF: 1` (`site_access::ADMIN_CSRF_HEADER`)
 pub fn verify_admin_mutation<'a>(
     admin_binding: bool,
     headers: &'a HeaderMap,
+    admin_domain: Option<&str>,
     public_url: Option<&str>,
     siwe_domain: &str,
 ) -> Result<&'a str, &'static str> {
@@ -186,7 +206,7 @@ pub fn verify_admin_mutation<'a>(
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
         .ok_or("Missing Origin header")?;
 
-    let allowed = allowed_origins(public_url, siwe_domain);
+    let allowed = allowed_origins(admin_domain, public_url, siwe_domain);
     if allowed.is_empty() || !allowed.iter().any(|a| a.eq_ignore_ascii_case(origin)) {
         return Err("Cross-origin request rejected");
     }
@@ -215,10 +235,10 @@ pub fn validate_oidc_url(raw: &str) -> Result<String, String> {
     if trimmed.contains('\\') || trimmed.contains('%') {
         return Err("OIDC URL must not contain backslashes or percent-encoding".into());
     }
-    if let Some(after_scheme) = trimmed
-        .strip_prefix("https://")
-        .or_else(|| trimmed.strip_prefix("HTTPS://"))
-        && let Some((_, raw_path)) = after_scheme.split_once('/')
+    if trimmed
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        && let Some((_, raw_path)) = trimmed[8..].split_once('/')
         && raw_path.split('/').any(|seg| seg == "." || seg == "..")
     {
         return Err("OIDC URL path contains invalid traversal segments".into());

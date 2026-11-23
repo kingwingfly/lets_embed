@@ -310,7 +310,10 @@ pub async fn list_accounts(
     let (limit, offset) = if needs_live_sort {
         (MAX_LIVE_DO_FETCH, 0usize)
     } else {
-        (ACCOUNTS_PAGE_SIZE, page.saturating_sub(1) * ACCOUNTS_PAGE_SIZE)
+        (
+            ACCOUNTS_PAGE_SIZE,
+            page.saturating_sub(1).saturating_mul(ACCOUNTS_PAGE_SIZE),
+        )
     };
 
     let list_sql = format!(

@@ -360,8 +360,8 @@ pub struct ResolveReportReq {
 pub struct ResolveReportResp {
     pub id: String,
     pub status: String,
-    pub resolved_at: i64,
-    pub resolved_by: String,
+    pub resolved_at: Option<i64>,
+    pub resolved_by: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
