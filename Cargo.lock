@@ -3504,6 +3504,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lets-embed-ui"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "leptos",
+ "serde",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "lets-embed-web"
 version = "0.1.0"
 dependencies = [

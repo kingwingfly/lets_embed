@@ -1,0 +1,53 @@
+[package]
+name = "lets-embed-ui"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation.workspace = true
+
+[dependencies]
+leptos = { version = "0.8", features = ["nightly"] }
+serde.workspace = true
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", features = [
+    "BroadcastChannel",
+    "Document",
+    "DomRect",
+    "DomTokenList",
+    "Element",
+    "Event",
+    "EventTarget",
+    "FocusEvent",
+    "History",
+    "HtmlButtonElement",
+    "HtmlDivElement",
+    "HtmlElement",
+    "HtmlImageElement",
+    "HtmlInputElement",
+    "HtmlTextAreaElement",
+    "HtmlVideoElement",
+    "KeyboardEvent",
+    "Location",
+    "MessageEvent",
+    "MouseEvent",
+    "Node",
+    "NodeList",
+    "PointerEvent",
+    "ResizeObserver",
+    "ResizeObserverEntry",
+    "Storage",
+    "StorageEvent",
+    "Touch",
+    "TouchEvent",
+    "TouchList",
+    "Window",
+] }
+
+[features]
+default = []
+ssr = ["leptos/ssr"]
+hydrate = ["leptos/hydrate", "dep:wasm-bindgen", "dep:js-sys"]
+csr = ["leptos/csr", "dep:wasm-bindgen", "dep:js-sys"]
