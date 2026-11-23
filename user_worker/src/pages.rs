@@ -44,10 +44,7 @@ const FALLBACK_SPA_HTML: &str = r#"<!doctype html>
   <meta name="robots" content="noindex, nofollow">
   <title>Account — Gallery</title>
   <script src="/user/assets/wallet-bridge.js" defer></script>
-  <script type="module">
-    import init from "/user/assets/pkg/user_worker_web.js";
-    init("/user/assets/pkg/user_worker_web_bg.wasm");
-  </script>
+  <script type="module" src="/user/assets/boot.js"></script>
 </head>
 <body>
   <div id="user-app-root"><noscript>JavaScript is required for account management.</noscript></div>
@@ -90,15 +87,12 @@ pub fn sanitize_asset_path(raw: &str) -> Option<String> {
     if trimmed.is_empty()
         || trimmed.len() > 256
         || trimmed.contains('\\')
+        || trimmed.contains('%')
         || trimmed.contains('\0')
         || trimmed.contains('?')
         || trimmed.contains('#')
         || trimmed.chars().any(char::is_control)
     {
-        return None;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c") {
         return None;
     }
     for seg in trimmed.split('/') {
@@ -264,18 +258,26 @@ mod tests {
             sanitize_asset_path("wallet-bridge.js").as_deref(),
             Some("wallet-bridge.js")
         );
+        assert_eq!(
+            sanitize_asset_path("boot.js").as_deref(),
+            Some("boot.js")
+        );
         for bad in [
             "",
             "/",
             "../secret",
             "pkg/../../etc/passwd",
             "pkg/%2e%2e/index.html",
+            "pkg/a%20b.js",
             "pkg\\foo.js",
             "pkg/a?b=1",
             "pkg/a\0.js",
         ] {
             assert!(sanitize_asset_path(bad).is_none(), "expected rejection for {bad}");
         }
+        // SPA shell must use external module boot script (no inline script blocked by CSP)
+        assert!(FALLBACK_SPA_HTML.contains(r#"src="/user/assets/boot.js""#));
+        assert!(!FALLBACK_SPA_HTML.contains("<script type=\"module\">\n"));
     }
 
     #[test]

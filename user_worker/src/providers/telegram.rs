@@ -273,6 +273,11 @@ pub async fn verify(
         {
             return r;
         }
+        if let Err(r) =
+            identity::rotate_session_on_identity_link(&st, &cookies, &active, &ident).await
+        {
+            return r;
+        }
         return Json(TelegramVerifyResp {
             user_id: active.user_id,
             action: "link",

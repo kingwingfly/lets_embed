@@ -1023,25 +1023,24 @@ pub async fn transfer_claim(
     let identities = identity::list_user_identities(&st, &account.user_id)
         .await
         .unwrap_or_default();
-    let matched_ident = identities.iter().find(|i| {
+    let Some(mi) = identities.iter().find(|i| {
         i.purpose == "login"
             && format!("{}|{}|{}", i.provider_id, i.issuer, i.subject) == env.identity_key
-    });
-    let (assurance_level, strict_age_ok) = match matched_ident {
-        Some(mi) => {
-            let strict_ok = provider_id.supports_strict_age_verification()
-                && mi.assurance_level == AssuranceLevel::Verified18
-                && mi.assurance_expires_at.is_none_or(|e| e > now);
-            (
-                if strict_ok {
-                    AssuranceLevel::Verified18
-                } else {
-                    mi.assurance_level
-                },
-                strict_ok,
-            )
-        }
-        None => (AssuranceLevel::None, false),
+    }) else {
+        return auth::api_error(
+            StatusCode::FORBIDDEN,
+            "The sign-in identity for this transfer code is no longer linked.",
+        );
+    };
+    let strict_age_ok = provider_id.supports_strict_age_verification()
+        && mi.assurance_level == AssuranceLevel::Verified18
+        && mi.assurance_expires_at.is_none_or(|e| e > now);
+    let assurance_level = if strict_age_ok {
+        AssuranceLevel::Verified18
+    } else if mi.assurance_level == AssuranceLevel::Verified18 {
+        AssuranceLevel::None
+    } else {
+        mi.assurance_level
     };
 
     // Enforce `AgeVerificationPolicy` uniformly on transfer claim (H7)!

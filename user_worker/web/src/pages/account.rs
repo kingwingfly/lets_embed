@@ -586,8 +586,7 @@ pub fn AccountPage() -> impl IntoView {
                         let is_self_attest_mode = data.policy.age_policy == AgeVerificationPolicy::SelfAttestation;
                         let is_strict_18 = data.policy.age_policy == AgeVerificationPolicy::StrictProviderVerified18;
                         let linkable_oauth: Vec<_> = data
-                            .policy
-                            .enabled_providers
+                            .available_providers
                             .iter()
                             .filter(|p| matches!(
                                 p.id,

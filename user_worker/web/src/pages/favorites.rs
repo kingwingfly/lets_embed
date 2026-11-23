@@ -482,6 +482,11 @@ pub fn FavoritesPage() -> impl IntoView {
                                 let media =
                                     parse_media_value(val, idx as i64, GalleryMediaKind::Image);
                                 let id = media.id();
+                                let details_href = if media.is_locked() {
+                                    None
+                                } else {
+                                    Some(format!("/details/{id}?mode=similar&q={id}"))
+                                };
                                 GalleryCard {
                                     key: format!("img:{id}"),
                                     id,
@@ -491,7 +496,7 @@ pub fn FavoritesPage() -> impl IntoView {
                                     media,
                                     image_count: 0,
                                     video_count: 0,
-                                    details_href: Some(format!("/details/{id}?mode=similar&q={id}")),
+                                    details_href,
                                     liked: None,
                                 }
                             })

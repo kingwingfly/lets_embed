@@ -14,7 +14,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
 };
 use base64::Engine as _;
 use serde::Deserialize;
@@ -206,6 +206,19 @@ pub async fn begin_oauth_flow(
 
     let now = session::now_secs();
     let ip_bucket = format!("oauth:{}", ip_rate_key(headers, &st.session_v2_secret));
+    match challenge_do::hit_rate_limit(&st.env, &ip_bucket, 600, 40).await {
+        Ok(rl) if !rl.allowed => {
+            return Err(auth::api_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many sign-in attempts; retry later",
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            worker::console_error!("oauth ip rate limit DO failed: {e:?}");
+            return Err(auth::internal_error());
+        }
+    }
     let (status, msg) = challenge_do::start_oauth_tx(
         &st.env,
         &OAuthTxStartReq {
@@ -220,7 +233,7 @@ pub async fn begin_oauth_flow(
             nonce: nonce.clone(),
             next_url,
             expires_at: now + OAUTH_TX_TTL_SECS,
-            ip_bucket: Some(ip_bucket),
+            ip_bucket: None,
         },
     )
     .await
@@ -460,24 +473,21 @@ pub async fn callback(
             );
         }
 
-        // Rotate session on identity change (if linking a Verified18 provider, new session carries it!).
-        if let Ok(Some(account)) = identity::load_account_by_id(&st, &active.user_id).await {
-            let now = session::now_secs();
-            let strict_ok = ident.is_strict_age_verified(now);
-            if strict_ok || active.ctx.assurance_level == AssuranceLevel::None {
-                let _ = identity::issue_v2_session(
-                    &st,
-                    &cookies,
-                    &account,
-                    provider.as_str(),
-                    &ident.identity_key(),
-                    ident.assurance_level,
-                    strict_ok,
-                )
-                .await;
-            }
+        // Always revoke old `active.sid` and rotate session on `purpose == "login"` link (H8).
+        if identity::rotate_session_on_identity_link(&st, &cookies, &active, &ident)
+            .await
+            .is_err()
+        {
+            return redirect_with_error("/user/login", "Could not rotate session after linking");
         }
-        return Redirect::to("/user/account?linked=1").into_response();
+        return (
+            StatusCode::FOUND,
+            [
+                (header::LOCATION, "/user/account?linked=1".to_string()),
+                (header::CACHE_CONTROL, "private, no-store".to_string()),
+            ],
+        )
+            .into_response();
     }
 
     let account = match identity::resolve_or_create_login_account(&st, &policy, &ident).await {

@@ -872,10 +872,131 @@ pub async fn list_user_identities(
         .collect())
 }
 
+/// Select a remaining `purpose == "login"` identity eligible under the live `SitePolicy`
+/// for session rotation after unlinking an identity (fixes H7/H8).
+pub fn select_rotation_fallback<'a>(
+    policy: &PublicSitePolicy,
+    remaining_login: &'a [&IdentityView],
+    now: u64,
+) -> Option<(&'a IdentityView, AssuranceLevel, bool)> {
+    let mut candidate: Option<(&'a IdentityView, AssuranceLevel, bool)> = None;
+    for ident in remaining_login {
+        let Some(pid) = provider_from_str(&ident.provider_id) else {
+            continue;
+        };
+        let strict_ok = pid.supports_strict_age_verification()
+            && ident.assurance_level == AssuranceLevel::Verified18
+            && ident.assurance_expires_at.is_none_or(|e| e > now);
+        let eff_assurance = if strict_ok {
+            AssuranceLevel::Verified18
+        } else if ident.assurance_level == AssuranceLevel::Verified18 {
+            AssuranceLevel::None
+        } else {
+            ident.assurance_level
+        };
+        if check_login_provider_eligibility(policy, pid, Some(eff_assurance)).is_ok() {
+            if strict_ok {
+                return Some((ident, eff_assurance, true));
+            }
+            if candidate.is_none() {
+                candidate = Some((ident, eff_assurance, false));
+            }
+        }
+    }
+    candidate
+}
+
+fn assurance_rank(level: AssuranceLevel) -> u8 {
+    match level {
+        AssuranceLevel::None => 0,
+        AssuranceLevel::SelfAttestation => 1,
+        AssuranceLevel::ProviderSelfReportedDob => 2,
+        AssuranceLevel::Verified18 => 3,
+    }
+}
+
+/// Rotate the caller's session after linking a `purpose == "login"` identity (fixes H8):
+/// revokes the old `active.sid` in `UserAccount` DO and issues a fresh `v2.` session,
+/// upgrading to `Verified18` if the newly linked identity is verified 18+ while never
+/// downgrading an already-verified session.
+pub async fn rotate_session_on_identity_link(
+    st: &AppState,
+    cookies: &Cookies,
+    active: &ActiveSession,
+    linked_ident: &VerifiedExternalIdentity,
+) -> Result<(), Response> {
+    let cur_info = if let Some(sid) = active.sid.as_deref() {
+        let info = do_client::do_session_info(&st.env, &active.do_key, sid)
+            .await
+            .ok()
+            .flatten();
+        let _ = do_client::do_session_revoke(&st.env, &active.do_key, sid).await;
+        info
+    } else {
+        None
+    };
+
+    let Some(account) = load_account_by_id(st, &active.user_id).await? else {
+        cookies.add(session::clear_session_cookie());
+        return Err(api_err(StatusCode::UNAUTHORIZED, "account not found"));
+    };
+
+    let now = session::now_secs();
+    let linked_strict = linked_ident.is_strict_age_verified(now);
+    let (auth_method, identity_key, assurance_level, strict_age_ok) = if linked_strict {
+        (
+            linked_ident.provider_id.as_str().to_string(),
+            linked_ident.identity_key(),
+            AssuranceLevel::Verified18,
+            true,
+        )
+    } else if let Some(ci) = cur_info.filter(|i| i.active) {
+        let best_assurance = if assurance_rank(linked_ident.assurance_level)
+            > assurance_rank(ci.assurance_level)
+        {
+            linked_ident.assurance_level
+        } else {
+            ci.assurance_level
+        };
+        (
+            ci.auth_method,
+            ci.identity_key,
+            best_assurance,
+            ci.strict_age_ok && best_assurance == AssuranceLevel::Verified18,
+        )
+    } else {
+        let best_assurance = if assurance_rank(linked_ident.assurance_level)
+            > assurance_rank(active.ctx.assurance_level)
+        {
+            linked_ident.assurance_level
+        } else {
+            active.ctx.assurance_level
+        };
+        (
+            linked_ident.provider_id.as_str().to_string(),
+            linked_ident.identity_key(),
+            best_assurance,
+            active.ctx.strict_age_ok && best_assurance == AssuranceLevel::Verified18,
+        )
+    };
+
+    issue_v2_session(
+        st,
+        cookies,
+        &account,
+        &auth_method,
+        &identity_key,
+        assurance_level,
+        strict_age_ok,
+    )
+    .await?;
+    Ok(())
+}
+
 /// Unlink an identity from `user_id`, refusing to remove the last remaining login
-/// identity. If the unlinked identity conferred `Verified18` or backed the current
-/// session, IMMEDIATELY revokes strict 18+ / tied sessions in `UserAccount` DO and
-/// rotates the caller's session!
+/// identity. Always revokes sessions bound to any unlinked `login` identity, and
+/// rotates the caller's session ONLY onto a remaining login identity permitted by
+/// live `SitePolicyDO` (otherwise clears the session cookie).
 pub async fn unlink_identity(
     st: &AppState,
     cookies: &Cookies,
@@ -941,14 +1062,8 @@ pub async fn unlink_identity(
         None
     };
 
-    let needs_revocation = unlink_requires_strict_revocation(
-        target.assurance_level,
-        &unlinked_key,
-        cur_info.as_ref().map(|i| i.identity_key.as_str()),
-    );
-
-    if needs_revocation {
-        // Revoke all sessions bound to the unlinked identity.
+    // Always revoke ALL sessions bound to an unlinked `login` identity across all devices (H8).
+    if target.purpose == "login" {
         let _ = do_client::do_session_revoke_all(
             &st.env,
             &active.do_key,
@@ -958,6 +1073,15 @@ pub async fn unlink_identity(
             },
         )
         .await;
+    }
+
+    let needs_rotation = unlink_requires_strict_revocation(
+        target.assurance_level,
+        &unlinked_key,
+        cur_info.as_ref().map(|i| i.identity_key.as_str()),
+    );
+
+    if needs_rotation {
         // If a verified 18+ identity was removed, also revoke all strict 18+ sessions immediately.
         if target.assurance_level == AssuranceLevel::Verified18 {
             let _ = do_client::do_session_revoke_all(
@@ -971,8 +1095,7 @@ pub async fn unlink_identity(
             .await;
         }
 
-        // Rotate the caller's session onto another remaining login identity (without strict_age_ok
-        // unless another unexpired Verified18 login identity still remains).
+        // Rotate the caller's session ONLY onto a remaining login identity permitted by live SitePolicyDO.
         let now = session::now_secs();
         let remaining_login: Vec<&IdentityView> = identities
             .iter()
@@ -984,27 +1107,27 @@ pub async fn unlink_identity(
             })
             .collect();
 
-        if let Some(account) = load_account_by_id(st, &active.user_id).await?
-            && let Some(fallback) = remaining_login.first()
+        let live_policy = crate::policy_do::load_site_policy(&st.env)
+            .await
+            .ok()
+            .map(|e| e.policy);
+
+        if let Some(policy) = live_policy.as_ref()
+            && let Some(account) = load_account_by_id(st, &active.user_id).await?
+            && let Some((fallback, eff_assurance, fallback_strict)) =
+                select_rotation_fallback(policy, &remaining_login, now)
         {
             let fallback_key = format!(
                 "{}|{}|{}",
                 fallback.provider_id, fallback.issuer, fallback.subject
             );
-            let fallback_strict = fallback.provider_id == AuthProviderId::OidcAgeAssurance.as_str()
-                && fallback.assurance_level == AssuranceLevel::Verified18
-                && fallback.assurance_expires_at.is_none_or(|e| e > now);
             let _ = issue_v2_session(
                 st,
                 cookies,
                 &account,
                 &fallback.provider_id,
                 &fallback_key,
-                if fallback_strict {
-                    AssuranceLevel::Verified18
-                } else {
-                    fallback.assurance_level
-                },
+                eff_assurance,
                 fallback_strict,
             )
             .await;
@@ -1198,5 +1321,79 @@ mod tests {
         assert!(is_recent_auth(1000, 1000));
         assert!(is_recent_auth(1000, 1600));
         assert!(!is_recent_auth(1000, 1601));
+    }
+
+    #[test]
+    fn unlink_rotation_enforces_live_policy_and_strict_18() {
+        let github = IdentityView {
+            provider_id: "github".into(),
+            issuer: "https://github.com".into(),
+            subject: "gh-1".into(),
+            purpose: "login".into(),
+            label: None,
+            verified_email: None,
+            assurance_level: AssuranceLevel::None,
+            assurance_method: None,
+            assurance_verified_at: None,
+            assurance_expires_at: None,
+            created_at: 100,
+        };
+        let oidc_valid = IdentityView {
+            provider_id: "oidc_age_assurance".into(),
+            issuer: "https://age.example.com".into(),
+            subject: "age-2".into(),
+            purpose: "login".into(),
+            label: None,
+            verified_email: None,
+            assurance_level: AssuranceLevel::Verified18,
+            assurance_method: Some("age_over_18".into()),
+            assurance_verified_at: Some(900),
+            assurance_expires_at: Some(2000),
+            created_at: 200,
+        };
+        let oidc_expired = IdentityView {
+            assurance_expires_at: Some(999),
+            ..oidc_valid.clone()
+        };
+
+        let strict_policy = PublicSitePolicy {
+            age_policy: AgeVerificationPolicy::StrictProviderVerified18,
+            enabled_providers: vec![
+                AuthProviderPublicConfig {
+                    id: AuthProviderId::GitHub,
+                    enabled: true,
+                    display_name: None,
+                    issuer: None,
+                    public_client_id: Some("gh".into()),
+                    soft_birthday_check: false,
+                },
+                AuthProviderPublicConfig {
+                    id: AuthProviderId::OidcAgeAssurance,
+                    enabled: true,
+                    display_name: None,
+                    issuer: Some("https://age.example.com".into()),
+                    public_client_id: Some("oidc".into()),
+                    soft_birthday_check: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        // Under Strict 18+, GitHub-only remaining identity MUST NOT receive a rotated session.
+        assert!(select_rotation_fallback(&strict_policy, &[&github], 1000).is_none());
+        // Expired Verified18 OIDC MUST also be rejected under Strict 18+.
+        assert!(select_rotation_fallback(&strict_policy, &[&oidc_expired], 1000).is_none());
+        // Unexpired Verified18 OIDC is selected with strict_ok = true.
+        let both = [&github, &oidc_valid];
+        let picked = select_rotation_fallback(&strict_policy, &both, 1000);
+        assert!(matches!(picked, Some((_, AssuranceLevel::Verified18, true))));
+
+        // Under Off mode, a disabled provider MUST NOT be rotated onto.
+        let disabled_policy = PublicSitePolicy {
+            age_policy: AgeVerificationPolicy::Off,
+            enabled_providers: vec![],
+            ..Default::default()
+        };
+        assert!(select_rotation_fallback(&disabled_policy, &[&github], 1000).is_none());
     }
 }
