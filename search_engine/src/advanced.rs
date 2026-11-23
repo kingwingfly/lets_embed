@@ -11,10 +11,14 @@ use pgvector::HalfVector;
 use search_types::{
     Image, Post,
     query::{AdvancedSort, QueryExpr, QueryPlan, ResultKind, SearchField, parse_and_compile},
+    validate_min_similarity,
 };
 use sqlx::{Executor as _, Postgres, QueryBuilder, Row as _};
 
-use crate::{Engine, escape_like};
+use crate::{
+    Engine, VECTOR_STATEMENT_TIMEOUT_SQL, escape_like,
+    safety::SafetyFilter,
+};
 
 /// Relative weight subtracted for negative semantic prompts (`NOT clip:...` / `NOT dino:...`).
 const NEGATIVE_VECTOR_WEIGHT: f32 = 0.6;
@@ -31,6 +35,10 @@ pub struct AdvancedSearchRequest {
     pub sort: AdvancedSort,
     /// Weight for CLIP in `[0.05, 0.95]` when both CLIP and DINOv3 are active (default `0.5`).
     pub clip_weight: f32,
+    /// Optional minimum SigLIP2 cosine similarity cutoff in `[0.0, 1.0]`.
+    pub clip_min_similarity: Option<f32>,
+    /// Optional minimum DINOv3 cosine similarity cutoff in `[0.0, 1.0]`.
+    pub dino_min_similarity: Option<f32>,
     pub limit: i64,
     pub offset: i64,
 }
@@ -419,6 +427,7 @@ pub(crate) fn build_metadata_images_query(
     tag_map: &HashMap<String, Vec<i64>>,
     positive_tags: &[String],
     sort: AdvancedSort,
+    safety: Option<&SafetyFilter<'_>>,
     limit: i64,
     offset: i64,
 ) -> QueryBuilder<Postgres> {
@@ -429,6 +438,9 @@ pub(crate) fn build_metadata_images_query(
             "WITH matched AS (SELECT i.id, i.name::TEXT AS name, i.width, i.height FROM images i WHERE ",
         );
         push_image_predicate(&mut qb, meta, tag_map);
+        if let Some(sf) = safety {
+            sf.push_allowed_image_sql(&mut qb, "i");
+        }
         qb.push(") SELECT m.id, m.name, m.width, m.height FROM matched m ORDER BY ");
         if pos_tag_clauses.len() == 1 {
             push_tag_clause_score(&mut qb, &pos_tag_clauses[0]);
@@ -455,6 +467,9 @@ pub(crate) fn build_metadata_images_query(
         "SELECT i.id, i.name::TEXT AS name, i.width, i.height FROM images i WHERE ",
     );
     push_image_predicate(&mut qb, meta, tag_map);
+    if let Some(sf) = safety {
+        sf.push_allowed_image_sql(&mut qb, "i");
+    }
     qb.push(" ORDER BY i.id DESC LIMIT ");
     qb.push_bind(limit);
     qb.push(" OFFSET ");
@@ -462,11 +477,14 @@ pub(crate) fn build_metadata_images_query(
     qb
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_single_vector_query(
     col: &'static str,
     vec: HalfVector,
     meta_filter: Option<&QueryExpr>,
     tag_map: &HashMap<String, Vec<i64>>,
+    min_similarity: Option<f32>,
+    safety: Option<&SafetyFilter<'_>>,
     limit: i64,
     offset: i64,
 ) -> QueryBuilder<Postgres> {
@@ -486,13 +504,21 @@ pub(crate) fn build_single_vector_query(
         qb.push(" AND ");
         push_image_predicate(&mut qb, meta, tag_map);
     }
+    if let Some(sf) = safety {
+        sf.push_allowed_image_sql(&mut qb, "i");
+    }
     qb.push(" ORDER BY i.");
     qb.push(col);
     qb.push(" <=> ");
     qb.push_bind(vec);
     qb.push("::halfvec FETCH FIRST ");
     qb.push(VECTOR_CANDIDATE_LIMIT);
-    qb.push(" ROWS WITH TIES) SELECT id, name, width, height FROM cands ORDER BY dist ASC, id DESC LIMIT ");
+    qb.push(" ROWS WITH TIES) SELECT id, name, width, height FROM cands");
+    if let Some(min_sim) = min_similarity.filter(|&v| v > 0.0) {
+        qb.push(" WHERE (1.0 - dist) >= ");
+        qb.push_bind(f64::from(min_sim));
+    }
+    qb.push(" ORDER BY dist ASC, id DESC LIMIT ");
     qb.push_bind(limit);
     qb.push(" OFFSET ");
     qb.push_bind(offset);
@@ -506,6 +532,9 @@ pub(crate) fn build_dual_vector_query(
     clip_weight: f32,
     meta_filter: Option<&QueryExpr>,
     tag_map: &HashMap<String, Vec<i64>>,
+    clip_min_similarity: Option<f32>,
+    dino_min_similarity: Option<f32>,
+    safety: Option<&SafetyFilter<'_>>,
     limit: i64,
     offset: i64,
 ) -> QueryBuilder<Postgres> {
@@ -516,6 +545,9 @@ pub(crate) fn build_dual_vector_query(
     if let Some(meta) = meta_filter {
         qb.push(" AND ");
         push_image_predicate(&mut qb, meta, tag_map);
+    }
+    if let Some(sf) = safety {
+        sf.push_allowed_image_sql(&mut qb, "i");
     }
     qb.push(" ORDER BY i.clip_embedding <=> ");
     qb.push_bind(clip_vec.clone());
@@ -528,13 +560,39 @@ pub(crate) fn build_dual_vector_query(
         qb.push(" AND ");
         push_image_predicate(&mut qb, meta, tag_map);
     }
+    if let Some(sf) = safety {
+        sf.push_allowed_image_sql(&mut qb, "i");
+    }
     qb.push(" ORDER BY i.dinov3_embedding <=> ");
     qb.push_bind(dino_vec.clone());
     qb.push("::halfvec FETCH FIRST ");
     qb.push(DUAL_VECTOR_CANDIDATE_LIMIT);
     qb.push(
-        " ROWS WITH TIES), candidates AS (SELECT id FROM clip_cands UNION SELECT id FROM dino_cands) SELECT i.id, i.name::TEXT AS name, i.width, i.height FROM candidates c JOIN images i ON i.id = c.id ORDER BY (",
+        " ROWS WITH TIES), candidates AS (SELECT id FROM clip_cands UNION SELECT id FROM dino_cands) SELECT i.id, i.name::TEXT AS name, i.width, i.height FROM candidates c JOIN images i ON i.id = c.id",
     );
+    let clip_cut = clip_min_similarity.filter(|&v| v > 0.0);
+    let dino_cut = dino_min_similarity.filter(|&v| v > 0.0);
+    if clip_cut.is_some() || dino_cut.is_some() {
+        qb.push(" WHERE ");
+        let mut need_and = false;
+        if let Some(cm) = clip_cut {
+            qb.push("(1.0 - (i.clip_embedding <=> ");
+            qb.push_bind(clip_vec.clone());
+            qb.push("::halfvec)) >= ");
+            qb.push_bind(f64::from(cm));
+            need_and = true;
+        }
+        if let Some(dm) = dino_cut {
+            if need_and {
+                qb.push(" AND ");
+            }
+            qb.push("(1.0 - (i.dinov3_embedding <=> ");
+            qb.push_bind(dino_vec.clone());
+            qb.push("::halfvec)) >= ");
+            qb.push_bind(f64::from(dm));
+        }
+    }
+    qb.push(" ORDER BY (");
     qb.push_bind(f64::from(clip_weight));
     qb.push(" * (i.clip_embedding <=> ");
     qb.push_bind(clip_vec);
@@ -553,6 +611,8 @@ pub(crate) fn build_similar_images_query(
     seed_vec: HalfVector,
     seed_id: i64,
     exclude_post_id: Option<i64>,
+    min_similarity: Option<f32>,
+    safety: Option<&SafetyFilter<'_>>,
     limit: i64,
     offset: i64,
 ) -> QueryBuilder<Postgres> {
@@ -569,11 +629,19 @@ pub(crate) fn build_similar_images_query(
         qb.push_bind(post_id);
         qb.push(")");
     }
+    if let Some(sf) = safety {
+        sf.push_allowed_image_sql(&mut qb, "i");
+    }
     qb.push(" ORDER BY i.dinov3_embedding <=> ");
     qb.push_bind(seed_vec);
     qb.push("::halfvec FETCH FIRST ");
     qb.push(VECTOR_CANDIDATE_LIMIT);
-    qb.push(" ROWS WITH TIES) SELECT id, name, width, height FROM cands ORDER BY dist ASC, id DESC LIMIT ");
+    qb.push(" ROWS WITH TIES) SELECT id, name, width, height FROM cands");
+    if let Some(min_sim) = min_similarity.filter(|&v| v > 0.0) {
+        qb.push(" WHERE (1.0 - dist) >= ");
+        qb.push_bind(f64::from(min_sim));
+    }
+    qb.push(" ORDER BY dist ASC, id DESC LIMIT ");
     qb.push_bind(limit);
     qb.push(" OFFSET ");
     qb.push_bind(offset);
@@ -734,11 +802,20 @@ impl Engine {
         &self,
         req: AdvancedSearchRequest,
     ) -> anyhow::Result<AdvancedSearchResult> {
+        self.advanced_search_with_safety(req, None).await
+    }
+
+    pub async fn advanced_search_with_safety(
+        &self,
+        req: AdvancedSearchRequest,
+        safety: Option<&SafetyFilter<'_>>,
+    ) -> anyhow::Result<AdvancedSearchResult> {
         if req.limit < 0 || req.offset < 0 {
             bail!("both limit and offset should >= 0");
         }
         let (_expr, plan) = parse_and_compile(&req.query).map_err(|e| anyhow!("{e}"))?;
-        self.execute_advanced_plan(&plan, &req).await
+        self.execute_advanced_plan_with_safety(&plan, &req, safety)
+            .await
     }
 
     pub async fn execute_advanced_plan(
@@ -746,9 +823,24 @@ impl Engine {
         plan: &QueryPlan,
         req: &AdvancedSearchRequest,
     ) -> anyhow::Result<AdvancedSearchResult> {
+        self.execute_advanced_plan_with_safety(plan, req, None)
+            .await
+    }
+
+    pub async fn execute_advanced_plan_with_safety(
+        &self,
+        plan: &QueryPlan,
+        req: &AdvancedSearchRequest,
+        safety: Option<&SafetyFilter<'_>>,
+    ) -> anyhow::Result<AdvancedSearchResult> {
         if req.limit < 0 || req.offset < 0 {
             bail!("both limit and offset should >= 0");
         }
+        let clip_min_sim = validate_min_similarity(req.clip_min_similarity)
+            .map_err(|e| anyhow!("{e}"))?;
+        let dino_min_sim = validate_min_similarity(req.dino_min_similarity)
+            .map_err(|e| anyhow!("{e}"))?;
+
         if plan.result_kind == ResultKind::Posts {
             let Some(meta) = &plan.meta_filter else {
                 return Ok(AdvancedSearchResult::Posts(vec![]));
@@ -773,6 +865,21 @@ impl Engine {
                 })
                 .try_collect()?;
             return Ok(AdvancedSearchResult::Posts(posts));
+        }
+
+        // Anti-oracle seed check BEFORE reading ANY `dinov3_embedding` (both positive and negated `dino:<id>`).
+        if plan.has_dino() {
+            let mut all_ids: Vec<i64> = plan
+                .dino_pos
+                .iter()
+                .chain(plan.dino_neg.iter())
+                .copied()
+                .collect();
+            all_ids.sort_unstable();
+            all_ids.dedup();
+            if let Some(sf) = safety {
+                self.ensure_images_unlocked(&all_ids, sf).await?;
+            }
         }
 
         // Pre-resolve every distinct Tag string referenced in the metadata AST.
@@ -851,8 +958,15 @@ impl Engine {
         // Dispatch by vector combination: None, Single (CLIP or DINO), or Dual (CLIP + DINO).
         let images = match (clip_vec, dino_vec) {
             (None, None) => {
-                self.query_images_metadata_only(plan, &tag_map, req.sort, req.limit, req.offset)
-                    .await?
+                self.query_images_metadata_only(
+                    plan,
+                    &tag_map,
+                    req.sort,
+                    safety,
+                    req.limit,
+                    req.offset,
+                )
+                .await?
             }
             (Some(c), None) => {
                 self.query_images_single_vector(
@@ -860,6 +974,8 @@ impl Engine {
                     c,
                     plan.meta_filter.as_ref(),
                     &tag_map,
+                    clip_min_sim,
+                    safety,
                     req.limit,
                     req.offset,
                 )
@@ -871,6 +987,8 @@ impl Engine {
                     d,
                     plan.meta_filter.as_ref(),
                     &tag_map,
+                    dino_min_sim,
+                    safety,
                     req.limit,
                     req.offset,
                 )
@@ -888,6 +1006,9 @@ impl Engine {
                     clip_weight,
                     plan.meta_filter.as_ref(),
                     &tag_map,
+                    clip_min_sim,
+                    dino_min_sim,
+                    safety,
                     req.limit,
                     req.offset,
                 )
@@ -903,6 +1024,7 @@ impl Engine {
         plan: &QueryPlan,
         tag_map: &HashMap<String, Vec<i64>>,
         sort: AdvancedSort,
+        safety: Option<&SafetyFilter<'_>>,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<Image>> {
@@ -922,57 +1044,70 @@ impl Engine {
             if ids.is_empty() {
                 return Ok(vec![]);
             }
-            let rows = sqlx::query(
-                r#"
-                WITH img_match AS (
-                    SELECT wti.image_id, MAX(wti.score) AS max_score
-                    FROM wd_tag_images wti
-                    WHERE wti.wd_tag_id = ANY($1::BIGINT[])
-                    GROUP BY wti.image_id
-                )
-                SELECT i.id, i.name::TEXT AS name, i.width, i.height
-                FROM img_match im
-                JOIN images i ON i.id = im.image_id
-                ORDER BY im.max_score DESC, im.image_id DESC
-                LIMIT $2 OFFSET $3
-                "#,
-            )
-            .bind(ids)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?;
+            let mut qb = QueryBuilder::<Postgres>::new(
+                "WITH img_match AS (SELECT wti.image_id, MAX(wti.score) AS max_score FROM wd_tag_images wti WHERE wti.wd_tag_id = ANY(",
+            );
+            qb.push_bind(ids.to_vec());
+            qb.push(
+                "::BIGINT[]) GROUP BY wti.image_id) SELECT i.id, i.name::TEXT AS name, i.width, i.height FROM img_match im JOIN images i ON i.id = im.image_id WHERE TRUE",
+            );
+            if let Some(sf) = safety {
+                sf.push_allowed_image_sql(&mut qb, "i");
+            }
+            qb.push(" ORDER BY im.max_score DESC, im.image_id DESC LIMIT ");
+            qb.push_bind(limit);
+            qb.push(" OFFSET ");
+            qb.push_bind(offset);
+            let rows = qb.build().fetch_all(&self.pool).await?;
             return map_image_rows(rows);
         }
 
-        let mut qb =
-            build_metadata_images_query(meta, tag_map, &plan.positive_tags, sort, limit, offset);
+        let mut qb = build_metadata_images_query(
+            meta,
+            tag_map,
+            &plan.positive_tags,
+            sort,
+            safety,
+            limit,
+            offset,
+        );
         let rows = qb.build().fetch_all(&self.pool).await?;
         map_image_rows(rows)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn query_images_single_vector(
         &self,
         col: &'static str,
         vec: HalfVector,
         meta_filter: Option<&QueryExpr>,
         tag_map: &HashMap<String, Vec<i64>>,
+        min_similarity: Option<f32>,
+        safety: Option<&SafetyFilter<'_>>,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<Image>> {
-        let mut qb = build_single_vector_query(col, vec, meta_filter, tag_map, limit, offset);
+        let safety_active = safety.is_some_and(SafetyFilter::is_filtering_active);
+        let mut qb = build_single_vector_query(
+            col,
+            vec,
+            meta_filter,
+            tag_map,
+            min_similarity,
+            safety,
+            limit,
+            offset,
+        );
 
-        if meta_filter.is_some() {
-            let mut tx = self.pool.begin().await?;
-            tx.execute("SET TRANSACTION READ ONLY").await?;
+        let mut tx = self.pool.begin().await?;
+        tx.execute("SET TRANSACTION READ ONLY").await?;
+        tx.execute(VECTOR_STATEMENT_TIMEOUT_SQL).await?;
+        if meta_filter.is_some() || safety_active {
             tx.execute("SET LOCAL hnsw.max_scan_tuples = 20000").await?;
-            let rows = qb.build().fetch_all(&mut *tx).await?;
-            tx.commit().await?;
-            map_image_rows(rows)
-        } else {
-            let rows = qb.build().fetch_all(&self.pool).await?;
-            map_image_rows(rows)
         }
+        let rows = qb.build().fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        map_image_rows(rows)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -983,30 +1118,35 @@ impl Engine {
         clip_weight: f32,
         meta_filter: Option<&QueryExpr>,
         tag_map: &HashMap<String, Vec<i64>>,
+        clip_min_similarity: Option<f32>,
+        dino_min_similarity: Option<f32>,
+        safety: Option<&SafetyFilter<'_>>,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<Image>> {
+        let safety_active = safety.is_some_and(SafetyFilter::is_filtering_active);
         let mut qb = build_dual_vector_query(
             clip_vec,
             dino_vec,
             clip_weight,
             meta_filter,
             tag_map,
+            clip_min_similarity,
+            dino_min_similarity,
+            safety,
             limit,
             offset,
         );
 
-        if meta_filter.is_some() {
-            let mut tx = self.pool.begin().await?;
-            tx.execute("SET TRANSACTION READ ONLY").await?;
+        let mut tx = self.pool.begin().await?;
+        tx.execute("SET TRANSACTION READ ONLY").await?;
+        tx.execute(VECTOR_STATEMENT_TIMEOUT_SQL).await?;
+        if meta_filter.is_some() || safety_active {
             tx.execute("SET LOCAL hnsw.max_scan_tuples = 20000").await?;
-            let rows = qb.build().fetch_all(&mut *tx).await?;
-            tx.commit().await?;
-            map_image_rows(rows)
-        } else {
-            let rows = qb.build().fetch_all(&self.pool).await?;
-            map_image_rows(rows)
         }
+        let rows = qb.build().fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        map_image_rows(rows)
     }
 }
 
@@ -1147,6 +1287,7 @@ mod tests {
             &tag_map,
             &plan_dup.positive_tags,
             AdvancedSort::Relevance,
+            None,
             50,
             0,
         );
@@ -1169,6 +1310,7 @@ mod tests {
             &tag_map,
             &plan_neg.positive_tags,
             AdvancedSort::Relevance,
+            None,
             50,
             0,
         );
@@ -1190,6 +1332,7 @@ mod tests {
             &tag_map,
             &plan_two.positive_tags,
             AdvancedSort::Relevance,
+            None,
             50,
             0,
         );
@@ -1212,16 +1355,35 @@ mod tests {
     #[test]
     fn vector_queries_use_fetch_first_with_ties_and_similar_excludes_seed_and_post() {
         let hv = HalfVector::from_f32_slice(&[1.0, 0.0, 0.0, 0.0]);
-        let mut qb_single =
-            build_single_vector_query("clip_embedding", hv.clone(), None, &HashMap::new(), 50, 0);
+        let mut qb_single = build_single_vector_query(
+            "clip_embedding",
+            hv.clone(),
+            None,
+            &HashMap::new(),
+            Some(0.45),
+            None,
+            50,
+            0,
+        );
         let built_single = qb_single.build();
         let sql_str_single = built_single.sql();
         let sql_single = sql_str_single.as_str();
         assert!(sql_single.contains("FETCH FIRST 2000 ROWS WITH TIES"));
+        assert!(sql_single.contains("WHERE (1.0 - dist) >= $3"));
         assert!(sql_single.contains("ORDER BY dist ASC, id DESC LIMIT"));
 
-        let mut qb_dual =
-            build_dual_vector_query(hv.clone(), hv.clone(), 0.5, None, &HashMap::new(), 50, 0);
+        let mut qb_dual = build_dual_vector_query(
+            hv.clone(),
+            hv.clone(),
+            0.5,
+            None,
+            &HashMap::new(),
+            Some(0.35),
+            Some(0.55),
+            None,
+            50,
+            0,
+        );
         let built_dual = qb_dual.build();
         let sql_str_dual = built_dual.sql();
         let sql_dual = sql_str_dual.as_str();
@@ -1229,8 +1391,10 @@ mod tests {
             sql_dual.matches("FETCH FIRST 1000 ROWS WITH TIES").count(),
             2
         );
+        assert!(sql_dual.contains("(1.0 - (i.clip_embedding <=>"));
+        assert!(sql_dual.contains("(1.0 - (i.dinov3_embedding <=>"));
 
-        let mut qb_sim = build_similar_images_query(hv, 42, Some(7), 50, 0);
+        let mut qb_sim = build_similar_images_query(hv, 42, Some(7), Some(0.6), None, 50, 0);
         let built_sim = qb_sim.build();
         let sql_str_sim = built_sim.sql();
         let sql_sim = sql_str_sim.as_str();
@@ -1239,6 +1403,7 @@ mod tests {
             "NOT EXISTS (SELECT 1 FROM post_images pi WHERE pi.image_id = i.id AND pi.post_id = $3)"
         ));
         assert!(sql_sim.contains("FETCH FIRST 2000 ROWS WITH TIES"));
+        assert!(sql_sim.contains("WHERE (1.0 - dist) >= $5"));
         assert!(sql_sim.contains("ORDER BY dist ASC, id DESC LIMIT"));
     }
 }

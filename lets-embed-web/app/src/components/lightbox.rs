@@ -3,7 +3,10 @@ use crate::{
         LikeButton, LikeVariant, Viewer,
         image_details::{list_post_images, list_post_videos},
     },
-    types::{GalleryDensity, GalleryDensityState, PostItem, save_gallery_density},
+    types::{
+        GalleryDensityState, PostItem, SafetyUiState, blur_mode_to_ui, mask_to_ui,
+        navigate_external, unlock_href_for_mask,
+    },
     util::{
         encode_path, format_duration, layout_image_masonry, lock_body_scroll, navigate_from_modal,
         push_modal_history, trap_dialog_tab,
@@ -14,7 +17,11 @@ use leptos_router::{NavigateOptions, hooks::use_navigate};
 use leptos_use_element_size::{UseElementSizeReturn, use_element_size};
 use leptos_use_event_listener::use_event_listener;
 use leptos_use_intersection_observer::use_intersection_observer;
-use search_types::{Image, PostMeta, Video};
+use lets_embed_ui::{
+    ContentMaskCard, DensityPicker, GalleryMask, GalleryMaskPreset, GalleryMediaKind,
+    ReportTargetKind, SpoilerOverlay,
+};
+use search_types::{PostMeta, ProjectedImage, ProjectedVideo};
 
 const PAGE: usize = 20;
 
@@ -28,13 +35,17 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
     let need_images = initial_img_len < expected_img_count;
     let need_videos = initial_vid_len < expected_vid_count;
 
-    let images_sig: RwSignal<Vec<Image>> = RwSignal::new(post.images.clone());
-    let viewer_images: StoredValue<Vec<Image>> = StoredValue::new(post.images);
-    let videos_sig: RwSignal<Vec<Video>> = RwSignal::new(post.videos);
+    let images_sig: RwSignal<Vec<ProjectedImage>> = RwSignal::new(post.images.clone());
+    let viewer_images: StoredValue<Vec<ProjectedImage>> = StoredValue::new(post.images);
+    let videos_sig: RwSignal<Vec<ProjectedVideo>> = RwSignal::new(post.videos);
     let images_err: RwSignal<Option<String>> = RwSignal::new(None);
     let title = post.title;
+    let title_for_report = title.clone();
     let navigate = use_navigate();
     let dialog_ref: NodeRef<html::Div> = NodeRef::new();
+    let safety = use_context::<SafetyUiState>();
+    let panic_epoch_sig: Option<Signal<u64>> = safety.map(|s| s.panic_epoch.into());
+
     lock_body_scroll();
     push_modal_history(move || lightbox.set(None));
 
@@ -59,6 +70,28 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
 
     let visible = RwSignal::new(PAGE.min(initial_img_len));
     let sentinel = NodeRef::<html::Div>::new();
+    let viewer = RwSignal::new(None::<usize>);
+    let viewer_open = Memo::new(move |_| viewer.get().is_some());
+
+    // Immediately wipe DOM media elements and close Lightbox when Safe Mode / Panic activates.
+    if let Some(s) = safety {
+        let last_epoch = StoredValue::new(s.panic_epoch.get_untracked());
+        Effect::new(move |_| {
+            let cur = s.panic_epoch.get();
+            if cur != last_epoch.get_value() {
+                last_epoch.set_value(cur);
+                #[cfg(feature = "hydrate")]
+                if let Some(el) = dialog_ref.get_untracked() {
+                    lets_embed_ui::browser::wipe_media_elements_in(Some(el.as_ref()));
+                }
+                images_sig.set(Vec::new());
+                videos_sig.set(Vec::new());
+                viewer_images.set_value(Vec::new());
+                viewer.set(None);
+                lightbox.set(None);
+            }
+        });
+    }
 
     if let Some(res) = full_images {
         Effect::new(move |_| {
@@ -105,9 +138,6 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
             || (full_videos.is_some_and(|r| r.get().is_none()) && expected_vid_count > 0)
     };
 
-    let viewer = RwSignal::new(None::<usize>);
-    let viewer_open = Memo::new(move |_| viewer.get().is_some());
-
     // Close the lightbox on Escape and trap Tab when the nested Viewer is not on top.
     let _ = use_event_listener(window(), ev::keydown, move |e| {
         if viewer_open.get_untracked() {
@@ -139,52 +169,118 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
         }
     });
 
+    let on_unlock = Callback::new(move |mask: GalleryMask| {
+        navigate_external(unlock_href_for_mask(&mask));
+    });
+
     let render_videos = move || {
         videos_sig.with(|vids| {
             vids.iter()
-                .map(|v| {
-                    let vid_id = v.id;
-                    let url = format!("/videos/{}", encode_path(&v.name));
-                    let aspect = if v.width > 0 && v.height > 0 {
-                        format!("aspect-ratio:{}/{};", v.width, v.height)
-                    } else {
-                        "aspect-ratio:16/9;".to_string()
-                    };
-                    let dur = (v.duration > 0).then(|| format_duration(v.duration));
-                    let dims = (v.width > 0 && v.height > 0)
-                        .then(|| format!("{}×{}", v.width, v.height));
-                    view! {
-                        <div class="relative group rounded-xl overflow-hidden bg-black ring-1 ring-white/10">
-                            <video
-                                class="w-full block bg-black object-contain select-none"
-                                style=aspect
-                                controls
-                                playsinline
-                                preload="metadata"
-                                src=url
-                            />
-                            <div class="absolute top-1.5 right-1.5 z-10">
-                                <LikeButton
-                                    kind="video"
-                                    target_id=vid_id
-                                    variant=LikeVariant::Card
+                .map(|v| match v {
+                    ProjectedVideo::Clear {
+                        id,
+                        url,
+                        width,
+                        height,
+                        duration,
+                        ..
+                    } => {
+                        let vid_id = *id;
+                        let vid_url = url.clone();
+                        let aspect = if *width > 0 && *height > 0 {
+                            format!("aspect-ratio:{width}/{height};")
+                        } else {
+                            "aspect-ratio:16/9;".to_string()
+                        };
+                        let dur = (*duration > 0).then(|| format_duration(*duration));
+                        let dims = (*width > 0 && *height > 0)
+                            .then(|| format!("{width}×{height}"));
+                        view! {
+                            <div class="relative group rounded-xl overflow-hidden bg-black ring-1 ring-white/10">
+                                <video
+                                    class="w-full block bg-black object-contain select-none"
+                                    style=aspect
+                                    controls
+                                    playsinline
+                                    preload="metadata"
+                                    src=vid_url
                                 />
-                            </div>
-                            {(dur.is_some() || dims.is_some()).then(|| view! {
-                                <div class="absolute top-1.5 left-1.5 z-10 pointer-events-none flex items-center gap-1">
-                                    {dur.map(|d| view! {
-                                        <span class="px-2 py-0.5 rounded-full bg-black/70 text-white text-[11px] font-medium tabular-nums">
-                                            {d}
-                                        </span>
+                                <div class="absolute top-1.5 right-1.5 z-10 flex items-center gap-1">
+                                    {safety.filter(|s| s.is_managed.get()).map(|s| view! {
+                                        <button
+                                            type="button"
+                                            title="Report video"
+                                            class="px-2 py-0.5 rounded-full bg-black/70 hover:bg-rose-500 text-white text-[11px] font-medium cursor-pointer"
+                                            on:click=move |ev: ev::MouseEvent| {
+                                                ev.stop_propagation();
+                                                s.open_report(
+                                                    ReportTargetKind::Video,
+                                                    vid_id,
+                                                    format!("Video #{vid_id}"),
+                                                );
+                                            }
+                                        >
+                                            "Report"
+                                        </button>
                                     })}
-                                    {dims.map(|dim| view! {
-                                        <span class="px-2 py-0.5 rounded-full bg-black/60 text-sky-100/80 text-[11px] tabular-nums">
-                                            {dim}
-                                        </span>
-                                    })}
+                                    <LikeButton
+                                        kind="video"
+                                        target_id=vid_id
+                                        variant=LikeVariant::Card
+                                    />
                                 </div>
-                            })}
-                        </div>
+                                {(dur.is_some() || dims.is_some()).then(|| view! {
+                                    <div class="absolute top-1.5 left-1.5 z-10 pointer-events-none flex items-center gap-1">
+                                        {dur.map(|d| view! {
+                                            <span class="px-2 py-0.5 rounded-full bg-black/70 text-white text-[11px] font-medium tabular-nums">
+                                                {d}
+                                            </span>
+                                        })}
+                                        {dims.map(|dim| view! {
+                                            <span class="px-2 py-0.5 rounded-full bg-black/60 text-sky-100/80 text-[11px] tabular-nums">
+                                                {dim}
+                                            </span>
+                                        })}
+                                    </div>
+                                })}
+                            </div>
+                        }
+                        .into_any()
+                    }
+                    ProjectedVideo::Locked {
+                        id,
+                        width,
+                        height,
+                        duration,
+                        mask,
+                    } => {
+                        let vid_id = *id;
+                        let dur = (*duration > 0).then(|| format_duration(*duration));
+                        let ui_mask = mask_to_ui(mask);
+                        let dims = (*width, *height);
+                        view! {
+                            <div class="relative group rounded-xl overflow-hidden bg-slate-900 ring-1 ring-white/10">
+                                <ContentMaskCard
+                                    mask=ui_mask
+                                    dimensions=dims
+                                    compact=true
+                                    on_unlock_click=on_unlock
+                                />
+                                <div class="absolute top-1.5 right-1.5 z-10">
+                                    <LikeButton
+                                        kind="video"
+                                        target_id=vid_id
+                                        variant=LikeVariant::Card
+                                    />
+                                </div>
+                                {dur.map(|d| view! {
+                                    <span class="absolute top-1.5 left-1.5 z-10 pointer-events-none px-2 py-0.5 rounded-full bg-black/70 text-white text-[11px] font-medium tabular-nums">
+                                        {d}
+                                    </span>
+                                })}
+                            </div>
+                        }
+                        .into_any()
                     }
                 })
                 .collect::<Vec<_>>()
@@ -238,21 +334,6 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
     };
 
     let density = use_context::<GalleryDensityState>().unwrap_or_default().0;
-    let render_density_btn = move |d: GalleryDensity, label: &'static str| {
-        view! {
-            <button
-                type="button"
-                class="gallery-density-btn"
-                aria-pressed=move || (density.get() == d).to_string()
-                on:click=move |_| {
-                    density.set(d);
-                    save_gallery_density(d);
-                }
-            >
-                {label}
-            </button>
-        }
-    };
 
     let album_scroll_el = NodeRef::<html::Div>::new();
     let UseElementSizeReturn {
@@ -297,11 +378,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                 </div>
                 {move || (total_images() > 0).then(|| view! {
                     <div class="order-3 md:order-2 w-full md:w-auto flex items-center justify-start md:justify-end">
-                        <div class="gallery-density gallery-density-dark" role="group" aria-label="Grid size">
-                            {render_density_btn(GalleryDensity::Compact, "Compact")}
-                            {render_density_btn(GalleryDensity::Medium, "Medium")}
-                            {render_density_btn(GalleryDensity::Large, "Large")}
-                        </div>
+                        <DensityPicker density=density dark=true persist=true />
                     </div>
                 })}
                 <div class="order-2 md:order-3 flex items-center gap-2 sm:gap-3 shrink-0">
@@ -312,6 +389,25 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                         show_label=true
                         hide_label_mobile=true
                     />
+                    {move || safety.filter(|s| s.is_managed.get()).map(|s| {
+                        let lbl = if title_for_report.is_empty() {
+                            format!("Post #{post_id}")
+                        } else {
+                            title_for_report.clone()
+                        };
+                        view! {
+                            <button
+                                type="button"
+                                title="Report post"
+                                class="px-2.5 py-1 rounded-full bg-white/10 hover:bg-rose-500/70 text-sky-100 text-xs font-medium transition-colors cursor-pointer"
+                                on:click=move |_| {
+                                    s.open_report(ReportTargetKind::Post, post_id, lbl.clone());
+                                }
+                            >
+                                "Report"
+                            </button>
+                        }
+                    })}
                     <div class="text-xs sm:text-sm text-sky-200/70 tabular-nums whitespace-nowrap">
                         {move || {
                             let tot = total_images();
@@ -347,44 +443,120 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                                         masonry_cols
                                             .with(|cols| cols.get(col_idx).cloned().unwrap_or_default())
                                     }
-                                    key=|(_, im)| im.id
+                                    key=|(_, im)| im.id()
                                     let((i, im))
                                 >
                                     {
-                                        let img_id = im.id;
-                                        let url = format!("/images/{}.webp", encode_path(&im.name));
-                                        let alt = im.name.clone();
+                                        let img_id = im.id();
+                                        let locked = im.is_locked();
                                         let href = format!("/details/{img_id}");
                                         let click_href = href.clone();
                                         let nav = use_navigate();
-                                        let (w, h) = if im.width > 0 && im.height > 0 {
-                                            (im.width, im.height)
+                                        let (raw_w, raw_h) = (im.width(), im.height());
+                                        let (w, h) = if raw_w > 0 && raw_h > 0 {
+                                            (raw_w, raw_h)
                                         } else {
                                             (4, 3)
                                         };
                                         let aspect_style = format!("aspect-ratio:{w}/{h};");
+
+                                        let media_view = match im {
+                                            ProjectedImage::Clear { url, name, .. } => {
+                                                let alt = name
+                                                    .filter(|s| !s.is_empty())
+                                                    .unwrap_or_else(|| format!("Image #{img_id}"));
+                                                view! {
+                                                    <button
+                                                        type="button"
+                                                        aria-label=move || format!("Zoom image {} of {}", i + 1, total_images())
+                                                        class="block w-full p-0 border-0 bg-transparent cursor-zoom-in focus-visible:outline-2 focus-visible:outline-sky-400"
+                                                        style=aspect_style
+                                                        on:click=move |_| {
+                                                            viewer_images.set_value(images_sig.get_untracked());
+                                                            viewer.set(Some(i));
+                                                        }
+                                                    >
+                                                        <img
+                                                            loading="lazy"
+                                                            decoding="async"
+                                                            width=w
+                                                            height=h
+                                                            alt=alt
+                                                            class="block w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-300"
+                                                            src=url
+                                                        />
+                                                    </button>
+                                                }
+                                                .into_any()
+                                            }
+                                            ProjectedImage::Spoiler {
+                                                preview_url,
+                                                reveal_url,
+                                                label,
+                                                preset,
+                                                blur_mode,
+                                                ..
+                                            } => {
+                                                let ui_preset = GalleryMaskPreset::parse(&preset);
+                                                let ui_blur = blur_mode_to_ui(blur_mode);
+                                                let open_cb = Callback::new(move |()| {
+                                                    viewer_images.set_value(images_sig.get_untracked());
+                                                    viewer.set(Some(i));
+                                                });
+                                                let alt = format!("Image #{img_id}");
+                                                match panic_epoch_sig {
+                                                    Some(epoch) => view! {
+                                                        <SpoilerOverlay
+                                                            id=img_id
+                                                            kind=GalleryMediaKind::Image
+                                                            width=w
+                                                            height=h
+                                                            preview_url=preview_url
+                                                            reveal_url=reveal_url
+                                                            alt=alt
+                                                            label=label
+                                                            preset=ui_preset
+                                                            blur_mode=ui_blur
+                                                            panic_epoch=epoch
+                                                            on_open=open_cb
+                                                        />
+                                                    }
+                                                    .into_any(),
+                                                    None => view! {
+                                                        <SpoilerOverlay
+                                                            id=img_id
+                                                            kind=GalleryMediaKind::Image
+                                                            width=w
+                                                            height=h
+                                                            preview_url=preview_url
+                                                            reveal_url=reveal_url
+                                                            alt=alt
+                                                            label=label
+                                                            preset=ui_preset
+                                                            blur_mode=ui_blur
+                                                            on_open=open_cb
+                                                        />
+                                                    }
+                                                    .into_any(),
+                                                }
+                                            }
+                                            ProjectedImage::Locked { mask, .. } => {
+                                                let ui_mask = mask_to_ui(&mask);
+                                                view! {
+                                                    <ContentMaskCard
+                                                        mask=ui_mask
+                                                        dimensions=(w, h)
+                                                        compact=true
+                                                        on_unlock_click=on_unlock
+                                                    />
+                                                }
+                                                .into_any()
+                                            }
+                                        };
+
                                         view! {
                                             <div class="relative group w-full overflow-hidden rounded-xl bg-white/10 ring-1 ring-white/10">
-                                                <button
-                                                    type="button"
-                                                    aria-label=move || format!("Zoom image {} of {}", i + 1, total_images())
-                                                    class="block w-full p-0 border-0 bg-transparent cursor-zoom-in focus-visible:outline-2 focus-visible:outline-sky-400"
-                                                    style=aspect_style
-                                                    on:click=move |_| {
-                                                        viewer_images.set_value(images_sig.get_untracked());
-                                                        viewer.set(Some(i));
-                                                    }
-                                                >
-                                                    <img
-                                                        loading="lazy"
-                                                        decoding="async"
-                                                        width=w
-                                                        height=h
-                                                        alt=alt
-                                                        class="block w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-300"
-                                                        src=url
-                                                    />
-                                                </button>
+                                                {media_view}
                                                 <div class="absolute top-1.5 right-1.5 z-10">
                                                     <LikeButton
                                                         kind="image"
@@ -392,30 +564,32 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                                                         variant=LikeVariant::Card
                                                     />
                                                 </div>
-                                                <a
-                                                    href=href
-                                                    title="Open image details & similar"
-                                                    class="absolute bottom-1.5 right-1.5 z-10 px-2 py-0.5 rounded-full
-                                                           text-[11px] font-semibold bg-slate-900/75 hover:bg-sky-500
-                                                           text-white backdrop-blur-xs opacity-0 group-hover:opacity-100
-                                                           group-focus-within:opacity-100 touch-visible transition-opacity"
-                                                    on:click=move |ev: ev::MouseEvent| {
-                                                        ev.stop_propagation();
-                                                        if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
-                                                            ev.prevent_default();
-                                                            let nav = nav.clone();
-                                                            navigate_from_modal(
-                                                                click_href.clone(),
-                                                                move || lightbox.set(None),
-                                                                move |dest, replace| {
-                                                                    nav(dest, NavigateOptions { replace, ..Default::default() });
-                                                                },
-                                                            );
+                                                {(!locked).then(|| view! {
+                                                    <a
+                                                        href=href
+                                                        title="Open image details & similar"
+                                                        class="absolute bottom-1.5 right-1.5 z-10 px-2 py-0.5 rounded-full
+                                                               text-[11px] font-semibold bg-slate-900/75 hover:bg-sky-500
+                                                               text-white backdrop-blur-xs opacity-0 group-hover:opacity-100
+                                                               group-focus-within:opacity-100 touch-visible transition-opacity"
+                                                        on:click=move |ev: ev::MouseEvent| {
+                                                            ev.stop_propagation();
+                                                            if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
+                                                                ev.prevent_default();
+                                                                let nav = nav.clone();
+                                                                navigate_from_modal(
+                                                                    click_href.clone(),
+                                                                    move || lightbox.set(None),
+                                                                    move |dest, replace| {
+                                                                        nav(dest, NavigateOptions { replace, ..Default::default() });
+                                                                    },
+                                                                );
+                                                            }
                                                         }
-                                                    }
-                                                >
-                                                    "Details \u{2197}"
-                                                </a>
+                                                    >
+                                                        "Details \u{2197}"
+                                                    </a>
+                                                })}
                                             </div>
                                         }
                                     }
@@ -466,7 +640,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
 
 #[server(endpoint = "fetch_post_meta")]
 async fn fetch_post_meta(post_id: i64) -> Result<PostMeta, ServerFnError> {
-    use crate::state::AppState;
+    use crate::state::{AppState, RequestSafetyContext};
     use std::sync::Arc;
 
     use axum::extract::State;
@@ -474,6 +648,7 @@ async fn fetch_post_meta(post_id: i64) -> Result<PostMeta, ServerFnError> {
     use search_engine::Engine;
 
     let state = expect_context::<AppState>();
+    let _ctx = RequestSafetyContext::from_leptos_context(&state)?;
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
     engine

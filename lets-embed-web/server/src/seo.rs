@@ -1,12 +1,17 @@
 //! Public SEO endpoints: `/robots.txt`, `/sitemap.xml`, and chunked `/sitemap/{page}.xml`.
+//!
+//! - In Managed Mode, canonical origin is ALWAYS the pinned `PUBLIC_URL` (never `Host`/`X-Forwarded-Host`).
+//! - Sitemaps ALWAYS run under the anonymous safe view (`sitemap_post_count_with_policy` /
+//!   `sitemap_post_entries_with_policy`), honoring `policy.legal.noindex_restricted`.
 
 use std::sync::Arc;
 
 use app::{
-    state::AppState,
-    util::{normalize_public_origin, origin_from_headers},
+    state::{AppState, RequestSafetyContext},
+    util::resolve_origin_for_request,
 };
 use axum::{
+    Extension,
     extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
@@ -16,11 +21,7 @@ use axum::{
 pub const SITEMAP_PAGE_SIZE: i64 = 5_000;
 
 fn resolve_origin(state: &AppState, headers: &HeaderMap) -> Option<String> {
-    state
-        .public_url
-        .as_deref()
-        .and_then(normalize_public_origin)
-        .or_else(|| origin_from_headers(headers))
+    resolve_origin_for_request(state, headers)
 }
 
 fn xml_escape(s: &str) -> String {
@@ -100,7 +101,9 @@ pub async fn robots_txt(State(state): State<AppState>, headers: HeaderMap) -> Re
         "User-agent: *\n\
          Allow: /\n\
          Disallow: /user/\n\
-         Disallow: /api/\n",
+         Disallow: /admin/\n\
+         Disallow: /api/\n\
+         Disallow: /media/\n",
     );
     if let Some(origin) = resolve_origin(&state, &headers) {
         body.push_str(&format!("\nSitemap: {origin}/sitemap.xml\n"));
@@ -117,12 +120,28 @@ pub async fn robots_txt(State(state): State<AppState>, headers: HeaderMap) -> Re
 
 /// `GET /sitemap.xml` — serves a single `<urlset>` when the catalog fits in one
 /// chunk, or a `<sitemapindex>` referencing `/sitemap/1.xml` .. `/sitemap/{n}.xml`.
-pub async fn sitemap_root(State(state): State<AppState>, headers: HeaderMap) -> Response {
+pub async fn sitemap_root(
+    State(state): State<AppState>,
+    ctx_ext: Option<Extension<RequestSafetyContext>>,
+    headers: HeaderMap,
+) -> Response {
+    let policy = match ctx_ext {
+        Some(Extension(c)) => c.policy,
+        None if state.mode.is_managed() => {
+            return (
+                StatusCode::FORBIDDEN,
+                [(header::CACHE_CONTROL, "private, no-store")],
+                "Forbidden",
+            )
+                .into_response();
+        }
+        None => state.policy_store.current_standalone(),
+    };
     let Some(origin) = resolve_origin(&state, &headers) else {
         return (StatusCode::BAD_REQUEST, "Unable to determine site origin").into_response();
     };
     let engine: Arc<search_engine::Engine> = state.engine.clone();
-    let total = match engine.sitemap_post_count().await {
+    let total = match engine.sitemap_post_count_with_policy(&policy).await {
         Ok(n) => n.max(0),
         Err(e) => {
             tracing::error!("sitemap_post_count failed: {e}");
@@ -131,7 +150,10 @@ pub async fn sitemap_root(State(state): State<AppState>, headers: HeaderMap) -> 
     };
 
     let xml = if total <= SITEMAP_PAGE_SIZE {
-        let entries = match engine.sitemap_post_entries(SITEMAP_PAGE_SIZE, 0).await {
+        let entries = match engine
+            .sitemap_post_entries_with_policy(&policy, SITEMAP_PAGE_SIZE, 0)
+            .await
+        {
             Ok(list) => list,
             Err(e) => {
                 tracing::error!("sitemap_post_entries failed: {e}");
@@ -158,9 +180,22 @@ pub async fn sitemap_root(State(state): State<AppState>, headers: HeaderMap) -> 
 /// `GET /sitemap/{page}` (e.g. `/sitemap/1.xml`)
 pub async fn sitemap_page(
     State(state): State<AppState>,
+    ctx_ext: Option<Extension<RequestSafetyContext>>,
     Path(raw_page): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    let policy = match ctx_ext {
+        Some(Extension(c)) => c.policy,
+        None if state.mode.is_managed() => {
+            return (
+                StatusCode::FORBIDDEN,
+                [(header::CACHE_CONTROL, "private, no-store")],
+                "Forbidden",
+            )
+                .into_response();
+        }
+        None => state.policy_store.current_standalone(),
+    };
     let Some(page) = parse_sitemap_page(&raw_page) else {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
     };
@@ -168,7 +203,7 @@ pub async fn sitemap_page(
         return (StatusCode::BAD_REQUEST, "Unable to determine site origin").into_response();
     };
     let engine: Arc<search_engine::Engine> = state.engine.clone();
-    let total = match engine.sitemap_post_count().await {
+    let total = match engine.sitemap_post_count_with_policy(&policy).await {
         Ok(n) => n.max(0),
         Err(e) => {
             tracing::error!("sitemap_post_count failed: {e}");
@@ -181,7 +216,10 @@ pub async fn sitemap_page(
     }
 
     let offset = (i64::from(page) - 1).saturating_mul(SITEMAP_PAGE_SIZE);
-    let entries = match engine.sitemap_post_entries(SITEMAP_PAGE_SIZE, offset).await {
+    let entries = match engine
+        .sitemap_post_entries_with_policy(&policy, SITEMAP_PAGE_SIZE, offset)
+        .await
+    {
         Ok(list) => list,
         Err(e) => {
             tracing::error!("sitemap_post_entries failed: {e}");

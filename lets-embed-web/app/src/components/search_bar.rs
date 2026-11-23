@@ -2,8 +2,8 @@ use crate::components::{
     AccountWidget, AdvancedSearchPanel, BackToTop, SelectOption, SelectVariant, SkySelect,
 };
 use crate::types::{
-    DEFAULT_SEARCH_LIMIT, GalleryDensity, GalleryDensityState, Mode, parse_url_limit,
-    save_gallery_density,
+    DEFAULT_SEARCH_LIMIT, GalleryDensityState, Mode, SafetyUiState, parse_url_limit,
+    parse_url_min_similarity,
 };
 use js_sys::futures::JsFuture;
 use leptos::{prelude::*, task::spawn_local};
@@ -15,6 +15,7 @@ use leptos_router::{
 #[cfg(feature = "hydrate")]
 use leptos_use_element_size::{UseElementSizeReturn, use_element_size};
 use leptos_use_signal_debounce_throttle::signal_debounced;
+use lets_embed_ui::{DensityPicker, NoticeBanner, NoticeContent, NoticeTone, SafeModeToggle};
 use search_types::query::{AdvancedSort, QueryExpr, ResultKind, SearchField, parse_and_compile};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::{JsCast as _, JsValue};
@@ -36,13 +37,14 @@ pub struct SearchSuggestion {
 }
 
 /// Parsed URL search parameters on the main gallery route (`/`), matching `Results`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UrlSearchState {
     pub mode: Mode,
     pub q: String,
     pub adv: String,
     pub sort: AdvancedSort,
     pub clip_weight: i32,
+    pub min_similarity: Option<f32>,
     pub img_nonce: String,
     pub limit: usize,
 }
@@ -55,11 +57,34 @@ impl Default for UrlSearchState {
             adv: String::new(),
             sort: AdvancedSort::Relevance,
             clip_weight: 50,
+            min_similarity: None,
             img_nonce: String::new(),
             limit: DEFAULT_LIMIT,
         }
     }
 }
+
+#[cfg(feature = "hydrate")]
+async fn persist_safe_mode(enabled: bool) {
+    use web_sys::{Headers, RequestInit};
+
+    let Some(win) = web_sys::window() else {
+        return;
+    };
+    let opts = RequestInit::new();
+    opts.set_method("POST");
+    if let Ok(headers) = Headers::new() {
+        let _ = headers.set("Content-Type", "application/json");
+        let _ = headers.set(site_access::USER_CSRF_HEADER, "1");
+        opts.set_headers(&headers);
+    }
+    let body = serde_json::json!({ "safe_mode": enabled }).to_string();
+    opts.set_body(&JsValue::from_str(&body));
+    let _ = JsFuture::from(win.fetch_with_str_and_init("/user/api/preferences", &opts)).await;
+}
+
+#[cfg(not(feature = "hydrate"))]
+async fn persist_safe_mode(_enabled: bool) {}
 
 /// Summary descriptor rendered in the Active Advanced Query Summary Strip.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,12 +130,14 @@ fn should_suggest(mode: Mode, q: &str) -> bool {
 
 /// Shared URL parser for the main gallery route so initial render and subsequent
 /// navigations always agree with `Results` on defaults (`Mode::All`, `limit = 50`).
+#[allow(clippy::too_many_arguments)]
 fn parse_url_state(
     mode_raw: Option<String>,
     q_raw: Option<String>,
     adv_raw: Option<String>,
     sort_raw: Option<String>,
     cw_raw: Option<String>,
+    min_sim_raw: Option<String>,
     img_raw: Option<String>,
     limit_raw: Option<String>,
 ) -> UrlSearchState {
@@ -125,6 +152,7 @@ fn parse_url_state(
         .and_then(|s| s.parse::<i32>().ok())
         .unwrap_or(50)
         .clamp(5, 95);
+    let min_similarity = parse_url_min_similarity(min_sim_raw.as_deref());
     let img_nonce = img_raw.unwrap_or_default();
     let limit = parse_url_limit(limit_raw.as_deref()) as usize;
     UrlSearchState {
@@ -133,6 +161,7 @@ fn parse_url_state(
         adv,
         sort,
         clip_weight,
+        min_similarity,
         img_nonce,
         limit,
     }
@@ -379,6 +408,7 @@ pub fn SearchBar() -> impl IntoView {
                 m.get("adv"),
                 m.get("sort"),
                 m.get("cw"),
+                m.get("min_sim"),
                 m.get("img"),
                 m.get("limit"),
             )
@@ -570,6 +600,20 @@ pub fn SearchBar() -> impl IntoView {
     let dropdown_open = move || input_focused.get() && !suggestions.with(Vec::is_empty);
 
     let density = use_context::<GalleryDensityState>().unwrap_or_default().0;
+    let safety = expect_context::<SafetyUiState>();
+    let on_safe_mode_toggle = Callback::new(move |next: bool| {
+        if next {
+            lets_embed_ui::browser::wipe_media_elements_in(None);
+        }
+        if safety.is_managed.get_untracked() {
+            spawn_local(async move {
+                persist_safe_mode(next).await;
+                let _ = safety.reload_epoch.try_update(|e| *e = e.wrapping_add(1));
+            });
+        } else {
+            safety.reload_epoch.update(|e| *e = e.wrapping_add(1));
+        }
+    });
     let is_home = move || pathname.with(|p| p == "/");
     let header_card_ref = NodeRef::<leptos::html::Div>::new();
 
@@ -608,22 +652,6 @@ pub fn SearchBar() -> impl IntoView {
             }
         });
     }
-
-    let render_density_btn = move |d: GalleryDensity, label: &'static str| {
-        view! {
-            <button
-                type="button"
-                class="gallery-density-btn"
-                aria-pressed=move || (density.get() == d).to_string()
-                on:click=move |_| {
-                    density.set(d);
-                    save_gallery_density(d);
-                }
-            >
-                {label}
-            </button>
-        }
-    };
 
     let bar_row_cls = move || {
         if is_home() {
@@ -914,16 +942,18 @@ pub fn SearchBar() -> impl IntoView {
                     // Gallery density selector integrated into the floating header on the home page
                     {move || is_home().then(|| view! {
                         <div class="order-4 md:order-5 xl:order-4 shrink-0">
-                            <div class="gallery-density" role="group" aria-label="Grid size">
-                                {render_density_btn(GalleryDensity::Compact, "Compact")}
-                                {render_density_btn(GalleryDensity::Medium, "Medium")}
-                                {render_density_btn(GalleryDensity::Large, "Large")}
-                            </div>
+                            <DensityPicker density=density persist=true />
                         </div>
                     })}
 
-                    // Compact action buttons: Random (+ inline Posts|Images when active) & Advanced
+                    // Compact action buttons: Safe Mode, Random (+ inline Posts|Images when active) & Advanced
                     <div class=actions_slot_cls>
+                        <SafeModeToggle
+                            safe_mode=safety.safe_mode
+                            panic_epoch=safety.panic_epoch
+                            compact=true
+                            on_toggle=on_safe_mode_toggle
+                        />
                         {move || if is_random_mode() {
                             let cur_target = random_target();
                             let reroll = go_random_main.clone();
@@ -1121,6 +1151,36 @@ pub fn SearchBar() -> impl IntoView {
             }
         })}
 
+        {move || {
+            if !safety.notice_banner_enabled.get() {
+                return None;
+            }
+            let html = safety.notice_banner_html.get()?;
+            let dismiss_key = safety.notice_banner_key.get_untracked();
+            Some(view! {
+                <div class="w-full px-2 sm:px-3.5 mt-2">
+                    <div class="max-w-[1640px] mx-auto">
+                        {if dismiss_key.is_empty() {
+                            view! {
+                                <NoticeBanner
+                                    content=NoticeContent::PreSanitizedHtml(html)
+                                    tone=NoticeTone::Info
+                                />
+                            }.into_any()
+                        } else {
+                            view! {
+                                <NoticeBanner
+                                    content=NoticeContent::PreSanitizedHtml(html)
+                                    tone=NoticeTone::Info
+                                    dismiss_key=dismiss_key
+                                />
+                            }.into_any()
+                        }}
+                    </div>
+                </div>
+            })
+        }}
+
         <Outlet />
         <BackToTop />
     }
@@ -1128,7 +1188,7 @@ pub fn SearchBar() -> impl IntoView {
 
 #[server(endpoint = "suggest_search")]
 async fn suggest_search(mode: String, q: String) -> Result<Vec<SearchSuggestion>, ServerFnError> {
-    use crate::state::AppState;
+    use crate::state::{AppState, RequestSafetyContext};
     use std::sync::Arc;
 
     use axum::extract::State;
@@ -1152,6 +1212,8 @@ async fn suggest_search(mode: String, q: String) -> Result<Vec<SearchSuggestion>
     }
 
     let state = expect_context::<AppState>();
+    let safety_ctx = RequestSafetyContext::from_leptos_context(&state)?;
+    let safety_filter = safety_ctx.safety_filter();
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
     fn to_err(e: impl std::fmt::Display) -> ServerFnError {
@@ -1181,7 +1243,7 @@ async fn suggest_search(mode: String, q: String) -> Result<Vec<SearchSuggestion>
             out
         }
         Mode::Tag => engine
-            .suggest_tags(&q, 10)
+            .suggest_tags_with_safety(&q, 10, Some(&safety_filter))
             .await
             .map_err(to_err)?
             .into_iter()
@@ -1248,11 +1310,12 @@ mod tests {
 
     #[test]
     fn url_state_defaults_to_all_and_limit_50() {
-        let st = parse_url_state(None, None, None, None, None, None, None);
+        let st = parse_url_state(None, None, None, None, None, None, None, None);
         assert_eq!(st.mode, Mode::All);
         assert_eq!(st.q, "");
         assert_eq!(st.limit, 50);
         assert_eq!(st.clip_weight, 50);
+        assert_eq!(st.min_similarity, None);
         assert_eq!(st.sort, AdvancedSort::Relevance);
 
         let adv = parse_url_state(
@@ -1261,6 +1324,7 @@ mod tests {
             Some("tag:maid".into()),
             Some("newest".into()),
             Some("120".into()),
+            Some("0.42".into()),
             Some("999".into()),
             Some("25".into()),
         );
@@ -1268,14 +1332,16 @@ mod tests {
         assert_eq!(adv.adv, "tag:maid");
         assert_eq!(adv.sort, AdvancedSort::Newest);
         assert_eq!(adv.clip_weight, 95);
+        assert_eq!(adv.min_similarity, Some(0.42));
         assert_eq!(adv.img_nonce, "999");
         assert_eq!(adv.limit, 25);
 
-        let zero_lim = parse_url_state(None, None, None, None, None, None, Some("0".into()));
+        let zero_lim = parse_url_state(None, None, None, None, None, None, None, Some("0".into()));
         assert_eq!(zero_lim.limit, 50);
-        let neg_lim = parse_url_state(None, None, None, None, None, None, Some("-5".into()));
+        let neg_lim = parse_url_state(None, None, None, None, None, None, None, Some("-5".into()));
         assert_eq!(neg_lim.limit, 50);
-        let huge_lim = parse_url_state(None, None, None, None, None, None, Some("999".into()));
+        let huge_lim =
+            parse_url_state(None, None, None, None, None, None, None, Some("999".into()));
         assert_eq!(huge_lim.limit, 100);
     }
 

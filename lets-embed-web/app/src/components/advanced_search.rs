@@ -5,7 +5,9 @@ use crate::components::{
         should_suggest_field,
     },
 };
-use crate::types::{AdvancedUploads, AdvancedUploadsPayload, ImageQuery, Mode, UploadedImageSlot};
+use crate::types::{
+    AdvancedUploads, AdvancedUploadsPayload, ImageQuery, Mode, SafetyUiState, UploadedImageSlot,
+};
 #[cfg(feature = "hydrate")]
 use crate::util::trap_dialog_tab;
 use crate::util::{lock_body_scroll, navigate_from_modal, push_modal_history};
@@ -16,6 +18,7 @@ use leptos_router::{NavigateOptions, hooks::use_navigate};
 #[cfg(feature = "hydrate")]
 use leptos_use_event_listener::use_event_listener;
 use leptos_use_signal_debounce_throttle::signal_debounced;
+use lets_embed_ui::MinSimilaritySlider;
 use search_types::query::{
     AdvancedSort, QueryExpr, QueryPlan, ResultKind, SearchField, VectorTier, parse_and_compile,
     parse_query,
@@ -831,6 +834,7 @@ fn build_advanced_nav_url(
     plan: &QueryPlan,
     sort: AdvancedSort,
     clip_weight: i32,
+    min_similarity: Option<f32>,
     img_nonce: Option<&str>,
     limit: usize,
 ) -> String {
@@ -840,6 +844,13 @@ fn build_advanced_nav_url(
     }
     if plan.has_clip() && plan.has_dino() && clip_weight != 50 {
         url.push_str(&format!("&cw={}", clip_weight.clamp(5, 95)));
+    }
+    if plan.has_vectors()
+        && let Some(ms) = min_similarity
+        && ms.is_finite()
+        && ms > 0.0005
+    {
+        url.push_str(&format!("&min_sim={:.2}", ms.clamp(0.0, 1.0)));
     }
     if let Some(nonce) = img_nonce {
         url.push_str(&format!("&img={}", urlencoding::encode(nonce)));
@@ -1358,11 +1369,24 @@ pub fn AdvancedSearchPanel(
     let navigate = use_navigate();
     let adv_uploads = expect_context::<AdvancedUploads>();
     let single_img = expect_context::<ImageQuery>();
+    let safety = use_context::<SafetyUiState>();
 
     let init_limit = initial_state
         .as_ref()
         .map(|s| s.limit)
         .unwrap_or(DEFAULT_LIMIT);
+    let init_min_sim = initial_state
+        .as_ref()
+        .and_then(|s| s.min_similarity)
+        .unwrap_or_else(|| {
+            safety
+                .map(|s| {
+                    s.default_dinov3_min
+                        .get_untracked()
+                        .max(s.default_siglip2_min.get_untracked())
+                })
+                .unwrap_or(0.0)
+        });
 
     let next_id: StoredValue<u64> = StoredValue::new(1);
     let alloc_id = move || {
@@ -1393,6 +1417,7 @@ pub fn AdvancedSearchPanel(
     let upload_err_count: RwSignal<usize> = RwSignal::new(0);
     let sort: RwSignal<AdvancedSort> = RwSignal::new(init_sort);
     let clip_weight: RwSignal<i32> = RwSignal::new(init_cw);
+    let min_similarity: RwSignal<f32> = RwSignal::new(init_min_sim);
     let show_cheat_sheet: RwSignal<bool> = RwSignal::new(false);
     let submit_seq: StoredValue<u64> = StoredValue::new(1);
     let backdrop_pointerdown: StoredValue<bool> = StoredValue::new(false);
@@ -1564,6 +1589,7 @@ pub fn AdvancedSearchPanel(
         raw_out_of_sync.set(false);
         sort.set(AdvancedSort::Relevance);
         clip_weight.set(50);
+        min_similarity.set(0.0);
     };
 
     let do_submit = {
@@ -1596,11 +1622,13 @@ pub fn AdvancedSearchPanel(
             } else {
                 (raw, None)
             };
+            let min_sim_val = min_similarity.get_untracked();
             let url = build_advanced_nav_url(
                 &submitted_raw,
                 &plan,
                 sort.get_untracked(),
                 clip_weight.get_untracked(),
+                (min_sim_val > 0.0005).then_some(min_sim_val),
                 nonce.as_deref(),
                 init_limit,
             );
@@ -2554,36 +2582,54 @@ pub fn AdvancedSearchPanel(
                         })}
                     </div>
 
-                    // Section 3: Dynamic Options (CLIP/Visual balance slider OR Tag sort toggle)
+                    // Section 3: Dynamic Options (CLIP/Visual balance + Min similarity OR Tag sort toggle)
                     {move || match validation.get() {
-                        ValidationState::Valid(plan) if plan.has_clip() && plan.has_dino() => {
+                        ValidationState::Valid(plan) if plan.has_vectors() => {
+                            let dual = plan.has_clip() && plan.has_dino();
+                            let badge = match (plan.has_clip(), plan.has_dino()) {
+                                (true, true) => "SigLIP2 + DINOv3",
+                                (true, false) => "SigLIP2",
+                                (false, true) => "DINOv3",
+                                _ => "Vector",
+                            };
                             Some(view! {
-                                <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-3.5 py-2.5
-                                            rounded-2xl bg-indigo-50/60 ring-1 ring-indigo-200/80">
-                                    <div class="flex items-center gap-2 text-xs font-semibold text-indigo-800">
-                                        <span>"CLIP / Visual balance"</span>
-                                    </div>
-                                    <div class="flex items-center gap-3 flex-1 sm:max-w-md">
-                                        <span class="text-xs font-medium text-sky-700 tabular-nums whitespace-nowrap">
-                                            {move || format!("CLIP {}%", clip_weight.get())}
-                                        </span>
-                                        <input
-                                            type="range"
-                                            min="5"
-                                            max="95"
-                                            step="5"
-                                            aria-label="CLIP versus Visual similarity balance"
-                                            class="flex-1 accent-indigo-500 cursor-pointer"
-                                            prop:value=move || clip_weight.get().to_string()
-                                            on:input=move |ev| {
-                                                if let Ok(v) = event_target_value(&ev).parse::<i32>() {
-                                                    clip_weight.set(v.clamp(5, 95));
-                                                }
-                                            }
+                                <div class="flex flex-col gap-2">
+                                    {dual.then(|| view! {
+                                        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-3.5 py-2.5
+                                                    rounded-2xl bg-indigo-50/60 ring-1 ring-indigo-200/80">
+                                            <div class="flex items-center gap-2 text-xs font-semibold text-indigo-800">
+                                                <span>"CLIP / Visual balance"</span>
+                                            </div>
+                                            <div class="flex items-center gap-3 flex-1 sm:max-w-md">
+                                                <span class="text-xs font-medium text-sky-700 tabular-nums whitespace-nowrap">
+                                                    {move || format!("CLIP {}%", clip_weight.get())}
+                                                </span>
+                                                <input
+                                                    type="range"
+                                                    min="5"
+                                                    max="95"
+                                                    step="5"
+                                                    aria-label="CLIP versus Visual similarity balance"
+                                                    class="flex-1 accent-indigo-500 cursor-pointer"
+                                                    prop:value=move || clip_weight.get().to_string()
+                                                    on:input=move |ev| {
+                                                        if let Ok(v) = event_target_value(&ev).parse::<i32>() {
+                                                            clip_weight.set(v.clamp(5, 95));
+                                                        }
+                                                    }
+                                                />
+                                                <span class="text-xs font-medium text-indigo-700 tabular-nums whitespace-nowrap">
+                                                    {move || format!("Visual {}%", 100 - clip_weight.get())}
+                                                </span>
+                                            </div>
+                                        </div>
+                                    })}
+                                    <div class="px-3.5 py-2.5 rounded-2xl bg-sky-50/65 ring-1 ring-sky-200/80">
+                                        <MinSimilaritySlider
+                                            value=min_similarity
+                                            label="Min similarity"
+                                            model_badge=badge
                                         />
-                                        <span class="text-xs font-medium text-indigo-700 tabular-nums whitespace-nowrap">
-                                            {move || format!("Visual {}%", 100 - clip_weight.get())}
-                                        </span>
                                     </div>
                                 </div>
                             }.into_any())
@@ -3009,11 +3055,27 @@ mod tests {
     fn builds_advanced_nav_url_with_optional_params() {
         let (_, tag_plan) = parse_and_compile("tag:maid").unwrap();
         assert_eq!(
-            build_advanced_nav_url("tag:maid", &tag_plan, AdvancedSort::Relevance, 50, None, 50),
+            build_advanced_nav_url(
+                "tag:maid",
+                &tag_plan,
+                AdvancedSort::Relevance,
+                50,
+                None,
+                None,
+                50
+            ),
             "/?mode=advanced&adv=tag%3Amaid"
         );
         assert_eq!(
-            build_advanced_nav_url("tag:maid", &tag_plan, AdvancedSort::Newest, 50, None, 25),
+            build_advanced_nav_url(
+                "tag:maid",
+                &tag_plan,
+                AdvancedSort::Newest,
+                50,
+                Some(0.5),
+                None,
+                25
+            ),
             "/?mode=advanced&adv=tag%3Amaid&sort=newest&limit=25"
         );
 
@@ -3024,10 +3086,11 @@ mod tests {
                 &dual_plan,
                 AdvancedSort::Newest,
                 70,
+                Some(0.35),
                 None,
                 50
             ),
-            "/?mode=advanced&adv=clip%3A%22cafe%22%20AND%20dino%3A42&cw=70"
+            "/?mode=advanced&adv=clip%3A%22cafe%22%20AND%20dino%3A42&cw=70&min_sim=0.35"
         );
 
         let (_, upload_plan) = parse_and_compile("upload:0").unwrap();
@@ -3037,6 +3100,7 @@ mod tests {
                 &upload_plan,
                 AdvancedSort::Relevance,
                 50,
+                None,
                 Some("123-1"),
                 50
             ),

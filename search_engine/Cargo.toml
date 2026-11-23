@@ -20,6 +20,7 @@ ort.workspace = true
 tokenizers.workspace = true
 
 search_types = { path = "../search_types" }
+site_access = { path = "../site_access" }
 
 siglip2 = { path = "../siglip2" }
 dinov3 = { path = "../dinov3" }
@@ -31,3 +32,6 @@ moka = { version = "0.12", features = ["future"] }
 [features]
 default = []
 serde = ["search_types/serde"]
+
+[dev-dependencies]
+serde_json.workspace = true
