@@ -211,9 +211,27 @@ pub async fn bootstrap(State(st): State<AppState>, cookies: Cookies) -> Response
 #[derive(Debug, Deserialize)]
 pub struct PreferencesReq {
     #[serde(default)]
-    pub enabled_switchers: Vec<String>,
+    pub enabled_switchers: Option<Vec<String>>,
     #[serde(default)]
-    pub safe_mode: bool,
+    pub safe_mode: Option<bool>,
+}
+
+/// Pure partial-update resolver for `POST /user/api/preferences`:
+/// omitting `enabled_switchers` (e.g. Safe Mode panic toggle sending `{"safe_mode": true}`)
+/// preserves existing saved switchers; omitting `safe_mode` preserves existing `safe_mode`.
+pub fn resolve_preferences_update(
+    policy: &PublicSitePolicy,
+    existing_switchers: &[String],
+    existing_safe_mode: bool,
+    req: &PreferencesReq,
+) -> (Vec<String>, bool) {
+    let raw_switchers = req
+        .enabled_switchers
+        .as_deref()
+        .unwrap_or(existing_switchers);
+    let filtered = filter_valid_switchers(policy, raw_switchers);
+    let next_safe = req.safe_mode.unwrap_or(existing_safe_mode);
+    (filtered, next_safe)
 }
 
 #[derive(Debug, Serialize)]
@@ -245,10 +263,15 @@ pub async fn update_preferences(
         }
     };
 
-    let filtered = filter_valid_switchers(&policy, &req.enabled_switchers);
+    let (filtered, next_safe) = resolve_preferences_update(
+        &policy,
+        &active.ctx.enabled_switchers,
+        active.ctx.safe_mode,
+        &req,
+    );
     let prefs_json = match serde_json::to_string(&StoredContentPrefs {
         enabled_switchers: filtered.clone(),
-        safe_mode: req.safe_mode,
+        safe_mode: next_safe,
     }) {
         Ok(s) => s,
         Err(_) => return auth::internal_error(),
@@ -270,7 +293,7 @@ pub async fn update_preferences(
         &active.do_key,
         &PrefsUpdateReq {
             enabled_switchers: filtered.clone(),
-            safe_mode: req.safe_mode,
+            safe_mode: next_safe,
         },
     )
     .await
@@ -287,7 +310,7 @@ pub async fn update_preferences(
 
     Json(PreferencesResp {
         enabled_switchers: filtered,
-        safe_mode: req.safe_mode,
+        safe_mode: next_safe,
         effective_switchers,
     })
     .into_response()
@@ -952,5 +975,63 @@ mod tests {
         assert!(validate_report_input("comment", 1, "spam_other", None).is_err());
         assert!(validate_report_input("image", 0, "spam_other", None).is_err());
         assert!(validate_report_input("image", 5, "spam_other", Some("bad\0note")).is_err());
+    }
+
+    #[test]
+    fn partial_preferences_update_preserves_existing_switchers_and_safe_mode() {
+        let policy = PublicSitePolicy {
+            rules: vec![
+                site_access::SafetyRuleConfig {
+                    id: "r18".into(),
+                    name: "R-18".into(),
+                    mode: RuleMode::Switcher,
+                    query: "tag:explicit".into(),
+                    default_min_score: 0.5,
+                    preset: site_access::PlaceholderPreset::R18,
+                    requires_login: true,
+                    requires_age_18: true,
+                    enabled: true,
+                },
+                site_access::SafetyRuleConfig {
+                    id: "gore".into(),
+                    name: "Gore".into(),
+                    mode: RuleMode::Switcher,
+                    query: "tag:blood".into(),
+                    default_min_score: 0.5,
+                    preset: site_access::PlaceholderPreset::Blood,
+                    requires_login: true,
+                    requires_age_18: true,
+                    enabled: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let existing = vec!["r18".to_string(), "gore".to_string()];
+
+        // Panic toggle sending `{"safe_mode": true}` MUST preserve existing switchers!
+        let panic_on: PreferencesReq = serde_json::from_str(r#"{"safe_mode": true}"#).unwrap();
+        let (sw, safe) = resolve_preferences_update(&policy, &existing, false, &panic_on);
+        assert_eq!(sw, existing);
+        assert!(safe);
+
+        // Exiting Safe Mode (`{"safe_mode": false}`) STILL preserves existing switchers!
+        let panic_off: PreferencesReq = serde_json::from_str(r#"{"safe_mode": false}"#).unwrap();
+        let (sw2, safe2) = resolve_preferences_update(&policy, &existing, true, &panic_off);
+        assert_eq!(sw2, existing);
+        assert!(!safe2);
+
+        // Updating only `enabled_switchers` preserves existing `safe_mode`.
+        let only_sw: PreferencesReq =
+            serde_json::from_str(r#"{"enabled_switchers": ["r18"]}"#).unwrap();
+        let (sw3, safe3) = resolve_preferences_update(&policy, &existing, true, &only_sw);
+        assert_eq!(sw3, vec!["r18".to_string()]);
+        assert!(safe3);
+
+        // Explicit empty `enabled_switchers` clears switchers.
+        let clear_sw: PreferencesReq =
+            serde_json::from_str(r#"{"enabled_switchers": [], "safe_mode": false}"#).unwrap();
+        let (sw4, safe4) = resolve_preferences_update(&policy, &existing, true, &clear_sw);
+        assert!(sw4.is_empty());
+        assert!(!safe4);
     }
 }
