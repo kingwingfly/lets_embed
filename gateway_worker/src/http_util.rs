@@ -9,10 +9,9 @@ use axum::{
     },
     response::{IntoResponse, Redirect, Response},
 };
-use sha2::{Digest, Sha256};
 use site_access::{
-    ADMIN_VIEW_COOKIE, ChargeKind, ChargeReq, STRIPPED_ORIGIN_COOKIES, UPGRADE_PATH,
-    is_privileged_request_header,
+    ADMIN_VIEW_COOKIE, ChargeKind, ChargeReq, GUEST_SESSION_COOKIE, STRIPPED_ORIGIN_COOKIES,
+    UPGRADE_PATH, is_privileged_request_header,
 };
 use worker::{Env, Result};
 
@@ -20,8 +19,10 @@ pub(crate) const USER_ALLOWED_METHODS: &str = "GET, HEAD, POST, DELETE, PUT, PAT
 pub(crate) const GALLERY_ALLOWED_METHODS: &str = "GET, HEAD, POST";
 pub(crate) const MEDIA_ALLOWED_METHODS: &str = "GET, HEAD";
 pub(crate) const MAX_GATEWAY_BODY_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_ADMIN_BODY_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_IMAGE_SEARCH_BODY_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_TEXT_SEARCH_BODY_BYTES: usize = 32 * 1024;
+pub(crate) const MAX_REVEAL_BODY_BYTES: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Upstreams {
@@ -61,8 +62,17 @@ impl Upstreams {
             parse_upstream_origin(&raw)
                 .map_err(|reason| worker::Error::RustError(format!("invalid {name}: {reason}")))
         };
+        let api = match env.var("API_UPSTREAM") {
+            Ok(v) => {
+                let raw = v.to_string();
+                parse_upstream_origin(&raw).map_err(|reason| {
+                    worker::Error::RustError(format!("invalid API_UPSTREAM: {reason}"))
+                })?
+            }
+            Err(_) => var("APP_ORIGIN")?,
+        };
         Ok(Self {
-            api: var("API_UPSTREAM")?,
+            api,
             image: var("IMAGE_UPSTREAM")?,
             video: var("VIDEO_UPSTREAM")?,
         })
@@ -152,6 +162,21 @@ pub(crate) fn request_host<'a>(uri: &'a Uri, headers: &'a HeaderMap) -> Option<&
     Some(host)
 }
 
+pub(crate) fn is_https_request(uri: &Uri, headers: &HeaderMap) -> bool {
+    if uri
+        .scheme_str()
+        .is_some_and(|s| s.eq_ignore_ascii_case("http"))
+    {
+        return false;
+    }
+    if let Ok(Some(xfp)) = single_header(headers, "x-forwarded-proto")
+        && xfp.trim().eq_ignore_ascii_case("http")
+    {
+        return false;
+    }
+    true
+}
+
 pub(crate) fn is_same_origin(uri: &Uri, headers: &HeaderMap) -> bool {
     let Ok(sec_fetch_site) = single_header(headers, "sec-fetch-site") else {
         return false;
@@ -180,6 +205,15 @@ pub(crate) fn is_same_origin(uri: &Uri, headers: &HeaderMap) -> bool {
     } else {
         false
     }
+}
+
+/// Validates the required `X-Requested-With: fetch` anti-CSRF header on
+/// `POST /api/safety/reveal`.
+pub(crate) fn has_reveal_csrf_header(headers: &HeaderMap) -> bool {
+    single_header(headers, "x-requested-with")
+        .ok()
+        .flatten()
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("fetch"))
 }
 
 pub(crate) fn is_rfc3986_unreserved(b: u8) -> bool {
@@ -223,14 +257,17 @@ pub(crate) fn sanitize_origin_cookie(headers: &HeaderMap) -> Option<String> {
     (!kept.is_empty()).then(|| kept.join("; "))
 }
 
-/// Strips admin/Cloudflare Access cookies before forwarding to `USER_WORKER`
-/// while preserving `ue_session` and `__Host-auth_tx`.
+/// Strips admin, Cloudflare Access, and guest-reveal cookies before forwarding to
+/// `USER_WORKER` while preserving `ue_session` and `__Host-auth_tx`.
 pub(crate) fn sanitize_user_worker_cookie(headers: &HeaderMap) -> Option<String> {
     let mut kept = Vec::new();
     for raw in headers.get_all("cookie").iter().filter_map(|v| v.to_str().ok()) {
         for cookie in raw.split(';').map(str::trim).filter(|c| !c.is_empty()) {
             let name = cookie.split('=').next().unwrap_or("").trim();
-            if name != ADMIN_VIEW_COOKIE && name != "CF_Authorization" {
+            if name != ADMIN_VIEW_COOKIE
+                && name != GUEST_SESSION_COOKIE
+                && name != "CF_Authorization"
+            {
                 kept.push(cookie);
             }
         }
@@ -247,6 +284,7 @@ pub(crate) fn should_strip_api_request_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("x-forwarded-proto")
         || name.eq_ignore_ascii_case("forwarded")
         || name.eq_ignore_ascii_case("cf-ipcountry")
+        || name.eq_ignore_ascii_case("x-internal-api-secret")
         || is_privileged_request_header(name)
 }
 
@@ -399,6 +437,7 @@ pub(crate) fn browse_route(method: &Method, path: &str) -> bool {
             | "/api/fetch_post_meta"
             | "/api/suggest_search"
             | "/api/site_config"
+            | "/api/safety/reveal"
     ) {
         return true;
     }
@@ -667,13 +706,7 @@ pub(crate) fn encode_next(s: &str) -> String {
 
 /// Lowercase hex SHA-256 of `s`.
 pub(crate) fn sha256_hex(s: &str) -> String {
-    Sha256::digest(s.as_bytes())
-        .iter()
-        .fold(String::with_capacity(64), |mut acc, b| {
-            use std::fmt::Write as _;
-            let _ = write!(acc, "{b:02x}");
-            acc
-        })
+    site_access::sha256_hex(s.as_bytes())
 }
 
 /// Read one `application/x-www-form-urlencoded` field value from a raw body,

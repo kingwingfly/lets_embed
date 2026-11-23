@@ -1,14 +1,21 @@
 //! Hardened edge gateway Worker (`lets-embed-gateway-worker`).
 //!
-//! Enforces:
+//! Enforces Policy v3 end-to-end:
+//! - Canonical path validation
+//! - Cloudflare Access-verified `/admin*` routing (with optional `ADMIN_ALLOWED_EMAILS`),
+//!   lazy `KeyDomain::AdminAssertion` loading, and request-bound `AdminAssertion` v2 (`aa2.`)
+//! - Fail-closed strict `decode_active_policy_v3` sync from singleton `SITE_POLICY` DO
 //! - Step 0 authoritative geo-blocking via `request.cf().country()` (exempting `/admin*`)
-//! - Fail-closed policy sync from singleton `SITE_POLICY` DO (`"global"`, `GET /policy`)
-//! - Cloudflare Access-verified `/admin*` routing to `ADMIN_DASHBOARD_WORKER`
-//! - Unconditional `404` retirement of `/user/admin*`
+//! - Unconditional `404` retirement of `/user/admin*` and blocking of raw `/images/*`,
+//!   `/videos/*`, and `/internal/*`
+//! - HKDF `SITE_SECRET` key derivation with optional per-purpose overrides
+//! - Zero implicit admin auto-unlock (`ADMIN_VIEW_COOKIE` strictly limited to billing/wall waiver)
 //! - Revocable `v2` sessions + legacy cutover with live `USER_ACCOUNT` DO `/session-context`
-//! - Raw `/images/*` & `/videos/*` `404` blocking and capability-based `/media/*` enforcement
-//! - Authorize-before-bill canonical metering & separated `/preview-budget` with locked CF blur
-//! - Privileged header/cookie stripping + signed short-lived `X-Gateway-Assertion`
+//! - Policy v3 `compute_policy_access` + `ActorBinding` + `GatewayAssertion` v3 (`ga3.`)
+//! - Object-bound click-to-reveal (`POST /api/safety/reveal`) with signed `le_guest_sid` cookie
+//! - `MediaCapability` v3 (`mc3.`) redemption with authoritative `/internal/facts-rev/{kind}/{id}`
+//!   checks, `authorize_media_capability_v3`, authorize-before-bill canonical metering,
+//!   and fail-closed locked Cloudflare Images preview blur (`cf-resized: internal=ok`)
 
 mod auth;
 mod http_util;
@@ -24,15 +31,16 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::any,
 };
-use serde::{Deserialize, Serialize};
 use site_access::{
     ADMIN_ASSERTION_AUDIENCE, ADMIN_ASSERTION_HEADER, ADMIN_ASSERTION_TTL,
-    ADMIN_ASSERTION_VERSION, ADMIN_HEADER, ADMIN_VIEW_COOKIE, AdminAssertion,
+    ADMIN_ASSERTION_VERSION, ADMIN_HEADER, ADMIN_VIEW_COOKIE, ActorBinding, AdminAssertionClaims,
     GATEWAY_ASSERTION_AUDIENCE, GATEWAY_ASSERTION_HEADER, GATEWAY_ASSERTION_TTL,
-    GATEWAY_ASSERTION_VERSION, GatewayAssertion, GuestReq, HoldReq, HoldResp, MediaCapKind,
-    PublicSitePolicy, SESSION_COOKIE, SessionContext, compute_policy_digest,
-    is_privileged_request_header, sign_admin_assertion, sign_gateway_assertion,
-    verify_media_capability, verify_session_any,
+    GATEWAY_ASSERTION_VERSION, GUEST_SESSION_COOKIE, GUEST_SESSION_VERSION, GatewayAssertion,
+    GuestReq, GuestSessionToken, HoldReq, HoldResp, MEDIA_CAP_AUDIENCE, MediaCapKind,
+    PolicyAccessResult, PolicyCallerContext, PublicSitePolicy, SESSION_COOKIE, SessionContext,
+    authorize_media_capability_v3, compute_policy_access, compute_policy_digest,
+    decode_active_policy_v3, is_privileged_request_header, sign_admin_assertion,
+    sign_gateway_assertion, sign_guest_session, verify_media_capability, verify_session_any,
 };
 use tower_cookies::{CookieManagerLayer, Cookies};
 use tower_service::Service;
@@ -42,33 +50,31 @@ use worker::{
 };
 
 use crate::auth::{
-    ADMIN_VIEW_SUB, LiveSession, SessionContextReq, admin_eligible_switchers,
-    clear_session_cookie_header, compute_eligible_switchers,
+    GUEST_SESSION_TTL, GatewaySecretInputs, LiveSession, SessionContextReq,
+    clear_session_cookie_header, filter_allowed_admin_email, guest_session_set_cookie_header,
+    parse_admin_allowed_emails, resolve_actor_binding, resolve_admin_assertion_secret,
+    resolve_gateway_secrets,
 };
 use crate::http_util::{
-    GALLERY_ALLOWED_METHODS, MAX_GATEWAY_BODY_BYTES, MEDIA_ALLOWED_METHODS, USER_ALLOWED_METHODS,
-    Upstreams, browse_route, build_api_upstream_target, checked_gallery_method,
-    checked_media_method, checked_user_method, guest_id, is_always_public_path, is_canonical_path,
-    is_hop_by_hop, is_public_cacheable_path, is_same_origin, is_segment_prefix, is_sitemap_path,
+    GALLERY_ALLOWED_METHODS, MAX_ADMIN_BODY_BYTES, MAX_GATEWAY_BODY_BYTES, MAX_REVEAL_BODY_BYTES,
+    MEDIA_ALLOWED_METHODS, USER_ALLOWED_METHODS, Upstreams, browse_route,
+    build_api_upstream_target, checked_gallery_method, checked_media_method, checked_user_method,
+    guest_id, has_reveal_csrf_header, is_always_public_path, is_canonical_path, is_hop_by_hop,
+    is_https_request, is_public_cacheable_path, is_same_origin, is_segment_prefix, is_sitemap_path,
     login_response, metered_item, method_not_allowed, payment_required, private_no_store,
     request_host, sanitize_origin_cookie, sanitize_user_worker_cookie,
     should_strip_api_request_header,
 };
 use crate::media::{
-    PreviewBlurConfig, PreviewBudgetReq, authorize_media_capability, build_media_upstream_target,
-    extract_media_cap_query, is_allowed_media_request_header, parse_media_route,
+    PreviewBlurConfig, PreviewBudgetReq, build_facts_rev_target, build_media_upstream_target,
+    extract_media_cap_query, is_allowed_media_request_header,
+    is_verified_preview_transform_response, parse_facts_rev_response, parse_media_route,
     resolve_preview_blur,
 };
 
 // ---------------------------------------------------------------------------
-// Policy Snapshot & Validation
+// Strict Policy v3 Snapshot Decoding
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SitePolicyResponse {
-    policy: PublicSitePolicy,
-    digest: String,
-}
 
 #[derive(Debug, Clone)]
 struct SitePolicySnapshot {
@@ -76,18 +82,43 @@ struct SitePolicySnapshot {
     digest: String,
 }
 
-fn validate_site_policy_response(
-    resp: SitePolicyResponse,
-) -> std::result::Result<SitePolicySnapshot, &'static str> {
-    if resp.policy.min_enforce_rev > resp.policy.revision {
-        return Err("min_enforce_rev exceeds policy revision");
+/// Strictly parses the `SitePolicyDO` `GET /policy` JSON envelope
+/// (`{"policy": ..., "digest": "..."}`) using [`decode_active_policy_v3`].
+///
+/// Fails closed on unsupported `schema_version`, legacy `"rules"` field,
+/// malformed JSON, invalid Policy v3 invariants, or digest mismatch.
+fn parse_site_policy_envelope_v3(
+    raw_envelope: &str,
+) -> std::result::Result<SitePolicySnapshot, String> {
+    let envelope: serde_json::Value = serde_json::from_str(raw_envelope)
+        .map_err(|e| format!("malformed SITE_POLICY JSON: {e}"))?;
+    let obj = envelope
+        .as_object()
+        .ok_or_else(|| "SITE_POLICY response must be a JSON object".to_string())?;
+    let policy_val = obj
+        .get("policy")
+        .ok_or_else(|| "SITE_POLICY response missing 'policy' field".to_string())?;
+    let envelope_digest = obj
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "SITE_POLICY response missing string 'digest' field".to_string())?;
+
+    let policy_json = serde_json::to_string(policy_val)
+        .map_err(|e| format!("serialize SITE_POLICY policy object: {e}"))?;
+    let mut policy = decode_active_policy_v3(&policy_json)
+        .map_err(|e| format!("invalid active policy v3: {e}"))?;
+
+    let computed = compute_policy_digest(&policy);
+    if envelope_digest != computed {
+        return Err("SITE_POLICY envelope digest mismatch".to_string());
     }
-    let computed = compute_policy_digest(&resp.policy);
-    if resp.digest != computed {
-        return Err("policy digest mismatch");
+    if policy.policy_digest.is_empty() {
+        policy.policy_digest = computed.clone();
+    } else if policy.policy_digest != computed {
+        return Err("policy_digest mismatch".to_string());
     }
     Ok(SitePolicySnapshot {
-        policy: resp.policy,
+        policy,
         digest: computed,
     })
 }
@@ -101,13 +132,27 @@ struct GatewayConfig {
     jwt_secret: Arc<Vec<u8>>,
     session_v2_secret: Arc<Vec<u8>>,
     gateway_assertion_secret: Arc<Vec<u8>>,
-    admin_assertion_secret: Arc<Vec<u8>>,
     media_cap_secret: Arc<Vec<u8>>,
+    internal_api_secret: Arc<Vec<u8>>,
+    guest_session_secret: Arc<Vec<u8>>,
     admin_email: Option<String>,
+    admin_allowed_emails: Option<Arc<Vec<String>>>,
     visitor_country: Option<String>,
-    client_id: Arc<String>,
-    client_secret: Arc<String>,
+    cf_access_service_token: Option<Arc<(String, String)>>,
     upstreams: Arc<Upstreams>,
+}
+
+impl GatewayConfig {
+    /// Returns the live verified staff CF Access email ONLY if it passes the
+    /// optional `ADMIN_ALLOWED_EMAILS` allowlist.
+    ///
+    /// NEVER populated from `ADMIN_VIEW_COOKIE`.
+    fn live_admin_email(&self) -> Option<&str> {
+        filter_allowed_admin_email(
+            self.admin_email.as_deref(),
+            self.admin_allowed_emails.as_deref().map(Vec::as_slice),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -168,6 +213,10 @@ impl From<worker::Error> for BackendError {
 #[allow(async_fn_in_trait)]
 trait GatewayBackend {
     fn now_secs(&self) -> u64;
+    /// Generates a cryptographically random 128-bit lowercase hex string (32 chars).
+    fn random_hex_128(&self) -> std::result::Result<String, BackendError>;
+    /// Lazily resolves `KeyDomain::AdminAssertion` ONLY when handling `/admin*` routes.
+    fn load_admin_assertion_secret(&self) -> std::result::Result<Vec<u8>, BackendError>;
     async fn load_site_policy(&self) -> std::result::Result<SitePolicySnapshot, BackendError>;
     async fn load_session_context(
         &self,
@@ -195,6 +244,10 @@ trait GatewayBackend {
         &self,
         req: UpstreamFetchReq,
     ) -> std::result::Result<Response, BackendError>;
+    async fn fetch_facts_rev(
+        &self,
+        req: UpstreamFetchReq,
+    ) -> std::result::Result<(u16, String), BackendError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +256,28 @@ trait GatewayBackend {
 
 struct WorkerBackend<'a> {
     env: &'a Env,
+}
+
+fn optional_env_str(env: &Env, name: &str) -> Option<String> {
+    env.secret(name)
+        .ok()
+        .map(|s| s.to_string())
+        .or_else(|| env.var(name).ok().map(|v| v.to_string()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn optional_cf_access_service_token(env: &Env) -> Result<Option<(String, String)>> {
+    let id = optional_env_str(env, "CF_ACCESS_CLIENT_ID");
+    let secret = optional_env_str(env, "CF_ACCESS_CLIENT_SECRET");
+    match (id, secret) {
+        (Some(id), Some(secret)) => Ok(Some((id, secret))),
+        (None, None) => Ok(None),
+        _ => Err(worker::Error::RustError(
+            "CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET must both be set or both unset"
+                .into(),
+        )),
+    }
 }
 
 fn build_cf_object(
@@ -240,9 +315,62 @@ fn build_cf_object(
     Some(cf)
 }
 
+fn build_worker_upstream_request(
+    req: UpstreamFetchReq,
+) -> std::result::Result<Request, BackendError> {
+    let mut init = RequestInit::new();
+    let has_body = !matches!(req.method, worker::Method::Get | worker::Method::Head);
+    init.with_method(req.method);
+    init.with_redirect(worker::RequestRedirect::Manual);
+    if has_body && !req.body.is_empty() {
+        init.with_body(Some(Uint8Array::from(&req.body[..]).into()));
+    }
+    for (name, val) in &req.headers {
+        let _ = init.headers.append(name, val);
+    }
+    let js_init: worker::web_sys::RequestInit = (&init).into();
+    if let Some(cf) = build_cf_object(req.no_cache, req.preview_blur) {
+        let _ = worker::js_sys::Reflect::set(js_init.as_ref(), &"cf".into(), &cf);
+    }
+    let web_req = worker::web_sys::Request::new_with_str_and_init(req.url.as_str(), &js_init)
+        .map_err(|e| BackendError(format!("build upstream request failed: {e:?}")))?;
+    Ok(Request::from(web_req))
+}
+
 impl GatewayBackend for WorkerBackend<'_> {
     fn now_secs(&self) -> u64 {
         worker::Date::now().as_millis() / 1000
+    }
+
+    fn random_hex_128(&self) -> std::result::Result<String, BackendError> {
+        use worker::{
+            js_sys::{Function, Reflect, Uint8Array, global},
+            wasm_bindgen::JsCast,
+        };
+        let crypto = Reflect::get(&global(), &"crypto".into())
+            .map_err(|e| BackendError(format!("global crypto unavailable: {e:?}")))?;
+        let get_random_values: Function = Reflect::get(&crypto, &"getRandomValues".into())
+            .map_err(|e| BackendError(format!("crypto.getRandomValues unavailable: {e:?}")))?
+            .dyn_into()
+            .map_err(|_| BackendError("crypto.getRandomValues is not a function".into()))?;
+        let buf = Uint8Array::new_with_length(16);
+        get_random_values
+            .call1(&crypto, buf.as_ref())
+            .map_err(|e| BackendError(format!("crypto.getRandomValues failed: {e:?}")))?;
+        let mut bytes = [0u8; 16];
+        buf.copy_to(&mut bytes);
+        Ok(bytes.iter().fold(String::with_capacity(32), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        }))
+    }
+
+    fn load_admin_assertion_secret(&self) -> std::result::Result<Vec<u8>, BackendError> {
+        let explicit = optional_env_str(self.env, "ADMIN_ASSERTION_SECRET");
+        let site_secret = optional_env_str(self.env, "SITE_SECRET");
+        resolve_admin_assertion_secret(explicit.as_deref(), site_secret.as_deref())
+            .map_err(|e| BackendError(e.to_string()))
     }
 
     async fn load_site_policy(&self) -> std::result::Result<SitePolicySnapshot, BackendError> {
@@ -257,8 +385,8 @@ impl GatewayBackend for WorkerBackend<'_> {
         if status != 200 {
             return Err(BackendError(format!("SITE_POLICY returned HTTP {status}")));
         }
-        let parsed: SitePolicyResponse = resp.json().await?;
-        validate_site_policy_response(parsed).map_err(|reason| BackendError(reason.to_string()))
+        let raw = resp.text().await?;
+        parse_site_policy_envelope_v3(&raw).map_err(BackendError)
     }
 
     async fn load_session_context(
@@ -371,25 +499,24 @@ impl GatewayBackend for WorkerBackend<'_> {
         &self,
         req: UpstreamFetchReq,
     ) -> std::result::Result<Response, BackendError> {
-        let mut init = RequestInit::new();
-        let has_body = !matches!(req.method, worker::Method::Get | worker::Method::Head);
-        init.with_method(req.method);
-        init.with_redirect(worker::RequestRedirect::Manual);
-        if has_body && !req.body.is_empty() {
-            init.with_body(Some(Uint8Array::from(&req.body[..]).into()));
-        }
-        for (name, val) in &req.headers {
-            let _ = init.headers.append(name, val);
-        }
-        let js_init: worker::web_sys::RequestInit = (&init).into();
-        if let Some(cf) = build_cf_object(req.no_cache, req.preview_blur) {
-            let _ = worker::js_sys::Reflect::set(js_init.as_ref(), &"cf".into(), &cf);
-        }
-        let web_req = worker::web_sys::Request::new_with_str_and_init(req.url.as_str(), &js_init)
-            .map_err(|e| BackendError(format!("build upstream request failed: {e:?}")))?;
-        let worker_req = Request::from(web_req);
+        let worker_req = build_worker_upstream_request(req)?;
         let resp = Fetch::Request(worker_req).send().await?;
         Ok(Response::from(resp))
+    }
+
+    async fn fetch_facts_rev(
+        &self,
+        req: UpstreamFetchReq,
+    ) -> std::result::Result<(u16, String), BackendError> {
+        let worker_req = build_worker_upstream_request(req)?;
+        let mut resp = Fetch::Request(worker_req).send().await?;
+        let status = resp.status_code();
+        if status == 200 {
+            let text = resp.text().await?;
+            Ok((status, text))
+        } else {
+            Ok((status, String::new()))
+        }
     }
 }
 
@@ -406,9 +533,11 @@ async fn access_admin(ctx: &Context, env: &Env) -> Result<Option<String>> {
     if !access.is_object() {
         return Ok(None);
     }
-    let expected = env.var("CF_ACCESS_AUD")?.to_string();
+    let Some(expected) = optional_env_str(env, "CF_ACCESS_AUD") else {
+        return Ok(None);
+    };
     let aud = Reflect::get(&access, &"aud".into())?.as_string();
-    if expected.is_empty() || aud.as_deref() != Some(&expected) {
+    if aud.as_deref() != Some(expected.as_str()) {
         return Ok(None);
     }
     let get: Function = Reflect::get(&access, &"getIdentity".into())?.dyn_into()?;
@@ -422,58 +551,51 @@ async fn access_admin(ctx: &Context, env: &Env) -> Result<Option<String>> {
         .filter(|s| !s.is_empty()))
 }
 
-fn required_secret_bytes(env: &Env, name: &str) -> Result<Vec<u8>> {
-    let val = env.secret(name)?.to_string();
-    if val.is_empty() {
-        return Err(worker::Error::RustError(format!("empty secret: {name}")));
-    }
-    Ok(val.into_bytes())
-}
-
-fn required_secret_string(env: &Env, name: &str) -> Result<String> {
-    let val = env.secret(name)?.to_string();
-    if val.is_empty() {
-        return Err(worker::Error::RustError(format!("empty secret: {name}")));
-    }
-    Ok(val)
-}
-
 async fn router(env: Env, ctx: Context, visitor_country: Option<String>) -> Result<Router> {
-    let client_id = required_secret_string(&env, "CF_ACCESS_CLIENT_ID")?;
-    let client_secret = required_secret_string(&env, "CF_ACCESS_CLIENT_SECRET")?;
-    let jwt_secret = required_secret_bytes(&env, "JWT_SECRET")?;
-    // Dedicated SESSION_V2_SECRET is recommended; during cutover, if unset or empty,
-    // fall back to JWT_SECRET (domain-separated inside site_access::verify_session_v2
-    // with the `"session/v2\0"` HMAC domain prefix).
-    let session_v2_secret = match env.secret("SESSION_V2_SECRET") {
-        Ok(secret) => {
-            let s = secret.to_string();
-            if s.is_empty() {
-                jwt_secret.clone()
-            } else {
-                s.into_bytes()
-            }
-        }
-        Err(_) => jwt_secret.clone(),
-    };
-    let gateway_assertion_secret = required_secret_bytes(&env, "GATEWAY_ASSERTION_SECRET")?;
-    let admin_assertion_secret = required_secret_bytes(&env, "ADMIN_ASSERTION_SECRET")?;
-    let media_cap_secret = required_secret_bytes(&env, "MEDIA_CAP_SECRET")?;
+    let site_secret = optional_env_str(&env, "SITE_SECRET");
+    let jwt_secret = optional_env_str(&env, "JWT_SECRET");
+    let session_v2_secret = optional_env_str(&env, "SESSION_V2_SECRET");
+    let session_secret = optional_env_str(&env, "SESSION_SECRET");
+    let media_cap_secret = optional_env_str(&env, "MEDIA_CAP_SECRET");
+    let gateway_assertion_secret = optional_env_str(&env, "GATEWAY_ASSERTION_SECRET");
+    let internal_api_secret = optional_env_str(&env, "INTERNAL_API_SECRET");
+    let guest_session_secret = optional_env_str(&env, "GUEST_SESSION_SECRET");
+
+    // NOTE: AdminAssertion is intentionally NOT resolved here — it is loaded lazily
+    // ONLY on `/admin*` inside `handle_admin_route` so rolling out an override key
+    // can never break gallery traffic!
+    let resolved = resolve_gateway_secrets(&GatewaySecretInputs {
+        site_secret: site_secret.as_deref(),
+        jwt_secret: jwt_secret.as_deref(),
+        session_v2_secret: session_v2_secret.as_deref(),
+        session_secret: session_secret.as_deref(),
+        media_cap_secret: media_cap_secret.as_deref(),
+        gateway_assertion_secret: gateway_assertion_secret.as_deref(),
+        internal_api_secret: internal_api_secret.as_deref(),
+        guest_session_secret: guest_session_secret.as_deref(),
+    })
+    .map_err(|e| worker::Error::RustError(e.to_string()))?;
+
+    let cf_access_service_token = optional_cf_access_service_token(&env)?.map(Arc::new);
+    let admin_allowed_emails =
+        parse_admin_allowed_emails(optional_env_str(&env, "ADMIN_ALLOWED_EMAILS").as_deref())
+            .map(Arc::new);
     let upstreams = Upstreams::from_env(&env)?;
     let admin_email = access_admin(&ctx, &env).await?;
 
     let state = AppState {
         env: Arc::new(env),
         cfg: GatewayConfig {
-            jwt_secret: Arc::new(jwt_secret),
-            session_v2_secret: Arc::new(session_v2_secret),
-            gateway_assertion_secret: Arc::new(gateway_assertion_secret),
-            admin_assertion_secret: Arc::new(admin_assertion_secret),
-            media_cap_secret: Arc::new(media_cap_secret),
+            jwt_secret: Arc::new(resolved.jwt_secret),
+            session_v2_secret: Arc::new(resolved.session_v2_secret),
+            gateway_assertion_secret: Arc::new(resolved.gateway_assertion_secret),
+            media_cap_secret: Arc::new(resolved.media_cap_secret),
+            internal_api_secret: Arc::new(resolved.internal_api_secret),
+            guest_session_secret: Arc::new(resolved.guest_session_secret),
             admin_email,
+            admin_allowed_emails,
             visitor_country,
-            client_id: Arc::new(client_id),
-            client_secret: Arc::new(client_secret),
+            cf_access_service_token,
             upstreams: Arc::new(upstreams),
         },
     };
@@ -510,7 +632,7 @@ async fn gateway(
 }
 
 // ---------------------------------------------------------------------------
-// Core Hardened Request Pipeline
+// Core Hardened Policy v3 Request Pipeline
 // ---------------------------------------------------------------------------
 
 enum SessionResolution {
@@ -524,7 +646,6 @@ async fn resolve_live_session(
     backend: &impl GatewayBackend,
     cfg: &GatewayConfig,
     cookies: &Cookies,
-    policy: &PublicSitePolicy,
     now: u64,
 ) -> SessionResolution {
     let Some(raw_cookie) = cookies.get(SESSION_COOKIE) else {
@@ -546,17 +667,15 @@ async fn resolve_live_session(
         .await
     {
         Ok(ctx) => {
-            if !ctx.active || ctx.banned {
+            if !ctx.active || ctx.banned || ctx.suspended {
                 return SessionResolution::Banned;
             }
             if !ctx.sid_valid {
                 return SessionResolution::Unauthenticated { clear_cookie: true };
             }
-            let eligible_switchers = compute_eligible_switchers(&ctx, policy);
             SessionResolution::Authenticated(LiveSession {
                 session: verified,
                 ctx,
-                eligible_switchers,
             })
         }
         Err(err) => {
@@ -586,6 +705,13 @@ fn log_backend_error(context: &str, err: &BackendError) {
     let _ = (context, err.0.as_str());
 }
 
+fn append_cf_access_service_headers(out: &mut Vec<(String, String)>, cfg: &GatewayConfig) {
+    if let Some((client_id, client_secret)) = cfg.cf_access_service_token.as_deref() {
+        out.push(("CF-Access-Client-Id".to_string(), client_id.clone()));
+        out.push(("CF-Access-Client-Secret".to_string(), client_secret.clone()));
+    }
+}
+
 fn build_service_headers(
     headers: &HeaderMap,
     target: ServiceTarget,
@@ -600,6 +726,7 @@ fn build_service_headers(
             || name.eq_ignore_ascii_case("x-forwarded-proto")
             || name.eq_ignore_ascii_case("forwarded")
             || name.eq_ignore_ascii_case("cf-ipcountry")
+            || name.eq_ignore_ascii_case("x-internal-api-secret")
             || name.eq_ignore_ascii_case("cookie")
         {
             continue;
@@ -650,13 +777,10 @@ fn build_api_headers(
         }
     }
     if let Some(host) = request_host(uri, headers) {
-        let proto = if uri
-            .scheme_str()
-            .is_some_and(|s| s.eq_ignore_ascii_case("http"))
-        {
-            "http"
-        } else {
+        let proto = if is_https_request(uri, headers) {
             "https"
+        } else {
+            "http"
         };
         out.push(("x-forwarded-host".to_string(), host.to_string()));
         out.push(("x-forwarded-proto".to_string(), proto.to_string()));
@@ -664,11 +788,7 @@ fn build_api_headers(
     if let Some(cookie) = sanitize_origin_cookie(headers) {
         out.push(("cookie".to_string(), cookie));
     }
-    out.push(("CF-Access-Client-Id".to_string(), cfg.client_id.to_string()));
-    out.push((
-        "CF-Access-Client-Secret".to_string(),
-        cfg.client_secret.to_string(),
-    ));
+    append_cf_access_service_headers(&mut out, cfg);
     out.push((
         GATEWAY_ASSERTION_HEADER.to_string(),
         signed_assertion.to_string(),
@@ -676,51 +796,59 @@ fn build_api_headers(
     out
 }
 
-fn build_media_headers(headers: &HeaderMap, cfg: &GatewayConfig) -> Vec<(String, String)> {
+fn build_facts_rev_headers(cfg: &GatewayConfig, signed_assertion: &str) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(5);
+    out.push(("accept".to_string(), "application/json".to_string()));
+    append_cf_access_service_headers(&mut out, cfg);
+    out.push((
+        GATEWAY_ASSERTION_HEADER.to_string(),
+        signed_assertion.to_string(),
+    ));
+    if let Ok(internal_str) = std::str::from_utf8(&cfg.internal_api_secret)
+        && !internal_str.is_empty()
+    {
+        out.push(("x-internal-api-secret".to_string(), internal_str.to_string()));
+    }
+    out
+}
+
+fn build_media_headers(
+    kind: MediaCapKind,
+    headers: &HeaderMap,
+    cfg: &GatewayConfig,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (k, v) in headers {
         let name = k.as_str();
-        if is_allowed_media_request_header(name)
+        if is_allowed_media_request_header(kind, name)
             && !is_privileged_request_header(name)
             && let Ok(val) = v.to_str()
         {
             out.push((name.to_string(), val.to_string()));
         }
     }
-    out.push(("CF-Access-Client-Id".to_string(), cfg.client_id.to_string()));
-    out.push((
-        "CF-Access-Client-Secret".to_string(),
-        cfg.client_secret.to_string(),
-    ));
+    append_cf_access_service_headers(&mut out, cfg);
     out
 }
 
-#[derive(Debug, Default)]
-struct AssertionSubject {
-    sub: Option<String>,
-    sid: Option<String>,
-    switchers: Vec<String>,
-    safe_mode: bool,
-    is_admin_view: bool,
-}
-
-fn sign_assertion_for_request(
+fn sign_assertion_v3(
     cfg: &GatewayConfig,
     snapshot: &SitePolicySnapshot,
     now: u64,
-    subject: AssertionSubject,
+    actor: ActorBinding,
+    access: PolicyAccessResult,
+    is_billing_waived: bool,
 ) -> std::result::Result<String, site_access::TokenError> {
     let assertion = GatewayAssertion {
         v: GATEWAY_ASSERTION_VERSION,
         aud: GATEWAY_ASSERTION_AUDIENCE.to_string(),
+        actor,
         rev: snapshot.policy.revision,
         min_enforce_rev: snapshot.policy.min_enforce_rev,
-        policy_digest: snapshot.digest.clone(),
-        sub: subject.sub,
-        sid: subject.sid,
-        switchers: subject.switchers,
-        safe_mode: subject.safe_mode,
-        is_admin_view: subject.is_admin_view,
+        digest: snapshot.digest.clone(),
+        direct_grants: access.direct_grants,
+        click_eligible: access.click_eligible,
+        is_billing_waived,
         exp: now.saturating_add(GATEWAY_ASSERTION_TTL),
     };
     sign_gateway_assertion(&assertion, &cfg.gateway_assertion_secret)
@@ -787,7 +915,7 @@ async fn handle_admin_route(
     let Some(worker_method) = checked_user_method(method) else {
         return method_not_allowed(USER_ALLOWED_METHODS);
     };
-    let Some(email) = cfg.admin_email.as_deref() else {
+    let Some(email) = cfg.live_admin_email() else {
         return private_no_store(
             (StatusCode::FORBIDDEN, "Administrator access required").into_response(),
         );
@@ -798,19 +926,58 @@ async fn handle_admin_route(
     let mut response = if browse_entry {
         Redirect::to("/").into_response()
     } else {
+        let has_body = !matches!(*method, Method::GET | Method::HEAD);
+        if has_body && body.len() > MAX_ADMIN_BODY_BYTES {
+            return private_no_store(
+                (StatusCode::PAYLOAD_TOO_LARGE, "Admin request body too large").into_response(),
+            );
+        }
+
+        // Load KeyDomain::AdminAssertion lazily ONLY on the `/admin*` branch.
+        let admin_assertion_secret = match backend.load_admin_assertion_secret() {
+            Ok(secret) => secret,
+            Err(err) => {
+                log_backend_error("admin assertion secret unavailable", &err);
+                return private_no_store(
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "admin assertion secret unavailable",
+                    )
+                        .into_response(),
+                );
+            }
+        };
+
         let pq = uri
             .path_and_query()
             .map(|p| p.as_str())
             .unwrap_or("/admin")
             .to_string();
-        let admin_assertion = AdminAssertion {
+        if pq.len() > 2048 {
+            return private_no_store(
+                (StatusCode::URI_TOO_LONG, "Admin request URI too long").into_response(),
+            );
+        }
+        let effective_body = if has_body { body } else { Bytes::new() };
+        let bh = site_access::sha256_hex(&effective_body);
+        let Ok(jti) = backend.random_hex_128() else {
+            return private_no_store(
+                (StatusCode::INTERNAL_SERVER_ERROR, "admin nonce failed").into_response(),
+            );
+        };
+
+        let admin_assertion = AdminAssertionClaims {
             v: ADMIN_ASSERTION_VERSION,
             aud: ADMIN_ASSERTION_AUDIENCE.to_string(),
             email: email.to_string(),
+            m: method.as_str().to_ascii_uppercase(),
+            p: pq.clone(),
+            bh,
+            jti,
             exp: backend.now_secs().saturating_add(ADMIN_ASSERTION_TTL),
         };
         let Ok(signed_admin_assertion) =
-            sign_admin_assertion(&admin_assertion, &cfg.admin_assertion_secret)
+            sign_admin_assertion(&admin_assertion, &admin_assertion_secret)
         else {
             return private_no_store(
                 (StatusCode::INTERNAL_SERVER_ERROR, "admin assertion failed").into_response(),
@@ -824,7 +991,7 @@ async fn handle_admin_route(
                 ServiceTarget::AdminDashboard,
                 Some((email, &signed_admin_assertion)),
             ),
-            body,
+            body: effective_body,
         };
         match backend
             .forward_service(ServiceTarget::AdminDashboard, req)
@@ -868,15 +1035,15 @@ async fn handle_media_route(
     worker_method: worker::Method,
     headers: &HeaderMap,
     cookies: &Cookies,
-    is_admin_view: bool,
+    is_billing_waived: bool,
     now: u64,
 ) -> Response {
     let Some((kind, id)) = parse_media_route(uri.path()) else {
         return private_no_store((StatusCode::NOT_FOUND, "Not Found").into_response());
     };
-    // Fail closed BEFORE billing or upstream fetch when server-side preview blur
-    // is disabled, preventing `/media/preview/*` from serving untransformed clear bytes.
-    if kind == MediaCapKind::Preview && !snapshot.policy.cloudflare_images_blur {
+    // Fail closed BEFORE billing, origin calls, or upstream fetch when fixed server-side
+    // preview blur is disabled, preventing `/media/preview/*` from ever leaking clear bytes.
+    if kind == MediaCapKind::Preview && !snapshot.policy.fixed_blur_enabled {
         return private_no_store(
             (StatusCode::FORBIDDEN, "Server-side preview blur is disabled").into_response(),
         );
@@ -886,54 +1053,181 @@ async fn handle_media_route(
             (StatusCode::FORBIDDEN, "Missing or invalid media capability").into_response(),
         );
     };
+
+    // Step 1: Strictly verify Policy v3 `MediaCapability` (`mc3.`, rejecting v1/v2!)
+    // BEFORE billing, cache delivery, or upstream fetch on GET, HEAD, AND Range requests.
     let Ok(cap) = verify_media_capability(
         &cap_token,
         &cfg.media_cap_secret,
+        MEDIA_CAP_AUDIENCE,
         kind,
         id,
         now,
         snapshot.policy.min_enforce_rev,
+        snapshot.policy.revision,
     ) else {
         return private_no_store(
             (StatusCode::FORBIDDEN, "Invalid or expired media capability").into_response(),
         );
     };
 
-    // Resolve live caller session (if any `ue_session` cookie was presented).
-    let (auth, clear_cookie) =
-        match resolve_live_session(backend, cfg, cookies, &snapshot.policy, now).await {
-            SessionResolution::Authenticated(live) => (Some(live), false),
-            SessionResolution::Unauthenticated { clear_cookie } => (None, clear_cookie),
-            SessionResolution::Banned => {
-                return private_no_store(
-                    (StatusCode::FORBIDDEN, "Account suspended").into_response(),
-                );
-            }
-            SessionResolution::BackendUnavailable => {
-                return private_no_store(
-                    (StatusCode::BAD_GATEWAY, "Access service unavailable").into_response(),
-                );
-            }
-        };
+    // Step 2: Resolve live caller session, ActorBinding, and PolicyAccessResult.
+    let (auth, clear_cookie) = match resolve_live_session(backend, cfg, cookies, now).await {
+        SessionResolution::Authenticated(live) => (Some(live), false),
+        SessionResolution::Unauthenticated { clear_cookie } => (None, clear_cookie),
+        SessionResolution::Banned => {
+            return private_no_store(
+                (StatusCode::FORBIDDEN, "Account suspended").into_response(),
+            );
+        }
+        SessionResolution::BackendUnavailable => {
+            return private_no_store(
+                (StatusCode::BAD_GATEWAY, "Access service unavailable").into_response(),
+            );
+        }
+    };
 
-    // Step 5.2: Authorize caller BEFORE any billing or preview-budget check (M1).
-    if !authorize_media_capability(&cap, auth.as_ref(), is_admin_view, &snapshot.policy) {
+    let live_admin_email = if clear_cookie {
+        None
+    } else {
+        cfg.live_admin_email()
+    };
+    let guest_cookie = cookies.get(GUEST_SESSION_COOKIE);
+    let live_actor = resolve_actor_binding(
+        auth.as_ref(),
+        clear_cookie,
+        live_admin_email,
+        guest_cookie.as_ref().map(|c| c.value()),
+        &cfg.guest_session_secret,
+        now,
+    );
+    let live_access = compute_policy_access(
+        &snapshot.policy,
+        &PolicyCallerContext {
+            session: auth.as_ref().map(|l| l.ctx.clone()),
+            session_revoked_or_invalid: clear_cookie,
+            live_admin_email: live_admin_email.map(str::to_string),
+            country: cfg.visitor_country.clone(),
+        },
+    );
+
+    // Step 3: Fast pre-check actor & entitlement match BEFORE hitting origin `/internal/facts-rev`
+    // or billing DO. If this fails, no `facts_rev` value could ever authorize the capability.
+    if !authorize_media_capability_v3(
+        &cap,
+        &live_actor,
+        &live_access,
+        &snapshot.policy,
+        Some(cap.facts_rev),
+    ) {
         return maybe_clear_session_cookie(
             private_no_store((StatusCode::FORBIDDEN, "Media access denied").into_response()),
             clear_cookie,
         );
     }
 
-    // Validate canonical upstream URL BEFORE any billing check.
-    let Ok(target_url) = build_media_upstream_target(kind, &cap.path, &cfg.upstreams) else {
+    // Step 4: When `policy.safety_enabled == true`, query authoritative `facts_rev` from
+    // `APP_ORIGIN/internal/facts-rev/{kind}/{id}` (applies to previously public `Anon` caps too!).
+    if snapshot.policy.safety_enabled {
+        let Ok(facts_url) = build_facts_rev_target(kind, id, &cfg.upstreams) else {
+            return maybe_clear_session_cookie(
+                private_no_store((StatusCode::FORBIDDEN, "Invalid media target").into_response()),
+                clear_cookie,
+            );
+        };
+        let Ok(signed_assertion) = sign_assertion_v3(
+            cfg,
+            snapshot,
+            now,
+            live_actor.clone(),
+            live_access.clone(),
+            is_billing_waived,
+        ) else {
+            return maybe_clear_session_cookie(assertion_sign_error_response(), clear_cookie);
+        };
+        let facts_req = UpstreamFetchReq {
+            url: facts_url,
+            method: worker::Method::Get,
+            headers: build_facts_rev_headers(cfg, &signed_assertion),
+            body: Bytes::new(),
+            no_cache: true,
+            preview_blur: None,
+        };
+        let current_facts_rev = match backend.fetch_facts_rev(facts_req).await {
+            Ok((200, body_text)) => match parse_facts_rev_response(&body_text) {
+                Ok(rev) => rev,
+                Err(reason) => {
+                    log_backend_error(
+                        "invalid facts-rev response from origin",
+                        &BackendError(reason.to_string()),
+                    );
+                    return maybe_clear_session_cookie(
+                        private_no_store(
+                            (StatusCode::SERVICE_UNAVAILABLE, "Media verification unavailable")
+                                .into_response(),
+                        ),
+                        clear_cookie,
+                    );
+                }
+            },
+            Ok((404, _)) => {
+                return maybe_clear_session_cookie(
+                    private_no_store(
+                        (StatusCode::FORBIDDEN, "Media asset unavailable").into_response(),
+                    ),
+                    clear_cookie,
+                );
+            }
+            Ok((status, _)) => {
+                log_backend_error(
+                    "facts-rev lookup returned error status",
+                    &BackendError(format!("HTTP {status}")),
+                );
+                return maybe_clear_session_cookie(
+                    private_no_store(
+                        (StatusCode::SERVICE_UNAVAILABLE, "Media verification unavailable")
+                            .into_response(),
+                    ),
+                    clear_cookie,
+                );
+            }
+            Err(err) => {
+                log_backend_error("facts-rev origin lookup failed", &err);
+                return maybe_clear_session_cookie(
+                    private_no_store(
+                        (StatusCode::SERVICE_UNAVAILABLE, "Media verification unavailable")
+                            .into_response(),
+                    ),
+                    clear_cookie,
+                );
+            }
+        };
+
+        if !authorize_media_capability_v3(
+            &cap,
+            &live_actor,
+            &live_access,
+            &snapshot.policy,
+            Some(current_facts_rev),
+        ) {
+            return maybe_clear_session_cookie(
+                private_no_store((StatusCode::FORBIDDEN, "Media capability stale").into_response()),
+                clear_cookie,
+            );
+        }
+    }
+
+    // Step 5: Validate canonical upstream URL BEFORE any billing check.
+    let Ok(target_url) = build_media_upstream_target(kind, &cap.immutable_locator, &cfg.upstreams)
+    else {
         return maybe_clear_session_cookie(
             private_no_store((StatusCode::FORBIDDEN, "Invalid media target").into_response()),
             clear_cookie,
         );
     };
 
-    // Step 5.3: Billing / preview budget (only after authorization passes; waived by admin view).
-    if !is_admin_view {
+    // Step 6: Billing / preview budget (ONLY after full authorization passes; waived by browse pass or live staff).
+    if !is_billing_waived {
         let guest = auth.is_none();
         let billing_status = match kind {
             MediaCapKind::Preview => {
@@ -1026,13 +1320,21 @@ async fn handle_media_route(
         }
     }
 
-    // Step 5.4: Upstream media fetch with locked blur (when enabled), no shared cache,
-    // manual redirects, and explicit 3xx rejection.
+    // Step 7: Upstream media fetch with locked blur (for Preview), no shared cache,
+    // manual redirects, and fail-closed transform verification.
     let preview_blur = resolve_preview_blur(kind, &snapshot.policy);
+    if kind == MediaCapKind::Preview && preview_blur.is_none() {
+        return maybe_clear_session_cookie(
+            private_no_store(
+                (StatusCode::FORBIDDEN, "Server-side preview blur is disabled").into_response(),
+            ),
+            clear_cookie,
+        );
+    }
     let fetch_req = UpstreamFetchReq {
         url: target_url,
         method: worker_method,
-        headers: build_media_headers(headers, cfg),
+        headers: build_media_headers(kind, headers, cfg),
         body: Bytes::new(),
         no_cache: true,
         preview_blur,
@@ -1040,7 +1342,19 @@ async fn handle_media_route(
 
     let response = match backend.fetch_upstream(fetch_req).await {
         Ok(mut resp) => {
-            if resp.status().is_redirection() {
+            if kind == MediaCapKind::Preview {
+                // Fail closed (502) unless Cloudflare Images explicitly confirmed
+                // transformation (`cf-resized: internal=ok...`) on a 200 OK response!
+                if !is_verified_preview_transform_response(resp.status(), resp.headers()) {
+                    private_no_store(
+                        (StatusCode::BAD_GATEWAY, "Preview blur transform unavailable")
+                            .into_response(),
+                    )
+                } else {
+                    resp.headers_mut().remove("set-cookie");
+                    private_no_store(resp)
+                }
+            } else if resp.status().is_redirection() {
                 private_no_store(
                     (StatusCode::BAD_GATEWAY, "Upstream redirect rejected").into_response(),
                 )
@@ -1056,6 +1370,82 @@ async fn handle_media_route(
     };
 
     maybe_clear_session_cookie(response, clear_cookie)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_gallery_request(
+    backend: &impl GatewayBackend,
+    cfg: &GatewayConfig,
+    snapshot: &SitePolicySnapshot,
+    uri: &Uri,
+    worker_method: worker::Method,
+    headers: &HeaderMap,
+    body: Bytes,
+    now: u64,
+    mut actor: ActorBinding,
+    access: PolicyAccessResult,
+    is_billing_waived: bool,
+    is_reveal_route: bool,
+    clear_cookie: bool,
+    allow_public_cache: bool,
+) -> Response {
+    // On `POST /api/safety/reveal`, ensure guests without User/LiveAdmin/le_guest_sid
+    // receive a freshly minted signed `le_guest_sid` cookie so reveal capabilities are
+    // NEVER bound to `ActorBinding::Anon`.
+    let mut minted_guest_cookie: Option<String> = None;
+    if is_reveal_route && actor.is_anon() && !clear_cookie {
+        let Ok(rand_hex) = backend.random_hex_128() else {
+            return private_no_store(
+                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to mint guest session")
+                    .into_response(),
+            );
+        };
+        let gid = format!("gs_{rand_hex}");
+        let guest_claims = GuestSessionToken {
+            v: GUEST_SESSION_VERSION,
+            gid: gid.clone(),
+            iat: now,
+            exp: now.saturating_add(GUEST_SESSION_TTL),
+        };
+        let Ok(signed_guest) = sign_guest_session(&guest_claims, &cfg.guest_session_secret) else {
+            return private_no_store(
+                (StatusCode::INTERNAL_SERVER_ERROR, "Failed to sign guest session")
+                    .into_response(),
+            );
+        };
+        actor = ActorBinding::GuestSession { gid };
+        minted_guest_cookie = Some(guest_session_set_cookie_header(
+            &signed_guest,
+            is_https_request(uri, headers),
+        ));
+    }
+
+    let Ok(signed_assertion) =
+        sign_assertion_v3(cfg, snapshot, now, actor, access, is_billing_waived)
+    else {
+        return assertion_sign_error_response();
+    };
+
+    let mut resp = proxy_to_api(
+        backend,
+        cfg,
+        uri,
+        worker_method,
+        headers,
+        body,
+        &signed_assertion,
+        allow_public_cache && minted_guest_cookie.is_none(),
+    )
+    .await;
+
+    if let Some(cookie_hdr) = minted_guest_cookie {
+        resp.headers_mut().append(
+            "set-cookie",
+            cookie_hdr.parse().expect("ASCII le_guest_sid Set-Cookie"),
+        );
+        resp = private_no_store(resp);
+    }
+    resp
 }
 
 async fn handle_gateway_request(
@@ -1078,7 +1468,7 @@ async fn handle_gateway_request(
         return handle_admin_route(backend, cfg, &uri, &method, &headers, body).await;
     }
 
-    // Load authoritative policy from singleton `SITE_POLICY` DO (fail closed!).
+    // Load authoritative Policy v3 from singleton `SITE_POLICY` DO (fail closed!).
     let snapshot = match backend.load_site_policy().await {
         Ok(snapshot) => snapshot,
         Err(err) => {
@@ -1089,7 +1479,7 @@ async fn handle_gateway_request(
         }
     };
 
-    // Step 0: Authoritative Geo Enforcement (M4) — runs BEFORE admin browse pass,
+    // Step 0: Authoritative Geo Enforcement — runs BEFORE admin browse pass,
     // routing, or caching. Uses Cloudflare runtime `request.cf().country()` only.
     if snapshot.policy.geo.is_blocked(cfg.visitor_country.as_deref()) {
         return private_no_store(
@@ -1101,7 +1491,7 @@ async fn handle_gateway_request(
         );
     }
 
-    // `/user/admin` & `/user/admin/*` retired unconditionally -> 404 (H13).
+    // `/user/admin` & `/user/admin/*` retired unconditionally -> 404.
     if is_segment_prefix(path, "/user") {
         if is_segment_prefix(path, "/user/admin") {
             return private_no_store((StatusCode::NOT_FOUND, "Not Found").into_response());
@@ -1132,12 +1522,15 @@ async fn handle_gateway_request(
     }
 
     let now = backend.now_secs();
+    let live_admin_email = cfg.live_admin_email();
     let admin_pass = cookies
         .get(ADMIN_VIEW_COOKIE)
         .is_some_and(|c| site_access::valid_admin_view(&cfg.jwt_secret, c.value(), now));
-    let is_admin_view = admin_pass || cfg.admin_email.is_some();
+    // `ADMIN_VIEW_COOKIE` is STRICTLY limited to billing & guest login-wall waiver;
+    // it NEVER populates `live_admin_email` or grants content bypass!
+    let is_billing_waived = admin_pass || live_admin_email.is_some();
 
-    // Capability-gated `/media/{image,video,preview}/{id}?cap=...` route (C1, H1, H2, M1).
+    // Capability-gated `/media/{image,video,preview}/{id}?cap=...` route.
     if is_segment_prefix(path, "/media") {
         let Some(worker_method) = checked_media_method(&method) else {
             return method_not_allowed(MEDIA_ALLOWED_METHODS);
@@ -1151,7 +1544,7 @@ async fn handle_gateway_request(
             worker_method,
             &headers,
             &cookies,
-            is_admin_view,
+            is_billing_waived,
             now,
         )
         .await;
@@ -1161,16 +1554,25 @@ async fn handle_gateway_request(
         return method_not_allowed(GALLERY_ALLOWED_METHODS);
     };
 
-    // Block raw `/images/*` and `/videos/*` unconditionally (C1).
-    if is_segment_prefix(path, "/images") || is_segment_prefix(path, "/videos") {
+    // Block raw `/images/*`, `/videos/*`, and `/internal/*` unconditionally.
+    if is_segment_prefix(path, "/images")
+        || is_segment_prefix(path, "/videos")
+        || is_segment_prefix(path, "/internal")
+    {
         return private_no_store((StatusCode::NOT_FOUND, "Not Found").into_response());
     }
 
     // Always-public static/SEO/legal paths (`GET`/`HEAD`): `/robots.txt`,
     // `/favicon.ico`, `/terms`, `/privacy`, `/dmca`, `/content-policy`, `/pkg/*`.
     if matches!(method, Method::GET | Method::HEAD) && is_always_public_path(path) {
-        let Ok(signed) = sign_assertion_for_request(cfg, &snapshot, now, AssertionSubject::default())
-        else {
+        let Ok(signed) = sign_assertion_v3(
+            cfg,
+            &snapshot,
+            now,
+            ActorBinding::Anon,
+            PolicyAccessResult::default(),
+            false,
+        ) else {
             return assertion_sign_error_response();
         };
         let allow_public_cache = is_public_cacheable_path(path, true);
@@ -1188,21 +1590,25 @@ async fn handle_gateway_request(
     }
 
     // Resolve live caller session via `USER_ACCOUNT` DO (`POST /session-context`).
-    let (auth, clear_cookie) =
-        match resolve_live_session(backend, cfg, &cookies, &snapshot.policy, now).await {
-            SessionResolution::Authenticated(live) => (Some(live), false),
-            SessionResolution::Unauthenticated { clear_cookie } => (None, clear_cookie),
-            SessionResolution::Banned => {
-                return private_no_store(
-                    (StatusCode::FORBIDDEN, "Account suspended").into_response(),
-                );
-            }
-            SessionResolution::BackendUnavailable => {
-                return private_no_store(
-                    (StatusCode::BAD_GATEWAY, "Access service unavailable").into_response(),
-                );
-            }
-        };
+    let (auth, clear_cookie) = match resolve_live_session(backend, cfg, &cookies, now).await {
+        SessionResolution::Authenticated(live) => (Some(live), false),
+        SessionResolution::Unauthenticated { clear_cookie } => (None, clear_cookie),
+        SessionResolution::Banned => {
+            return private_no_store(
+                (StatusCode::FORBIDDEN, "Account suspended").into_response(),
+            );
+        }
+        SessionResolution::BackendUnavailable => {
+            return private_no_store(
+                (StatusCode::BAD_GATEWAY, "Access service unavailable").into_response(),
+            );
+        }
+    };
+
+    let is_reveal_route = path == "/api/safety/reveal";
+    if is_reveal_route && method != Method::POST {
+        return maybe_clear_session_cookie(method_not_allowed("POST"), clear_cookie);
+    }
 
     let browse = browse_route(&method, path);
     if auth.is_none() && !browse {
@@ -1216,7 +1622,7 @@ async fn handle_gateway_request(
     };
 
     // Same-origin CSRF check runs for ALL POST requests to `API_UPSTREAM`
-    // (both metered and unmetered), for ALL callers including `ADMIN_VIEW_COOKIE` (H13).
+    // (both metered and unmetered), for ALL callers including `ADMIN_VIEW_COOKIE`.
     if method == Method::POST && !is_same_origin(&uri, &headers) {
         return maybe_clear_session_cookie(
             private_no_store(
@@ -1225,46 +1631,76 @@ async fn handle_gateway_request(
             clear_cookie,
         );
     }
+
+    // Additional CSRF & size defense on `POST /api/safety/reveal`.
+    if is_reveal_route {
+        if !has_reveal_csrf_header(&headers) {
+            return maybe_clear_session_cookie(
+                private_no_store(
+                    (StatusCode::FORBIDDEN, "Missing X-Requested-With: fetch header")
+                        .into_response(),
+                ),
+                clear_cookie,
+            );
+        }
+        if body.len() > MAX_REVEAL_BODY_BYTES {
+            return maybe_clear_session_cookie(
+                private_no_store(
+                    (StatusCode::PAYLOAD_TOO_LARGE, "Reveal request body too large")
+                        .into_response(),
+                ),
+                clear_cookie,
+            );
+        }
+    }
+
     let metered_post = method == Method::POST && item.is_some();
 
-    // Build signed `X-Gateway-Assertion` for `lets-embed-web`.
+    // Compute live Policy v3 ActorBinding & PolicyAccessResult.
     // Sitemaps are always projected strictly as the anonymous safe view.
-    let subject = if is_sitemap_path(path) {
-        AssertionSubject::default()
-    } else if let Some(live) = auth.as_ref() {
-        AssertionSubject {
-            sub: Some(live.session.user_id().to_string()),
-            sid: live.session.sid().map(str::to_string),
-            switchers: live.eligible_switchers.clone(),
-            safe_mode: live.ctx.safe_mode,
-            is_admin_view,
-        }
-    } else if is_admin_view {
-        AssertionSubject {
-            sub: Some(ADMIN_VIEW_SUB.to_string()),
-            sid: None,
-            switchers: admin_eligible_switchers(&snapshot.policy),
-            safe_mode: false,
-            is_admin_view: true,
-        }
+    let effective_live_admin = if clear_cookie { None } else { live_admin_email };
+    let (actor, access, assertion_billing_waived) = if is_sitemap_path(path) {
+        (ActorBinding::Anon, PolicyAccessResult::default(), false)
     } else {
-        AssertionSubject::default()
-    };
-    let Ok(signed_assertion) = sign_assertion_for_request(cfg, &snapshot, now, subject) else {
-        return maybe_clear_session_cookie(assertion_sign_error_response(), clear_cookie);
+        let guest_cookie = cookies.get(GUEST_SESSION_COOKIE);
+        let resolved_actor = resolve_actor_binding(
+            auth.as_ref(),
+            clear_cookie,
+            effective_live_admin,
+            guest_cookie.as_ref().map(|c| c.value()),
+            &cfg.guest_session_secret,
+            now,
+        );
+        let resolved_access = compute_policy_access(
+            &snapshot.policy,
+            &PolicyCallerContext {
+                session: auth.as_ref().map(|l| l.ctx.clone()),
+                session_revoked_or_invalid: clear_cookie,
+                live_admin_email: effective_live_admin.map(str::to_string),
+                country: cfg.visitor_country.clone(),
+            },
+        );
+        (resolved_actor, resolved_access, is_billing_waived)
     };
 
-    // Admin browse pass waives login wall & quota/payment metering ONLY — geo,
-    // CSRF, assertion signing, and capability verification already executed above.
-    if is_admin_view {
-        let resp = proxy_to_api(
+    // Browse pass / live staff waives login wall & quota/payment metering ONLY —
+    // geo, CSRF, Policy v3 access evaluation (with zero implicit auto-unlock), and
+    // capability verification already executed above.
+    if is_billing_waived {
+        let resp = forward_gallery_request(
             backend,
             cfg,
+            &snapshot,
             &uri,
             worker_method,
             &headers,
             body,
-            &signed_assertion,
+            now,
+            actor,
+            access,
+            assertion_billing_waived,
+            is_reveal_route,
+            clear_cookie,
             false,
         )
         .await;
@@ -1273,6 +1709,11 @@ async fn handle_gateway_request(
 
     let guest = auth.is_none();
     if metered_post {
+        let Ok(signed_assertion) =
+            sign_assertion_v3(cfg, &snapshot, now, actor, access, assertion_billing_waived)
+        else {
+            return maybe_clear_session_cookie(assertion_sign_error_response(), clear_cookie);
+        };
         let item = item.expect("metered_post implies item is Some");
         let (account_key, reserve_res) = match auth.as_ref() {
             Some(live) => {
@@ -1362,14 +1803,20 @@ async fn handle_gateway_request(
 
     // Authenticated non-metered gallery request: already verified live via `/session-context`.
     if auth.is_some() {
-        let resp = proxy_to_api(
+        let resp = forward_gallery_request(
             backend,
             cfg,
+            &snapshot,
             &uri,
             worker_method,
             &headers,
             body,
-            &signed_assertion,
+            now,
+            actor,
+            access,
+            assertion_billing_waived,
+            is_reveal_route,
+            clear_cookie,
             false,
         )
         .await;
@@ -1392,14 +1839,20 @@ async fn handle_gateway_request(
     let resp = match decision {
         Ok(200) => {
             let allow_public_cache = is_public_cacheable_path(path, true) && !clear_cookie;
-            proxy_to_api(
+            forward_gallery_request(
                 backend,
                 cfg,
+                &snapshot,
                 &uri,
                 worker_method,
                 &headers,
                 body,
-                &signed_assertion,
+                now,
+                actor,
+                access,
+                assertion_billing_waived,
+                is_reveal_route,
+                clear_cookie,
                 allow_public_cache,
             )
             .await
@@ -1425,7 +1878,7 @@ async fn handle_gateway_request(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     use std::future::Future;
     use std::pin::pin;
@@ -1433,25 +1886,23 @@ mod tests {
 
     use axum::http::header::CONTENT_TYPE;
     use site_access::{
-        AgeGateTrigger, AgeVerificationPolicy, AssuranceLevel, ChargeKind, GeoPolicy,
-        LegacySessionClaims, MEDIA_CAP_ANON_SUB, MEDIA_CAP_VERSION, MediaBillingKey,
-        MediaCapability, PlaceholderPreset, RuleMode, SESSION_V2_VERSION, SafetyRuleConfig,
-        SessionV2Claims, builtin_safety_presets, sign_legacy_session, sign_media_capability,
-        sign_session_v2, verify_gateway_assertion,
+        AgeGateTrigger, AgeVerificationPolicy, AssuranceLevel, ChargeKind, ContentPolicy,
+        GeoPolicy, KeyDomain, LegacySessionClaims, MEDIA_CAP_VERSION, MediaBillingKey,
+        MediaCapability, PlaceholderPreset, PolicyAction, PolicyBypass, PolicyRef,
+        SESSION_V2_VERSION, SessionV2Claims, builtin_safety_presets, canonical_policy_json,
+        derive_domain_secret, sign_legacy_session, sign_media_capability, sign_session_v2,
+        verify_admin_assertion, verify_gateway_assertion, verify_guest_session,
     };
 
     use super::*;
+    use crate::auth::ResolvedGatewaySecrets;
     use crate::http_util::{
         MeterError, form_field, parse_upstream_origin, require_form_urlencoded, sha256_hex,
     };
     use crate::media::{LOCKED_PREVIEW_BLUR, encode_canonical_cap_path};
 
     const TEST_NOW: u64 = 1_700_000_000;
-    const TEST_JWT_SECRET: &[u8] = b"test-jwt-secret-key-0123456789";
-    const TEST_V2_SECRET: &[u8] = b"test-session-v2-secret-9876543210";
-    const TEST_ASSERTION_SECRET: &[u8] = b"test-gateway-assertion-secret-abcd";
-    const TEST_ADMIN_ASSERTION_SECRET: &[u8] = b"test-admin-assertion-secret-wxyz";
-    const TEST_MEDIA_CAP_SECRET: &[u8] = b"test-media-cap-secret-efgh";
+    const TEST_SITE_SECRET: &str = "test-master-site-secret-at-least-32-bytes-long!!";
     const ETH_WALLET: &str = "0x1111111111111111111111111111111111111111";
 
     fn block_on<F: Future>(fut: F) -> F::Output {
@@ -1472,28 +1923,46 @@ mod tests {
         }
     }
 
+    fn test_resolved_secrets() -> ResolvedGatewaySecrets {
+        resolve_gateway_secrets(&GatewaySecretInputs {
+            site_secret: Some(TEST_SITE_SECRET),
+            ..GatewaySecretInputs::default()
+        })
+        .expect("resolve from SITE_SECRET")
+    }
+
+    fn test_admin_secret() -> Vec<u8> {
+        resolve_admin_assertion_secret(None, Some(TEST_SITE_SECRET))
+            .expect("resolve AdminAssertion from SITE_SECRET")
+    }
+
     fn test_cfg() -> GatewayConfig {
+        let secrets = test_resolved_secrets();
         GatewayConfig {
-            jwt_secret: Arc::new(TEST_JWT_SECRET.to_vec()),
-            session_v2_secret: Arc::new(TEST_V2_SECRET.to_vec()),
-            gateway_assertion_secret: Arc::new(TEST_ASSERTION_SECRET.to_vec()),
-            admin_assertion_secret: Arc::new(TEST_ADMIN_ASSERTION_SECRET.to_vec()),
-            media_cap_secret: Arc::new(TEST_MEDIA_CAP_SECRET.to_vec()),
+            jwt_secret: Arc::new(secrets.jwt_secret),
+            session_v2_secret: Arc::new(secrets.session_v2_secret),
+            gateway_assertion_secret: Arc::new(secrets.gateway_assertion_secret),
+            media_cap_secret: Arc::new(secrets.media_cap_secret),
+            internal_api_secret: Arc::new(secrets.internal_api_secret),
+            guest_session_secret: Arc::new(secrets.guest_session_secret),
             admin_email: None,
+            admin_allowed_emails: None,
             visitor_country: Some("US".to_string()),
-            client_id: Arc::new("svc-id".to_string()),
-            client_secret: Arc::new("svc-secret".to_string()),
+            cf_access_service_token: Some(Arc::new((
+                "svc-id".to_string(),
+                "svc-secret".to_string(),
+            ))),
             upstreams: Arc::new(test_upstreams()),
         }
     }
 
     fn sample_safety_policy() -> PublicSitePolicy {
-        PublicSitePolicy {
+        let mut p = PublicSitePolicy {
             revision: 5,
             min_enforce_rev: 3,
             safety_enabled: true,
-            rules: builtin_safety_presets(),
-            cloudflare_images_blur: true,
+            fixed_blur_enabled: true,
+            policies: builtin_safety_presets(),
             age_policy: AgeVerificationPolicy::SelfAttestation,
             age_gate_trigger: AgeGateTrigger::JustInTime,
             geo: GeoPolicy {
@@ -1502,7 +1971,19 @@ mod tests {
                 block_tor: true,
             },
             ..PublicSitePolicy::default()
-        }
+        };
+        // Enable require_age_18 on r18 for strict age testing
+        p.policies[0].bypass.require_age_18 = true;
+        p.refresh_policy_digest();
+        p
+    }
+
+    fn policy_envelope_json(policy: &PublicSitePolicy) -> String {
+        let mut cloned = policy.clone();
+        cloned.refresh_policy_digest();
+        let canonical = canonical_policy_json(&cloned);
+        let digest = compute_policy_digest(&cloned);
+        format!(r#"{{"policy":{canonical},"digest":"{digest}"}}"#)
     }
 
     fn form_headers() -> HeaderMap {
@@ -1526,8 +2007,10 @@ mod tests {
     #[derive(Debug, Clone)]
     struct RecordedServiceCall {
         target: ServiceTarget,
+        method: worker::Method,
         path_and_query: String,
         headers: Vec<(String, String)>,
+        body: Bytes,
     }
 
     #[derive(Debug, Clone)]
@@ -1541,14 +2024,20 @@ mod tests {
 
     struct MockBackend {
         now: u64,
-        policy_result: std::result::Result<SitePolicyResponse, String>,
+        rng_counter: Cell<u64>,
+        admin_secret_result: std::result::Result<Vec<u8>, String>,
+        admin_secret_loads: Cell<usize>,
+        policy_envelope: std::result::Result<String, String>,
         session_contexts: HashMap<String, SessionContext>,
         account_statuses: HashMap<String, u16>,
         default_account_status: u16,
         reserve_hold_id: Option<String>,
+        facts_rev_responses: HashMap<String, std::result::Result<(u16, String), String>>,
+        default_facts_rev: std::result::Result<(u16, String), String>,
         upstream_status: StatusCode,
         upstream_cache_control: Option<&'static str>,
         upstream_set_cookie: Option<&'static str>,
+        upstream_cf_resized: Option<&'static str>,
         account_calls: RefCell<Vec<RecordedAccountCall>>,
         session_calls: RefCell<Vec<(String, Option<String>)>>,
         service_calls: RefCell<Vec<RecordedServiceCall>>,
@@ -1557,17 +2046,23 @@ mod tests {
 
     impl MockBackend {
         fn with_policy(policy: PublicSitePolicy) -> Self {
-            let digest = compute_policy_digest(&policy);
+            let env_json = policy_envelope_json(&policy);
             Self {
                 now: TEST_NOW,
-                policy_result: Ok(SitePolicyResponse { policy, digest }),
+                rng_counter: Cell::new(1),
+                admin_secret_result: Ok(test_admin_secret()),
+                admin_secret_loads: Cell::new(0),
+                policy_envelope: Ok(env_json),
                 session_contexts: HashMap::new(),
                 account_statuses: HashMap::new(),
                 default_account_status: 200,
                 reserve_hold_id: Some("hold-1".to_string()),
+                facts_rev_responses: HashMap::new(),
+                default_facts_rev: Ok((200, r#"{"facts_rev":7}"#.to_string())),
                 upstream_status: StatusCode::OK,
                 upstream_cache_control: Some("public, max-age=3600"),
                 upstream_set_cookie: None,
+                upstream_cf_resized: Some("internal=ok/q=30 t=0.05"),
                 account_calls: RefCell::new(Vec::new()),
                 session_calls: RefCell::new(Vec::new()),
                 service_calls: RefCell::new(Vec::new()),
@@ -1581,10 +2076,23 @@ mod tests {
             self.now
         }
 
+        fn random_hex_128(&self) -> std::result::Result<String, BackendError> {
+            let n = self.rng_counter.get();
+            self.rng_counter.set(n + 1);
+            Ok(format!("{n:032x}"))
+        }
+
+        fn load_admin_assertion_secret(&self) -> std::result::Result<Vec<u8>, BackendError> {
+            self.admin_secret_loads
+                .set(self.admin_secret_loads.get() + 1);
+            self.admin_secret_result
+                .clone()
+                .map_err(BackendError)
+        }
+
         async fn load_site_policy(&self) -> std::result::Result<SitePolicySnapshot, BackendError> {
-            match &self.policy_result {
-                Ok(resp) => validate_site_policy_response(resp.clone())
-                    .map_err(|reason| BackendError(reason.to_string())),
+            match &self.policy_envelope {
+                Ok(raw) => parse_site_policy_envelope_v3(raw).map_err(BackendError),
                 Err(msg) => Err(BackendError(msg.clone())),
             }
         }
@@ -1652,8 +2160,10 @@ mod tests {
         ) -> std::result::Result<Response, BackendError> {
             self.service_calls.borrow_mut().push(RecordedServiceCall {
                 target,
+                method: req.method,
                 path_and_query: req.path_and_query,
                 headers: req.headers,
+                body: req.body,
             });
             Ok((StatusCode::OK, "service ok").into_response())
         }
@@ -1662,6 +2172,7 @@ mod tests {
             &self,
             req: UpstreamFetchReq,
         ) -> std::result::Result<Response, BackendError> {
+            let is_preview = req.preview_blur.is_some();
             self.upstream_calls.borrow_mut().push(RecordedUpstreamCall {
                 url: req.url.to_string(),
                 method: req.method,
@@ -1677,12 +2188,34 @@ mod tests {
             if let Some(sc) = self.upstream_set_cookie {
                 resp.headers_mut().insert("set-cookie", sc.parse().unwrap());
             }
+            if is_preview && let Some(cf_resized) = self.upstream_cf_resized {
+                resp.headers_mut()
+                    .insert("cf-resized", cf_resized.parse().unwrap());
+            }
             Ok(resp)
+        }
+
+        async fn fetch_facts_rev(
+            &self,
+            req: UpstreamFetchReq,
+        ) -> std::result::Result<(u16, String), BackendError> {
+            let path = req.url.path().to_string();
+            self.upstream_calls.borrow_mut().push(RecordedUpstreamCall {
+                url: req.url.to_string(),
+                method: req.method,
+                headers: req.headers,
+                no_cache: req.no_cache,
+                preview_blur: req.preview_blur,
+            });
+            let outcome = self
+                .facts_rev_responses
+                .get(&path)
+                .unwrap_or(&self.default_facts_rev);
+            outcome.clone().map_err(BackendError)
         }
     }
 
     fn cookies_from_headers(headers: &HeaderMap) -> Cookies {
-        // Parse `Cookie` header(s) into a `tower_cookies::Cookies` via its cookie jar layer.
         use axum::http::Request as HttpReq;
         use std::sync::Mutex;
         use tower_service::Service as _;
@@ -1723,7 +2256,7 @@ mod tests {
         ))
     }
 
-    fn make_v2_cookie(user_id: &str, do_key: &str, sid: &str) -> String {
+    fn make_v2_cookie(cfg: &GatewayConfig, user_id: &str, do_key: &str, sid: &str) -> String {
         let tok = sign_session_v2(
             &SessionV2Claims {
                 v: SESSION_V2_VERSION,
@@ -1733,14 +2266,28 @@ mod tests {
                 iat: TEST_NOW - 60,
                 exp: TEST_NOW + 3600,
             },
-            TEST_V2_SECRET,
+            &cfg.session_v2_secret,
         )
         .unwrap();
         format!("{SESSION_COOKIE}={tok}")
     }
 
-    fn make_admin_view_cookie() -> String {
-        let pass = site_access::admin_view_pass(TEST_JWT_SECRET, TEST_NOW + site_access::VIEW_TTL);
+    fn make_guest_cookie(cfg: &GatewayConfig, gid: &str) -> String {
+        let tok = sign_guest_session(
+            &GuestSessionToken {
+                v: GUEST_SESSION_VERSION,
+                gid: gid.to_string(),
+                iat: TEST_NOW - 10,
+                exp: TEST_NOW + 3600,
+            },
+            &cfg.guest_session_secret,
+        )
+        .unwrap();
+        format!("{GUEST_SESSION_COOKIE}={tok}")
+    }
+
+    fn make_admin_view_cookie(cfg: &GatewayConfig) -> String {
+        let pass = site_access::admin_view_pass(&cfg.jwt_secret, TEST_NOW + site_access::VIEW_TTL);
         format!("{ADMIN_VIEW_COOKIE}={pass}")
     }
 
@@ -1752,8 +2299,303 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Step 0 Geo-Block & Fail-Closed SITE_POLICY Tests
+    // 1. HKDF Master Secret (`SITE_SECRET`) & Lazy AdminAssertion Key Loading
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn site_secret_hkdf_derives_distinct_domain_keys_and_honors_overrides() {
+        let derived = resolve_gateway_secrets(&GatewaySecretInputs {
+            site_secret: Some(TEST_SITE_SECRET),
+            ..GatewaySecretInputs::default()
+        })
+        .expect("SITE_SECRET alone must resolve all non-admin domains");
+
+        assert_eq!(
+            derived.jwt_secret,
+            derive_domain_secret(TEST_SITE_SECRET, KeyDomain::Session).into_bytes()
+        );
+        assert_eq!(
+            derived.session_v2_secret,
+            derive_domain_secret(TEST_SITE_SECRET, KeyDomain::Session).into_bytes()
+        );
+        assert_eq!(
+            derived.media_cap_secret,
+            derive_domain_secret(TEST_SITE_SECRET, KeyDomain::MediaCap).into_bytes()
+        );
+        assert_eq!(
+            derived.gateway_assertion_secret,
+            derive_domain_secret(TEST_SITE_SECRET, KeyDomain::GatewayAssertion).into_bytes()
+        );
+        assert_eq!(
+            derived.internal_api_secret,
+            derive_domain_secret(TEST_SITE_SECRET, KeyDomain::InternalApi).into_bytes()
+        );
+        assert_eq!(
+            derived.guest_session_secret,
+            derive_domain_secret(TEST_SITE_SECRET, KeyDomain::GuestSession).into_bytes()
+        );
+        // All distinct domains derive distinct secrets
+        assert_ne!(derived.session_v2_secret, derived.media_cap_secret);
+        assert_ne!(derived.media_cap_secret, derived.gateway_assertion_secret);
+        assert_ne!(derived.gateway_assertion_secret, derived.internal_api_secret);
+        assert_ne!(derived.internal_api_secret, derived.guest_session_secret);
+
+        let admin_derived = resolve_admin_assertion_secret(None, Some(TEST_SITE_SECRET)).unwrap();
+        assert_eq!(
+            admin_derived,
+            derive_domain_secret(TEST_SITE_SECRET, KeyDomain::AdminAssertion).into_bytes()
+        );
+        assert_ne!(admin_derived, derived.gateway_assertion_secret);
+
+        // Explicit per-purpose overrides win over SITE_SECRET
+        let overridden = resolve_gateway_secrets(&GatewaySecretInputs {
+            site_secret: Some(TEST_SITE_SECRET),
+            session_v2_secret: Some("override-sess-v2"),
+            media_cap_secret: Some("override-media"),
+            gateway_assertion_secret: Some("override-gw"),
+            internal_api_secret: Some("override-internal"),
+            guest_session_secret: Some("override-guest"),
+            jwt_secret: Some("override-jwt"),
+            session_secret: None,
+        })
+        .unwrap();
+        assert_eq!(overridden.jwt_secret, b"override-jwt");
+        assert_eq!(overridden.session_v2_secret, b"override-sess-v2");
+        assert_eq!(overridden.media_cap_secret, b"override-media");
+        assert_eq!(overridden.gateway_assertion_secret, b"override-gw");
+        assert_eq!(overridden.internal_api_secret, b"override-internal");
+        assert_eq!(overridden.guest_session_secret, b"override-guest");
+        assert_eq!(
+            resolve_admin_assertion_secret(Some("override-admin"), Some(TEST_SITE_SECRET)).unwrap(),
+            b"override-admin"
+        );
+
+        // Missing both SITE_SECRET and overrides fails closed
+        assert!(resolve_gateway_secrets(&GatewaySecretInputs::default()).is_err());
+        assert!(resolve_admin_assertion_secret(None, None).is_err());
+
+        // Lazy AdminAssertion loading: gallery routes NEVER touch admin_assertion_secret!
+        let mut backend = MockBackend::with_policy(sample_safety_policy());
+        backend.admin_secret_result = Err("ADMIN_ASSERTION_SECRET missing".to_string());
+        let mut cfg = test_cfg();
+        let gallery_resp = dispatch(&backend, &cfg, Method::GET, "/", HeaderMap::new(), Bytes::new());
+        assert_eq!(gallery_resp.status(), StatusCode::OK);
+        assert_eq!(
+            backend.admin_secret_loads.get(),
+            0,
+            "gallery traffic must NEVER load AdminAssertion secret"
+        );
+
+        // `/admin` DOES load AdminAssertion lazily and fails closed (500) if missing!
+        cfg.admin_email = Some("ops@gallery.test".to_string());
+        let admin_resp = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "/admin/api/settings",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(admin_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(backend.admin_secret_loads.get(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. Zero Implicit Admin Auto-Unlock, ADMIN_ALLOWED_EMAILS & Browse-Pass Isolation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn zero_implicit_admin_auto_unlock_and_browse_pass_isolation() {
+        let mut policy = sample_safety_policy();
+        // Add an explicit `include_live_admin: true` policy to distinguish browse pass vs live staff
+        policy.policies.push(ContentPolicy {
+            id: "staff_bypass".into(),
+            grant_generation: 1,
+            enabled: true,
+            priority: 40,
+            name: "Staff Bypass".into(),
+            preset: PlaceholderPreset::Custom,
+            match_expr: "tag:blood".into(),
+            except_expr: None,
+            default_tag_min: 0.45,
+            action: PolicyAction::Block,
+            bypass: PolicyBypass {
+                include_live_admin: true,
+                ..PolicyBypass::default()
+            },
+        });
+        policy.refresh_policy_digest();
+
+        let mut backend = MockBackend::with_policy(policy.clone());
+        backend.account_statuses.insert("guest".to_string(), 401);
+        let mut cfg = test_cfg();
+
+        // 1. ADMIN_VIEW_COOKIE (browse pass) waives guest wall & billing (`is_billing_waived: true`),
+        //    but grants ZERO `direct_grants` and NEVER sets `ActorBinding::LiveAdmin`!
+        let mut h = HeaderMap::new();
+        h.insert("cookie", make_admin_view_cookie(&cfg).parse().unwrap());
+        let resp = dispatch(&backend, &cfg, Method::GET, "/", h, Bytes::new());
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(backend.account_calls.borrow().is_empty(), "browse pass waives guest DO call");
+        {
+            let up = backend.upstream_calls.borrow();
+            let raw = header_value(&up[0].headers, GATEWAY_ASSERTION_HEADER).unwrap();
+            let ga = verify_gateway_assertion(
+                raw,
+                &cfg.gateway_assertion_secret,
+                GATEWAY_ASSERTION_AUDIENCE,
+                TEST_NOW,
+                5,
+            )
+            .unwrap();
+            assert!(ga.is_billing_waived);
+            assert_eq!(ga.actor, ActorBinding::Anon);
+            assert!(
+                ga.direct_grants.is_empty(),
+                "ADMIN_VIEW_COOKIE MUST NOT grant ANY direct_grants (not even include_live_admin!)"
+            );
+            assert_eq!(ga.click_eligible, vec![PolicyRef::new("sensitive", 1)]);
+        }
+
+        // 2. Live CF Access staff identity (without gallery session):
+        //    - Gets `ActorBinding::LiveAdmin { email }`
+        //    - Grants ONLY `staff_bypass` (explicit `include_live_admin: true`),
+        //      and NEVER implicitly unlocks `r18` or `blood` (`include_live_admin: false`)!
+        backend.upstream_calls.borrow_mut().clear();
+        cfg.admin_email = Some("Staff@Gallery.Test".to_string());
+        let resp2 = dispatch(&backend, &cfg, Method::GET, "/", HeaderMap::new(), Bytes::new());
+        assert_eq!(resp2.status(), StatusCode::OK);
+        {
+            let up = backend.upstream_calls.borrow();
+            let raw = header_value(&up[0].headers, GATEWAY_ASSERTION_HEADER).unwrap();
+            let ga = verify_gateway_assertion(
+                raw,
+                &cfg.gateway_assertion_secret,
+                GATEWAY_ASSERTION_AUDIENCE,
+                TEST_NOW,
+                5,
+            )
+            .unwrap();
+            assert!(ga.is_billing_waived);
+            assert_eq!(
+                ga.actor,
+                ActorBinding::LiveAdmin {
+                    email: "Staff@Gallery.Test".into()
+                }
+            );
+            assert_eq!(ga.direct_grants, vec![PolicyRef::new("staff_bypass", 1)]);
+            assert!(!ga.direct_grants.contains(&PolicyRef::new("r18", 1)));
+            assert!(!ga.direct_grants.contains(&PolicyRef::new("blood", 1)));
+        }
+    }
+
+    #[test]
+    fn admin_allowed_emails_restricts_admin_routes_and_live_admin_email() {
+        let mut policy = sample_safety_policy();
+        policy.policies[2].bypass.include_live_admin = true;
+        policy.refresh_policy_digest();
+
+        let backend = MockBackend::with_policy(policy);
+        let mut cfg = test_cfg();
+        cfg.admin_allowed_emails = parse_admin_allowed_emails(Some(
+            "  Alice@Gallery.Test , bob@gallery.test ",
+        ))
+        .map(Arc::new);
+
+        // Malformed non-empty allowlist (e.g. ",,,") fails closed!
+        assert_eq!(
+            filter_allowed_admin_email(
+                Some("alice@gallery.test"),
+                parse_admin_allowed_emails(Some(",,,")).as_deref()
+            ),
+            None
+        );
+
+        // Non-listed CF Access email -> rejected (403) on `/admin` AND denied `live_admin_email`!
+        cfg.admin_email = Some("eve@gallery.test".to_string());
+        assert_eq!(cfg.live_admin_email(), None);
+        assert_eq!(
+            dispatch(&backend, &cfg, Method::GET, "/admin", HeaderMap::new(), Bytes::new()).status(),
+            StatusCode::FORBIDDEN
+        );
+        let r_gallery = dispatch(&backend, &cfg, Method::GET, "/", HeaderMap::new(), Bytes::new());
+        assert_eq!(r_gallery.status(), StatusCode::OK);
+        {
+            let up = backend.upstream_calls.borrow();
+            let raw = header_value(&up[0].headers, GATEWAY_ASSERTION_HEADER).unwrap();
+            let ga = verify_gateway_assertion(
+                raw,
+                &cfg.gateway_assertion_secret,
+                GATEWAY_ASSERTION_AUDIENCE,
+                TEST_NOW,
+                5,
+            )
+            .unwrap();
+            assert_eq!(ga.actor, ActorBinding::Anon);
+            assert!(!ga.is_billing_waived);
+            assert!(ga.direct_grants.is_empty());
+        }
+
+        // Case-insensitive match in `ADMIN_ALLOWED_EMAILS` -> allowed on `/admin` AND `LiveAdmin`!
+        cfg.admin_email = Some("ALICE@gallery.test".to_string());
+        assert_eq!(cfg.live_admin_email(), Some("ALICE@gallery.test"));
+        assert_eq!(
+            dispatch(&backend, &cfg, Method::GET, "/admin", HeaderMap::new(), Bytes::new()).status(),
+            StatusCode::OK
+        );
+        backend.upstream_calls.borrow_mut().clear();
+        let r_staff = dispatch(&backend, &cfg, Method::GET, "/", HeaderMap::new(), Bytes::new());
+        assert_eq!(r_staff.status(), StatusCode::OK);
+        let up = backend.upstream_calls.borrow();
+        let raw = header_value(&up[0].headers, GATEWAY_ASSERTION_HEADER).unwrap();
+        let ga = verify_gateway_assertion(
+            raw,
+            &cfg.gateway_assertion_secret,
+            GATEWAY_ASSERTION_AUDIENCE,
+            TEST_NOW,
+            5,
+        )
+        .unwrap();
+        assert_eq!(
+            ga.actor,
+            ActorBinding::LiveAdmin {
+                email: "ALICE@gallery.test".into()
+            }
+        );
+        assert_eq!(ga.direct_grants, vec![PolicyRef::new("blood", 1)]);
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. Strict Policy v3 Decoding, Geo-Block & `/internal/*` Protection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn site_policy_rejects_legacy_schema_rules_malformed_and_bad_digest_fail_closed() {
+        let cfg = test_cfg();
+
+        let bad_envelopes = [
+            // Missing schema_version + legacy rules
+            r#"{"policy":{"revision":1,"safety_enabled":true,"rules":[]},"digest":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+            // schema_version: 2
+            r#"{"policy":{"schema_version":2,"revision":1,"safety_enabled":true},"digest":"0000000000000000000000000000000000000000000000000000000000000000"}"#,
+            // Tampered envelope digest
+            &policy_envelope_json(&sample_safety_policy())
+                .replace(&compute_policy_digest(&sample_safety_policy()), &"0".repeat(64)),
+            // Malformed JSON
+            "not-json",
+        ];
+
+        for raw in bad_envelopes {
+            let mut backend = MockBackend::with_policy(sample_safety_policy());
+            backend.policy_envelope = Ok(raw.to_string());
+            let resp = dispatch(&backend, &cfg, Method::GET, "/", HeaderMap::new(), Bytes::new());
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                resp.headers().get("cache-control").unwrap(),
+                "private, no-store"
+            );
+        }
+    }
 
     #[test]
     fn geo_block_enforces_cf_country_ignores_spoofed_header_and_exempts_admin() {
@@ -1763,14 +2605,14 @@ mod tests {
             block_unknown: true,
             block_tor: true,
         };
+        policy.refresh_policy_digest();
         let backend = MockBackend::with_policy(policy);
 
-        // 1. Blocked country KP with spoofed `CF-IPCountry: US` header AND valid admin browse cookie -> still 451!
         let mut cfg = test_cfg();
         cfg.visitor_country = Some("KP".to_string());
         let mut hdrs = HeaderMap::new();
         hdrs.insert("cf-ipcountry", "US".parse().unwrap());
-        hdrs.insert("cookie", make_admin_view_cookie().parse().unwrap());
+        hdrs.insert("cookie", make_admin_view_cookie(&cfg).parse().unwrap());
         let resp = dispatch(&backend, &cfg, Method::GET, "/", hdrs, Bytes::new());
         assert_eq!(resp.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
         assert_eq!(
@@ -1779,7 +2621,6 @@ mod tests {
         );
         assert!(backend.upstream_calls.borrow().is_empty());
 
-        // 2. Tor (`T1`), unknown (`XX`), and missing country (`None`) all blocked when configured.
         for country in [Some("T1"), Some("XX"), None] {
             cfg.visitor_country = country.map(str::to_string);
             let mut h = HeaderMap::new();
@@ -1788,406 +2629,676 @@ mod tests {
             assert_eq!(r.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
         }
 
-        // 3. `/admin` and `/admin/*` are EXEMPT from geo-block so admins cannot lock themselves out.
+        // `/admin` exempt from geo-block
         cfg.visitor_country = Some("KP".to_string());
         cfg.admin_email = Some("ops@gallery.test".to_string());
-        let admin_resp = dispatch(&backend, &cfg, Method::GET, "/admin", HeaderMap::new(), Bytes::new());
+        let admin_resp =
+            dispatch(&backend, &cfg, Method::GET, "/admin", HeaderMap::new(), Bytes::new());
         assert_eq!(admin_resp.status(), StatusCode::OK);
-        assert_eq!(
-            admin_resp.headers().get("cache-control").unwrap(),
-            "private, no-store"
-        );
-        let calls = backend.service_calls.borrow();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].target, ServiceTarget::AdminDashboard);
-        assert_eq!(calls[0].path_and_query, "/admin");
-        assert_eq!(
-            header_value(&calls[0].headers, ADMIN_HEADER),
-            Some("ops@gallery.test")
-        );
-
-        // 4. Allowed country `US` with spoofed `CF-IPCountry: KP` header -> NOT blocked (header ignored).
-        cfg.visitor_country = Some("US".to_string());
-        cfg.admin_email = None;
-        let mut spoof = HeaderMap::new();
-        spoof.insert("cf-ipcountry", "KP".parse().unwrap());
-        let ok_resp = dispatch(&backend, &cfg, Method::GET, "/robots.txt", spoof, Bytes::new());
-        assert_eq!(ok_resp.status(), StatusCode::OK);
     }
 
     #[test]
-    fn site_policy_outage_or_bad_digest_fails_closed_while_admin_stays_reachable() {
-        let mut backend = MockBackend::with_policy(sample_safety_policy());
-        backend.policy_result = Err("DO unreachable".to_string());
-
-        let mut cfg = test_cfg();
-        let resp = dispatch(&backend, &cfg, Method::GET, "/", HeaderMap::new(), Bytes::new());
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            resp.headers().get("cache-control").unwrap(),
-            "private, no-store"
-        );
-
-        // Tampered digest also fails closed with 503.
-        let mut bad_digest_backend = MockBackend::with_policy(sample_safety_policy());
-        bad_digest_backend.policy_result = Ok(SitePolicyResponse {
-            policy: sample_safety_policy(),
-            digest: "0".repeat(64),
-        });
-        let r2 = dispatch(
-            &bad_digest_backend,
-            &cfg,
-            Method::GET,
-            "/robots.txt",
-            HeaderMap::new(),
-            Bytes::new(),
-        );
-        assert_eq!(r2.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        // Admin path remains accessible during SITE_POLICY outage to allow recovery.
-        cfg.admin_email = Some("ops@gallery.test".to_string());
-        let admin_ok = dispatch(&backend, &cfg, Method::GET, "/admin", HeaderMap::new(), Bytes::new());
-        assert_eq!(admin_ok.status(), StatusCode::OK);
-    }
-
-    // -----------------------------------------------------------------------
-    // Admin Routing, /user/admin* Retirement & /user/* Header Stripping (H13)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn user_admin_retired_404_and_admin_dashboard_requires_access() {
+    fn raw_images_videos_and_internal_routes_blocked_with_404() {
         let backend = MockBackend::with_policy(sample_safety_policy());
         let mut cfg = test_cfg();
-
-        // Unauthenticated `/admin` -> 403 (even with ADMIN_VIEW_COOKIE!).
-        let mut with_view = HeaderMap::new();
-        with_view.insert("cookie", make_admin_view_cookie().parse().unwrap());
-        let r = dispatch(&backend, &cfg, Method::GET, "/admin", with_view, Bytes::new());
-        assert_eq!(r.status(), StatusCode::FORBIDDEN);
-
-        // `/user/admin` and `/user/admin/*` unconditionally return 404 even with CF Access admin!
         cfg.admin_email = Some("ops@gallery.test".to_string());
+
         for (m, p) in [
+            (Method::GET, "/images/a.webp"),
+            (Method::GET, "/videos/clip.mp4"),
+            (Method::GET, "/internal/facts-rev/image/42"),
+            (Method::POST, "/internal/validate-safety-catalog"),
             (Method::GET, "/user/admin"),
-            (Method::GET, "/user/admin/browse"),
             (Method::POST, "/user/admin/settings"),
-            (Method::DELETE, "/user/admin/foo"),
         ] {
-            let resp = dispatch(&backend, &cfg, m, p, HeaderMap::new(), Bytes::new());
-            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "expected 404 on {p}");
-            assert_eq!(
-                resp.headers().get("cache-control").unwrap(),
-                "private, no-store"
-            );
-        }
-        assert!(backend.service_calls.borrow().is_empty());
-
-        // `/admin/browse` sets __Host-ue_admin_view and redirects to `/`.
-        let browse = dispatch(
-            &backend,
-            &cfg,
-            Method::GET,
-            "/admin/browse",
-            HeaderMap::new(),
-            Bytes::new(),
-        );
-        assert_eq!(browse.status(), StatusCode::SEE_OTHER);
-        assert_eq!(browse.headers().get("location").unwrap(), "/");
-        assert_eq!(
-            browse.headers().get("cache-control").unwrap(),
-            "private, no-store"
-        );
-        let sc = browse.headers().get("set-cookie").unwrap().to_str().unwrap();
-        assert!(sc.starts_with("__Host-ue_admin_view="));
-        assert!(sc.contains("HttpOnly"));
-
-        // `/user/account` forwards to USER_WORKER stripping ALL privileged + forwarded headers
-        // and admin/Access cookies, and never setting ADMIN_HEADER.
-        let mut spoofed = HeaderMap::new();
-        spoofed.insert("x-gallery-admin-email", "evil@test".parse().unwrap());
-        spoofed.insert("x-gateway-assertion", "ga1.fake.sig".parse().unwrap());
-        spoofed.insert("cf-access-jwt-assertion", "fake-jwt".parse().unwrap());
-        spoofed.insert("x-forwarded-host", "evil.host".parse().unwrap());
-        spoofed.insert("x-forwarded-proto", "http".parse().unwrap());
-        spoofed.insert("forwarded", "host=evil.host".parse().unwrap());
-        spoofed.insert(
-            "cookie",
-            format!("{}; {}=abc", make_admin_view_cookie(), SESSION_COOKIE)
-                .parse()
-                .unwrap(),
-        );
-        let user_resp = dispatch(&backend, &cfg, Method::GET, "/user/account", spoofed, Bytes::new());
-        assert_eq!(user_resp.status(), StatusCode::OK);
-        {
-            let calls = backend.service_calls.borrow();
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].target, ServiceTarget::UserWorker);
-            assert_eq!(header_value(&calls[0].headers, ADMIN_HEADER), None);
-            assert_eq!(
-                header_value(&calls[0].headers, GATEWAY_ASSERTION_HEADER),
-                None
-            );
-            assert_eq!(
-                header_value(&calls[0].headers, "cf-access-jwt-assertion"),
-                None
-            );
-            assert_eq!(header_value(&calls[0].headers, "x-forwarded-host"), None);
-            assert_eq!(header_value(&calls[0].headers, "x-forwarded-proto"), None);
-            assert_eq!(header_value(&calls[0].headers, "forwarded"), None);
-            let fwd_cookie = header_value(&calls[0].headers, "cookie").unwrap();
-            assert!(fwd_cookie.contains("ue_session=abc"));
-            assert!(!fwd_cookie.contains(ADMIN_VIEW_COOKIE));
-        }
-
-        // `/admin/api/settings` forwards to ADMIN_DASHBOARD_WORKER stripping forwarded headers
-        // and all STRIPPED_ORIGIN_COOKIES while preserving admin SPA CSRF cookie.
-        let mut admin_spoof = HeaderMap::new();
-        admin_spoof.insert("x-forwarded-host", "evil.host".parse().unwrap());
-        admin_spoof.insert("x-forwarded-proto", "http".parse().unwrap());
-        admin_spoof.insert("forwarded", "for=1.2.3.4".parse().unwrap());
-        admin_spoof.insert(
-            "cookie",
-            format!(
-                "__Host-admin_csrf=tok1; {}=s1; {}; gw_token=g; __Host-auth_tx=t; CF_Authorization=c",
-                SESSION_COOKIE,
-                make_admin_view_cookie()
-            )
-            .parse()
-            .unwrap(),
-        );
-        let admin_api = dispatch(
-            &backend,
-            &cfg,
-            Method::GET,
-            "/admin/api/settings",
-            admin_spoof,
-            Bytes::new(),
-        );
-        assert_eq!(admin_api.status(), StatusCode::OK);
-        let calls = backend.service_calls.borrow();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1].target, ServiceTarget::AdminDashboard);
-        assert_eq!(header_value(&calls[1].headers, "x-forwarded-host"), None);
-        assert_eq!(header_value(&calls[1].headers, "x-forwarded-proto"), None);
-        assert_eq!(header_value(&calls[1].headers, "forwarded"), None);
-        assert_eq!(
-            header_value(&calls[1].headers, "cookie"),
-            Some("__Host-admin_csrf=tok1")
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Raw /images/* & /videos/* Block + Capability /media/* Enforcement (C1, H1, H2, M1)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn raw_images_and_videos_are_blocked_with_404_even_for_admins() {
-        let backend = MockBackend::with_policy(sample_safety_policy());
-        let mut cfg = test_cfg();
-        cfg.admin_email = Some("ops@gallery.test".to_string());
-
-        for p in ["/images/a.webp", "/images/album/pic.webp", "/videos/clip.mp4", "/images", "/videos"] {
             let mut h = HeaderMap::new();
-            h.insert("cookie", make_admin_view_cookie().parse().unwrap());
-            let r = dispatch(&backend, &cfg, Method::GET, p, h, Bytes::new());
+            h.insert("cookie", make_admin_view_cookie(&cfg).parse().unwrap());
+            let r = dispatch(&backend, &cfg, m, p, h, Bytes::new());
             assert_eq!(r.status(), StatusCode::NOT_FOUND, "must 404 {p}");
             assert_eq!(
                 r.headers().get("cache-control").unwrap(),
                 "private, no-store"
             );
         }
-        assert!(backend.account_calls.borrow().is_empty());
         assert!(backend.upstream_calls.borrow().is_empty());
     }
 
+    // -----------------------------------------------------------------------
+    // 4. `POST /api/safety/reveal` CSRF & `le_guest_sid` Minting
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn media_capability_rejects_tampered_expired_stale_rev_and_wrong_target_with_zero_charge() {
-        let policy = sample_safety_policy(); // rev = 5, min_enforce_rev = 3
-        let backend = MockBackend::with_policy(policy);
+    fn safety_reveal_enforces_csrf_mints_guest_session_and_reuses_existing_cookie() {
+        let policy = sample_safety_policy();
+        let mut backend = MockBackend::with_policy(policy);
+        backend.account_statuses.insert("guest".to_string(), 200);
         let cfg = test_cfg();
 
-        let valid_cap = MediaCapability {
-            v: MEDIA_CAP_VERSION,
-            kind: MediaCapKind::Image,
-            id: 42,
-            path: "2026/01/photo_42.webp".to_string(),
-            rev: 5,
-            sub: MEDIA_CAP_ANON_SUB.to_string(),
-            sid: None,
-            req_switchers: Vec::new(),
-            exp: TEST_NOW + 300,
-        };
-        let valid_tok = sign_media_capability(&valid_cap, TEST_MEDIA_CAP_SECRET).unwrap();
+        let body = Bytes::from_static(br#"{"kind":"image","asset_id":42,"policy_rev":5}"#);
 
-        // 1. Missing cap -> 403
-        assert_eq!(
-            dispatch(&backend, &cfg, Method::GET, "/media/image/42", HeaderMap::new(), Bytes::new()).status(),
-            StatusCode::FORBIDDEN
-        );
-        // 2. Duplicate cap -> 403
-        assert_eq!(
-            dispatch(
-                &backend,
-                &cfg,
-                Method::GET,
-                &format!("/media/image/42?cap={valid_tok}&cap={valid_tok}"),
-                HeaderMap::new(),
-                Bytes::new()
-            )
-            .status(),
-            StatusCode::FORBIDDEN
-        );
-        // 3. Tampered signature -> 403
-        let mut tampered = valid_tok.clone();
-        let last = tampered.pop().unwrap();
-        tampered.push(if last == 'A' { 'B' } else { 'A' });
-        assert_eq!(
-            dispatch(
-                &backend,
-                &cfg,
-                Method::GET,
-                &format!("/media/image/42?cap={tampered}"),
-                HeaderMap::new(),
-                Bytes::new()
-            )
-            .status(),
-            StatusCode::FORBIDDEN
-        );
-        // 4. Wrong ID -> 403
-        assert_eq!(
-            dispatch(
-                &backend,
-                &cfg,
-                Method::GET,
-                &format!("/media/image/43?cap={valid_tok}"),
-                HeaderMap::new(),
-                Bytes::new()
-            )
-            .status(),
-            StatusCode::FORBIDDEN
-        );
-        // 5. Wrong kind -> 403
-        assert_eq!(
-            dispatch(
-                &backend,
-                &cfg,
-                Method::GET,
-                &format!("/media/preview/42?cap={valid_tok}"),
-                HeaderMap::new(),
-                Bytes::new()
-            )
-            .status(),
-            StatusCode::FORBIDDEN
-        );
-        // 6. Expired cap -> 403
-        let expired_tok = sign_media_capability(
-            &MediaCapability {
-                exp: TEST_NOW - 1,
-                ..valid_cap.clone()
-            },
-            TEST_MEDIA_CAP_SECRET,
-        )
-        .unwrap();
-        assert_eq!(
-            dispatch(
-                &backend,
-                &cfg,
-                Method::GET,
-                &format!("/media/image/42?cap={expired_tok}"),
-                HeaderMap::new(),
-                Bytes::new()
-            )
-            .status(),
-            StatusCode::FORBIDDEN
-        );
-        // 7. Stale rev (< min_enforce_rev = 3) -> 403
-        let stale_tok = sign_media_capability(
-            &MediaCapability {
-                rev: 2,
-                ..valid_cap.clone()
-            },
-            TEST_MEDIA_CAP_SECRET,
-        )
-        .unwrap();
-        assert_eq!(
-            dispatch(
-                &backend,
-                &cfg,
-                Method::GET,
-                &format!("/media/image/42?cap={stale_tok}"),
-                HeaderMap::new(),
-                Bytes::new()
-            )
-            .status(),
-            StatusCode::FORBIDDEN
-        );
-        // 8. POST to /media/* -> 405 Method Not Allowed
+        // 1. Missing Origin -> 403
+        let mut no_origin = HeaderMap::new();
+        no_origin.insert("x-requested-with", "fetch".parse().unwrap());
         assert_eq!(
             dispatch(
                 &backend,
                 &cfg,
                 Method::POST,
-                &format!("/media/image/42?cap={valid_tok}"),
+                "https://gallery.test/api/safety/reveal",
+                no_origin,
+                body.clone(),
+            )
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // 2. Missing X-Requested-With: fetch -> 403
+        let mut no_xrw = HeaderMap::new();
+        no_xrw.insert("origin", "https://gallery.test".parse().unwrap());
+        assert_eq!(
+            dispatch(
+                &backend,
+                &cfg,
+                Method::POST,
+                "https://gallery.test/api/safety/reveal",
+                no_xrw,
+                body.clone(),
+            )
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // 3. GET /api/safety/reveal -> 405
+        assert_eq!(
+            dispatch(
+                &backend,
+                &cfg,
+                Method::GET,
+                "https://gallery.test/api/safety/reveal",
                 HeaderMap::new(),
-                Bytes::new()
+                Bytes::new(),
             )
             .status(),
             StatusCode::METHOD_NOT_ALLOWED
         );
-        // ZERO DO calls and ZERO upstream calls on any denied request!
-        assert!(backend.account_calls.borrow().is_empty());
         assert!(backend.upstream_calls.borrow().is_empty());
 
-        // 9. Valid anonymous safe cap -> 200, guest billing with canonical `media:image:42`,
-        //    private no-store, no shared cache.
+        // 4. Valid guest POST /api/safety/reveal without le_guest_sid:
+        //    mints fresh le_guest_sid, passes ActorBinding::GuestSession in ga3., sets HttpOnly Secure cookie!
+        let mut ok_hdrs = HeaderMap::new();
+        ok_hdrs.insert("origin", "https://gallery.test".parse().unwrap());
+        ok_hdrs.insert("x-requested-with", "fetch".parse().unwrap());
+        let resp = dispatch(
+            &backend,
+            &cfg,
+            Method::POST,
+            "https://gallery.test/api/safety/reveal",
+            ok_hdrs.clone(),
+            body.clone(),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "private, no-store");
+        let sc = resp
+            .headers()
+            .get("set-cookie")
+            .expect("must set le_guest_sid")
+            .to_str()
+            .unwrap();
+        assert!(sc.starts_with("le_guest_sid=gs1."));
+        assert!(sc.contains("HttpOnly"));
+        assert!(sc.contains("SameSite=Lax"));
+        assert!(sc.contains("Path=/"));
+        assert!(sc.contains("Secure"));
+
+        let cookie_pair = sc.split(';').next().unwrap();
+        let raw_guest_tok = cookie_pair.strip_prefix("le_guest_sid=").unwrap();
+        let verified_guest =
+            verify_guest_session(raw_guest_tok, &cfg.guest_session_secret, TEST_NOW).unwrap();
+
+        {
+            let up = backend.upstream_calls.borrow();
+            assert_eq!(up.len(), 1);
+            let ga = verify_gateway_assertion(
+                header_value(&up[0].headers, GATEWAY_ASSERTION_HEADER).unwrap(),
+                &cfg.gateway_assertion_secret,
+                GATEWAY_ASSERTION_AUDIENCE,
+                TEST_NOW,
+                5,
+            )
+            .unwrap();
+            assert_eq!(
+                ga.actor,
+                ActorBinding::GuestSession {
+                    gid: verified_guest.gid.clone()
+                }
+            );
+            assert!(ga.direct_grants.is_empty());
+            assert_eq!(ga.click_eligible, vec![PolicyRef::new("sensitive", 1)]);
+        }
+
+        // 5. Subsequent reveal with existing valid `le_guest_sid` reuses same gid and does NOT re-mint Set-Cookie
+        backend.upstream_calls.borrow_mut().clear();
+        ok_hdrs.insert("cookie", cookie_pair.parse().unwrap());
+        let resp2 = dispatch(
+            &backend,
+            &cfg,
+            Method::POST,
+            "https://gallery.test/api/safety/reveal",
+            ok_hdrs,
+            body,
+        );
+        assert_eq!(resp2.status(), StatusCode::OK);
+        assert!(resp2.headers().get("set-cookie").is_none());
+        let up = backend.upstream_calls.borrow();
+        let ga2 = verify_gateway_assertion(
+            header_value(&up[0].headers, GATEWAY_ASSERTION_HEADER).unwrap(),
+            &cfg.gateway_assertion_secret,
+            GATEWAY_ASSERTION_AUDIENCE,
+            TEST_NOW,
+            5,
+        )
+        .unwrap();
+        assert_eq!(
+            ga2.actor,
+            ActorBinding::GuestSession {
+                gid: verified_guest.gid
+            }
+        );
+        // le_guest_sid must be stripped from forwarded Cookie header to APP_ORIGIN
+        assert_eq!(header_value(&up[0].headers, "cookie"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. MediaCapability v3 Redemption, `facts_rev`, `revealed_refs`, and Preview Blur
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn media_cap_v3_rejects_v1_and_enforces_facts_rev_even_on_anon_caps_and_range() {
+        let policy = sample_safety_policy();
+        let mut backend = MockBackend::with_policy(policy);
+        let cfg = test_cfg();
+
+        // 1. Reject legacy v1 token BEFORE any origin or DO call
+        let legacy_v1 = "eyJ2IjoxLCJraW5kIjoiaW1hZ2UiLCJpZCI6NDJ9.fake_sig";
+        assert_eq!(
+            dispatch(
+                &backend,
+                &cfg,
+                Method::GET,
+                &format!("/media/image/42?cap={legacy_v1}"),
+                HeaderMap::new(),
+                Bytes::new(),
+            )
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(backend.upstream_calls.borrow().is_empty());
+        assert!(backend.account_calls.borrow().is_empty());
+
+        // 2. Public Anon cap (matched_blocks=[], matched_blurs=[]):
+        //    STILL queries `/internal/facts-rev/image/42` when safety_enabled == true!
+        let anon_cap = MediaCapability {
+            v: MEDIA_CAP_VERSION,
+            aud: MEDIA_CAP_AUDIENCE.into(),
+            kind: MediaCapKind::Image,
+            asset_id: 42,
+            immutable_locator: "2026/01/pic_42.webp".into(),
+            facts_rev: 7,
+            policy_rev: 5,
+            actor_binding: ActorBinding::Anon,
+            matched_blocks: vec![],
+            matched_blurs: vec![],
+            revealed_refs: vec![],
+            exp: TEST_NOW + 300,
+        };
+        let anon_tok = sign_media_capability(&anon_cap, &cfg.media_cap_secret).unwrap();
+
+        // 2a. facts_rev mismatch (8 != 7) on Anon cap (even with Range header!) -> 403, ZERO billing!
+        backend.default_facts_rev = Ok((200, r#"{"facts_rev":8}"#.to_string()));
+        let mut range_hdrs = HeaderMap::new();
+        range_hdrs.insert("range", "bytes=0-1023".parse().unwrap());
+        let stale_resp = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            &format!("/media/image/42?cap={anon_tok}"),
+            range_hdrs.clone(),
+            Bytes::new(),
+        );
+        assert_eq!(stale_resp.status(), StatusCode::FORBIDDEN);
+        assert!(backend.account_calls.borrow().is_empty());
+        {
+            let up = backend.upstream_calls.borrow();
+            assert_eq!(up.len(), 1);
+            assert_eq!(up[0].method, worker::Method::Get);
+            assert!(up[0].no_cache);
+            assert_eq!(
+                up[0].url,
+                "https://api.gallery.test/internal/facts-rev/image/42"
+            );
+            // Verify facts-rev request carries valid ga3. X-Gateway-Assertion + CF Access service token
+            assert!(
+                header_value(&up[0].headers, GATEWAY_ASSERTION_HEADER)
+                    .unwrap()
+                    .starts_with("ga3.")
+            );
+            assert_eq!(header_value(&up[0].headers, "cf-access-client-id"), Some("svc-id"));
+        }
+
+        // 2b. Origin 404 on facts-rev -> 403
+        backend.default_facts_rev = Ok((404, String::new()));
+        assert_eq!(
+            dispatch(
+                &backend,
+                &cfg,
+                Method::HEAD,
+                &format!("/media/image/42?cap={anon_tok}"),
+                HeaderMap::new(),
+                Bytes::new(),
+            )
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // 2c. Origin 500 or transport error on facts-rev -> fail closed 503
+        backend.default_facts_rev = Ok((500, String::new()));
+        assert_eq!(
+            dispatch(
+                &backend,
+                &cfg,
+                Method::GET,
+                &format!("/media/image/42?cap={anon_tok}"),
+                HeaderMap::new(),
+                Bytes::new(),
+            )
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        backend.default_facts_rev = Err("timeout".to_string());
+        assert_eq!(
+            dispatch(
+                &backend,
+                &cfg,
+                Method::GET,
+                &format!("/media/image/42?cap={anon_tok}"),
+                HeaderMap::new(),
+                Bytes::new(),
+            )
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(backend.account_calls.borrow().is_empty());
+
+        // 2d. Matching facts_rev == 7 -> 200 OK with Range forwarded and private, no-store!
+        backend.default_facts_rev = Ok((200, r#"{"facts_rev":7}"#.to_string()));
+        backend.upstream_calls.borrow_mut().clear();
         let ok = dispatch(
             &backend,
             &cfg,
             Method::GET,
-            &format!("/media/image/42?cap={valid_tok}"),
-            HeaderMap::new(),
+            &format!("/media/image/42?cap={anon_tok}"),
+            range_hdrs,
             Bytes::new(),
         );
         assert_eq!(ok.status(), StatusCode::OK);
         assert_eq!(ok.headers().get("cache-control").unwrap(), "private, no-store");
         assert_eq!(backend.account_calls.borrow().len(), 1);
-        assert_eq!(backend.account_calls.borrow()[0].operation, "guest");
+        assert_eq!(backend.upstream_calls.borrow().len(), 2);
         assert_eq!(
-            backend.account_calls.borrow()[0].payload["item"]["path"],
-            "media:image:42"
+            backend.upstream_calls.borrow()[1].url,
+            "https://image.gallery.test/2026/01/pic_42.webp"
         );
-        let up = backend.upstream_calls.borrow();
-        assert_eq!(up.len(), 1);
-        assert_eq!(up[0].url, "https://image.gallery.test/2026/01/photo_42.webp");
-        assert!(up[0].no_cache);
-        assert_eq!(up[0].preview_blur, None);
+        assert_eq!(
+            header_value(&backend.upstream_calls.borrow()[1].headers, "range"),
+            Some("bytes=0-1023")
+        );
     }
 
     #[test]
-    fn restricted_media_enforces_switchers_age_terms_safe_mode_sid_and_zero_charge_on_denial() {
+    fn media_cap_v3_enforces_revealed_refs_intersect_live_click_eligible_and_preview_fail_closed() {
+        let mut policy = sample_safety_policy();
+        policy.policies[1].bypass.exclude_countries = vec!["GB".into()];
+        policy.refresh_policy_digest();
+
+        let mut backend = MockBackend::with_policy(policy.clone());
+        let mut cfg = test_cfg();
+
+        let gid = "gs_0123456789abcdef0123456789abcdef";
+        let blur_ref = PolicyRef::new("sensitive", 1);
+        let revealed_cap = MediaCapability {
+            v: MEDIA_CAP_VERSION,
+            aud: MEDIA_CAP_AUDIENCE.into(),
+            kind: MediaCapKind::Image,
+            asset_id: 88,
+            immutable_locator: "2026/01/blur_88.webp".into(),
+            facts_rev: 7,
+            policy_rev: 5,
+            actor_binding: ActorBinding::GuestSession { gid: gid.into() },
+            matched_blocks: vec![],
+            matched_blurs: vec![blur_ref.clone()],
+            revealed_refs: vec![blur_ref.clone()],
+            exp: TEST_NOW + 600,
+        };
+        let tok = sign_media_capability(&revealed_cap, &cfg.media_cap_secret).unwrap();
+
+        let mut guest_hdrs = HeaderMap::new();
+        guest_hdrs.insert("cookie", make_guest_cookie(&cfg, gid).parse().unwrap());
+
+        // 1. Country US + matching le_guest_sid + facts_rev 7 -> 200 OK
+        let ok = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            &format!("/media/image/88?cap={tok}"),
+            guest_hdrs.clone(),
+            Bytes::new(),
+        );
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        // 2. Country switches to excluded GB -> `live_click_eligible` no longer contains `sensitive@1`
+        //    -> previously minted revealed cap IMMEDIATELY DENIED (403, ZERO billing)!
+        backend.account_calls.borrow_mut().clear();
+        cfg.visitor_country = Some("GB".into());
+        let geo_denied = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            &format!("/media/image/88?cap={tok}"),
+            guest_hdrs.clone(),
+            Bytes::new(),
+        );
+        assert_eq!(geo_denied.status(), StatusCode::FORBIDDEN);
+        assert!(backend.account_calls.borrow().is_empty());
+
+        // 3. Different guest session cookie -> actor mismatch -> 403
+        cfg.visitor_country = Some("US".into());
+        let mut other_guest = HeaderMap::new();
+        other_guest.insert(
+            "cookie",
+            make_guest_cookie(&cfg, "gs_ffffffffffffffffffffffffffffffff")
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            dispatch(
+                &backend,
+                &cfg,
+                Method::GET,
+                &format!("/media/image/88?cap={tok}"),
+                other_guest,
+                Bytes::new(),
+            )
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // 4. Preview capability checks:
+        let preview_cap = MediaCapability {
+            v: MEDIA_CAP_VERSION,
+            aud: MEDIA_CAP_AUDIENCE.into(),
+            kind: MediaCapKind::Preview,
+            asset_id: 88,
+            immutable_locator: "2026/01/blur_88.webp".into(),
+            facts_rev: 7,
+            policy_rev: 5,
+            actor_binding: ActorBinding::GuestSession { gid: gid.into() },
+            matched_blocks: vec![],
+            matched_blurs: vec![blur_ref],
+            revealed_refs: vec![],
+            exp: TEST_NOW + 600,
+        };
+        let ptok = sign_media_capability(&preview_cap, &cfg.media_cap_secret).unwrap();
+
+        // 4a. With fixed_blur_enabled == true and cf-resized: internal=ok -> 200 OK, locked blur, Range stripped!
+        backend.upstream_calls.borrow_mut().clear();
+        let mut preview_hdrs = guest_hdrs.clone();
+        preview_hdrs.insert("range", "bytes=0-100".parse().unwrap());
+        let p_ok = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            &format!("/media/preview/88?cap={ptok}&blur=0"),
+            preview_hdrs,
+            Bytes::new(),
+        );
+        assert_eq!(p_ok.status(), StatusCode::OK);
+        {
+            let up = backend.upstream_calls.borrow();
+            // Preview queries /internal/facts-rev/image/88 (NOT /preview/88!)
+            assert_eq!(up[0].url, "https://api.gallery.test/internal/facts-rev/image/88");
+            assert_eq!(up[1].preview_blur, Some(LOCKED_PREVIEW_BLUR));
+            assert_eq!(header_value(&up[1].headers, "range"), None);
+        }
+
+        // 4b. Transform unavailable (missing cf-resized) or error (`err=9524`) -> 502 Bad Gateway!
+        backend.upstream_cf_resized = None;
+        let p_no_hdr = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            &format!("/media/preview/88?cap={ptok}"),
+            guest_hdrs.clone(),
+            Bytes::new(),
+        );
+        assert_eq!(p_no_hdr.status(), StatusCode::BAD_GATEWAY);
+
+        backend.upstream_cf_resized = Some("err=9524");
+        let p_err = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            &format!("/media/preview/88?cap={ptok}"),
+            guest_hdrs.clone(),
+            Bytes::new(),
+        );
+        assert_eq!(p_err.status(), StatusCode::BAD_GATEWAY);
+
+        // 4c. When fixed_blur_enabled == false -> immediate 403 with ZERO origin/DO calls!
+        policy.fixed_blur_enabled = false;
+        policy.refresh_policy_digest();
+        backend.policy_envelope = Ok(policy_envelope_json(&policy));
+        backend.account_calls.borrow_mut().clear();
+        backend.upstream_calls.borrow_mut().clear();
+        let p_disabled = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            &format!("/media/preview/88?cap={ptok}"),
+            guest_hdrs,
+            Bytes::new(),
+        );
+        assert_eq!(p_disabled.status(), StatusCode::FORBIDDEN);
+        assert!(backend.account_calls.borrow().is_empty());
+        assert!(backend.upstream_calls.borrow().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. AdminAssertion v2 Signing & Method/Target/Body-Hash/Nonce Binding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn admin_route_signs_v2_assertion_bound_to_method_target_body_hash_and_unique_jti() {
+        let backend = MockBackend::with_policy(sample_safety_policy());
+        let mut cfg = test_cfg();
+        cfg.admin_email = Some("ops@gallery.test".to_string());
+
+        let body = Bytes::from_static(br#"{"safety_enabled":true,"revision":6}"#);
+        let mut hdrs = HeaderMap::new();
+        // Client attempts to smuggle spoofed admin assertion — must be stripped & replaced with single valid aa2.!
+        hdrs.insert(ADMIN_ASSERTION_HEADER, "aa2.forged.sig".parse().unwrap());
+        hdrs.insert("content-type", "application/json".parse().unwrap());
+
+        let r1 = dispatch(
+            &backend,
+            &cfg,
+            Method::POST,
+            "/admin/api/policy?draft=1",
+            hdrs.clone(),
+            body.clone(),
+        );
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        let r2 = dispatch(
+            &backend,
+            &cfg,
+            Method::POST,
+            "/admin/api/policy?draft=1",
+            hdrs,
+            body.clone(),
+        );
+        assert_eq!(r2.status(), StatusCode::OK);
+
+        let aa1 = {
+            let calls = backend.service_calls.borrow();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].target, ServiceTarget::AdminDashboard);
+            assert_eq!(calls[0].method, worker::Method::Post);
+            assert_eq!(calls[0].path_and_query, "/admin/api/policy?draft=1");
+            assert_eq!(calls[0].body, body);
+
+            // Exactly ONE X-Gallery-Admin-Assertion header forwarded
+            let count_aa = calls[0]
+                .headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(ADMIN_ASSERTION_HEADER))
+                .count();
+            assert_eq!(count_aa, 1);
+
+            let aa1 = header_value(&calls[0].headers, ADMIN_ASSERTION_HEADER)
+                .unwrap()
+                .to_string();
+            let aa2 = header_value(&calls[1].headers, ADMIN_ASSERTION_HEADER)
+                .unwrap()
+                .to_string();
+            assert!(aa1.starts_with("aa2."));
+
+            let secret = test_admin_secret();
+            let c1 = verify_admin_assertion(
+                &aa1,
+                &secret,
+                ADMIN_ASSERTION_AUDIENCE,
+                "POST",
+                "/admin/api/policy?draft=1",
+                &body,
+                TEST_NOW,
+                5,
+            )
+            .expect("valid AdminAssertion v2");
+            let c2 = verify_admin_assertion(
+                &aa2,
+                &secret,
+                ADMIN_ASSERTION_AUDIENCE,
+                "POST",
+                "/admin/api/policy?draft=1",
+                &body,
+                TEST_NOW,
+                5,
+            )
+            .expect("valid second AdminAssertion v2");
+
+            assert_eq!(c1.email, "ops@gallery.test");
+            assert_eq!(c1.m, "POST");
+            assert_eq!(c1.p, "/admin/api/policy?draft=1");
+            assert_eq!(c1.bh, site_access::sha256_hex(&body));
+            assert_eq!(c1.jti.len(), 32);
+            assert_ne!(c1.jti, c2.jti, "each admin request must mint a unique jti nonce");
+
+            // Wrong method / wrong target / tampered body must all fail verification!
+            assert!(
+                verify_admin_assertion(
+                    &aa1,
+                    &secret,
+                    ADMIN_ASSERTION_AUDIENCE,
+                    "DELETE",
+                    "/admin/api/policy?draft=1",
+                    &body,
+                    TEST_NOW,
+                    5,
+                )
+                .is_err()
+            );
+            assert!(
+                verify_admin_assertion(
+                    &aa1,
+                    &secret,
+                    ADMIN_ASSERTION_AUDIENCE,
+                    "POST",
+                    "/admin/api/policy?draft=2",
+                    &body,
+                    TEST_NOW,
+                    5,
+                )
+                .is_err()
+            );
+            assert!(
+                verify_admin_assertion(
+                    &aa1,
+                    &secret,
+                    ADMIN_ASSERTION_AUDIENCE,
+                    "POST",
+                    "/admin/api/policy?draft=1",
+                    br#"{"safety_enabled":false}"#,
+                    TEST_NOW,
+                    5,
+                )
+                .is_err()
+            );
+            aa1
+        };
+
+        // Non-`/admin` routes strip spoofed `X-Gallery-Admin-Assertion`!
+        let mut spoof = HeaderMap::new();
+        spoof.insert(ADMIN_ASSERTION_HEADER, aa1.parse().unwrap());
+        let user_resp = dispatch(&backend, &cfg, Method::GET, "/user/account", spoof.clone(), Bytes::new());
+        assert_eq!(user_resp.status(), StatusCode::OK);
+        assert_eq!(
+            header_value(&backend.service_calls.borrow().last().unwrap().headers, ADMIN_ASSERTION_HEADER),
+            None
+        );
+        let gallery_resp = dispatch(&backend, &cfg, Method::GET, "/", spoof, Bytes::new());
+        assert_eq!(gallery_resp.status(), StatusCode::OK);
+        assert_eq!(
+            header_value(&backend.upstream_calls.borrow().last().unwrap().headers, ADMIN_ASSERTION_HEADER),
+            None
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. Retained Core Session, Metering, Routing & Sanitization Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn restricted_user_media_enforces_age_terms_generation_ban_suspended_and_zero_charge() {
         let mut policy = sample_safety_policy();
         policy.age_policy = AgeVerificationPolicy::StrictProviderVerified18;
+        policy.refresh_policy_digest();
         let terms_v = policy.legal.terms_version;
         let terms_d = policy.legal.terms_digest.clone();
 
         let do_key = "usr:550e8400-e29b-41d4-a716-446655440000";
         let user_id = "user-42";
         let sid = "sid-live-1";
+        let cfg = test_cfg();
 
         let restricted_cap = MediaCapability {
             v: MEDIA_CAP_VERSION,
+            aud: MEDIA_CAP_AUDIENCE.into(),
             kind: MediaCapKind::Image,
-            id: 99,
-            path: "restricted/item 99.webp".to_string(),
-            rev: 5,
-            sub: user_id.to_string(),
-            sid: Some(sid.to_string()),
-            req_switchers: vec!["r18".to_string()],
+            asset_id: 99,
+            immutable_locator: "restricted/item 99.webp".into(),
+            facts_rev: 7,
+            policy_rev: 5,
+            actor_binding: ActorBinding::User {
+                sub: user_id.into(),
+                sid: sid.into(),
+            },
+            matched_blocks: vec![PolicyRef::new("r18", 1)],
+            matched_blurs: vec![],
+            revealed_refs: vec![],
             exp: TEST_NOW + 300,
         };
-        let cap_tok = sign_media_capability(&restricted_cap, TEST_MEDIA_CAP_SECRET).unwrap();
+        let cap_tok = sign_media_capability(&restricted_cap, &cfg.media_cap_secret).unwrap();
         let uri = format!("/media/image/99?cap={cap_tok}");
-        let cfg = test_cfg();
 
         let make_hdrs = |cookie: String| {
             let mut h = HeaderMap::new();
@@ -2198,50 +3309,28 @@ mod tests {
         let base_ctx = SessionContext {
             active: true,
             banned: false,
+            suspended: false,
             sid_valid: true,
             assurance_level: AssuranceLevel::Verified18,
             strict_age_ok: true,
             terms_version_accepted: Some(terms_v),
-            terms_digest_accepted: Some(terms_d.clone()),
-            enabled_switchers: vec!["r18".to_string()],
-            safe_mode: false,
+            terms_digest_accepted: Some(terms_d),
+            enabled_switchers: vec![PolicyRef::new("r18", 1)],
+            pref_version: 1,
         };
 
-        // Failure cases — EVERY ONE must return 403 and incur ZERO account_call billing!
         let denied_cases: Vec<(&str, SessionContext)> = vec![
             (
-                "safe_mode active",
+                "stale grant_generation",
                 SessionContext {
-                    safe_mode: true,
+                    enabled_switchers: vec![PolicyRef::new("r18", 2)],
                     ..base_ctx.clone()
                 },
             ),
             (
-                "missing switcher",
+                "suspended user",
                 SessionContext {
-                    enabled_switchers: vec!["blood".to_string()],
-                    ..base_ctx.clone()
-                },
-            ),
-            (
-                "unaccepted terms version",
-                SessionContext {
-                    terms_version_accepted: Some(terms_v + 1),
-                    ..base_ctx.clone()
-                },
-            ),
-            (
-                "unaccepted terms digest",
-                SessionContext {
-                    terms_digest_accepted: Some("a".repeat(64)),
-                    ..base_ctx.clone()
-                },
-            ),
-            (
-                "strict age not satisfied (self attestation only)",
-                SessionContext {
-                    assurance_level: AssuranceLevel::SelfAttestation,
-                    strict_age_ok: false,
+                    suspended: true,
                     ..base_ctx.clone()
                 },
             ),
@@ -2259,6 +3348,21 @@ mod tests {
                     ..base_ctx.clone()
                 },
             ),
+            (
+                "insufficient age assurance",
+                SessionContext {
+                    assurance_level: AssuranceLevel::SelfAttestation,
+                    strict_age_ok: false,
+                    ..base_ctx.clone()
+                },
+            ),
+            (
+                "mismatched terms version",
+                SessionContext {
+                    terms_version_accepted: Some(terms_v + 1),
+                    ..base_ctx.clone()
+                },
+            ),
         ];
 
         for (label, ctx) in denied_cases {
@@ -2269,258 +3373,150 @@ mod tests {
                 &cfg,
                 Method::GET,
                 &uri,
-                make_hdrs(make_v2_cookie(user_id, do_key, sid)),
+                make_hdrs(make_v2_cookie(&cfg, user_id, do_key, sid)),
                 Bytes::new(),
             );
             assert_eq!(resp.status(), StatusCode::FORBIDDEN, "case: {label}");
             assert!(
                 backend.account_calls.borrow().is_empty(),
-                "case {label} MUST NOT charge or call billing DO"
+                "case {label} MUST NOT charge"
             );
             assert!(
                 backend.upstream_calls.borrow().is_empty(),
-                "case {label} MUST NOT fetch media upstream"
-            );
-            if !ctx.sid_valid && !ctx.banned {
-                let sc = resp
-                    .headers()
-                    .get("set-cookie")
-                    .expect("revoked sid must clear cookie")
-                    .to_str()
-                    .unwrap();
-                assert!(sc.contains("Max-Age=0"));
-            }
-        }
-
-        // Wrong sid on caller session -> 403, ZERO charge!
-        {
-            let mut backend = MockBackend::with_policy(policy.clone());
-            backend
-                .session_contexts
-                .insert(do_key.to_string(), base_ctx.clone());
-            let r = dispatch(
-                &backend,
-                &cfg,
-                Method::GET,
-                &uri,
-                make_hdrs(make_v2_cookie(user_id, do_key, "sid-different")),
-                Bytes::new(),
-            );
-            assert_eq!(r.status(), StatusCode::FORBIDDEN);
-            assert!(backend.account_calls.borrow().is_empty());
-        }
-
-        // Authorized caller: HEAD uses `can-charge`, GET uses `charge`, canonical `media:image:99`.
-        {
-            let mut backend = MockBackend::with_policy(policy.clone());
-            backend
-                .session_contexts
-                .insert(do_key.to_string(), base_ctx.clone());
-            let head_r = dispatch(
-                &backend,
-                &cfg,
-                Method::HEAD,
-                &uri,
-                make_hdrs(make_v2_cookie(user_id, do_key, sid)),
-                Bytes::new(),
-            );
-            assert_eq!(head_r.status(), StatusCode::OK);
-            assert_eq!(backend.account_calls.borrow()[0].operation, "can-charge");
-            assert_eq!(backend.account_calls.borrow()[0].do_key, do_key);
-            assert_eq!(
-                backend.account_calls.borrow()[0].payload["path"],
-                MediaBillingKey::image(99).canonical_key()
-            );
-
-            let get_r = dispatch(
-                &backend,
-                &cfg,
-                Method::GET,
-                &uri,
-                make_hdrs(make_v2_cookie(user_id, do_key, sid)),
-                Bytes::new(),
-            );
-            assert_eq!(get_r.status(), StatusCode::OK);
-            assert_eq!(backend.account_calls.borrow()[1].operation, "charge");
-            assert_eq!(
-                backend.upstream_calls.borrow()[1].url,
-                "https://image.gallery.test/restricted/item%2099.webp"
+                "case {label} MUST NOT hit origin"
             );
         }
-    }
 
-    #[test]
-    fn preview_uses_separate_budget_locked_cf_blur_and_rejects_upstream_redirects() {
-        let policy = sample_safety_policy(); // cloudflare_images_blur: true
+        // Authorized caller -> HEAD uses can-charge, GET uses charge with canonical media:image:99
         let mut backend = MockBackend::with_policy(policy);
-        backend.upstream_set_cookie = Some("evil=1");
-        let cfg = test_cfg();
-
-        let preview_cap = MediaCapability {
-            v: MEDIA_CAP_VERSION,
-            kind: MediaCapKind::Preview,
-            id: 77,
-            path: "2026/01/spicy_77.webp".to_string(),
-            rev: 5,
-            sub: MEDIA_CAP_ANON_SUB.to_string(),
-            sid: None,
-            req_switchers: Vec::new(),
-            exp: TEST_NOW + 600,
-        };
-        let tok = sign_media_capability(&preview_cap, TEST_MEDIA_CAP_SECRET).unwrap();
-
-        // Client attempts to inject blur=0&width=4000 query overrides — must be ignored!
-        let uri = format!("/media/preview/77?cap={tok}&blur=0&width=4000");
-
-        // HEAD is side-effect-free (`head: true`) on `/preview-budget`.
-        let head = dispatch(&backend, &cfg, Method::HEAD, &uri, HeaderMap::new(), Bytes::new());
-        assert_eq!(head.status(), StatusCode::OK);
-        let calls = backend.account_calls.borrow();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].operation, "preview-budget");
-        assert_eq!(calls[0].payload["key"], MediaBillingKey::preview_budget_key(77));
-        assert_eq!(calls[0].payload["head"], true);
-        drop(calls);
-
-        // GET uses `/preview-budget` (NEVER `charge`/`guest`), locked blur config, strips origin Set-Cookie.
-        let get = dispatch(&backend, &cfg, Method::GET, &uri, HeaderMap::new(), Bytes::new());
-        assert_eq!(get.status(), StatusCode::OK);
-        assert_eq!(get.headers().get("cache-control").unwrap(), "private, no-store");
-        assert!(get.headers().get("set-cookie").is_none());
-        let calls = backend.account_calls.borrow();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1].operation, "preview-budget");
-        assert_eq!(calls[1].payload["head"], false);
-        assert!(calls.iter().all(|c| c.operation == "preview-budget"));
-        drop(calls);
-
-        let up = backend.upstream_calls.borrow();
-        assert_eq!(up[0].method, worker::Method::Head);
-        assert_eq!(up[1].method, worker::Method::Get);
-        assert_eq!(up[1].url, "https://image.gallery.test/2026/01/spicy_77.webp");
-        assert!(up[1].no_cache);
-        assert_eq!(up[1].preview_blur, Some(LOCKED_PREVIEW_BLUR));
-        assert_eq!(up[1].preview_blur.unwrap().blur, 80);
-        assert_eq!(up[1].preview_blur.unwrap().width, 360);
-        assert_eq!(up[1].preview_blur.unwrap().quality, 30);
-        assert_eq!(up[1].preview_blur.unwrap().format, "webp");
-        drop(up);
-
-        // Upstream 3xx redirect MUST be rejected with 502 Bad Gateway!
-        backend.upstream_status = StatusCode::FOUND;
-        let redirect_rejected =
-            dispatch(&backend, &cfg, Method::GET, &uri, HeaderMap::new(), Bytes::new());
-        assert_eq!(redirect_rejected.status(), StatusCode::BAD_GATEWAY);
+        backend.session_contexts.insert(do_key.to_string(), base_ctx);
+        let head_r = dispatch(
+            &backend,
+            &cfg,
+            Method::HEAD,
+            &uri,
+            make_hdrs(make_v2_cookie(&cfg, user_id, do_key, sid)),
+            Bytes::new(),
+        );
+        assert_eq!(head_r.status(), StatusCode::OK);
+        assert_eq!(backend.account_calls.borrow()[0].do_key, do_key);
+        assert_eq!(backend.account_calls.borrow()[0].operation, "can-charge");
         assert_eq!(
-            redirect_rejected.headers().get("cache-control").unwrap(),
-            "private, no-store"
+            backend.account_calls.borrow()[0].payload["path"],
+            MediaBillingKey::image(99).canonical_key()
+        );
+
+        let get_r = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            &uri,
+            make_hdrs(make_v2_cookie(&cfg, user_id, do_key, sid)),
+            Bytes::new(),
+        );
+        assert_eq!(get_r.status(), StatusCode::OK);
+        assert_eq!(backend.account_calls.borrow()[1].operation, "charge");
+        assert_eq!(
+            backend.upstream_calls.borrow().last().unwrap().url,
+            "https://image.gallery.test/restricted/item%2099.webp"
         );
     }
 
     #[test]
-    fn admin_view_cookie_waives_login_and_billing_but_enforces_csrf_assertion_and_media_cap() {
+    fn legacy_session_cutover_and_revoked_v2_session_handling() {
         let policy = sample_safety_policy();
-        let mut backend = MockBackend::with_policy(policy.clone());
-        // Simulate login_required = yes for guests
-        backend.account_statuses.insert("guest".to_string(), 401);
+        let mut backend = MockBackend::with_policy(policy);
+        backend.session_contexts.insert(
+            ETH_WALLET.to_string(),
+            SessionContext {
+                active: true,
+                banned: false,
+                suspended: false,
+                sid_valid: true,
+                ..SessionContext::default()
+            },
+        );
         let cfg = test_cfg();
 
-        // 1. Cross-origin metered POST search with ADMIN_VIEW_COOKIE MUST still be rejected with 403!
-        let mut csrf_hdrs = form_headers();
-        csrf_hdrs.insert("cookie", make_admin_view_cookie().parse().unwrap());
-        csrf_hdrs.insert("origin", "https://evil.test".parse().unwrap());
-        let csrf_resp = dispatch(
+        let legacy_tok = sign_legacy_session(
+            &LegacySessionClaims {
+                sub: ETH_WALLET.to_string(),
+                iat: TEST_NOW - 10,
+                exp: TEST_NOW + 3600,
+            },
+            &cfg.jwt_secret,
+        )
+        .unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("cookie", format!("{SESSION_COOKIE}={legacy_tok}").parse().unwrap());
+        let resp = dispatch(
             &backend,
             &cfg,
-            Method::POST,
-            "https://gallery.test/api/search_by_desc",
-            csrf_hdrs,
-            Bytes::from_static(b"q=sunset"),
+            Method::GET,
+            "/api/like_previews?items=post:1",
+            h,
+            Bytes::new(),
         );
-        assert_eq!(csrf_resp.status(), StatusCode::FORBIDDEN);
-        assert!(backend.upstream_calls.borrow().is_empty());
-
-        // 2. Same-origin metered POST search with ADMIN_VIEW_COOKIE succeeds, waives billing,
-        //    strips spoofed headers/cookies, and signs X-Gateway-Assertion with `is_admin_view: true`!
-        let mut ok_hdrs = form_headers();
-        ok_hdrs.insert("cookie", format!("{}; other=ok", make_admin_view_cookie()).parse().unwrap());
-        ok_hdrs.insert("origin", "https://gallery.test".parse().unwrap());
-        ok_hdrs.insert("x-gateway-assertion", "ga1.forged.sig".parse().unwrap());
-        ok_hdrs.insert("x-gallery-switchers", "r18".parse().unwrap());
-        ok_hdrs.insert("x-policy-revision", "999".parse().unwrap());
-        let ok_resp = dispatch(
-            &backend,
-            &cfg,
-            Method::POST,
-            "https://gallery.test/api/search_by_desc",
-            ok_hdrs,
-            Bytes::from_static(b"q=sunset"),
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            backend.session_calls.borrow().as_slice(),
+            &[(ETH_WALLET.to_string(), None)]
         );
-        assert_eq!(ok_resp.status(), StatusCode::OK);
-        assert!(backend.account_calls.borrow().is_empty());
-
-        let up = backend.upstream_calls.borrow();
-        assert_eq!(up.len(), 1);
-        assert_eq!(header_value(&up[0].headers, "x-gallery-switchers"), None);
-        assert_eq!(header_value(&up[0].headers, "x-policy-revision"), None);
-        let fwd_cookie = header_value(&up[0].headers, "cookie").unwrap();
-        assert_eq!(fwd_cookie, "other=ok");
-
-        let assertion_raw = header_value(&up[0].headers, GATEWAY_ASSERTION_HEADER).unwrap();
-        let verified = verify_gateway_assertion(
-            assertion_raw,
-            TEST_ASSERTION_SECRET,
+        let ga = verify_gateway_assertion(
+            header_value(&backend.upstream_calls.borrow()[0].headers, GATEWAY_ASSERTION_HEADER)
+                .unwrap(),
+            &cfg.gateway_assertion_secret,
             GATEWAY_ASSERTION_AUDIENCE,
             TEST_NOW,
             5,
         )
         .unwrap();
-        assert!(verified.is_admin_view);
-        assert_eq!(verified.sub.as_deref(), Some(ADMIN_VIEW_SUB));
-        assert_eq!(verified.rev, policy.revision);
-        assert_eq!(verified.min_enforce_rev, policy.min_enforce_rev);
-        assert_eq!(verified.policy_digest, compute_policy_digest(&policy));
-        assert!(verified.switchers.iter().any(|s| s == "r18"));
-        drop(up);
+        assert_eq!(
+            ga.actor,
+            ActorBinding::User {
+                sub: ETH_WALLET.to_string(),
+                sid: "legacy".to_string()
+            }
+        );
 
-        // 3. Admin-subject media capability requires active ADMIN_VIEW_COOKIE (denied without it!).
-        let admin_cap = MediaCapability {
-            v: MEDIA_CAP_VERSION,
-            kind: MediaCapKind::Video,
-            id: 12,
-            path: "clips/vid_12.mp4".to_string(),
-            rev: 5,
-            sub: ADMIN_VIEW_SUB.to_string(),
-            sid: None,
-            req_switchers: vec!["r18".to_string()],
-            exp: TEST_NOW + 300,
-        };
-        let admin_cap_tok = sign_media_capability(&admin_cap, TEST_MEDIA_CAP_SECRET).unwrap();
-        let media_uri = format!("/media/video/12?cap={admin_cap_tok}");
-        assert_eq!(
-            dispatch(&backend, &cfg, Method::GET, &media_uri, HeaderMap::new(), Bytes::new()).status(),
-            StatusCode::FORBIDDEN
+        // Revoked v2 session on authenticated route -> 401 + Set-Cookie clearing ue_session!
+        backend.session_contexts.insert(
+            ETH_WALLET.to_string(),
+            SessionContext {
+                active: true,
+                banned: false,
+                suspended: false,
+                sid_valid: false,
+                ..SessionContext::default()
+            },
         );
-        let mut admin_media_hdrs = HeaderMap::new();
-        admin_media_hdrs.insert("cookie", make_admin_view_cookie().parse().unwrap());
-        let admin_media_ok =
-            dispatch(&backend, &cfg, Method::GET, &media_uri, admin_media_hdrs, Bytes::new());
-        assert_eq!(admin_media_ok.status(), StatusCode::OK);
-        assert!(backend.account_calls.borrow().is_empty());
-        assert_eq!(
-            backend.upstream_calls.borrow().last().unwrap().url,
-            "https://video.gallery.test/clips/vid_12.mp4"
+        let mut h2 = HeaderMap::new();
+        h2.insert(
+            "cookie",
+            make_v2_cookie(&cfg, ETH_WALLET, ETH_WALLET, "revoked-sid")
+                .parse()
+                .unwrap(),
         );
+        let revoked = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "/api/like_previews?items=post:1",
+            h2,
+            Bytes::new(),
+        );
+        assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+        let sc = revoked.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(sc.starts_with("ue_session=;"));
+        assert!(sc.contains("Max-Age=0"));
     }
 
     #[test]
     fn public_legal_seo_static_paths_and_cache_control_rules() {
         let mut backend = MockBackend::with_policy(sample_safety_policy());
-        // Simulate login_required=yes first
         backend.account_statuses.insert("guest".to_string(), 401);
         let cfg = test_cfg();
 
-        // Always-public legal & static paths succeed even when login_required=yes.
         for path in [
             "/robots.txt",
             "/pkg/app.wasm",
@@ -2534,20 +3530,17 @@ mod tests {
             assert_eq!(r.status(), StatusCode::OK, "expected 200 on {path}");
             let cc = r.headers().get("cache-control").unwrap().to_str().unwrap();
             if path == "/robots.txt" || path.starts_with("/pkg/") {
-                assert_eq!(cc, "public, max-age=3600", "public cache preserved on {path}");
+                assert_eq!(cc, "public, max-age=3600");
             } else {
-                assert_eq!(cc, "private, no-store", "private no-store on {path}");
+                assert_eq!(cc, "private, no-store");
             }
         }
-        // Sitemap stays gated when login_required=yes.
         assert_eq!(
             dispatch(&backend, &cfg, Method::GET, "/sitemap.xml", HeaderMap::new(), Bytes::new())
                 .status(),
             StatusCode::SEE_OTHER
         );
 
-        // When login_required=no, anonymous sitemap is 200 and preserves public Cache-Control,
-        // while gallery `/` emits private, no-store.
         backend.account_statuses.insert("guest".to_string(), 200);
         let sitemap = dispatch(
             &backend,
@@ -2568,40 +3561,10 @@ mod tests {
             home.headers().get("cache-control").unwrap(),
             "private, no-store"
         );
-
-        // Public-cacheable routes MUST force `private, no-store` on non-2xx responses
-        // or whenever upstream attaches `Set-Cookie`.
-        for status in [
-            StatusCode::FOUND,
-            StatusCode::NOT_FOUND,
-            StatusCode::INTERNAL_SERVER_ERROR,
-        ] {
-            backend.upstream_status = status;
-            for p in ["/robots.txt", "/pkg/app.wasm", "/sitemap/1.xml"] {
-                let r = dispatch(&backend, &cfg, Method::GET, p, HeaderMap::new(), Bytes::new());
-                assert_eq!(r.status(), status);
-                assert_eq!(
-                    r.headers().get("cache-control").unwrap(),
-                    "private, no-store",
-                    "non-2xx {status} on {p} must not be publicly cached"
-                );
-            }
-        }
-        backend.upstream_status = StatusCode::OK;
-        backend.upstream_set_cookie = Some("sid=leak; Path=/");
-        for p in ["/robots.txt", "/pkg/app.wasm", "/sitemap/1.xml"] {
-            let r = dispatch(&backend, &cfg, Method::GET, p, HeaderMap::new(), Bytes::new());
-            assert_eq!(r.status(), StatusCode::OK);
-            assert_eq!(
-                r.headers().get("cache-control").unwrap(),
-                "private, no-store",
-                "Set-Cookie on {p} must force private, no-store"
-            );
-        }
     }
 
     #[test]
-    fn unmetered_post_routes_enforce_same_origin_csrf_for_all_callers() {
+    fn metered_post_search_reserves_commits_on_2xx_and_releases_on_error() {
         let policy = sample_safety_policy();
         let mut backend = MockBackend::with_policy(policy);
         let do_key = "usr:550e8400-e29b-41d4-a716-446655440000";
@@ -2610,323 +3573,77 @@ mod tests {
             SessionContext {
                 active: true,
                 banned: false,
+                suspended: false,
                 sid_valid: true,
                 ..SessionContext::default()
             },
         );
         let cfg = test_cfg();
 
-        for path in [
-            "/api/search_advanced",
-            "/api/fetch_post_meta",
-            "/api/suggest_search",
-            "/api/site_config",
-            "/api/search_query",
-            "/api/list_post_images",
-            "/api/fetch_image_details",
-        ] {
-            let full_uri = format!("https://gallery.test{path}");
-            for caller_cookie in [
-                make_v2_cookie("user-42", do_key, "sid-1"),
-                make_admin_view_cookie(),
-            ] {
-                // Missing Origin / Sec-Fetch-Site -> 403
-                let mut missing = form_headers();
-                missing.insert("cookie", caller_cookie.parse().unwrap());
-                let r_missing = dispatch(
-                    &backend,
-                    &cfg,
-                    Method::POST,
-                    &full_uri,
-                    missing,
-                    Bytes::from_static(b"q=tag%3Amaid"),
-                );
-                assert_eq!(r_missing.status(), StatusCode::FORBIDDEN, "missing origin on {path}");
+        let mut h = form_headers();
+        h.insert("origin", "https://gallery.test".parse().unwrap());
+        h.insert(
+            "cookie",
+            make_v2_cookie(&cfg, "user-42", do_key, "sid-1")
+                .parse()
+                .unwrap(),
+        );
 
-                // Cross-origin -> 403
-                let mut cross = form_headers();
-                cross.insert("cookie", caller_cookie.parse().unwrap());
-                cross.insert("origin", "https://evil.test".parse().unwrap());
-                let r_cross = dispatch(
-                    &backend,
-                    &cfg,
-                    Method::POST,
-                    &full_uri,
-                    cross,
-                    Bytes::from_static(b"q=tag%3Amaid"),
-                );
-                assert_eq!(r_cross.status(), StatusCode::FORBIDDEN, "cross-origin on {path}");
-            }
-        }
-        assert!(backend.upstream_calls.borrow().is_empty());
-
-        // Same-origin succeeds cleanly.
-        let mut ok_hdrs = form_headers();
-        ok_hdrs.insert("origin", "https://gallery.test".parse().unwrap());
-        ok_hdrs.insert("cookie", make_admin_view_cookie().parse().unwrap());
         let ok = dispatch(
             &backend,
             &cfg,
             Method::POST,
-            "https://gallery.test/api/search_advanced",
-            ok_hdrs,
-            Bytes::from_static(b"q=tag%3Amaid"),
+            "https://gallery.test/api/search_by_desc",
+            h.clone(),
+            Bytes::from_static(b"q=ocean"),
         );
         assert_eq!(ok.status(), StatusCode::OK);
-    }
+        {
+            let calls = backend.account_calls.borrow();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].operation, "reserve");
+            assert_eq!(calls[1].operation, "commit");
+        }
 
-    #[test]
-    fn compute_eligible_switchers_checks_terms_age_safe_mode_and_rule_mode() {
-        let mut policy = sample_safety_policy();
-        policy.age_policy = AgeVerificationPolicy::SelfAttestation;
-        policy.age_gate_trigger = AgeGateTrigger::Off;
-        policy.rules.push(SafetyRuleConfig {
-            id: "disabled_rule".into(),
-            name: "Disabled".into(),
-            mode: RuleMode::Switcher,
-            query: "tag:blood".into(),
-            default_min_score: 0.5,
-            preset: PlaceholderPreset::Custom,
-            requires_login: false,
-            requires_age_18: false,
-            enabled: false,
-        });
-
-        let mut ctx = SessionContext {
-            active: true,
-            banned: false,
-            sid_valid: true,
-            assurance_level: AssuranceLevel::SelfAttestation,
-            strict_age_ok: false,
-            terms_version_accepted: Some(policy.legal.terms_version),
-            terms_digest_accepted: Some(policy.legal.terms_digest.clone()),
-            enabled_switchers: vec![
-                "r18".into(),
-                "sensitive".into(), // SpoilerBlur, not Switcher
-                "blood".into(),
-                "disabled_rule".into(),
-            ],
-            safe_mode: false,
-        };
-
-        // Under SelfAttestation with accepted terms: both r18 and blood eligible (not sensitive/disabled).
-        assert_eq!(compute_eligible_switchers(&ctx, &policy), vec!["r18", "blood"]);
-
-        // Without age assurance under SelfAttestation: r18 dropped, blood remains.
-        ctx.assurance_level = AssuranceLevel::None;
-        assert_eq!(compute_eligible_switchers(&ctx, &policy), vec!["blood"]);
-
-        // Under StrictProviderVerified18: SelfAttestation is insufficient; needs strict_age_ok + Verified18.
-        policy.age_policy = AgeVerificationPolicy::StrictProviderVerified18;
-        ctx.assurance_level = AssuranceLevel::SelfAttestation;
-        assert_eq!(compute_eligible_switchers(&ctx, &policy), vec!["blood"]);
-        ctx.assurance_level = AssuranceLevel::Verified18;
-        ctx.strict_age_ok = true;
-        assert_eq!(compute_eligible_switchers(&ctx, &policy), vec!["r18", "blood"]);
-
-        // Safe mode immediately wipes all switchers.
-        ctx.safe_mode = true;
-        assert!(compute_eligible_switchers(&ctx, &policy).is_empty());
-    }
-
-    #[test]
-    fn legacy_session_cutover_and_revoked_v2_session_handling() {
-        let policy = sample_safety_policy();
-        let mut backend = MockBackend::with_policy(policy);
-        backend.session_contexts.insert(
-            ETH_WALLET.to_string(),
-            SessionContext {
-                active: true,
-                banned: false,
-                sid_valid: true,
-                ..SessionContext::default()
-            },
-        );
-        let cfg = test_cfg();
-
-        // Legacy wallet session verifies via cutover and checks DO with `sid: None`.
-        let legacy_tok = sign_legacy_session(
-            &LegacySessionClaims {
-                sub: ETH_WALLET.to_string(),
-                iat: TEST_NOW - 10,
-                exp: TEST_NOW + 3600,
-            },
-            TEST_JWT_SECRET,
-        )
-        .unwrap();
-        let mut h = HeaderMap::new();
-        h.insert("cookie", format!("{SESSION_COOKIE}={legacy_tok}").parse().unwrap());
-        let resp = dispatch(&backend, &cfg, Method::GET, "/api/like_previews?items=post:1", h, Bytes::new());
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            backend.session_calls.borrow().as_slice(),
-            &[(ETH_WALLET.to_string(), None)]
-        );
-
-        // Revoked v2 session on authenticated-only route -> 401 + Set-Cookie clearing ue_session!
-        backend.session_contexts.insert(
-            ETH_WALLET.to_string(),
-            SessionContext {
-                active: true,
-                banned: false,
-                sid_valid: false,
-                ..SessionContext::default()
-            },
-        );
-        let mut h2 = HeaderMap::new();
-        h2.insert(
-            "cookie",
-            make_v2_cookie(ETH_WALLET, ETH_WALLET, "revoked-sid")
-                .parse()
-                .unwrap(),
-        );
-        let revoked = dispatch(
+        backend.account_calls.borrow_mut().clear();
+        backend.upstream_status = StatusCode::INTERNAL_SERVER_ERROR;
+        let err = dispatch(
             &backend,
             &cfg,
-            Method::GET,
-            "/api/like_previews?items=post:1",
-            h2,
-            Bytes::new(),
+            Method::POST,
+            "https://gallery.test/api/search_by_desc",
+            h,
+            Bytes::from_static(b"q=ocean"),
         );
-        assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
-        let sc = revoked.headers().get("set-cookie").unwrap().to_str().unwrap();
-        assert!(sc.starts_with("ue_session=;"));
-        assert!(sc.contains("Max-Age=0"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Retained & Updated Pure Unit Tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn clients_without_fetch_metadata_can_negotiate_the_upgrade_page() {
-        let mut headers = HeaderMap::new();
-        for (accept, expected) in [
-            ("application/json, text/html;q=0.8", StatusCode::SEE_OTHER),
-            (
-                "text/html; q=0, application/json",
-                StatusCode::PAYMENT_REQUIRED,
-            ),
-        ] {
-            headers.insert("accept", accept.parse().unwrap());
-            assert_eq!(payment_required(&headers, true).status(), expected);
-        }
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let calls = backend.account_calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].operation, "reserve");
+        assert_eq!(calls[1].operation, "release");
     }
 
     #[test]
-    fn segment_prefix_matches_whole_segments_only() {
-        assert!(is_segment_prefix("/admin", "/admin"));
-        assert!(is_segment_prefix("/admin/api/policy", "/admin"));
-        assert!(!is_segment_prefix("/admin2", "/admin"));
-        assert!(!is_segment_prefix("/administrator", "/admin"));
-        assert!(is_segment_prefix("/user/admin", "/user/admin"));
-        assert!(is_segment_prefix("/user/admin/settings", "/user/admin"));
-        assert!(!is_segment_prefix("/user/admin2", "/user/admin"));
-    }
-
-    #[test]
-    fn form_field_decodes_keys_and_rejects_duplicates() {
-        let body = Bytes::from_static(b"limit=20&%71=cat+ears&offset=0");
-        assert_eq!(form_field(&body, "q").as_deref(), Some("cat ears"));
-
-        let dup = Bytes::from_static(b"q=first&%71=second");
-        assert_eq!(form_field(&dup, "q"), None);
-
-        let missing = Bytes::from_static(b"limit=20");
-        assert_eq!(form_field(&missing, "q"), None);
-    }
-
-    #[test]
-    fn parse_upstream_origin_accepts_https_origins_and_rejects_extras() {
-        assert_eq!(
-            parse_upstream_origin("https://api.gallery.test").unwrap(),
-            "https://api.gallery.test"
-        );
+    fn http_util_canonicalization_sanitization_and_metering_helpers() {
         assert_eq!(
             parse_upstream_origin("  https://api.gallery.test/  ").unwrap(),
             "https://api.gallery.test"
         );
-        assert_eq!(
-            parse_upstream_origin("https://api.gallery.test:443/").unwrap(),
-            "https://api.gallery.test"
-        );
-        assert_eq!(
-            parse_upstream_origin("https://api.gallery.test:8443/").unwrap(),
-            "https://api.gallery.test:8443"
-        );
-
-        for bad in [
-            "",
-            "   ",
-            "not-a-url",
-            "http://api.gallery.test",
-            "ftp://api.gallery.test",
-            "https://user:pass@api.gallery.test",
-            "https://api.gallery.test/base",
-            "https://api.gallery.test?x=1",
-            "https://api.gallery.test#frag",
-        ] {
-            assert!(parse_upstream_origin(bad).is_err(), "must reject {bad:?}");
-        }
-    }
-
-    #[test]
-    fn canonical_path_and_media_cap_path_block_traversal_attacks() {
-        for ok in [
-            "/",
-            "/admin",
-            "/media/image/42",
-            "/api/search_advanced_clip",
-            "/pkg/app.wasm",
-        ] {
-            assert!(is_canonical_path(ok), "must accept {ok:?}");
-        }
-
-        for attack in [
-            "/x/%2e%2e/api/search_advanced_clip",
-            "/admin/%2e%2e/secret",
-            "//admin",
-            "/api%2fsearch_advanced_clip",
-            "/api%5csearch_advanced_clip",
-            "/media/image/bad%2",
-        ] {
-            assert!(!is_canonical_path(attack), "must reject {attack:?}");
-        }
-
-        // Media cap path canonicalization & traversal defense (rejects `%` and `:` directly,
-        // matching hardened `site_access::is_safe_media_path`).
+        assert!(parse_upstream_origin("http://api.gallery.test").is_err());
+        assert!(is_canonical_path("/media/image/42"));
+        assert!(!is_canonical_path("/x/%2e%2e/api/search_advanced_clip"));
         assert_eq!(
             encode_canonical_cap_path("Demo album/a(1).webp").as_deref(),
             Some("/Demo%20album/a%281%29.webp")
         );
-        for bad_cap in [
-            "",
-            "/leading.webp",
-            "trailing/",
-            "../secret.webp",
-            "%2e%2e/secret.webp",
-            "Demo%20album/a.webp",
-            "a/%2e/b.webp",
-            "a%2fb.webp",
-            "a%5cb.webp",
-            "a:b.webp",
-            "https://evil.test/x.webp",
-            "a?b=1",
-            "a#frag",
-            "bad%2",
-        ] {
-            assert!(
-                build_media_upstream_target(MediaCapKind::Image, bad_cap, &test_upstreams())
-                    .is_err(),
-                "must reject cap.path {bad_cap:?}"
-            );
-        }
-    }
+        assert!(build_media_upstream_target(MediaCapKind::Image, "../x.webp", &test_upstreams()).is_err());
 
-    #[test]
-    fn sanitize_origin_cookie_strips_all_sensitive_cookies_across_multiple_headers() {
         let mut h = HeaderMap::new();
-        h.append("cookie", "pref=dark; ue_session=s1; __Host-ue_admin_view=a1".parse().unwrap());
+        h.append(
+            "cookie",
+            "pref=dark; ue_session=s1; le_guest_sid=g1; __Host-ue_admin_view=a1"
+                .parse()
+                .unwrap(),
+        );
         h.append(
             "cookie",
             "gw_token=old; gw_app=old2; __Host-auth_tx=tx; CF_Authorization=cf; keep=yes"
@@ -2937,139 +3654,16 @@ mod tests {
             sanitize_origin_cookie(&h).as_deref(),
             Some("pref=dark; keep=yes")
         );
-    }
 
-    #[test]
-    fn browse_route_allows_legal_seo_and_pinned_search_and_blocks_raw_media_and_like_previews() {
-        for ok_get in [
-            "/",
-            "/favicon.ico",
-            "/robots.txt",
-            "/sitemap.xml",
-            "/sitemap/1.xml",
-            "/terms",
-            "/privacy",
-            "/dmca",
-            "/content-policy",
-            "/pkg/app.js",
-            "/details/42",
-        ] {
-            assert!(browse_route(&Method::GET, ok_get), "GET {ok_get}");
-        }
-        assert!(!browse_route(&Method::GET, "/images/a.webp"));
-        assert!(!browse_route(&Method::GET, "/videos/a.mp4"));
-        assert!(!browse_route(&Method::GET, "/api/like_previews"));
-
-        for pinned in [
-            "/api/fetch_post_meta",
-            "/api/suggest_search",
-            "/api/site_config",
-            "/api/search_similar",
-            "/api/search_by_image",
-            "/api/search_by_desc",
-            "/api/search_advanced",
-            "/api/search_advanced_embed",
-            "/api/search_advanced_clip",
-            "/api/search_advanced_image",
-        ] {
-            assert!(browse_route(&Method::POST, pinned), "POST {pinned}");
-            assert!(!browse_route(&Method::GET, pinned), "GET {pinned}");
-        }
-        assert!(browse_route(&Method::POST, "/api/search_query1234567890"));
-    }
-
-    #[test]
-    fn anonymous_post_site_config_allowed_under_open_guest_browsing() {
-        let policy = sample_safety_policy();
-        let mut backend = MockBackend::with_policy(policy.clone());
-        // login_required = false -> guest DO returns 200.
-        backend.account_statuses.insert("guest".to_string(), 200);
-        let cfg = test_cfg();
-
-        // Same-origin anonymous POST /api/site_config succeeds and proxies with anonymous assertion.
-        let mut ok_hdrs = HeaderMap::new();
-        ok_hdrs.insert("origin", "https://gallery.test".parse().unwrap());
-        let ok = dispatch(
-            &backend,
-            &cfg,
-            Method::POST,
-            "https://gallery.test/api/site_config",
-            ok_hdrs.clone(),
-            Bytes::new(),
-        );
-        assert_eq!(ok.status(), StatusCode::OK);
+        let form = form_headers();
         assert_eq!(
-            ok.headers().get("cache-control").unwrap(),
-            "private, no-store"
+            form_field(&Bytes::from_static(b"limit=20&%71=cat+ears"), "q").as_deref(),
+            Some("cat ears")
         );
-        {
-            let calls = backend.account_calls.borrow();
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].operation, "guest");
-            assert!(calls[0].payload["item"].is_null());
-        }
-        {
-            let up = backend.upstream_calls.borrow();
-            assert_eq!(up.len(), 1);
-            assert_eq!(up[0].url, "https://api.gallery.test/api/site_config");
-            let assertion_raw = header_value(&up[0].headers, GATEWAY_ASSERTION_HEADER).unwrap();
-            let verified = verify_gateway_assertion(
-                assertion_raw,
-                TEST_ASSERTION_SECRET,
-                GATEWAY_ASSERTION_AUDIENCE,
-                TEST_NOW,
-                5,
-            )
-            .unwrap();
-            assert_eq!(verified.sub, None);
-            assert!(verified.switchers.is_empty());
-            assert_eq!(verified.rev, policy.revision);
-        }
-
-        // Cross-origin anonymous POST /api/site_config is still rejected with 403 CSRF.
-        let mut cross_hdrs = HeaderMap::new();
-        cross_hdrs.insert("origin", "https://evil.test".parse().unwrap());
-        let cross = dispatch(
-            &backend,
-            &cfg,
-            Method::POST,
-            "https://gallery.test/api/site_config",
-            cross_hdrs,
-            Bytes::new(),
-        );
-        assert_eq!(cross.status(), StatusCode::FORBIDDEN);
-
-        // Anonymous GET /api/site_config stays gated (401).
-        let get_resp = dispatch(
-            &backend,
-            &cfg,
-            Method::GET,
-            "https://gallery.test/api/site_config",
-            HeaderMap::new(),
-            Bytes::new(),
-        );
-        assert_eq!(get_resp.status(), StatusCode::UNAUTHORIZED);
-
-        // Under login_required = true (guest DO returns 401), anonymous POST /api/site_config -> 401.
-        backend.account_statuses.insert("guest".to_string(), 401);
-        let gated = dispatch(
-            &backend,
-            &cfg,
-            Method::POST,
-            "https://gallery.test/api/site_config",
-            ok_hdrs,
-            Bytes::new(),
-        );
-        assert_eq!(gated.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
-    fn require_form_urlencoded_and_metered_item_validate_search_endpoints() {
         let mut mixed_dup = form_headers();
         mixed_dup.append(CONTENT_TYPE, "application/json".parse().unwrap());
         assert!(require_form_urlencoded(&mixed_dup).is_err());
 
-        let form = form_headers();
         let sim = metered_item(
             &Method::POST,
             "/api/search_similar",
@@ -3086,171 +3680,10 @@ mod tests {
             metered_item(&Method::POST, "/api/search_by_desc", &form, &over_32k).unwrap_err(),
             MeterError::PayloadTooLarge
         );
-    }
-
-    #[test]
-    fn checked_methods_enforce_user_gallery_and_media_allowlists() {
+        assert!(browse_route(&Method::POST, "/api/safety/reveal"));
+        assert!(!browse_route(&Method::GET, "/api/safety/reveal"));
         assert_eq!(checked_media_method(&Method::GET), Some(worker::Method::Get));
-        assert_eq!(checked_media_method(&Method::HEAD), Some(worker::Method::Head));
         assert_eq!(checked_media_method(&Method::POST), None);
-        assert_eq!(checked_gallery_method(&Method::POST), Some(worker::Method::Post));
-        assert_eq!(checked_gallery_method(&Method::DELETE), None);
-        assert_eq!(checked_user_method(&Method::DELETE), Some(worker::Method::Delete));
-        assert_eq!(checked_user_method(&Method::TRACE), None);
-    }
-
-    #[test]
-    fn is_same_origin_validates_origin_and_fetch_metadata() {
-        let https_uri: Uri = "https://gallery.test/api/search_by_desc".parse().unwrap();
-        let mut h = HeaderMap::new();
-        h.insert("origin", "https://gallery.test".parse().unwrap());
-        assert!(is_same_origin(&https_uri, &h));
-
-        h.insert("sec-fetch-site", "cross-site".parse().unwrap());
-        assert!(!is_same_origin(&https_uri, &h));
-    }
-
-    #[test]
-    fn metered_post_search_reserves_commits_on_2xx_and_releases_on_error() {
-        let policy = sample_safety_policy();
-        let mut backend = MockBackend::with_policy(policy);
-        let do_key = "usr:550e8400-e29b-41d4-a716-446655440000";
-        backend.session_contexts.insert(
-            do_key.to_string(),
-            SessionContext {
-                active: true,
-                banned: false,
-                sid_valid: true,
-                ..SessionContext::default()
-            },
-        );
-        let cfg = test_cfg();
-
-        let mut h = form_headers();
-        h.insert("origin", "https://gallery.test".parse().unwrap());
-        h.insert(
-            "cookie",
-            make_v2_cookie("user-42", do_key, "sid-1").parse().unwrap(),
-        );
-
-        // Upstream 200 -> reserve then commit
-        let ok = dispatch(
-            &backend,
-            &cfg,
-            Method::POST,
-            "https://gallery.test/api/search_by_desc",
-            h.clone(),
-            Bytes::from_static(b"q=ocean"),
-        );
-        assert_eq!(ok.status(), StatusCode::OK);
-        {
-            let calls = backend.account_calls.borrow();
-            assert_eq!(calls.len(), 2);
-            assert_eq!(calls[0].operation, "reserve");
-            assert_eq!(calls[1].operation, "commit");
-            assert_eq!(calls[1].payload["hold_id"], "hold-1");
-        }
-
-        // Upstream 500 -> reserve then release
-        backend.account_calls.borrow_mut().clear();
-        backend.upstream_status = StatusCode::INTERNAL_SERVER_ERROR;
-        let err = dispatch(
-            &backend,
-            &cfg,
-            Method::POST,
-            "https://gallery.test/api/search_by_desc",
-            h,
-            Bytes::from_static(b"q=ocean"),
-        );
-        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let calls = backend.account_calls.borrow();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].operation, "reserve");
-        assert_eq!(calls[1].operation, "release");
-        assert_eq!(calls[1].payload["hold_id"], "hold-1");
-    }
-
-    #[test]
-    fn preview_without_cf_blur_and_admin_safe_mode_override_behave_securely() {
-        let mut policy = sample_safety_policy();
-        policy.cloudflare_images_blur = false;
-        let mut backend = MockBackend::with_policy(policy.clone());
-        let do_key = "usr:550e8400-e29b-41d4-a716-446655440000";
-        backend.session_contexts.insert(
-            do_key.to_string(),
-            SessionContext {
-                active: true,
-                banned: false,
-                sid_valid: true,
-                safe_mode: true,
-                ..SessionContext::default()
-            },
-        );
-        let cfg = test_cfg();
-
-        // When cloudflare_images_blur is false, /media/preview/* MUST fail closed (403)
-        // with ZERO billing calls and ZERO upstream clear-image fetches!
-        let preview_cap = MediaCapability {
-            v: MEDIA_CAP_VERSION,
-            kind: MediaCapKind::Preview,
-            id: 55,
-            path: "p/55.webp".to_string(),
-            rev: 5,
-            sub: MEDIA_CAP_ANON_SUB.to_string(),
-            sid: None,
-            req_switchers: Vec::new(),
-            exp: TEST_NOW + 300,
-        };
-        let preview_tok = sign_media_capability(&preview_cap, TEST_MEDIA_CAP_SECRET).unwrap();
-        let resp = dispatch(
-            &backend,
-            &cfg,
-            Method::GET,
-            &format!("/media/preview/55?cap={preview_tok}"),
-            HeaderMap::new(),
-            Bytes::new(),
-        );
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert_eq!(
-            resp.headers().get("cache-control").unwrap(),
-            "private, no-store"
-        );
-        assert!(backend.account_calls.borrow().is_empty());
-        assert!(backend.upstream_calls.borrow().is_empty());
-
-        // Admin browse pass combined with a user session in `safe_mode = true` MUST deny admin restricted media!
-        let admin_cap = MediaCapability {
-            v: MEDIA_CAP_VERSION,
-            kind: MediaCapKind::Image,
-            id: 56,
-            path: "r/56.webp".to_string(),
-            rev: 5,
-            sub: ADMIN_VIEW_SUB.to_string(),
-            sid: None,
-            req_switchers: vec!["r18".to_string()],
-            exp: TEST_NOW + 300,
-        };
-        let admin_tok = sign_media_capability(&admin_cap, TEST_MEDIA_CAP_SECRET).unwrap();
-        let mut h = HeaderMap::new();
-        h.insert(
-            "cookie",
-            format!(
-                "{}; {}",
-                make_admin_view_cookie(),
-                make_v2_cookie("user-42", do_key, "sid-1")
-            )
-            .parse()
-            .unwrap(),
-        );
-        let denied = dispatch(
-            &backend,
-            &cfg,
-            Method::GET,
-            &format!("/media/image/56?cap={admin_tok}"),
-            h,
-            Bytes::new(),
-        );
-        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

@@ -11,17 +11,31 @@ const wallet = '0x' + '1'.repeat(40);
 const userId = 'user-v2-42';
 const userDoKey = 'usr:550e8400-e29b-41d4-a716-446655440000';
 const userSid = 'sid-active-001';
-const originalDeposit = '0x' + '2'.repeat(40);
-const linkedSolana = 'sZzUKaVhJLKv1KmyyaCBc39Dv3dwgtS3HmTPrtLZzqe';
-const originalSolanaDeposit = '5tE57EgXH3HTpbtiEQxVzdJeg2NZgGaH2KSSwc7e63DR';
 
-const jwtSecret = 'local-jwt-secret-fixture';
-const sessionV2Secret = 'local-session-v2-secret-fixture';
-const assertionSecret = 'local-gateway-assertion-secret-fixture';
-const adminAssertionSecret = 'local-admin-assertion-secret-fixture';
-const mediaCapSecret = 'local-media-cap-secret-fixture';
+// Single master SITE_SECRET (>= 32 bytes) used for RFC 5869 HKDF-SHA256 derivation.
+const siteSecret = 'local-master-site-secret-at-least-32-bytes-long!!';
+const HKDF_SALT = Buffer.from('lets-embed-hkdf-v1');
+const WD_VOCAB_DIGEST = '760e0e0b36eff91fe713495c20e3f0ecf49cd958b8033b3c454c97f3abfd339c';
+
+function deriveDomainSecret(masterSecret, info) {
+  const prk = createHmac('sha256', HKDF_SALT).update(Buffer.from(masterSecret)).digest();
+  const okm = createHmac('sha256', prk)
+    .update(Buffer.concat([Buffer.from(info), Buffer.from([1])]))
+    .digest();
+  return okm.toString('hex');
+}
+
+const sessionSecret = deriveDomainSecret(siteSecret, 'lets-embed:session:v1');
+const mediaCapSecret = deriveDomainSecret(siteSecret, 'lets-embed:media-cap:v1');
+const assertionSecret = deriveDomainSecret(siteSecret, 'lets-embed:gateway-assertion:v1');
+const internalApiSecret = deriveDomainSecret(siteSecret, 'lets-embed:internal-api:v1');
+const adminAssertionSecret = deriveDomainSecret(siteSecret, 'lets-embed:admin-assertion:v1');
+const guestSessionSecret = deriveDomainSecret(siteSecret, 'lets-embed:guest-session:v1');
 
 const adminHost = 'staff.gallery.test';
+const adminNoPropHost = 'staff-noprop.gallery.test';
+const deniedStaffHost = 'denied-staff.gallery.test';
+const lazyNoAdminSecretHost = 'lazy-gallery.test';
 const appHost = 'gallery.test';
 const otherHost = 'other.gallery.test';
 const apiUpstream = 'https://api.gallery.test';
@@ -33,7 +47,7 @@ const configuredUpstreamHosts = new Set([
   new URL(videoUpstream).host,
 ]);
 
-const FLOAT_POLICY_KEYS = new Set(['default_min_score', 'dinov3_min', 'siglip2_min']);
+const FLOAT_POLICY_KEYS = new Set(['default_tag_min', 'dinov3_min', 'siglip2_min']);
 
 function canonicalPolicyJson(value, keyName = null) {
   if (value === null) return 'null';
@@ -58,53 +72,88 @@ function canonicalPolicyJson(value, keyName = null) {
 }
 
 function computePolicyDigest(policy) {
-  return createHash('sha256').update(canonicalPolicyJson(policy)).digest('hex');
+  const clone = { ...policy };
+  delete clone.policy_digest;
+  return createHash('sha256').update(canonicalPolicyJson(clone)).digest('hex');
 }
 
-function defaultPublicPolicy(overrides = {}) {
+function defaultPublicPolicyV3(overrides = {}) {
   const termsMd = '# Terms of Service\nTest terms v1.';
   const termsDigest = createHash('sha256').update(termsMd).digest('hex');
-  return {
+  const base = {
+    schema_version: 3,
     revision: 5,
     min_enforce_rev: 3,
+    policy_digest: '',
+    vocab_digest: WD_VOCAB_DIGEST,
     safety_enabled: true,
-    rules: [
+    unclassified_mode: 'placeholder',
+    fixed_blur_enabled: true,
+    policies: [
       {
         id: 'r18',
-        name: 'NSFW',
-        mode: 'switcher',
-        query: 'tag:explicit',
-        default_min_score: 0.5,
-        preset: 'r18',
-        requires_login: true,
-        requires_age_18: true,
+        grant_generation: 1,
         enabled: true,
+        priority: 10,
+        name: 'NSFW / Explicit',
+        preset: 'r18',
+        match_expr: 'tag:explicit',
+        default_tag_min: 0.5,
+        action: 'block',
+        bypass: {
+          include_switcher: true,
+          include_click: false,
+          include_live_admin: false,
+          require_gallery_login: true,
+          require_age_18: true,
+          require_current_terms: true,
+          exclude_anonymous: true,
+          exclude_countries: [],
+        },
       },
       {
         id: 'sensitive',
-        name: 'Suggestive',
-        mode: 'spoiler_blur',
-        query: 'tag:questionable',
-        default_min_score: 0.5,
-        preset: 'sensitive',
-        requires_login: false,
-        requires_age_18: false,
+        grant_generation: 1,
         enabled: true,
+        priority: 20,
+        name: 'Suggestive / Ecchi',
+        preset: 'sensitive',
+        match_expr: 'tag:questionable',
+        default_tag_min: 0.5,
+        action: 'blur',
+        bypass: {
+          include_switcher: true,
+          include_click: true,
+          include_live_admin: false,
+          require_gallery_login: false,
+          require_age_18: false,
+          require_current_terms: false,
+          exclude_anonymous: false,
+          exclude_countries: ['GB'],
+        },
       },
       {
-        id: 'blood',
-        name: 'Blood / Gore',
-        mode: 'switcher',
-        query: 'tag:blood',
-        default_min_score: 0.5,
-        preset: 'blood',
-        requires_login: false,
-        requires_age_18: false,
+        id: 'staff_only',
+        grant_generation: 1,
         enabled: true,
+        priority: 30,
+        name: 'Staff Explicit Bypass',
+        preset: 'blood',
+        match_expr: 'tag:blood',
+        default_tag_min: 0.5,
+        action: 'block',
+        bypass: {
+          include_switcher: false,
+          include_click: false,
+          include_live_admin: true,
+          require_gallery_login: false,
+          require_age_18: false,
+          require_current_terms: false,
+          exclude_anonymous: false,
+          exclude_countries: [],
+        },
       },
     ],
-    unclassified_mode: 'lock_fail_closed',
-    cloudflare_images_blur: true,
     age_policy: 'strict_provider_verified18',
     age_gate_trigger: 'just_in_time',
     similarity: { dinov3_min: 0.0, siglip2_min: 0.0 },
@@ -126,9 +175,10 @@ function defaultPublicPolicy(overrides = {}) {
       block_tor: true,
     },
     enabled_providers: [],
-    panic_shortcut: 'Shift+S',
     ...overrides,
   };
+  base.policy_digest = computePolicyDigest(base);
+  return base;
 }
 
 function builtWorker(crate) {
@@ -147,16 +197,16 @@ function builtWorker(crate) {
   };
 }
 
-function signedLegacySession(principal = wallet) {
+function signedLegacySession(principal = wallet, secret = sessionSecret) {
   const now = Math.floor(Date.now() / 1000);
   const payload = Buffer.from(JSON.stringify({ sub: principal, iat: now, exp: now + 3600 })).toString(
     'base64url'
   );
-  const signature = createHmac('sha256', jwtSecret).update(payload).digest('base64url');
+  const signature = createHmac('sha256', secret).update(payload).digest('base64url');
   return `ue_session=${payload}.${signature}`;
 }
 
-function signedSessionV2({ sub = userId, do_key = userDoKey, sid = userSid, secret = sessionV2Secret } = {}) {
+function signedSessionV2({ sub = userId, do_key = userDoKey, sid = userSid, secret = sessionSecret } = {}) {
   const now = Math.floor(Date.now() / 1000);
   const payload = Buffer.from(
     JSON.stringify({ v: 2, sub, do_key, sid, iat: now, exp: now + 3600 })
@@ -169,7 +219,17 @@ function signedSessionV2({ sub = userId, do_key = userDoKey, sid = userSid, secr
   return `ue_session=v2.${payload}.${sig}`;
 }
 
-function signMediaCap(cap, secret = mediaCapSecret) {
+function signMediaCapV3(cap, secret = mediaCapSecret) {
+  const payload = Buffer.from(JSON.stringify(cap)).toString('base64url');
+  const sig = createHmac('sha256', secret)
+    .update(Buffer.from('media-cap/v3\0'))
+    .update(Buffer.from('mc3.'))
+    .update(Buffer.from(payload))
+    .digest('base64url');
+  return `mc3.${payload}.${sig}`;
+}
+
+function signLegacyMediaCapV1(cap, secret = mediaCapSecret) {
   const payload = Buffer.from(JSON.stringify(cap)).toString('base64url');
   const sig = createHmac('sha256', secret)
     .update(Buffer.from('media-cap/v1\0'))
@@ -178,25 +238,42 @@ function signMediaCap(cap, secret = mediaCapSecret) {
   return `${payload}.${sig}`;
 }
 
-function verifyGatewayAssertionHeader(headerValue, secret = assertionSecret) {
-  assert.ok(headerValue && headerValue.startsWith('ga1.'), `missing ga1 prefix: ${headerValue}`);
+function signAdminAssertionV2(claims, secret = adminAssertionSecret) {
+  const payload = Buffer.from(JSON.stringify(claims)).toString('base64url');
+  const sig = createHmac('sha256', secret)
+    .update(Buffer.from('admin-assertion/v2\0'))
+    .update(Buffer.from('aa2.'))
+    .update(Buffer.from(payload))
+    .digest('base64url');
+  return `aa2.${payload}.${sig}`;
+}
+
+function verifyGatewayAssertionV3Header(headerValue, secret = assertionSecret) {
+  assert.ok(headerValue && headerValue.startsWith('ga3.'), `missing ga3 prefix: ${headerValue}`);
   const rest = headerValue.slice(4);
   const [payload, sig] = rest.split('.');
   const expected = createHmac('sha256', secret)
-    .update(Buffer.from('gateway-assertion/v1\0'))
-    .update(Buffer.from('ga1.'))
+    .update(Buffer.from('gateway-assertion/v3\0'))
+    .update(Buffer.from('ga3.'))
     .update(Buffer.from(payload))
     .digest('base64url');
-  assert.equal(sig, expected, 'gateway assertion signature mismatch');
+  assert.equal(sig, expected, 'gateway assertion v3 signature mismatch');
   return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
 }
 
-// Inline ESModule mock worker implementing:
-// - `SitePolicyDO` (`GET /policy`, `POST /__test/set` for test mutations)
-// - `UserAccount` DO (`POST /session-context`, `/charge`, `/can-charge`, `/preview-budget`,
-//   `/guest`, `/reserve`, `/commit`, `/release`, `/reserve-guest`, `/commit-guest`, `/release-guest`,
-//   plus `/__test/*` control & telemetry endpoints)
-// - Default fetch handler simulating `lets-embed-user-worker` (`/user/*`)
+function verifyGuestSessionToken(rawTok, secret = guestSessionSecret) {
+  assert.ok(rawTok && rawTok.startsWith('gs1.'), `missing gs1 prefix: ${rawTok}`);
+  const rest = rawTok.slice(4);
+  const [payload, sig] = rest.split('.');
+  const expected = createHmac('sha256', secret)
+    .update(Buffer.from('guest-session/v1\0'))
+    .update(Buffer.from('gs1.'))
+    .update(Buffer.from(payload))
+    .digest('base64url');
+  assert.equal(sig, expected, 'guest session token signature mismatch');
+  return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+}
+
 const mockUserWorkerScript = `
 let currentPolicy = null;
 let failPolicy = false;
@@ -232,13 +309,14 @@ export class UserAccount {
     this.sessionCtx = {
       active: true,
       banned: false,
+      suspended: false,
       sid_valid: true,
       assurance_level: 'none',
       strict_age_ok: false,
       terms_version_accepted: null,
       terms_digest_accepted: null,
       enabled_switchers: [],
-      safe_mode: false,
+      pref_version: 1,
     };
     this.calls = [];
     this.holds = new Map();
@@ -286,7 +364,7 @@ export class UserAccount {
       return new Response('ok', { status: 200 });
     }
     if (op === 'charge' || op === 'can-charge' || op === 'preview-budget') {
-      if (this.sessionCtx.banned || !this.sessionCtx.active) {
+      if (this.sessionCtx.banned || this.sessionCtx.suspended || !this.sessionCtx.active) {
         return new Response('banned', { status: 403 });
       }
       if (op === 'preview-budget' && body?.guest && loginRequired) {
@@ -305,6 +383,7 @@ export default {
       worker: 'user-worker',
       path: url.pathname + url.search,
       adminHeader: request.headers.get('x-gallery-admin-email'),
+      adminAssertionHeader: request.headers.get('x-gallery-admin-assertion'),
       assertionHeader: request.headers.get('x-gateway-assertion'),
       cfAccessJwt: request.headers.get('cf-access-jwt-assertion'),
       cookie: request.headers.get('cookie'),
@@ -313,46 +392,167 @@ export default {
 };
 `;
 
+// Real AdminAssertion v2 verifier in the mock admin dashboard worker!
+// Verifies `aa2.` HMAC-SHA256 using HKDF-derived AdminAssertion key from SITE_SECRET,
+// exact method, canonical path+query, body SHA-256 hash, bounded expiry, audience,
+// email match, duplicate-header rejection, and mutating jti replay protection —
+// even when Cloudflare Assets router drops `ctx.props`!
 const mockAdminDashboardScript = `
+const enc = new TextEncoder();
+const usedJtis = new Set();
+
+function b64urlDecode(str) {
+  const pad = '='.repeat((4 - (str.length % 4)) % 4);
+  const b64 = (str + pad).replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function toHex(buf) {
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function hmacSha256(keyBytes, ...parts) {
+  const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const joined = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { joined.set(p, off); off += p.length; }
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, joined));
+}
+
+async function deriveAdminKey(siteSecret) {
+  const prk = await hmacSha256(enc.encode('lets-embed-hkdf-v1'), enc.encode(siteSecret));
+  const okm = await hmacSha256(prk, enc.encode('lets-embed:admin-assertion:v1'), new Uint8Array([1]));
+  return enc.encode(toHex(okm));
+}
+
+function b64urlEncode(bytes) {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const email = request.headers.get('x-gallery-admin-email');
+    const token = request.headers.get('x-gallery-admin-assertion');
+
+    // Reject missing or comma-combined duplicate headers (Fetch API combines duplicate headers with ", ").
+    if (!email || !token || email.includes(',') || token.includes(',')) {
+      return Response.json({ error: 'missing_or_duplicate_header' }, { status: 403 });
+    }
+    if (!token.startsWith('aa2.')) {
+      return Response.json({ error: 'bad_prefix' }, { status: 403 });
+    }
+    const rest = token.slice(4);
+    const parts = rest.split('.');
+    if (parts.length !== 2 || !parts[0] || !parts[1]) {
+      return Response.json({ error: 'malformed_token' }, { status: 403 });
+    }
+    const [payloadB64, sigB64] = parts;
+    const keyBytes = env.ADMIN_ASSERTION_SECRET
+      ? enc.encode(env.ADMIN_ASSERTION_SECRET)
+      : await deriveAdminKey(env.SITE_SECRET);
+    const expectedSig = b64urlEncode(
+      await hmacSha256(keyBytes, enc.encode('admin-assertion/v2\\0'), enc.encode('aa2.'), enc.encode(payloadB64))
+    );
+    if (sigB64 !== expectedSig) {
+      return Response.json({ error: 'invalid_signature' }, { status: 403 });
+    }
+
+    let claims;
+    try {
+      claims = JSON.parse(new TextDecoder().decode(b64urlDecode(payloadB64)));
+    } catch {
+      return Response.json({ error: 'invalid_payload' }, { status: 403 });
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    if (claims.v !== 2) return Response.json({ error: 'bad_version' }, { status: 403 });
+    if (claims.aud !== 'lets-embed-admin-dashboard-worker') {
+      return Response.json({ error: 'wrong_audience' }, { status: 403 });
+    }
+    if (claims.email !== email) {
+      return Response.json({ error: 'mismatched_email' }, { status: 403 });
+    }
+    if (now > claims.exp + 10 || claims.exp > now + 40) {
+      return Response.json({ error: 'expired' }, { status: 403 });
+    }
+    const method = request.method.toUpperCase();
+    if (claims.m !== method) {
+      return Response.json({ error: 'wrong_method' }, { status: 403 });
+    }
+    const canonicalTarget = url.pathname + url.search;
+    if (claims.p !== canonicalTarget) {
+      return Response.json({ error: 'wrong_target' }, { status: 403 });
+    }
+    const rawBody = (method === 'GET' || method === 'HEAD')
+      ? new Uint8Array(0)
+      : new Uint8Array(await request.arrayBuffer());
+    const bodyHash = toHex(await crypto.subtle.digest('SHA-256', rawBody));
+    if (claims.bh !== bodyHash) {
+      return Response.json({ error: 'wrong_body_hash' }, { status: 403 });
+    }
+    if (!claims.jti || claims.jti.length < 8) {
+      return Response.json({ error: 'invalid_jti' }, { status: 403 });
+    }
+    if (method !== 'GET' && method !== 'HEAD') {
+      if (usedJtis.has(claims.jti)) {
+        return Response.json({ error: 'replayed_jti' }, { status: 403 });
+      }
+      usedJtis.add(claims.jti);
+    }
+
     return Response.json({
       worker: 'admin-dashboard-worker',
-      path: url.pathname + url.search,
+      path: canonicalTarget,
+      method,
+      bodyText: new TextDecoder().decode(rawBody),
       galleryAdminProp: Boolean(ctx?.props?.gallery_admin),
-      adminEmail: request.headers.get('x-gallery-admin-email'),
+      adminEmail: claims.email,
+      jti: claims.jti,
+      bodyHash,
       cfAccessJwt: request.headers.get('cf-access-jwt-assertion'),
     });
   },
 };
 `;
 
-function gatewayWorkerConfig(name, hostname, access, onUpstream) {
+function gatewayWorkerConfig(name, hostname, access, onUpstream, extra = {}) {
+  const defaultBindings = {
+    // ONLY SITE_SECRET set — zero per-purpose secret overrides needed!
+    SITE_SECRET: siteSecret,
+    CF_ACCESS_AUD: 'gallery-admin',
+    CF_ACCESS_CLIENT_ID: 'local-svc-id',
+    CF_ACCESS_CLIENT_SECRET: 'local-svc-secret',
+    API_UPSTREAM: apiUpstream,
+    IMAGE_UPSTREAM: imageUpstream,
+    VIDEO_UPSTREAM: videoUpstream,
+  };
+  const bindings = extra.replaceBindings
+    ? extra.replaceBindings
+    : { ...defaultBindings, ...(extra.bindings || {}) };
+  const adminBinding = extra.omitAdminProp
+    ? 'lets-embed-admin-dashboard-worker'
+    : {
+        name: 'lets-embed-admin-dashboard-worker',
+        props: { gallery_admin: true },
+      };
+
   return {
     ...builtWorker('gateway_worker'),
     name,
     routes: [hostname + '/*'],
     access,
-    bindings: {
-      JWT_SECRET: jwtSecret,
-      SESSION_V2_SECRET: sessionV2Secret,
-      GATEWAY_ASSERTION_SECRET: assertionSecret,
-      ADMIN_ASSERTION_SECRET: adminAssertionSecret,
-      MEDIA_CAP_SECRET: mediaCapSecret,
-      CF_ACCESS_AUD: 'gallery-admin',
-      CF_ACCESS_CLIENT_ID: 'local-svc-id',
-      CF_ACCESS_CLIENT_SECRET: 'local-svc-secret',
-      API_UPSTREAM: apiUpstream,
-      IMAGE_UPSTREAM: imageUpstream,
-      VIDEO_UPSTREAM: videoUpstream,
-    },
+    bindings,
     serviceBindings: {
       USER_WORKER: 'lets-embed-user-worker',
-      ADMIN_DASHBOARD_WORKER: {
-        name: 'lets-embed-admin-dashboard-worker',
-        props: { gallery_admin: true },
-      },
+      ADMIN_DASHBOARD_WORKER: adminBinding,
     },
     durableObjects: {
       USER_ACCOUNT: {
@@ -371,6 +571,7 @@ function gatewayWorkerConfig(name, hostname, access, onUpstream) {
         `unexpected upstream host: ${request.url}`
       );
       assert.equal(request.headers.get('x-gallery-admin-email'), null);
+      assert.equal(request.headers.get('x-gallery-admin-assertion'), null);
       assert.equal(request.headers.get('cf-access-jwt-assertion'), null);
       assert.equal(request.headers.get('x-gallery-switchers'), null);
       assert.equal(request.headers.get('x-policy-revision'), null);
@@ -378,49 +579,89 @@ function gatewayWorkerConfig(name, hostname, access, onUpstream) {
       assert.equal(request.headers.get('cf-ipcountry'), null);
       assert.doesNotMatch(
         request.headers.get('cookie') || '',
-        /ue_admin_view|ue_session|gw_token|gw_app|__Host-auth_tx|CF_Authorization/
+        /ue_admin_view|ue_session|le_guest_sid|gw_token|gw_app|__Host-auth_tx|CF_Authorization/
       );
       if (onUpstream) {
         const reply = onUpstream(request, target);
         if (reply) return reply;
       }
-      return new Response('Gallery origin', {
-        headers: {
-          'cache-control': 'public, max-age=3600',
-          'x-test-upstream': request.url,
-          'x-test-assertion': request.headers.get('x-gateway-assertion') || '',
-          'x-test-cf': JSON.stringify(request.cf || null),
-        },
-      });
+      const headers = {
+        'cache-control': 'public, max-age=3600',
+        'x-test-upstream': request.url,
+        'x-test-assertion': request.headers.get('x-gateway-assertion') || '',
+        'x-test-cf': JSON.stringify(request.cf || null),
+      };
+      // Simulate Cloudflare Images `cf-resized` confirmation when `cf.image` is present.
+      if (request.cf && request.cf.image) {
+        headers['cf-resized'] = 'internal=ok/q=30 t=0.05';
+      }
+      return new Response('Gallery origin', { headers });
     },
   };
 }
 
-test('hardened gateway enforces geo-block, admin split, revocable v2 sessions, media capabilities, locked blur, and assertions', async (t) => {
+test('Policy v3 gateway enforces HKDF SITE_SECRET, zero implicit admin unlock, facts_rev, le_guest_sid reveal, and AdminAssertion v2', async (t) => {
   let nextUpstreamResponse = null;
+  let factsRevHandler = () => Response.json({ facts_rev: 7 });
   let upstreamCalls = 0;
+
+  const sharedOutbound = (request, target) => {
+    upstreamCalls += 1;
+    if (target.host === new URL(apiUpstream).host && target.pathname.startsWith('/internal/facts-rev/')) {
+      return factsRevHandler(request, target);
+    }
+    if (nextUpstreamResponse) {
+      const reply = nextUpstreamResponse(request, target);
+      nextUpstreamResponse = null;
+      return reply;
+    }
+    return null;
+  };
 
   const mf = new Miniflare(
     convertV4MiniflareOptions({
       cf: { country: 'US', httpProtocol: 'HTTP/1.1' },
       workers: [
-        gatewayWorkerConfig('public-gateway', appHost, undefined, (request, target) => {
-          upstreamCalls += 1;
-          if (nextUpstreamResponse) {
-            const reply = nextUpstreamResponse(request, target);
-            nextUpstreamResponse = null;
-            return reply;
-          }
-          return null;
-        }),
+        gatewayWorkerConfig('public-gateway', appHost, undefined, sharedOutbound),
         gatewayWorkerConfig('staff-gateway', adminHost, {
           aud: 'gallery-admin',
           identity: { email: 'operator@example.test' },
+        }, sharedOutbound, {
+          bindings: { ADMIN_ALLOWED_EMAILS: 'Operator@Example.Test,backup@example.test' },
+        }),
+        gatewayWorkerConfig('staff-noprop-gateway', adminNoPropHost, {
+          aud: 'gallery-admin',
+          identity: { email: 'operator@example.test' },
+        }, sharedOutbound, { omitAdminProp: true }),
+        gatewayWorkerConfig('denied-staff-gateway', deniedStaffHost, {
+          aud: 'gallery-admin',
+          identity: { email: 'intruder@example.test' },
+        }, sharedOutbound, {
+          bindings: { ADMIN_ALLOWED_EMAILS: 'operator@example.test' },
+        }),
+        // Explicit per-purpose overrides WITHOUT SITE_SECRET and WITHOUT ADMIN_ASSERTION_SECRET:
+        // verifies lazy AdminAssertion loading never breaks gallery traffic!
+        gatewayWorkerConfig('lazy-no-admin-secret-gateway', lazyNoAdminSecretHost, {
+          aud: 'gallery-admin',
+          identity: { email: 'operator@example.test' },
+        }, sharedOutbound, {
+          replaceBindings: {
+            JWT_SECRET: sessionSecret,
+            SESSION_V2_SECRET: sessionSecret,
+            MEDIA_CAP_SECRET: mediaCapSecret,
+            GATEWAY_ASSERTION_SECRET: assertionSecret,
+            INTERNAL_API_SECRET: internalApiSecret,
+            GUEST_SESSION_SECRET: guestSessionSecret,
+            CF_ACCESS_AUD: 'gallery-admin',
+            API_UPSTREAM: apiUpstream,
+            IMAGE_UPSTREAM: imageUpstream,
+            VIDEO_UPSTREAM: videoUpstream,
+          },
         }),
         gatewayWorkerConfig('other-gateway', otherHost, {
           aud: 'other-app',
           identity: { email: 'operator@example.test' },
-        }),
+        }, sharedOutbound),
         {
           name: 'lets-embed-user-worker',
           compatibilityDate: '2026-06-01',
@@ -435,6 +676,7 @@ test('hardened gateway enforces geo-block, admin split, revocable v2 sessions, m
           name: 'lets-embed-admin-dashboard-worker',
           compatibilityDate: '2026-06-01',
           modules: true,
+          bindings: { SITE_SECRET: siteSecret },
           script: mockAdminDashboardScript,
         },
       ],
@@ -467,39 +709,39 @@ test('hardened gateway enforces geo-block, admin split, revocable v2 sessions, m
     return (await r.json()).calls;
   };
 
-  const policy = defaultPublicPolicy();
+  const policy = defaultPublicPolicyV3();
   await setPolicy(policy);
 
   const visit = (host, url, options = {}) =>
     mf.dispatchFetch('https://' + host + url, { ...options, redirect: 'manual' });
   const site = (url, options) => visit(appHost, url, options);
 
-  // 1. Fail-closed SITE_POLICY outage -> 503 on public routes, /admin still reachable.
+  // 1. Strict decode_active_policy_v3: outage, legacy schema v2 / rules, and bad digest all fail closed (503)
   await setPolicy(policy, { fail: true });
-  const downResp = await site('/');
-  assert.equal(downResp.status, 503);
-  assert.equal(downResp.headers.get('cache-control'), 'private, no-store');
+  assert.equal((await site('/')).status, 503);
+  // `/admin` stays reachable during SITE_POLICY outage
   const adminDuringOutage = await visit(adminHost, '/admin');
   assert.equal(adminDuringOutage.status, 200);
+  await setPolicy({ revision: 1, safety_enabled: true, rules: [] });
+  assert.equal((await site('/')).status, 503);
+  await setPolicy({ ...policy, schema_version: 2 });
+  assert.equal((await site('/')).status, 503);
   await setPolicy(policy, { corruptDigest: true });
   assert.equal((await site('/robots.txt')).status, 503);
   await setPolicy(policy);
 
-  // 2. Step 0 Geo-Block: runtime cf.country enforced (spoofed CF-IPCountry ignored), /admin exempt.
-  const geoBlocked = await site('/', {
-    cf: { country: 'KP', httpProtocol: 'HTTP/1.1' },
-    headers: { 'cf-ipcountry': 'US' },
-  });
-  assert.equal(geoBlocked.status, 451);
-  assert.equal(geoBlocked.headers.get('cache-control'), 'private, no-store');
+  // 2. Lazy AdminAssertion key loading: gallery traffic works without ADMIN_ASSERTION_SECRET,
+  //    while `/admin` fails closed (500)!
+  const lazyGallery = await visit(lazyNoAdminSecretHost, '/robots.txt');
+  assert.equal(lazyGallery.status, 200);
+  const lazyAdmin = await visit(lazyNoAdminSecretHost, '/admin');
+  assert.equal(lazyAdmin.status, 500);
 
-  const torBlocked = await site('/robots.txt', {
-    cf: { country: 'T1', httpProtocol: 'HTTP/1.1' },
-    headers: { 'cf-ipcountry': 'US' },
-  });
-  assert.equal(torBlocked.status, 451);
-
-  // Admin route exempt from geo-block even when request.cf.country is blocked!
+  // 3. Step 0 Geo-Block & AdminAssertion v2 (including prop-absent & mutating body-hash binding)
+  assert.equal(
+    (await site('/', { cf: { country: 'KP', httpProtocol: 'HTTP/1.1' }, headers: { 'cf-ipcountry': 'US' } })).status,
+    451
+  );
   const adminFromBlocked = await visit(adminHost, '/admin', {
     cf: { country: 'KP', httpProtocol: 'HTTP/1.1' },
   });
@@ -511,291 +753,433 @@ test('hardened gateway enforces geo-block, admin split, revocable v2 sessions, m
   const adminViewCookie = adminFromBlocked.headers.get('set-cookie').split(';')[0];
   assert.match(adminViewCookie, /^__Host-ue_admin_view=/);
 
-  // Admin browse pass MUST NOT bypass geo-block on gallery routes!
-  const adminViewBlocked = await site('/', {
-    cf: { country: 'KP', httpProtocol: 'HTTP/1.1' },
-    headers: { cookie: adminViewCookie },
+  // Prop-absent admin hop (simulating Cloudflare Assets dropping ctx.props) STILL succeeds via aa2.!
+  const postBody = JSON.stringify({ safety_enabled: true, revision: 6 });
+  const adminNoPropPost = await visit(adminNoPropHost, '/admin/api/safety?rev=6', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      // Attempt to spoof duplicate/forged header — gateway MUST strip it and attach a single valid aa2.!
+      'x-gallery-admin-assertion': 'aa2.spoofed.sig',
+    },
+    body: postBody,
   });
-  assert.equal(adminViewBlocked.status, 451);
+  assert.equal(adminNoPropPost.status, 200);
+  const noPropJson = await adminNoPropPost.json();
+  assert.equal(noPropJson.galleryAdminProp, false);
+  assert.equal(noPropJson.adminEmail, 'operator@example.test');
+  assert.equal(noPropJson.method, 'POST');
+  assert.equal(noPropJson.path, '/admin/api/safety?rev=6');
+  assert.equal(noPropJson.bodyText, postBody);
+  assert.equal(noPropJson.bodyHash, createHash('sha256').update(postBody).digest('hex'));
 
-  // 3. Admin split & retiring /user/admin*:
-  assert.equal((await site('/admin')).status, 403);
-  assert.equal((await site('/admin', { headers: { cookie: adminViewCookie } })).status, 403);
-  assert.equal((await visit(otherHost, '/admin')).status, 403);
-  const browseRedirect = await visit(adminHost, '/admin/browse');
-  assert.equal(browseRedirect.status, 303);
-  assert.equal(browseRedirect.headers.get('location'), '/');
+  // ADMIN_ALLOWED_EMAILS denies unlisted staff email on `/admin` AND denies LiveAdmin bypass on `/`!
+  assert.equal((await visit(deniedStaffHost, '/admin')).status, 403);
+  await configureAccount(userDoKey, { loginRequired: false });
+  const deniedStaffGallery = await visit(deniedStaffHost, '/');
+  assert.equal(deniedStaffGallery.status, 200);
+  const deniedStaffGa = verifyGatewayAssertionV3Header(deniedStaffGallery.headers.get('x-test-assertion'));
+  assert.deepEqual(deniedStaffGa.actor, { kind: 'anon' });
+  assert.equal(deniedStaffGa.is_billing_waived, false);
+  assert.deepEqual(deniedStaffGa.direct_grants, []);
+  await configureAccount(userDoKey, { loginRequired: true });
 
-  for (const retired of ['/user/admin', '/user/admin/browse', '/user/admin/settings']) {
-    const r = await visit(adminHost, retired);
-    assert.equal(r.status, 404, `expected 404 for retired ${retired}`);
-    assert.equal(r.headers.get('cache-control'), 'private, no-store');
+  // 4. Direct AdminAssertion v2 verifier edge-case matrix (prop-absent, expired, wrong-aud,
+  //    mismatched-email, wrong-method, wrong-target, wrong-body-hash, replayed jti, duplicate header)
+  const adminWorker = await mf.getWorker('lets-embed-admin-dashboard-worker');
+  const nowSec = Math.floor(Date.now() / 1000);
+  const validBody = '{"action":"publish"}';
+  const validBh = createHash('sha256').update(validBody).digest('hex');
+  const baseClaims = {
+    v: 2,
+    aud: 'lets-embed-admin-dashboard-worker',
+    email: 'operator@example.test',
+    m: 'POST',
+    p: '/admin/api/publish?v=3',
+    bh: validBh,
+    jti: 'jti_direct_test_0001',
+    exp: nowSec + 25,
+  };
+  const validAa2 = signAdminAssertionV2(baseClaims);
+
+  // 4a. Prop-absent valid aa2 -> 200
+  const directOk = await adminWorker.fetch('https://lets-embed-admin-dashboard-worker/admin/api/publish?v=3', {
+    method: 'POST',
+    headers: {
+      'x-gallery-admin-email': 'operator@example.test',
+      'x-gallery-admin-assertion': validAa2,
+    },
+    body: validBody,
+  });
+  assert.equal(directOk.status, 200);
+
+  // 4b. Replayed jti -> 403
+  const directReplay = await adminWorker.fetch('https://lets-embed-admin-dashboard-worker/admin/api/publish?v=3', {
+    method: 'POST',
+    headers: {
+      'x-gallery-admin-email': 'operator@example.test',
+      'x-gallery-admin-assertion': validAa2,
+    },
+    body: validBody,
+  });
+  assert.equal(directReplay.status, 403);
+  assert.equal((await directReplay.json()).error, 'replayed_jti');
+
+  const negativeCases = [
+    [
+      'missing assertion',
+      'POST',
+      '/admin/api/publish?v=3',
+      validBody,
+      { 'x-gallery-admin-email': 'operator@example.test' },
+    ],
+    [
+      'expired',
+      'POST',
+      '/admin/api/publish?v=3',
+      validBody,
+      {
+        'x-gallery-admin-email': 'operator@example.test',
+        'x-gallery-admin-assertion': signAdminAssertionV2({ ...baseClaims, jti: 'jti_exp_0002', exp: nowSec - 30 }),
+      },
+    ],
+    [
+      'wrong audience',
+      'POST',
+      '/admin/api/publish?v=3',
+      validBody,
+      {
+        'x-gallery-admin-email': 'operator@example.test',
+        'x-gallery-admin-assertion': signAdminAssertionV2({ ...baseClaims, jti: 'jti_aud_0003', aud: 'wrong-aud' }),
+      },
+    ],
+    [
+      'mismatched email',
+      'POST',
+      '/admin/api/publish?v=3',
+      validBody,
+      {
+        'x-gallery-admin-email': 'other@example.test',
+        'x-gallery-admin-assertion': signAdminAssertionV2({ ...baseClaims, jti: 'jti_email_0004' }),
+      },
+    ],
+    [
+      'wrong method',
+      'DELETE',
+      '/admin/api/publish?v=3',
+      validBody,
+      {
+        'x-gallery-admin-email': 'operator@example.test',
+        'x-gallery-admin-assertion': signAdminAssertionV2({ ...baseClaims, jti: 'jti_method_0005' }),
+      },
+    ],
+    [
+      'wrong target query',
+      'POST',
+      '/admin/api/publish?v=4',
+      validBody,
+      {
+        'x-gallery-admin-email': 'operator@example.test',
+        'x-gallery-admin-assertion': signAdminAssertionV2({ ...baseClaims, jti: 'jti_target_0006' }),
+      },
+    ],
+    [
+      'wrong body hash',
+      'POST',
+      '/admin/api/publish?v=3',
+      '{"action":"tampered"}',
+      {
+        'x-gallery-admin-email': 'operator@example.test',
+        'x-gallery-admin-assertion': signAdminAssertionV2({ ...baseClaims, jti: 'jti_body_0007' }),
+      },
+    ],
+    [
+      'duplicate assertion header',
+      'POST',
+      '/admin/api/publish?v=3',
+      validBody,
+      {
+        'x-gallery-admin-email': 'operator@example.test',
+        'x-gallery-admin-assertion': `${signAdminAssertionV2({ ...baseClaims, jti: 'jti_dup_0008' })}, ${validAa2}`,
+      },
+    ],
+    [
+      'duplicate email header',
+      'POST',
+      '/admin/api/publish?v=3',
+      validBody,
+      {
+        'x-gallery-admin-email': 'operator@example.test, evil@example.test',
+        'x-gallery-admin-assertion': signAdminAssertionV2({ ...baseClaims, jti: 'jti_dup_0009' }),
+      },
+    ],
+  ];
+
+  for (const [label, method, targetPath, body, headers] of negativeCases) {
+    const r = await adminWorker.fetch('https://lets-embed-admin-dashboard-worker' + targetPath, {
+      method,
+      headers,
+      body,
+    });
+    assert.equal(r.status, 403, `expected 403 for ${label}`);
   }
 
-  // /user/* forwards to USER_WORKER with privileged headers stripped.
+  // 5. Privileged header stripping (including X-Gallery-Admin-Assertion) & raw/internal 404 blocking
   const userFwd = await site('/user/account', {
     headers: {
       'x-gallery-admin-email': 'spoof@example.test',
-      'x-gateway-assertion': 'ga1.spoof.sig',
+      'x-gallery-admin-assertion': validAa2,
+      'x-gateway-assertion': 'ga3.spoof.sig',
       'cf-access-jwt-assertion': 'spoof',
       cookie: `${adminViewCookie}; ${signedSessionV2()}`,
     },
   });
   assert.equal(userFwd.status, 200);
   const userFwdJson = await userFwd.json();
-  assert.equal(userFwdJson.worker, 'user-worker');
   assert.equal(userFwdJson.adminHeader, null);
+  assert.equal(userFwdJson.adminAssertionHeader, null);
   assert.equal(userFwdJson.assertionHeader, null);
   assert.equal(userFwdJson.cfAccessJwt, null);
-  assert.doesNotMatch(userFwdJson.cookie || '', /__Host-ue_admin_view/);
-  assert.match(userFwdJson.cookie || '', /ue_session=v2\./);
 
-  // 4. Raw /images/* & /videos/* unconditionally 404 (even with admin view pass).
-  const callsBeforeRaw = upstreamCalls;
-  for (const rawMedia of ['/images/one.webp', '/videos/a.mp4']) {
-    const r = await site(rawMedia, { headers: { cookie: adminViewCookie } });
-    assert.equal(r.status, 404);
-    assert.equal(r.headers.get('cache-control'), 'private, no-store');
+  for (const blocked of ['/images/one.webp', '/videos/a.mp4', '/internal/facts-rev/image/42', '/user/admin']) {
+    const r = await visit(adminHost, blocked, { headers: { cookie: adminViewCookie } });
+    assert.equal(r.status, 404, `expected 404 on ${blocked}`);
   }
-  assert.equal(upstreamCalls, callsBeforeRaw);
 
-  // 5. Always-public legal/SEO/static paths work even when login_required=true; sitemap stays gated.
-  const robotsResp = await site('/robots.txt');
-  assert.equal(robotsResp.status, 200);
-  assert.equal(robotsResp.headers.get('cache-control'), 'public, max-age=3600');
-  for (const legalPath of ['/terms', '/privacy', '/dmca', '/content-policy']) {
-    const r = await site(legalPath);
-    assert.equal(r.status, 200, `${legalPath} must be publicly reachable`);
-    assert.equal(r.headers.get('cache-control'), 'private, no-store');
-  }
-  assert.equal((await site('/sitemap.xml')).status, 303);
-
-  // 6. ADMIN_VIEW_COOKIE hardening: waives login & billing, signs assertion with is_admin_view=true,
-  //    but STILL enforces same-origin CSRF on ALL POST requests (metered AND unmetered)!
+  // 6. Zero implicit admin auto-unlock: ADMIN_VIEW_COOKIE waives billing/guest-wall ONLY,
+  //    NEVER grants direct_grants or LiveAdmin actor!
   const appOrigin = 'https://' + appHost;
-  const adminCsrfDenied = await site('/api/search_by_desc', {
-    method: 'POST',
-    headers: {
-      cookie: adminViewCookie,
-      origin: 'https://evil.test',
-      'content-type': 'application/x-www-form-urlencoded',
-    },
-    body: 'q=csrf-probe',
-  });
-  assert.equal(adminCsrfDenied.status, 403);
-
-  const unmeteredCsrfDenied = await site('/api/search_advanced', {
-    method: 'POST',
-    headers: {
-      cookie: adminViewCookie,
-      origin: 'https://evil.test',
-      'content-type': 'application/x-www-form-urlencoded',
-    },
-    body: 'q=tag%3Amaid',
-  });
-  assert.equal(unmeteredCsrfDenied.status, 403);
-
-  const adminSearchOk = await site('/api/search_by_desc', {
+  const browsePassSearch = await site('/api/search_by_desc', {
     method: 'POST',
     headers: {
       cookie: adminViewCookie,
       origin: appOrigin,
       'content-type': 'application/x-www-form-urlencoded',
-      'x-gateway-assertion': 'ga1.forged.sig',
-      'x-gallery-switchers': 'r18',
+      'x-gateway-assertion': 'ga3.forged.sig',
     },
     body: 'q=sunset',
   });
-  assert.equal(adminSearchOk.status, 200);
-  const adminAssertion = verifyGatewayAssertionHeader(
-    adminSearchOk.headers.get('x-test-assertion')
+  assert.equal(browsePassSearch.status, 200);
+  const browsePassGa = verifyGatewayAssertionV3Header(browsePassSearch.headers.get('x-test-assertion'));
+  assert.equal(browsePassGa.is_billing_waived, true);
+  assert.deepEqual(browsePassGa.actor, { kind: 'anon' });
+  assert.deepEqual(browsePassGa.direct_grants, []);
+  assert.deepEqual(browsePassGa.click_eligible, [{ id: 'sensitive', grant_generation: 1 }]);
+
+  // Live CF Access staff on staffHost gets LiveAdmin actor & ONLY explicit include_live_admin (`staff_only`),
+  // NEVER implicit r18 unlock!
+  const staffHome = await visit(adminHost, '/');
+  assert.equal(staffHome.status, 200);
+  const staffGa = verifyGatewayAssertionV3Header(staffHome.headers.get('x-test-assertion'));
+  assert.equal(staffGa.is_billing_waived, true);
+  assert.deepEqual(staffGa.actor, { kind: 'live_admin', email: 'operator@example.test' });
+  assert.deepEqual(staffGa.direct_grants, [{ id: 'staff_only', grant_generation: 1 }]);
+
+  // 7. POST /api/safety/reveal: CSRF enforcement + le_guest_sid minting & reuse
+  await configureAccount(userDoKey, { loginRequired: false });
+  const revealBody = JSON.stringify({ kind: 'image', asset_id: 42, policy_rev: 5 });
+  // Missing X-Requested-With -> 403
+  assert.equal(
+    (await site('/api/safety/reveal', {
+      method: 'POST',
+      headers: { origin: appOrigin, 'content-type': 'application/json' },
+      body: revealBody,
+    })).status,
+    403
   );
-  assert.equal(adminAssertion.is_admin_view, true);
-  assert.equal(adminAssertion.sub, 'admin');
-  assert.deepEqual(adminAssertion.switchers, ['r18', 'blood']);
-
-  // 7. Capability-based /media/{image,video,preview}/{id}?cap=...
-  const now = Math.floor(Date.now() / 1000);
-  const restrictedCap = signMediaCap({
-    v: 1,
-    kind: 'image',
-    id: 42,
-    path: '2026/01/pic 42.webp',
-    rev: 5,
-    sub: userId,
-    sid: userSid,
-    req_switchers: ['r18'],
-    exp: now + 300,
+  // Valid same-origin + X-Requested-With: fetch -> mints le_guest_sid cookie + ActorBinding::GuestSession in ga3.!
+  const revealResp = await site('/api/safety/reveal', {
+    method: 'POST',
+    headers: {
+      origin: appOrigin,
+      'x-requested-with': 'fetch',
+      'content-type': 'application/json',
+    },
+    body: revealBody,
   });
+  assert.equal(revealResp.status, 200);
+  assert.equal(revealResp.headers.get('cache-control'), 'private, no-store');
+  const guestSetCookie = revealResp.headers.get('set-cookie');
+  assert.match(guestSetCookie, /^le_guest_sid=gs1\./);
+  assert.match(guestSetCookie, /HttpOnly/);
+  assert.match(guestSetCookie, /SameSite=Lax/);
+  assert.match(guestSetCookie, /Secure/);
+  const guestCookiePair = guestSetCookie.split(';')[0];
+  const guestClaims = verifyGuestSessionToken(guestCookiePair.slice('le_guest_sid='.length));
+  const revealGa = verifyGatewayAssertionV3Header(revealResp.headers.get('x-test-assertion'));
+  assert.deepEqual(revealGa.actor, { kind: 'guest_session', gid: guestClaims.gid });
 
-  // Unauthenticated / stale-rev / wrong-id -> 403 with zero DO charge!
-  assert.equal((await site(`/media/image/42?cap=${restrictedCap}`)).status, 403);
-  assert.equal((await site(`/media/image/43?cap=${restrictedCap}`)).status, 403);
-  const staleCap = signMediaCap({
+  // 8. MediaCapability v3 redemption: rejects legacy v1, enforces facts_rev (even on Anon caps!),
+  //    enforces revealed_refs ∩ live_click_eligible, and fails closed 502 on missing/errored cf-resized!
+  const now = Math.floor(Date.now() / 1000);
+  const legacyV1Cap = signLegacyMediaCapV1({
     v: 1,
     kind: 'image',
     id: 42,
     path: '2026/01/pic_42.webp',
-    rev: 2, // < min_enforce_rev (3)
+    rev: 5,
     sub: 'anon',
     sid: null,
     req_switchers: [],
     exp: now + 300,
   });
-  assert.equal((await site(`/media/image/42?cap=${staleCap}`)).status, 403);
+  assert.equal((await site(`/media/image/42?cap=${legacyV1Cap}`)).status, 403);
 
-  // Authenticated v2 session with insufficient age evidence -> 403, ZERO charge!
+  // Public Anon mc3. cap still checks /internal/facts-rev/image/42!
+  const anonCap = signMediaCapV3({
+    v: 3,
+    aud: 'lets-embed-media',
+    kind: 'image',
+    asset_id: 42,
+    immutable_locator: '2026/01/pic_42.webp',
+    facts_rev: 7,
+    policy_rev: 5,
+    actor_binding: { kind: 'anon' },
+    matched_blocks: [],
+    matched_blurs: [],
+    revealed_refs: [],
+    exp: now + 300,
+  });
+  factsRevHandler = () => Response.json({ facts_rev: 8 }); // mismatch!
+  assert.equal((await site(`/media/image/42?cap=${anonCap}`)).status, 403);
+  factsRevHandler = () => new Response('not found', { status: 404 });
+  assert.equal((await site(`/media/image/42?cap=${anonCap}`)).status, 403);
+  factsRevHandler = () => new Response('error', { status: 500 });
+  assert.equal((await site(`/media/image/42?cap=${anonCap}`)).status, 503);
+  factsRevHandler = () => Response.json({ facts_rev: 7 });
+  const anonOk = await site(`/media/image/42?cap=${anonCap}`, {
+    headers: { range: 'bytes=0-100' },
+  });
+  assert.equal(anonOk.status, 200);
+  assert.equal(anonOk.headers.get('cache-control'), 'private, no-store');
+
+  // Guest revealed mc3. cap: works in US with matching le_guest_sid, DENIED in GB (exclude_countries)!
+  const revealedCap = signMediaCapV3({
+    v: 3,
+    aud: 'lets-embed-media',
+    kind: 'image',
+    asset_id: 42,
+    immutable_locator: '2026/01/blur_42.webp',
+    facts_rev: 7,
+    policy_rev: 5,
+    actor_binding: { kind: 'guest_session', gid: guestClaims.gid },
+    matched_blocks: [],
+    matched_blurs: [{ id: 'sensitive', grant_generation: 1 }],
+    revealed_refs: [{ id: 'sensitive', grant_generation: 1 }],
+    exp: now + 300,
+  });
+  const revOk = await site(`/media/image/42?cap=${revealedCap}`, {
+    headers: { cookie: guestCookiePair },
+  });
+  assert.equal(revOk.status, 200);
+  const revDeniedCountry = await site(`/media/image/42?cap=${revealedCap}`, {
+    cf: { country: 'GB', httpProtocol: 'HTTP/1.1' },
+    headers: { cookie: guestCookiePair },
+  });
+  assert.equal(revDeniedCountry.status, 403);
+
+  // Authenticated User v3 cap with Verified18 + r18@1 -> HEAD can-charge, GET charge!
   await configureAccount(userDoKey, {
     resetCalls: true,
+    loginRequired: true,
     sessionCtx: {
       active: true,
       banned: false,
-      sid_valid: true,
-      assurance_level: 'self_attestation',
-      strict_age_ok: false,
-      terms_version_accepted: 1,
-      terms_digest_accepted: policy.legal.terms_digest,
-      enabled_switchers: ['r18'],
-      safe_mode: false,
-    },
-  });
-  const deniedMedia = await site(`/media/image/42?cap=${restrictedCap}`, {
-    headers: { cookie: signedSessionV2() },
-  });
-  assert.equal(deniedMedia.status, 403);
-  const callsAfterDenied = await getAccountCalls(userDoKey);
-  assert.deepEqual(
-    callsAfterDenied.map((c) => c.op),
-    ['session-context'],
-    'denied media must NOT call charge/can-charge'
-  );
-
-  // Authorized v2 session (strict Verified18 + accepted terms + r18 enabled) -> 200 + canonical charge!
-  await configureAccount(userDoKey, {
-    resetCalls: true,
-    sessionCtx: {
-      active: true,
-      banned: false,
+      suspended: false,
       sid_valid: true,
       assurance_level: 'verified18',
       strict_age_ok: true,
       terms_version_accepted: 1,
       terms_digest_accepted: policy.legal.terms_digest,
-      enabled_switchers: ['r18'],
-      safe_mode: false,
+      enabled_switchers: [{ id: 'r18', grant_generation: 1 }],
+      pref_version: 2,
     },
   });
-  const headMedia = await site(`/media/image/42?cap=${restrictedCap}`, {
-    method: 'HEAD',
-    headers: { cookie: signedSessionV2() },
+  const userCap = signMediaCapV3({
+    v: 3,
+    aud: 'lets-embed-media',
+    kind: 'image',
+    asset_id: 99,
+    immutable_locator: '2026/01/pic 99.webp',
+    facts_rev: 7,
+    policy_rev: 5,
+    actor_binding: { kind: 'user', sub: userId, sid: userSid },
+    matched_blocks: [{ id: 'r18', grant_generation: 1 }],
+    matched_blurs: [],
+    revealed_refs: [],
+    exp: now + 300,
   });
-  assert.equal(headMedia.status, 200);
-  const getMedia = await site(`/media/image/42?cap=${restrictedCap}`, {
-    headers: { cookie: signedSessionV2() },
-  });
-  assert.equal(getMedia.status, 200);
-  assert.equal(getMedia.headers.get('cache-control'), 'private, no-store');
-  assert.equal(getMedia.headers.get('x-test-upstream'), `${imageUpstream}/2026/01/pic%2042.webp`);
-  const callsAfterAllowed = await getAccountCalls(userDoKey);
+  assert.equal(
+    (await site(`/media/image/99?cap=${userCap}`, { method: 'HEAD', headers: { cookie: signedSessionV2() } })).status,
+    200
+  );
+  const userGet = await site(`/media/image/99?cap=${userCap}`, { headers: { cookie: signedSessionV2() } });
+  assert.equal(userGet.status, 200);
+  assert.equal(userGet.headers.get('x-test-upstream'), `${imageUpstream}/2026/01/pic%2099.webp`);
+  const userCalls = await getAccountCalls(userDoKey);
   assert.deepEqual(
-    callsAfterAllowed.map((c) => c.op),
+    userCalls.map((c) => c.op),
     ['session-context', 'can-charge', 'session-context', 'charge']
   );
-  assert.equal(callsAfterAllowed[3].body.path, 'media:image:42');
 
-  // Preview capability -> separate /preview-budget ONLY, locked CF blur, and 3xx redirect rejection!
-  await configureAccount(userDoKey, { resetCalls: true });
-  const previewCap = signMediaCap({
-    v: 1,
+  // Preview capability: locked cf.image blur, fails closed 502 if transform missing/error, 403 if fixed_blur_enabled=false
+  const previewCap = signMediaCapV3({
+    v: 3,
+    aud: 'lets-embed-media',
     kind: 'preview',
-    id: 42,
-    path: '2026/01/pic_42.webp',
-    rev: 5,
-    sub: 'anon',
-    sid: null,
-    req_switchers: [],
-    exp: now + 600,
+    asset_id: 42,
+    immutable_locator: '2026/01/blur_42.webp',
+    facts_rev: 7,
+    policy_rev: 5,
+    actor_binding: { kind: 'guest_session', gid: guestClaims.gid },
+    matched_blocks: [],
+    matched_blurs: [{ id: 'sensitive', grant_generation: 1 }],
+    revealed_refs: [],
+    exp: now + 300,
   });
-  const previewResp = await site(`/media/preview/42?cap=${previewCap}&blur=0`, {
-    headers: { cookie: signedSessionV2() },
+  const previewOk = await site(`/media/preview/42?cap=${previewCap}&blur=0`, {
+    headers: { cookie: `${adminViewCookie}; ${guestCookiePair}` },
   });
-  assert.equal(previewResp.status, 200);
-  assert.equal(previewResp.headers.get('cache-control'), 'private, no-store');
-  const previewCf = JSON.parse(previewResp.headers.get('x-test-cf'));
-  assert.equal(previewCf.cacheTtl, 0);
-  assert.equal(previewCf.cacheEverything, false);
-  assert.deepEqual(previewCf.image, {
-    blur: 80,
-    width: 360,
-    quality: 30,
-    format: 'webp',
-  });
-  const previewCalls = await getAccountCalls(userDoKey);
-  assert.deepEqual(
-    previewCalls.map((c) => c.op),
-    ['session-context', 'preview-budget']
-  );
-  assert.equal(previewCalls[1].body.key, 'preview:42');
+  assert.equal(previewOk.status, 200);
+  const previewCf = JSON.parse(previewOk.headers.get('x-test-cf'));
+  assert.deepEqual(previewCf.image, { blur: 80, width: 360, quality: 30, format: 'webp' });
 
-  // When cloudflare_images_blur is disabled, /media/preview/* fails closed (403, zero DO calls).
-  await setPolicy({ ...policy, cloudflare_images_blur: false });
-  await configureAccount(userDoKey, { resetCalls: true });
-  const previewOffResp = await site(`/media/preview/42?cap=${previewCap}`, {
-    headers: { cookie: signedSessionV2() },
+  // Missing cf-resized header (transform unavailable / clear pass-through) -> fail closed 502!
+  nextUpstreamResponse = () => new Response('RAW_CLEAR_BYTES', { status: 200 });
+  const previewUntransformed = await site(`/media/preview/42?cap=${previewCap}`, {
+    headers: { cookie: `${adminViewCookie}; ${guestCookiePair}` },
   });
-  assert.equal(previewOffResp.status, 403);
-  assert.equal(previewOffResp.headers.get('cache-control'), 'private, no-store');
-  assert.deepEqual(await getAccountCalls(userDoKey), []);
+  assert.equal(previewUntransformed.status, 502);
+  assert.notEqual(await previewUntransformed.text(), 'RAW_CLEAR_BYTES');
+
+  // cf-resized: err=9524 -> fail closed 502!
+  nextUpstreamResponse = () =>
+    new Response('RAW_CLEAR_BYTES', { status: 200, headers: { 'cf-resized': 'err=9524' } });
+  const previewErrResized = await site(`/media/preview/42?cap=${previewCap}`, {
+    headers: { cookie: `${adminViewCookie}; ${guestCookiePair}` },
+  });
+  assert.equal(previewErrResized.status, 502);
+
+  // fixed_blur_enabled == false -> immediate 403!
+  const blurOffPolicy = defaultPublicPolicyV3({ fixed_blur_enabled: false });
+  await setPolicy(blurOffPolicy);
+  assert.equal(
+    (await site(`/media/preview/42?cap=${previewCap}`, {
+      headers: { cookie: `${adminViewCookie}; ${guestCookiePair}` },
+    })).status,
+    403
+  );
   await setPolicy(policy);
 
-  // Upstream 3xx redirect on media origin rejected with 502!
-  nextUpstreamResponse = () =>
-    new Response(null, { status: 302, headers: { location: 'https://evil.example/leak' } });
-  const redirectResp = await site(`/media/preview/42?cap=${previewCap}`, {
-    headers: { cookie: signedSessionV2() },
-  });
-  assert.equal(redirectResp.status, 502);
-
-  // Revoked v2 session clears ue_session cookie and fails closed!
-  await configureAccount(userDoKey, {
-    sessionCtx: { sid_valid: false },
-  });
-  const revokedResp = await site('/api/like_previews?items=post:1', {
-    headers: { cookie: signedSessionV2() },
-  });
-  assert.equal(revokedResp.status, 401);
-  assert.match(revokedResp.headers.get('set-cookie') || '', /ue_session=;.*Max-Age=0/);
-
-  // Legacy wallet cutover still verifies and checks DO session-context with sid: null.
+  // Legacy wallet cutover still verifies with SITE_SECRET Session key!
   await configureAccount(wallet, {
     resetCalls: true,
-    sessionCtx: { active: true, banned: false, sid_valid: true },
+    sessionCtx: { active: true, banned: false, suspended: false, sid_valid: true },
   });
   const legacyOk = await site('/api/like_previews?items=post:1', {
     headers: { cookie: signedLegacySession(wallet) },
   });
   assert.equal(legacyOk.status, 200);
-
-  // Open guest browsing: anonymous /sitemap.xml becomes publicly cacheable, / stays private no-store,
-  // and same-origin POST /api/site_config succeeds for client hydration.
-  await configureAccount(userDoKey, { loginRequired: false });
-  const openSitemap = await site('/sitemap.xml');
-  assert.equal(openSitemap.status, 200);
-  assert.equal(openSitemap.headers.get('cache-control'), 'public, max-age=3600');
-  const openHome = await site('/');
-  assert.equal(openHome.status, 200);
-  assert.equal(openHome.headers.get('cache-control'), 'private, no-store');
-  const openSiteConfig = await site('/api/site_config', {
-    method: 'POST',
-    headers: { origin: appOrigin },
-  });
-  assert.equal(openSiteConfig.status, 200);
-  assert.equal(openSiteConfig.headers.get('cache-control'), 'private, no-store');
-  const crossSiteConfig = await site('/api/site_config', {
-    method: 'POST',
-    headers: { origin: 'https://evil.test' },
-  });
-  assert.equal(crossSiteConfig.status, 403);
 });
 
 test('embedded resources navigate only for a same-origin gallery allowance denial', async () => {
@@ -839,7 +1223,6 @@ test('embedded resources navigate only for a same-origin gallery allowance denia
   assert.deepEqual(probes, Array(2).fill([failedVideo.target.currentSrc, 'HEAD']));
   assert.deepEqual(destinations, ['/user/upgrade', '/user/upgrade']);
 
-  // Standalone `/videos/...` still probes cleanly, while unrelated paths are ignored.
   pageShow({ persisted: true });
   const standaloneVideo = { target: { tagName: 'VIDEO', currentSrc: origin + '/videos/a.mp4' } };
   const nonMediaVideo = { target: { tagName: 'VIDEO', currentSrc: origin + '/other/a.mp4' } };

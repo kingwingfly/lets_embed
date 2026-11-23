@@ -1,17 +1,17 @@
 //! Capability-based `/media/{image,video,preview}/{id}?cap=...` route parsing,
-//! authorization, canonical upstream URL construction, and locked server-side
-//! Cloudflare Images blur configuration.
+//! Policy v3 `facts_rev` lookup helpers, canonical upstream URL construction,
+//! and locked server-side Cloudflare Images blur verification.
 
+use axum::http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
-use site_access::{MEDIA_CAP_ANON_SUB, MediaCapKind, MediaCapability, PublicSitePolicy};
+use site_access::{MediaCapKind, PublicSitePolicy};
 
-use crate::auth::{ADMIN_VIEW_SUB, LiveSession, admin_eligible_switchers};
 use crate::http_util::{
     Upstreams, is_canonical_path, is_rfc3986_unreserved, parse_upstream_origin, percent_decode,
 };
 
 /// Hardcoded, non-overridable Cloudflare Worker `cf.image` parameters used for
-/// server-side blurred previews when `policy.cloudflare_images_blur` is enabled.
+/// server-side blurred previews when `policy.fixed_blur_enabled` is true.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PreviewBlurConfig {
     pub(crate) blur: u8,
@@ -36,6 +36,62 @@ pub(crate) struct PreviewBudgetReq {
     pub(crate) key: String,
     pub(crate) head: bool,
     pub(crate) guest: bool,
+}
+
+/// Response payload from `GET {APP_ORIGIN}/internal/facts-rev/{kind}/{id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FactsRevResponse {
+    pub(crate) facts_rev: u64,
+}
+
+/// Maps a [`MediaCapKind`] to the authoritative origin `/internal/facts-rev/{kind}/{id}`
+/// resource kind (`"image"` | `"video"`). Blurred previews target image assets.
+pub(crate) const fn facts_rev_resource_kind(kind: MediaCapKind) -> &'static str {
+    match kind {
+        MediaCapKind::Image | MediaCapKind::Preview => "image",
+        MediaCapKind::Video => "video",
+    }
+}
+
+/// Builds and strictly validates `{API_UPSTREAM}/internal/facts-rev/{kind}/{id}`.
+pub(crate) fn build_facts_rev_target(
+    kind: MediaCapKind,
+    asset_id: i64,
+    upstreams: &Upstreams,
+) -> std::result::Result<worker::Url, ()> {
+    if asset_id <= 0 {
+        return Err(());
+    }
+    let upstream = parse_upstream_origin(upstreams.api.as_str()).map_err(|_| ())?;
+    let expected_path = format!("/internal/facts-rev/{}/{asset_id}", facts_rev_resource_kind(kind));
+    if !is_canonical_path(&expected_path) {
+        return Err(());
+    }
+    let target = format!("{upstream}{expected_path}");
+    let base_url = worker::Url::parse(&upstream).map_err(|_| ())?;
+    let target_url = worker::Url::parse(&target).map_err(|_| ())?;
+    if target_url.scheme() != base_url.scheme()
+        || target_url.host_str() != base_url.host_str()
+        || target_url.port_or_known_default() != base_url.port_or_known_default()
+        || !target_url.username().is_empty()
+        || target_url.password().is_some()
+        || target_url.path() != expected_path
+        || target_url.query().is_some()
+        || target_url.fragment().is_some()
+    {
+        return Err(());
+    }
+    Ok(target_url)
+}
+
+/// Strictly parses `{ "facts_rev": u64 }` from origin, rejecting malformed JSON or `0`.
+pub(crate) fn parse_facts_rev_response(raw: &str) -> std::result::Result<u64, &'static str> {
+    let parsed: FactsRevResponse =
+        serde_json::from_str(raw).map_err(|_| "malformed facts-rev JSON")?;
+    if parsed.facts_rev == 0 {
+        return Err("facts_rev must be >= 1");
+    }
+    Ok(parsed.facts_rev)
 }
 
 /// Parses `/media/{image|video|preview}/{id}` where `{id}` is a canonical
@@ -84,56 +140,8 @@ pub(crate) fn extract_media_cap_query(query: Option<&str>) -> Option<String> {
     found
 }
 
-/// Authorizes a cryptographically verified [`MediaCapability`] against the
-/// caller's live session context and current policy BEFORE any billing or
-/// budget check occurs.
-pub(crate) fn authorize_media_capability(
-    cap: &MediaCapability,
-    auth: Option<&LiveSession>,
-    is_admin_view: bool,
-    policy: &PublicSitePolicy,
-) -> bool {
-    if !cap.requires_live_session_check() {
-        // Anonymous safe capability (`sub == "anon"` and `req_switchers.is_empty()`).
-        // `verify_media_capability` has already verified `cap.rev >= policy.min_enforce_rev`.
-        return true;
-    }
-
-    if cap.sub == ADMIN_VIEW_SUB {
-        if !is_admin_view || cap.sid.is_some() {
-            return false;
-        }
-        if let Some(live) = auth
-            && live.ctx.safe_mode
-        {
-            return false;
-        }
-        let allowed = admin_eligible_switchers(policy);
-        return cap
-            .req_switchers
-            .iter()
-            .all(|req_sw| allowed.iter().any(|sw| sw == req_sw));
-    }
-
-    let Some(live) = auth else {
-        return false;
-    };
-    if !live.ctx.is_authenticated() || live.ctx.safe_mode {
-        return false;
-    }
-    if cap.sub != live.session.user_id() {
-        return false;
-    }
-    if cap.sid.as_deref() != live.session.sid() {
-        return false;
-    }
-    cap.req_switchers
-        .iter()
-        .all(|req_sw| live.eligible_switchers.iter().any(|sw| sw == req_sw))
-}
-
-/// Validates and canonicalizes a relative `cap.path` into a leading-slash
-/// RFC 3986 path safe to join onto `IMAGE_UPSTREAM` or `VIDEO_UPSTREAM`.
+/// Validates and canonicalizes a relative `cap.immutable_locator` into a
+/// leading-slash RFC 3986 path safe to join onto `IMAGE_UPSTREAM` or `VIDEO_UPSTREAM`.
 ///
 /// Aligned with `site_access::is_safe_media_path`: rejects leading/trailing `/`,
 /// empty segments, `.` / `..`, `'%'`, `':'`, `'\\'`, `'?'`, `'#'`, and control chars,
@@ -176,10 +184,10 @@ pub(crate) fn encode_canonical_cap_path(cap_path: &str) -> Option<String> {
 /// and no fragment.
 pub(crate) fn build_media_upstream_target(
     kind: MediaCapKind,
-    cap_path: &str,
+    immutable_locator: &str,
     upstreams: &Upstreams,
 ) -> std::result::Result<worker::Url, ()> {
-    let encoded_path = encode_canonical_cap_path(cap_path).ok_or(())?;
+    let encoded_path = encode_canonical_cap_path(immutable_locator).ok_or(())?;
     if !is_canonical_path(&encoded_path) {
         return Err(());
     }
@@ -208,9 +216,16 @@ pub(crate) fn build_media_upstream_target(
 
 /// Returns `true` for the strict allowlist of read-only client headers forwarded
 /// to private media origins (`IMAGE_UPSTREAM` / `VIDEO_UPSTREAM`).
-pub(crate) fn is_allowed_media_request_header(name: &str) -> bool {
+///
+/// For `MediaCapKind::Preview`, `Range` and `If-Range` are stripped so clients
+/// can never request raw byte ranges of a blurred preview.
+pub(crate) fn is_allowed_media_request_header(kind: MediaCapKind, name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if kind == MediaCapKind::Preview && matches!(lower.as_str(), "range" | "if-range") {
+        return false;
+    }
     matches!(
-        name.to_ascii_lowercase().as_str(),
+        lower.as_str(),
         "range"
             | "if-none-match"
             | "if-modified-since"
@@ -224,20 +239,42 @@ pub(crate) fn is_allowed_media_request_header(name: &str) -> bool {
 }
 
 /// Returns the non-overridable preview blur config when `kind == Preview` and
-/// `policy.cloudflare_images_blur` is enabled.
+/// `policy.fixed_blur_enabled` is true.
 pub(crate) const fn resolve_preview_blur(
     kind: MediaCapKind,
     policy: &PublicSitePolicy,
 ) -> Option<PreviewBlurConfig> {
-    if matches!(kind, MediaCapKind::Preview) && policy.cloudflare_images_blur {
+    if matches!(kind, MediaCapKind::Preview) && policy.fixed_blur_enabled {
         Some(LOCKED_PREVIEW_BLUR)
     } else {
         None
     }
 }
 
-/// Explicit sanity check that `MEDIA_CAP_ANON_SUB` never collides with `ADMIN_VIEW_SUB`.
-const _: () = assert!(
-    MEDIA_CAP_ANON_SUB.len() != ADMIN_VIEW_SUB.len()
-        || MEDIA_CAP_ANON_SUB.as_bytes()[0] != ADMIN_VIEW_SUB.as_bytes()[0]
-);
+/// Fail-closed verification that an upstream response for `MediaCapKind::Preview`
+/// was actually transformed by Cloudflare Images (`cf.image`).
+///
+/// Rejects:
+/// - Any non-`200 OK` status (3xx redirects, 4xx/5xx errors, 206 partial content)
+/// - Any `cf-not-resized` header
+/// - Missing `cf-resized` header (indicates Image Resizing unavailable / raw clear pass-through)
+/// - Any `cf-resized` header containing `err=` or `internal=err` or lacking `internal=ok`
+pub(crate) fn is_verified_preview_transform_response(
+    status: StatusCode,
+    headers: &HeaderMap,
+) -> bool {
+    if status != StatusCode::OK {
+        return false;
+    }
+    if headers.contains_key("cf-not-resized") {
+        return false;
+    }
+    let Some(raw) = headers.get("cf-resized").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let lower = raw.trim().to_ascii_lowercase();
+    if lower.is_empty() || lower.contains("err=") || lower.contains("internal=err") {
+        return false;
+    }
+    lower.contains("internal=ok")
+}
