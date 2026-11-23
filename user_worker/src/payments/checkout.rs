@@ -1,6 +1,11 @@
 //! Prepare an unsigned wallet transfer using the current deposit terms.
 
-use axum::{Json, extract::State, http::StatusCode, response::Response};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::Response,
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -11,13 +16,13 @@ use spl_associated_token_account_interface::{
 use tower_cookies::Cookies;
 
 use super::{
-    api_err, payment_db_error, resolve_price, rpc, rpc_unavailable, solana_sender,
+    api_err, eth_sender, payment_db_error, resolve_price, rpc, rpc_unavailable, solana_sender,
     verify_ethereum_network, verify_solana_network,
 };
 use crate::{
-    AppState,
+    AppState, auth,
     config::{self, Chain, TokenSpec},
-    do_client, rates, session, settings,
+    do_client, identity, rates, settings,
 };
 
 /// SPL Memo v2 program id used to attach a unique checkout reference to each
@@ -170,12 +175,13 @@ async fn solana_transaction_wire(
 #[worker::send]
 pub async fn prepare(
     State(st): State<AppState>,
+    headers: HeaderMap,
     cookies: Cookies,
     Json(req): Json<PrepareReq>,
 ) -> Result<Json<Value>, Response> {
-    let account = session::session_address(&cookies, &st.jwt_secret)
-        .ok_or_else(|| api_err(StatusCode::UNAUTHORIZED, "Sign in to top up."))?;
-    if account != req.account {
+    auth::require_same_origin(&st, &headers)?;
+    let active = identity::require_active_session(&st, &cookies).await?;
+    if req.account != active.user_id && req.account != active.do_key {
         return Err(api_err(
             StatusCode::CONFLICT,
             "Your gallery account changed. Reload before paying.",
@@ -196,7 +202,7 @@ pub async fn prepare(
             ),
         )
     })?;
-    match do_client::do_status(&st.env, &account).await {
+    match do_client::do_status(&st.env, &active.do_key).await {
         Ok(status) if status.banned => {
             return Err(api_err(
                 StatusCode::FORBIDDEN,
@@ -214,16 +220,8 @@ pub async fn prepare(
     }
     let policy = settings::load(&st.env).await.map_err(payment_db_error)?;
     let (sender, recipient) = match chain {
-        Chain::Ethereum => {
-            if !session::is_eth_address(&account) {
-                return Err(api_err(
-                    StatusCode::BAD_REQUEST,
-                    "Choose Solana for this gallery account.",
-                ));
-            }
-            (account, policy.eth_deposit)
-        }
-        Chain::Solana => (solana_sender(&st, &account).await?, policy.sol_deposit),
+        Chain::Ethereum => (eth_sender(&st, &active.user_id).await?, policy.eth_deposit),
+        Chain::Solana => (solana_sender(&st, &active.user_id).await?, policy.sol_deposit),
     };
     if !settings::valid_deposit_address(chain, &recipient) {
         return Err(api_err(

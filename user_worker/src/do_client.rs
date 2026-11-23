@@ -1,25 +1,119 @@
-//! FROZEN SCAFFOLD (fully implemented): client helpers for the UserAccount
-//! Durable Object. All internal DO requests use the synthetic origin
-//! `https://do` — only the path is meaningful.
+//! Client helpers for the `UserAccount` Durable Object.
+//! All internal DO requests use the synthetic origin `https://do` — only the path is meaningful.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use site_access::{AssuranceLevel, SessionContext};
 use worker::{Env, Method, Request, RequestInit, Response, Result};
 
 use crate::types::{BalanceResp, CreditReq, InitReq, StatusResp};
 
 pub const DO_BINDING: &str = "USER_ACCOUNT";
 
-/// Low-level call to a user's Durable Object. `address` must be lowercase.
+// ---------------------------------------------------------------------------
+// Session, Preferences, Terms & Preview Budget DO Wire Types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionContextReq {
+    #[serde(default)]
+    pub sid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionIssueReq {
+    pub sid: String,
+    pub auth_method: String,
+    pub identity_key: String,
+    pub assurance_level: AssuranceLevel,
+    pub strict_age_ok: bool,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionIssueResp {
+    pub sid: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRevokeReq {
+    pub sid: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionRevokeAllReq {
+    pub identity_key: Option<String>,
+    pub strict_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRevokeAllResp {
+    pub revoked: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfoResp {
+    pub sid: String,
+    pub auth_method: String,
+    pub identity_key: String,
+    pub assurance_level: AssuranceLevel,
+    pub strict_age_ok: bool,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrefsUpdateReq {
+    pub enabled_switchers: Vec<String>,
+    pub safe_mode: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TermsAcceptReq {
+    pub terms_version: u32,
+    pub terms_digest: String,
+    pub accepted_at: u64,
+    #[serde(default)]
+    pub self_attestation: Option<bool>,
+    #[serde(default)]
+    pub sid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewBudgetReq {
+    #[serde(default, alias = "path")]
+    pub key: String,
+    #[serde(default)]
+    pub head: bool,
+    #[serde(default)]
+    pub guest: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreviewBudgetResp {
+    pub allowed: bool,
+    pub remaining: u32,
+    pub retry_after_secs: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Low-level & Typed DO Clients
+// ---------------------------------------------------------------------------
+
+/// Low-level call to a user's Durable Object keyed by `do_key` (`users_v2.account_do_key`).
 pub async fn call_do<B: Serialize>(
     env: &Env,
-    address: &str,
+    do_key: &str,
     method: Method,
     path: &str,
     body: Option<&B>,
 ) -> Result<Response> {
     let stub = env
         .durable_object(DO_BINDING)?
-        .id_from_name(address)?
+        .id_from_name(do_key)?
         .get_stub()?;
     let mut init = RequestInit::new();
     init.with_method(method);
@@ -39,30 +133,104 @@ fn expect_ok(resp: &Response, what: &str) -> Result<()> {
     }
 }
 
-pub async fn do_status(env: &Env, address: &str) -> Result<StatusResp> {
-    let mut resp = call_do::<()>(env, address, Method::Get, "/status", None).await?;
+pub async fn do_status(env: &Env, do_key: &str) -> Result<StatusResp> {
+    let mut resp = call_do::<()>(env, do_key, Method::Get, "/status", None).await?;
     expect_ok(&resp, "do status")?;
     resp.json().await
 }
 
 /// Idempotent: applies the free grant on first touch, no-op afterwards.
-pub async fn do_init(env: &Env, address: &str) -> Result<StatusResp> {
+pub async fn do_init(env: &Env, do_key: &str) -> Result<StatusResp> {
     let body = InitReq {
-        address: address.to_string(),
+        address: do_key.to_string(),
     };
-    let mut resp = call_do(env, address, Method::Post, "/init", Some(&body)).await?;
+    let mut resp = call_do(env, do_key, Method::Post, "/init", Some(&body)).await?;
     expect_ok(&resp, "do init")?;
     resp.json().await
 }
 
-pub async fn do_credit(env: &Env, address: &str, req: &CreditReq) -> Result<BalanceResp> {
-    let mut resp = call_do(env, address, Method::Post, "/credit", Some(req)).await?;
+pub async fn do_credit(env: &Env, do_key: &str, req: &CreditReq) -> Result<BalanceResp> {
+    let mut resp = call_do(env, do_key, Method::Post, "/credit", Some(req)).await?;
     expect_ok(&resp, "do credit")?;
     resp.json().await
 }
 
-pub async fn payment_applied(env: &Env, address: &str, hash: &str) -> Result<bool> {
-    let mut resp = call_do(env, address, Method::Post, "/payment-applied", Some(&hash)).await?;
+pub async fn payment_applied(env: &Env, do_key: &str, hash: &str) -> Result<bool> {
+    let mut resp = call_do(env, do_key, Method::Post, "/payment-applied", Some(&hash)).await?;
     expect_ok(&resp, "payment lookup")?;
     resp.json().await
+}
+
+pub async fn do_session_context(
+    env: &Env,
+    do_key: &str,
+    sid: Option<&str>,
+) -> Result<SessionContext> {
+    let req = SessionContextReq {
+        sid: sid.map(str::to_string),
+    };
+    let mut resp = call_do(env, do_key, Method::Post, "/session-context", Some(&req)).await?;
+    expect_ok(&resp, "do session-context")?;
+    resp.json().await
+}
+
+pub async fn do_session_issue(
+    env: &Env,
+    do_key: &str,
+    req: &SessionIssueReq,
+) -> Result<SessionIssueResp> {
+    let mut resp = call_do(env, do_key, Method::Post, "/session-issue", Some(req)).await?;
+    expect_ok(&resp, "do session-issue")?;
+    resp.json().await
+}
+
+pub async fn do_session_revoke(env: &Env, do_key: &str, sid: &str) -> Result<()> {
+    let req = SessionRevokeReq {
+        sid: sid.to_string(),
+    };
+    let resp = call_do(env, do_key, Method::Post, "/session-revoke", Some(&req)).await?;
+    expect_ok(&resp, "do session-revoke")
+}
+
+pub async fn do_session_revoke_all(
+    env: &Env,
+    do_key: &str,
+    req: &SessionRevokeAllReq,
+) -> Result<SessionRevokeAllResp> {
+    let mut resp = call_do(env, do_key, Method::Post, "/session-revoke-all", Some(req)).await?;
+    expect_ok(&resp, "do session-revoke-all")?;
+    resp.json().await
+}
+
+pub async fn do_session_info(
+    env: &Env,
+    do_key: &str,
+    sid: &str,
+) -> Result<Option<SessionInfoResp>> {
+    let req = SessionRevokeReq {
+        sid: sid.to_string(),
+    };
+    let mut resp = call_do(env, do_key, Method::Post, "/session-info", Some(&req)).await?;
+    match resp.status_code() {
+        200 => Ok(Some(resp.json().await?)),
+        404 => Ok(None),
+        code => Err(worker::Error::RustError(format!(
+            "do session-info failed: {code}"
+        ))),
+    }
+}
+
+pub async fn do_prefs_update(
+    env: &Env,
+    do_key: &str,
+    req: &PrefsUpdateReq,
+) -> Result<SessionContext> {
+    let mut resp = call_do(env, do_key, Method::Post, "/prefs-update", Some(req)).await?;
+    expect_ok(&resp, "do prefs-update")?;
+    resp.json().await
+}
+
+pub async fn do_terms_accept(env: &Env, do_key: &str, req: &TermsAcceptReq) -> Result<()> {
+    let resp = call_do(env, do_key, Method::Post, "/terms-accept", Some(req)).await?;
+    expect_ok(&resp, "do terms-accept")
 }

@@ -1,29 +1,31 @@
-//! UNIT 2: SIWE auth handlers.
-//!
-//! - GET  /user/api/nonce  -> 200 Json(NonceResp); nonce stored in KV
-//!   (`NONCE_BINDING`) under "nonce:{nonce}" with `NONCE_TTL_SECS`.
-//! - POST /user/api/verify Json(VerifyReq) -> 200 Json(VerifyResp) + session
-//!   cookie | 400/401 Json(ApiError) | 403 banned.
-//! - POST /user/api/verify_solana Json(SiwsReq) -> 200 Json(VerifyResp) + session
-//!   cookie | 400/401 | 403 banned | 409 (address linked elsewhere). SIWS login:
-//!   the principal is the base58 Solana pubkey (standalone account).
-//! - POST /user/api/logout -> clears the cookie.
-//! - GET  /user/api/me     -> 200 Json(StatusResp) | 401.
+//! SIWE, SIWS, logout, nonce issuance (atomic `AuthChallengeDO`), and `/user/api/me`.
 
 use axum::{
     Json,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use serde::Deserialize;
+use serde::Serialize;
+use site_access::{
+    AssuranceLevel, AuthProviderId, AuthProviderPublicConfig, PublicSitePolicy,
+};
 use tower_cookies::Cookies;
 
-use crate::types::{ApiError, NonceResp, SiwsReq, VerifyReq, VerifyResp};
-use crate::{AppState, config, do_client, session, siwe, solana_link};
+use crate::{
+    AppState, challenge_do, config, do_client,
+    identity::{self, IdentityView, VerifiedExternalIdentity},
+    policy_do, session, settings, siwe, solana_link,
+    types::{ApiError, NonceResp, SiwsReq, VerifyReq, VerifyResp},
+};
 
 pub(crate) fn api_error(status: StatusCode, msg: impl Into<String>) -> Response {
-    (status, Json(ApiError { error: msg.into() })).into_response()
+    (
+        status,
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(ApiError { error: msg.into() }),
+    )
+        .into_response()
 }
 
 pub(crate) fn internal_error() -> Response {
@@ -38,89 +40,9 @@ pub(crate) fn display_address(addr: &str) -> String {
     }
 }
 
-pub(crate) async fn ensure_not_banned(st: &AppState, addr: &str) -> Result<(), Response> {
-    let db = match st.env.d1(crate::D1_BINDING) {
-        Ok(db) => db,
-        Err(e) => {
-            worker::console_error!("d1 binding failed: {e:?}");
-            return Err(internal_error());
-        }
-    };
-    #[derive(Deserialize)]
-    struct BanRow {
-        banned: i64,
-    }
-    let banned = match db
-        .prepare("SELECT banned FROM users WHERE address = ?")
-        .bind(&[addr.into()])
-    {
-        Ok(stmt) => match stmt.first::<BanRow>(None).await {
-            Ok(row) => row.is_some_and(|r| r.banned != 0),
-            Err(e) => {
-                worker::console_error!("ban check failed: {e:?}");
-                return Err(internal_error());
-            }
-        },
-        Err(e) => {
-            worker::console_error!("ban check bind failed: {e:?}");
-            return Err(internal_error());
-        }
-    };
-    if banned {
-        return Err(api_error(StatusCode::FORBIDDEN, "account banned"));
-    }
-    Ok(())
-}
-
-pub(crate) async fn touch_user_login(st: &AppState, addr: &str, now: u64) -> Result<(), Response> {
-    let db = match st.env.d1(crate::D1_BINDING) {
-        Ok(db) => db,
-        Err(e) => {
-            worker::console_error!("d1 binding failed: {e:?}");
-            return Err(internal_error());
-        }
-    };
-    let upsert = db
-        .prepare(
-            "INSERT INTO users (address, created_at, last_login) VALUES (?, ?, ?) \
-             ON CONFLICT(address) DO UPDATE SET last_login = excluded.last_login",
-        )
-        .bind(&[addr.into(), (now as f64).into(), (now as f64).into()]);
-    match upsert {
-        Ok(stmt) => {
-            if let Err(e) = stmt.run().await {
-                worker::console_error!("user upsert failed: {e:?}");
-                return Err(internal_error());
-            }
-        }
-        Err(e) => {
-            worker::console_error!("user upsert bind failed: {e:?}");
-            return Err(internal_error());
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn issue_session(st: &AppState, cookies: &Cookies, addr: &str) -> VerifyResp {
-    let now = session::now_secs();
-    let claims = session::SessionClaims {
-        sub: addr.to_string(),
-        iat: now,
-        exp: now + config::SESSION_TTL_SECS,
-    };
-    let token = session::jwt_sign(&claims, &st.jwt_secret);
-    cookies.add(session::make_session_cookie(
-        token,
-        config::SESSION_TTL_SECS as i64,
-    ));
-    VerifyResp {
-        address: display_address(addr),
-    }
-}
-
 /// Verify an `Origin` (or `Sec-Fetch-Site: same-origin` when `Origin` is absent
 /// or serialized as `"null"`, e.g. under a strict referrer policy) against
-/// `siwe_domain` to block cross-site / sibling-subdomain POST CSRF.
+/// `siwe_domain` / `public_url` to block cross-site / sibling-subdomain POST CSRF.
 pub(crate) fn same_origin(headers: &HeaderMap, domain: &str) -> bool {
     let sec_fetch = headers.get("sec-fetch-site").and_then(|h| h.to_str().ok());
     if let Some(origin) = headers.get("origin").and_then(|h| h.to_str().ok()) {
@@ -148,72 +70,44 @@ pub(crate) fn require_same_origin(st: &AppState, headers: &HeaderMap) -> Result<
     Ok(())
 }
 
-/// Ensure a verified principal is upserted in D1, not banned, and initialized in its DO.
-pub(crate) async fn finalize_eth_principal(st: &AppState, addr: &str) -> Result<(), Response> {
-    let now = session::now_secs();
-    touch_user_login(st, addr, now).await?;
-    ensure_not_banned(st, addr).await?;
-    if let Err(e) = do_client::do_init(&st.env, addr).await {
-        worker::console_error!("do init failed: {e:?}");
-        return Err(internal_error());
-    }
-    Ok(())
-}
-
-/// Check linked-wallet coexistence, upsert D1, check ban, and init DO for a Solana principal.
-pub(crate) async fn finalize_sol_principal(st: &AppState, addr: &str) -> Result<(), Response> {
-    let db = st.env.d1(crate::D1_BINDING).map_err(|e| {
-        worker::console_error!("d1 binding failed: {e:?}");
-        internal_error()
-    })?;
-    #[derive(Deserialize)]
-    struct AddrRow {
-        #[allow(dead_code)]
-        address: String,
-    }
-    let linked = match db
-        .prepare("SELECT address FROM users WHERE solana_address = ?")
-        .bind(&[addr.into()])
+/// Issue a single-use wallet nonce atomically in `AuthChallengeDO` (eliminates KV race H12).
+#[worker::send]
+pub async fn nonce(State(st): State<AppState>) -> Response {
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    if let Err(e) = challenge_do::issue_nonce(&st.env, &nonce, "wallet", config::NONCE_TTL_SECS).await
     {
-        Ok(stmt) => match stmt.first::<AddrRow>(None).await {
-            Ok(row) => row,
-            Err(e) => {
-                worker::console_error!("linked lookup failed: {e:?}");
-                return Err(internal_error());
-            }
-        },
-        Err(e) => {
-            worker::console_error!("linked lookup bind failed: {e:?}");
-            return Err(internal_error());
-        }
-    };
-    if linked.is_some() {
-        return Err(api_error(
-            StatusCode::CONFLICT,
-            "this wallet is linked to another account — unlink it there first",
-        ));
+        worker::console_error!("AuthChallengeDO nonce issue failed: {e:?}");
+        return internal_error();
     }
-    let now = session::now_secs();
-    touch_user_login(st, addr, now).await?;
-    ensure_not_banned(st, addr).await?;
-    if let Err(e) = do_client::do_init(&st.env, addr).await {
-        worker::console_error!("do init failed: {e:?}");
-        return Err(internal_error());
-    }
-    Ok(())
+    (
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(NonceResp { nonce }),
+    )
+        .into_response()
 }
 
-/// Verify an EIP-4361 SIWE direct-login payload, consume its single-use nonce,
-/// upsert the user row, enforce the ban check, and ensure the Durable Object exists.
+/// Verify an EIP-4361 SIWE direct-login payload, atomically consume its single-use
+/// nonce from `AuthChallengeDO`, enforce `AgeVerificationPolicy`, resolve/create
+/// the `users_v2` account, and return `(ResolvedAccount, VerifiedExternalIdentity)`.
 pub(crate) async fn verify_siwe_and_ensure_user(
     st: &AppState,
     req: &VerifyReq,
-) -> Result<String, Response> {
-    // 1) Parse the EIP-4361 message.
+) -> Result<(identity::ResolvedAccount, VerifiedExternalIdentity), Response> {
+    let policy = policy_do::load_site_policy(&st.env)
+        .await
+        .map_err(|e| {
+            worker::console_error!("siwe: policy load failed: {e:?}");
+            internal_error()
+        })?
+        .policy;
+    if let Err(msg) = identity::check_login_provider_eligibility(&policy, AuthProviderId::Siwe, None)
+    {
+        return Err(api_error(StatusCode::FORBIDDEN, msg));
+    }
+
     let msg = siwe::parse_siwe(&req.message)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    // 2) Domain / version / chain / direct-login URI binding (blocks cross-flow replay).
     if msg.domain != *st.siwe_domain {
         return Err(api_error(StatusCode::UNAUTHORIZED, "domain mismatch"));
     }
@@ -235,7 +129,6 @@ pub(crate) async fn verify_siwe_and_ensure_user(
         ));
     }
 
-    // 3) Timestamps: issued-at freshness + optional expiration.
     let now = session::now_secs();
     let Some(iat) = siwe::parse_rfc3339_epoch(&msg.issued_at) else {
         return Err(api_error(
@@ -261,31 +154,21 @@ pub(crate) async fn verify_siwe_and_ensure_user(
         }
     }
 
-    // 4) Single-use nonce: must exist in KV, then delete it.
-    let kv = st.env.kv(crate::NONCE_BINDING).map_err(|e| {
-        worker::console_error!("kv binding failed: {e:?}");
-        internal_error()
-    })?;
-    let nonce_key = format!("nonce:{}", msg.nonce);
-    match kv.get(&nonce_key).text().await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
+    // Atomic single-use nonce consumption in `AuthChallengeDO`!
+    match challenge_do::consume_nonce(&st.env, &msg.nonce, "wallet").await {
+        Ok(true) => {}
+        Ok(false) => {
             return Err(api_error(
                 StatusCode::UNAUTHORIZED,
                 "unknown or expired nonce",
             ));
         }
         Err(e) => {
-            worker::console_error!("nonce get failed: {e:?}");
+            worker::console_error!("siwe nonce consume failed: {e:?}");
             return Err(internal_error());
         }
     }
-    if let Err(e) = kv.delete(&nonce_key).await {
-        worker::console_error!("nonce delete failed: {e:?}");
-        return Err(internal_error());
-    }
 
-    // 5) Recover the signer and compare against the claimed address.
     let addr = siwe::recover_address(&req.message, &req.signature)
         .map_err(|e| api_error(StatusCode::UNAUTHORIZED, e.to_string()))?;
     if addr != msg.address.to_lowercase() {
@@ -295,46 +178,62 @@ pub(crate) async fn verify_siwe_and_ensure_user(
         ));
     }
 
-    finalize_eth_principal(st, &addr).await?;
-    Ok(addr)
+    let ident = VerifiedExternalIdentity {
+        provider_id: AuthProviderId::Siwe,
+        issuer: format!("eip155:{}", st.chain_id),
+        subject: addr.clone(),
+        label: Some("Ethereum wallet".to_string()),
+        verified_email: None,
+        assurance_level: AssuranceLevel::None,
+        assurance_method: None,
+        assurance_verified_at: None,
+        assurance_expires_at: None,
+    };
+    let account = identity::resolve_or_create_login_account(st, &policy, &ident).await?;
+    Ok((account, ident))
 }
 
-/// Verify a SIWS login payload, consume its single-use nonce, enforce linked
-/// wallet coexistence and ban checks, upsert the user row, and ensure the DO.
+/// The exact challenge a Solana wallet signs to log in (SIWS).
+pub fn siws_challenge(domain: &str, nonce: &str) -> String {
+    format!("Sign in to lets_embed with Solana\nDomain: {domain}\nNonce: {nonce}")
+}
+
+/// Verify a SIWS login payload, atomically consume its nonce from `AuthChallengeDO`,
+/// enforce `AgeVerificationPolicy`, and resolve/create the `users_v2` account.
 pub(crate) async fn verify_siws_and_ensure_user(
     st: &AppState,
     req: &SiwsReq,
-) -> Result<String, Response> {
-    // 1) The address must be a well-formed Solana principal.
+) -> Result<(identity::ResolvedAccount, VerifiedExternalIdentity), Response> {
+    let policy = policy_do::load_site_policy(&st.env)
+        .await
+        .map_err(|e| {
+            worker::console_error!("siws: policy load failed: {e:?}");
+            internal_error()
+        })?
+        .policy;
+    if let Err(msg) = identity::check_login_provider_eligibility(&policy, AuthProviderId::Siws, None)
+    {
+        return Err(api_error(StatusCode::FORBIDDEN, msg));
+    }
+
     if !session::is_sol_principal(&req.solana_address) {
         return Err(api_error(StatusCode::BAD_REQUEST, "invalid solana address"));
     }
 
-    // 2) Single-use nonce: must exist in KV, then delete it.
-    let kv = st.env.kv(crate::NONCE_BINDING).map_err(|e| {
-        worker::console_error!("kv binding failed: {e:?}");
-        internal_error()
-    })?;
-    let nonce_key = format!("nonce:{}", req.nonce);
-    match kv.get(&nonce_key).text().await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
+    match challenge_do::consume_nonce(&st.env, &req.nonce, "wallet").await {
+        Ok(true) => {}
+        Ok(false) => {
             return Err(api_error(
                 StatusCode::UNAUTHORIZED,
                 "unknown or expired nonce",
             ));
         }
         Err(e) => {
-            worker::console_error!("nonce get failed: {e:?}");
+            worker::console_error!("siws nonce consume failed: {e:?}");
             return Err(internal_error());
         }
     }
-    if let Err(e) = kv.delete(&nonce_key).await {
-        worker::console_error!("nonce delete failed: {e:?}");
-        return Err(internal_error());
-    }
 
-    // 3) Verify the ed25519 signature over the SIWS challenge.
     let msg = siws_challenge(st.siwe_domain.as_str(), &req.nonce);
     if !solana_link::verify_ed25519_challenge(
         &req.solana_address,
@@ -348,68 +247,85 @@ pub(crate) async fn verify_siws_and_ensure_user(
         ));
     }
 
-    let addr = req.solana_address.clone();
-    finalize_sol_principal(st, &addr).await?;
-    Ok(addr)
-}
-
-#[worker::send]
-pub async fn nonce(State(st): State<AppState>) -> Response {
-    let nonce = uuid::Uuid::new_v4().simple().to_string();
-
-    let kv = match st.env.kv(crate::NONCE_BINDING) {
-        Ok(kv) => kv,
-        Err(e) => {
-            worker::console_error!("kv binding failed: {e:?}");
-            return internal_error();
-        }
+    let ident = VerifiedExternalIdentity {
+        provider_id: AuthProviderId::Siws,
+        issuer: "solana:mainnet".to_string(),
+        subject: req.solana_address.clone(),
+        label: Some("Solana wallet".to_string()),
+        verified_email: None,
+        assurance_level: AssuranceLevel::None,
+        assurance_method: None,
+        assurance_verified_at: None,
+        assurance_expires_at: None,
     };
-    let put = match kv.put(&format!("nonce:{nonce}"), "1") {
-        Ok(p) => p,
-        Err(e) => {
-            worker::console_error!("nonce put failed: {e:?}");
-            return internal_error();
-        }
-    };
-    if let Err(e) = put.expiration_ttl(config::NONCE_TTL_SECS).execute().await {
-        worker::console_error!("nonce store failed: {e:?}");
-        return internal_error();
-    }
-
-    Json(NonceResp { nonce }).into_response()
+    let account = identity::resolve_or_create_login_account(st, &policy, &ident).await?;
+    Ok((account, ident))
 }
 
 #[worker::send]
 pub async fn verify(
     State(st): State<AppState>,
+    headers: HeaderMap,
     cookies: Cookies,
     Json(req): Json<VerifyReq>,
 ) -> Response {
-    match verify_siwe_and_ensure_user(&st, &req).await {
-        Ok(addr) => Json(issue_session(&st, &cookies, &addr)).into_response(),
-        Err(resp) => resp,
+    if let Err(r) = require_same_origin(&st, &headers) {
+        return r;
     }
+    let (account, ident) = match verify_siwe_and_ensure_user(&st, &req).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    if let Err(r) = identity::issue_v2_session(
+        &st,
+        &cookies,
+        &account,
+        AuthProviderId::Siwe.as_str(),
+        &ident.identity_key(),
+        AssuranceLevel::None,
+        false,
+    )
+    .await
+    {
+        return r;
+    }
+    Json(VerifyResp {
+        address: display_address(&ident.subject),
+    })
+    .into_response()
 }
 
-/// The exact challenge a Solana wallet signs to log in (SIWS). Domain-bound and
-/// nonce-bound; MUST match the login-page JS byte for byte.
-pub fn siws_challenge(domain: &str, nonce: &str) -> String {
-    format!("Sign in to lets_embed with Solana\nDomain: {domain}\nNonce: {nonce}")
-}
-
-/// Sign-In-With-Solana: authenticate with a Solana wallet as a standalone
-/// account whose principal is the base58 pubkey. Mirrors [`verify`] (the SIWE
-/// path) but proves control with an ed25519 signature over [`siws_challenge`].
 #[worker::send]
 pub async fn verify_solana(
     State(st): State<AppState>,
+    headers: HeaderMap,
     cookies: Cookies,
     Json(req): Json<SiwsReq>,
 ) -> Response {
-    match verify_siws_and_ensure_user(&st, &req).await {
-        Ok(addr) => Json(issue_session(&st, &cookies, &addr)).into_response(),
-        Err(resp) => resp,
+    if let Err(r) = require_same_origin(&st, &headers) {
+        return r;
     }
+    let (account, ident) = match verify_siws_and_ensure_user(&st, &req).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    if let Err(r) = identity::issue_v2_session(
+        &st,
+        &cookies,
+        &account,
+        AuthProviderId::Siws.as_str(),
+        &ident.identity_key(),
+        AssuranceLevel::None,
+        false,
+    )
+    .await
+    {
+        return r;
+    }
+    Json(VerifyResp {
+        address: ident.subject,
+    })
+    .into_response()
 }
 
 #[worker::send]
@@ -417,22 +333,238 @@ pub async fn logout(State(st): State<AppState>, headers: HeaderMap, cookies: Coo
     if let Err(r) = require_same_origin(&st, &headers) {
         return r;
     }
+    // Revoke active `sid` in `UserAccount` DO immediately (H8).
+    if let Some(verified) =
+        session::verify_cookie_session(&cookies, &st.session_v2_secret, Some(&st.jwt_secret))
+        && let Some(sid) = verified.sid()
+    {
+        let _ = do_client::do_session_revoke(&st.env, verified.do_key(), sid).await;
+    }
     cookies.add(session::clear_session_cookie());
     StatusCode::OK.into_response()
 }
 
+#[derive(Serialize)]
+struct PricingItemView {
+    kind: &'static str,
+    label: &'static str,
+    price: i64,
+    daily_free: i64,
+}
+
+#[derive(Serialize)]
+struct PlanView {
+    id: &'static str,
+    price_points: i64,
+    views_per_window: Option<i64>,
+    searches_per_window: i64,
+    period_days: u64,
+}
+
+#[derive(Serialize)]
+struct PricingSummary {
+    points_per_usd: i64,
+    minimum_topup: i64,
+    signup_points: i64,
+    dedupe_hours: u64,
+    eth_deposit: String,
+    sol_deposit: String,
+    plans: Vec<PlanView>,
+    items: Vec<PricingItemView>,
+}
+
+#[derive(Serialize)]
+struct MeResp {
+    // Existing StatusResp fields preserved 100% for backwards compatibility
+    address: String,
+    balance: i64,
+    plan: Option<String>,
+    period_end: u64,
+    views_remaining: Option<i64>,
+    searches_remaining: Option<i64>,
+    window_reset: u64,
+    banned: bool,
+    total_views: i64,
+    // Unified multi-auth + safety fields
+    user_id: String,
+    account_do_key: String,
+    display_name: Option<String>,
+    email: Option<String>,
+    identities: Vec<IdentityView>,
+    linked_eth_address: Option<String>,
+    linked_solana_address: Option<String>,
+    enabled_switchers: Vec<String>,
+    effective_switchers: Vec<String>,
+    safe_mode: bool,
+    terms_version_accepted: Option<u32>,
+    terms_digest_accepted: Option<String>,
+    terms_accepted_at: Option<u64>,
+    terms_up_to_date: bool,
+    assurance_level: AssuranceLevel,
+    strict_age_ok: bool,
+    session_auth_time: Option<u64>,
+    can_link_identity_now: bool,
+    available_providers: Vec<AuthProviderPublicConfig>,
+    policy: PublicSitePolicy,
+    pricing: PricingSummary,
+}
+
 #[worker::send]
 pub async fn me(State(st): State<AppState>, cookies: Cookies) -> Response {
-    let Some(addr) = session::session_address(&cookies, &st.jwt_secret) else {
-        return api_error(StatusCode::UNAUTHORIZED, "not signed in");
+    let active = match identity::require_active_session(&st, &cookies).await {
+        Ok(a) => a,
+        Err(r) => return r,
     };
-    match do_client::do_status(&st.env, &addr).await {
-        Ok(status) => Json(status).into_response(),
+
+    let status = match do_client::do_status(&st.env, &active.do_key).await {
+        Ok(s) => s,
         Err(e) => {
             worker::console_error!("do status failed: {e:?}");
-            internal_error()
+            return internal_error();
         }
-    }
+    };
+    let account = identity::load_account_by_id(&st, &active.user_id)
+        .await
+        .ok()
+        .flatten();
+    let identities = identity::list_user_identities(&st, &active.user_id)
+        .await
+        .unwrap_or_default();
+    let linked_eth = identity::linked_eth_wallet(&st, &active.user_id)
+        .await
+        .ok()
+        .flatten();
+    let linked_sol = identity::linked_solana_wallet(&st, &active.user_id)
+        .await
+        .ok()
+        .flatten();
+
+    let policy = match policy_do::load_site_policy(&st.env).await {
+        Ok(e) => e.policy,
+        Err(e) => {
+            worker::console_error!("me: SitePolicyDO failed: {e:?}");
+            return internal_error();
+        }
+    };
+    let access_policy = settings::load(&st.env).await.unwrap_or_default();
+
+    let session_info = if let Some(sid) = active.sid.as_deref() {
+        do_client::do_session_info(&st.env, &active.do_key, sid)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let now = session::now_secs();
+    let session_auth_time = session_info.as_ref().map(|s| s.created_at);
+    let can_link_identity_now =
+        session_auth_time.is_some_and(|t| identity::is_recent_auth(t, now));
+
+    let effective_switchers = active.ctx.effective_switchers(&policy);
+    let terms_up_to_date = active.ctx.satisfies_terms(&policy.legal);
+    let available_providers: Vec<AuthProviderPublicConfig> = policy
+        .effective_login_providers()
+        .into_iter()
+        .cloned()
+        .collect();
+
+    let display_addr = if !status.address.is_empty() && session::is_valid_principal(&status.address)
+    {
+        display_address(&status.address)
+    } else if let Some(ref eth) = linked_eth {
+        display_address(eth)
+    } else if let Some(ref sol) = linked_sol {
+        sol.clone()
+    } else {
+        account
+            .as_ref()
+            .and_then(|a| a.display_name.clone())
+            .unwrap_or_else(|| active.user_id.clone())
+    };
+
+    let eth_deposit =
+        if settings::valid_deposit_address(config::Chain::Ethereum, &access_policy.eth_deposit) {
+            access_policy.eth_deposit.clone()
+        } else {
+            String::new()
+        };
+    let sol_deposit =
+        if settings::valid_deposit_address(config::Chain::Solana, &access_policy.sol_deposit) {
+            access_policy.sol_deposit.clone()
+        } else {
+            String::new()
+        };
+
+    let plans: Vec<PlanView> = config::PLANS
+        .iter()
+        .filter_map(|p| access_policy.plan(p.id))
+        .map(|p| PlanView {
+            id: p.id,
+            price_points: p.price_points,
+            views_per_window: p.views_per_window,
+            searches_per_window: p.searches_per_window,
+            period_days: p.period_secs / 86_400,
+        })
+        .collect();
+    let items: Vec<PricingItemView> = site_access::ChargeKind::ALL
+        .into_iter()
+        .map(|kind| {
+            let item = access_policy.item(kind);
+            PricingItemView {
+                kind: kind.name(),
+                label: kind.label(),
+                price: item.price,
+                daily_free: item.daily_free,
+            }
+        })
+        .collect();
+
+    (
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(MeResp {
+            address: display_addr,
+            balance: status.balance,
+            plan: status.plan,
+            period_end: status.period_end,
+            views_remaining: status.views_remaining,
+            searches_remaining: status.searches_remaining,
+            window_reset: status.window_reset,
+            banned: status.banned,
+            total_views: status.total_views,
+            user_id: active.user_id,
+            account_do_key: active.do_key,
+            display_name: account.as_ref().and_then(|a| a.display_name.clone()),
+            email: account.as_ref().and_then(|a| a.email.clone()),
+            identities,
+            linked_eth_address: linked_eth.map(|a| display_address(&a)),
+            linked_solana_address: linked_sol,
+            enabled_switchers: active.ctx.enabled_switchers,
+            effective_switchers,
+            safe_mode: active.ctx.safe_mode,
+            terms_version_accepted: active.ctx.terms_version_accepted,
+            terms_digest_accepted: active.ctx.terms_digest_accepted,
+            terms_accepted_at: account.as_ref().and_then(|a| a.terms_accepted_at),
+            terms_up_to_date,
+            assurance_level: active.ctx.assurance_level,
+            strict_age_ok: active.ctx.strict_age_ok,
+            session_auth_time,
+            can_link_identity_now,
+            available_providers,
+            policy,
+            pricing: PricingSummary {
+                points_per_usd: access_policy.points_per_usd,
+                minimum_topup: access_policy.minimum_topup,
+                signup_points: access_policy.signup_points,
+                dedupe_hours: config::DEDUPE_WINDOW_SECS / 3600,
+                eth_deposit,
+                sol_deposit,
+                plans,
+                items,
+            },
+        }),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -450,8 +582,6 @@ mod tests {
 
     #[test]
     fn siws_signature_roundtrip_verifies() {
-        // A wallet signs the exact challenge; the shared verifier must accept it,
-        // and the signing key's base58 pubkey is a valid Solana principal.
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let pk_b58 = bs58::encode(sk.verifying_key().to_bytes()).into_string();
         assert!(session::is_sol_principal(&pk_b58));
@@ -460,7 +590,6 @@ mod tests {
         let sig_b58 = bs58::encode(sk.sign(msg.as_bytes()).to_bytes()).into_string();
         assert!(solana_link::verify_ed25519_b58(&pk_b58, &sig_b58, &msg));
 
-        // wrong domain in the rebuilt challenge must fail
         let other = siws_challenge("evil.example.com", "nonce-xyz");
         assert!(!solana_link::verify_ed25519_b58(&pk_b58, &sig_b58, &other));
     }
