@@ -24,6 +24,7 @@ use axum::{
 use clap::Parser;
 use leptos::prelude::*;
 use leptos_axum::{AxumRouteListing, LeptosRoutes, generate_route_list};
+use middleware::{MetadataRateLimiter, MiddlewareState};
 use site_access::PublicSitePolicy;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::{
@@ -39,8 +40,7 @@ async fn healthz() -> impl IntoResponse {
 }
 
 /// Build the core non-Leptos HTTP router (healthz, optional Standalone media ServeDir,
-/// SEO, legal Markdown routes, and `/api/like_previews`) wrapped in the deployment-mode
-/// safety & assertion middleware.
+/// SEO, legal Markdown routes, `/api/like_previews`, and `/api/post_images`).
 fn build_core_router(app_state: &AppState, serve_media_prefix: Option<PathBuf>) -> Router<AppState> {
     let mut router = Router::new().route("/healthz", get(healthz));
 
@@ -63,7 +63,11 @@ fn build_core_router(app_state: &AppState, serve_media_prefix: Option<PathBuf>) 
         .route("/privacy", get(legal_routes::privacy))
         .route("/dmca", get(legal_routes::dmca))
         .route("/content-policy", get(legal_routes::content_policy))
-        .route("/api/like_previews", get(previews::like_previews))
+        .route(
+            "/api/like_previews",
+            get(previews::like_previews).post(previews::like_previews_post),
+        )
+        .route("/api/post_images", get(previews::post_images))
 }
 
 fn build_app_router(
@@ -73,7 +77,10 @@ fn build_app_router(
     leptos_options: LeptosOptions,
 ) -> Router {
     let state_for_ctx = app_state.clone();
-    let state_for_mw = app_state.clone();
+    let mw_state = MiddlewareState {
+        app: app_state.clone(),
+        rate_limiter: Arc::new(MetadataRateLimiter::default()),
+    };
     build_core_router(&app_state, serve_media_prefix)
         .leptos_routes_with_context(
             &app_state,
@@ -83,7 +90,7 @@ fn build_app_router(
         )
         .fallback(leptos_axum::file_and_error_handler::<AppState, _>(shell))
         .layer(axum::middleware::from_fn_with_state(
-            state_for_mw,
+            mw_state,
             middleware::safety_and_auth_middleware,
         ))
         .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
@@ -190,6 +197,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, header},
     };
+    use middleware::MetadataRateLimitConfig;
     use site_access::{
         GATEWAY_ASSERTION_AUDIENCE, GATEWAY_ASSERTION_HEADER, GATEWAY_ASSERTION_VERSION,
         GatewayAssertion, compute_policy_digest, sign_gateway_assertion,
@@ -219,14 +227,25 @@ mod tests {
             .build()
     }
 
-    fn test_router(state: AppState, serve_prefix: Option<PathBuf>) -> Router {
-        let state_for_mw = state.clone();
+    fn test_router_with_limits(
+        state: AppState,
+        serve_prefix: Option<PathBuf>,
+        limits: MetadataRateLimitConfig,
+    ) -> Router {
+        let mw_state = MiddlewareState {
+            app: state.clone(),
+            rate_limiter: Arc::new(MetadataRateLimiter::new(limits)),
+        };
         build_core_router(&state, serve_prefix)
             .layer(axum::middleware::from_fn_with_state(
-                state_for_mw,
+                mw_state,
                 middleware::safety_and_auth_middleware,
             ))
             .with_state(state)
+    }
+
+    fn test_router(state: AppState, serve_prefix: Option<PathBuf>) -> Router {
+        test_router_with_limits(state, serve_prefix, MetadataRateLimitConfig::default())
     }
 
     async fn spawn_policy_server(policy: &PublicSitePolicy) -> String {
@@ -561,6 +580,7 @@ mod tests {
 
         // 7. `/robots.txt` uses ONLY pinned `PUBLIC_URL` and retains public caching.
         let robots = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/robots.txt")
@@ -586,6 +606,145 @@ mod tests {
         assert!(robots_body.contains("Sitemap: https://gallery.example.com/sitemap.xml"));
         assert!(!robots_body.contains("spoofed.evil"));
 
+        // 8. `POST /api/like_previews` and `GET /api/post_images` enforce Managed auth + `private, no-store`.
+        let post_previews_unauth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/like_previews")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"posts":[],"images":[],"videos":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_previews_unauth.status(), StatusCode::FORBIDDEN);
+
+        let post_previews_ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/like_previews")
+                    .header(GATEWAY_ASSERTION_HEADER, &valid_tok)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"posts":[],"images":[],"videos":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_previews_ok.status(), StatusCode::OK);
+        assert_eq!(
+            post_previews_ok.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+        let previews_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(post_previews_ok.into_body(), 4096).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            previews_json,
+            serde_json::json!({ "posts": [], "images": [], "videos": [] })
+        );
+
+        let post_images_unauth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/post_images?post_id=12")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_images_unauth.status(), StatusCode::FORBIDDEN);
+
+        let post_images_bad_query = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/post_images?post_id=not_a_number")
+                    .header(GATEWAY_ASSERTION_HEADER, &valid_tok)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_images_bad_query.status(), StatusCode::BAD_REQUEST);
+
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn metadata_rate_limiter_enforces_per_subject_and_global_429_limits() {
+        let policy = PublicSitePolicy {
+            revision: 2,
+            min_enforce_rev: 2,
+            safety_enabled: false,
+            ..PublicSitePolicy::default()
+        };
+        let policy_url = spawn_policy_server(&policy).await;
+        let assert_secret = b"rate-limit-assertion-secret-012345";
+        let cap_secret = b"rate-limit-cap-secret-0123456789";
+
+        let store = PolicyStore::managed(PolicySyncConfig {
+            policy_url,
+            cf_access_client_id: None,
+            cf_access_client_secret: None,
+            max_staleness: Duration::from_secs(60),
+        })
+        .unwrap();
+
+        let state = AppState {
+            leptos_options: test_leptos_opts(),
+            engine: test_engine(),
+            prefix: Arc::new(None),
+            public_url: Arc::new(Some("https://gallery.example.com".to_string())),
+            mode: DeploymentMode::Managed,
+            trust_proxy: false,
+            policy_store: Arc::new(store),
+            gateway_assertion_secret: Some(Arc::new(assert_secret.to_vec())),
+            media_cap_secret: Some(Arc::new(cap_secret.to_vec())),
+        };
+
+        let app = test_router_with_limits(
+            state,
+            None,
+            MetadataRateLimitConfig {
+                per_subject_limit: 2,
+                global_limit: 3,
+                window: Duration::from_secs(60),
+            },
+        );
+
+        let tok_a = signed_assertion(assert_secret, &policy, Some("user-a"), now_secs() + 20);
+        let tok_b = signed_assertion(assert_secret, &policy, Some("user-b"), now_secs() + 20);
+        let tok_c = signed_assertion(assert_secret, &policy, Some("user-c"), now_secs() + 20);
+
+        let make_req = |tok: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/like_previews")
+                .header(GATEWAY_ASSERTION_HEADER, tok)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"posts":[],"images":[],"videos":[]}"#))
+                .unwrap()
+        };
+
+        // user-a: requests 1 and 2 pass; request 3 hits per-subject 429!
+        assert_eq!(app.clone().oneshot(make_req(&tok_a)).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(app.clone().oneshot(make_req(&tok_a)).await.unwrap().status(), StatusCode::OK);
+        let r3 = app.clone().oneshot(make_req(&tok_a)).await.unwrap();
+        assert_eq!(r3.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(r3.headers().get(header::CACHE_CONTROL).unwrap(), "private, no-store");
+        assert!(r3.headers().contains_key(header::RETRY_AFTER));
+
+        // user-b: request 1 passes (global count reaches 3).
+        assert_eq!(app.clone().oneshot(make_req(&tok_b)).await.unwrap().status(), StatusCode::OK);
+
+        // user-c: hits global 429 limit immediately!
+        let rc = app.oneshot(make_req(&tok_c)).await.unwrap();
+        assert_eq!(rc.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rc.headers().get(header::CACHE_CONTROL).unwrap(), "private, no-store");
     }
 }

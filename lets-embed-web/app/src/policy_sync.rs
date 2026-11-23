@@ -183,21 +183,22 @@ fn snapshot_satisfies(
     if !snap.initialized {
         return None;
     }
+    let fresh = snap
+        .fetched_at
+        .is_some_and(|t| t.elapsed() < max_staleness);
+    if !fresh {
+        return None;
+    }
     let rev = snap.compiled.policy.revision;
     if rev < assertion.min_enforce_rev {
         return None;
     }
-    // Never downgrade if we already hold a strictly newer verified revision.
+    // Never downgrade if we already hold a strictly newer fresh verified revision.
     if rev > assertion.rev {
         return Some(snap.compiled.clone());
     }
-    // Same revision must match digest exactly and not exceed max staleness.
-    if rev == assertion.rev
-        && snap.compiled.digest == assertion.policy_digest
-        && snap
-            .fetched_at
-            .is_some_and(|t| t.elapsed() < max_staleness)
-    {
+    // Same revision must match digest exactly.
+    if rev == assertion.rev && snap.compiled.digest == assertion.policy_digest {
         return Some(snap.compiled.clone());
     }
     None
@@ -219,7 +220,7 @@ async fn fetch_policy_from_url(sync: &PolicySyncClient) -> anyhow::Result<Public
         req = req.header("CF-Access-Client-Secret", sec);
     }
 
-    let resp = req.send().await.context("policy upstream request failed")?;
+    let mut resp = req.send().await.context("policy upstream request failed")?;
     if resp.status() != reqwest::StatusCode::OK {
         bail!("policy upstream returned HTTP {}", resp.status());
     }
@@ -238,15 +239,24 @@ async fn fetch_policy_from_url(sync: &PolicySyncClient) -> anyhow::Result<Public
         bail!("policy response exceeds maximum size ({len} bytes)");
     }
 
-    let bytes = resp
-        .bytes()
+    // Stream chunks incrementally with a hard MAX_POLICY_BODY_BYTES cap so chunked
+    // responses without Content-Length can never cause unbounded memory buffering.
+    let mut bytes = Vec::with_capacity(
+        resp.content_length()
+            .map(|l| (l as usize).min(MAX_POLICY_BODY_BYTES))
+            .unwrap_or(4096),
+    );
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .context("failed reading policy response body")?;
-    if bytes.len() > MAX_POLICY_BODY_BYTES {
-        bail!(
-            "policy response exceeds maximum size ({} bytes)",
-            bytes.len()
-        );
+        .context("failed reading policy response body chunk")?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_POLICY_BODY_BYTES {
+            bail!(
+                "policy response exceeds maximum size ({MAX_POLICY_BODY_BYTES} bytes)"
+            );
+        }
+        bytes.extend_from_slice(&chunk);
     }
 
     let value: serde_json::Value =
@@ -411,5 +421,87 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn snapshot_satisfies_enforces_staleness_even_when_rev_exceeds_assertion() {
+        let p5 = PublicSitePolicy {
+            revision: 5,
+            min_enforce_rev: 4,
+            ..PublicSitePolicy::default()
+        };
+        let compiled = Arc::new(
+            CompiledPolicy::compile_with_resolver(
+                p5.clone(),
+                &Default::default(),
+                &Default::default(),
+                &Default::default(),
+            )
+            .unwrap(),
+        );
+        let mut older_assertion = make_assertion(&p5);
+        older_assertion.rev = 4;
+
+        let fresh_snap = PolicySnapshot {
+            initialized: true,
+            compiled: compiled.clone(),
+            fetched_at: Some(Instant::now()),
+        };
+        assert!(snapshot_satisfies(&fresh_snap, &older_assertion, Duration::from_secs(60)).is_some());
+
+        let stale_snap = PolicySnapshot {
+            initialized: true,
+            compiled,
+            fetched_at: Instant::now().checked_sub(Duration::from_secs(120)),
+        };
+        assert!(snapshot_satisfies(&stale_snap, &older_assertion, Duration::from_secs(60)).is_none());
+    }
+
+    #[tokio::test]
+    async fn chunked_oversized_policy_body_fails_closed_incrementally() {
+        use axum::body::Body;
+        use futures::stream;
+
+        let app = Router::new().route(
+            "/big-policy",
+            get(|| async {
+                // Stream >2 MiB without setting Content-Length (chunked transfer encoding).
+                let chunk = vec![b' '; 256 * 1024];
+                let chunks = (0..10).map(move |_| Ok::<_, std::io::Error>(chunk.clone()));
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(Body::from_stream(stream::iter(chunks)))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let store = PolicyStore::managed(PolicySyncConfig {
+            policy_url: format!("http://{addr}/big-policy"),
+            cf_access_client_id: None,
+            cf_access_client_secret: None,
+            max_staleness: Duration::from_secs(60),
+        })
+        .unwrap();
+
+        let p = PublicSitePolicy::default();
+        let assertion = make_assertion(&p);
+        let err = store
+            .resolve_for_assertion_with(&assertion, |pol| async move {
+                CompiledPolicy::compile_with_resolver(
+                    pol,
+                    &Default::default(),
+                    &Default::default(),
+                    &Default::default(),
+                )
+            })
+            .await
+            .expect_err("oversized chunked body must fail closed");
+        assert!(err.to_string().contains("exceeds maximum size"), "err: {err}");
     }
 }

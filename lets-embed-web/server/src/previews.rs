@@ -1,11 +1,14 @@
-//! Plain Axum route serving server-projected thumbnail metadata for the
-//! `user_worker` favorites page (`GET /api/like_previews?items=post:12,image:34`).
+//! Plain Axum routes serving server-projected thumbnail & album metadata for
+//! `user_worker`'s `/user/favorites` SPA:
 //!
-//! Projects EVERY image and video through `CompiledPolicy` BEFORE serialization:
-//! - Clear items emit server-projected `url` (and `name` in Standalone Mode only).
-//! - Spoiler items emit `preview_url`, `reveal_url`, `blur_mode`, `label`, `preset`.
-//! - Locked items emit ZERO `name`, ZERO `url`, ZERO `preview_url`, ZERO `reveal_url`,
-//!   while preserving `title`, `image_count`, `video_count`, and natural dimensions.
+//! - `POST /api/like_previews` — primary JSON API (`{ posts, images, videos }` ->
+//!   `{ posts: [{ post_id, title, image_count, video_count, cover }], images: [ProjectedImage], videos: [ProjectedVideo] }`)
+//! - `GET /api/like_previews?items=post:12,image:34` — backwards-compatible flat array endpoint
+//! - `GET /api/post_images?post_id=12` — full projected album details
+//!   (`{ title, authors, images: [ProjectedImage], videos: [ProjectedVideo] }`)
+//!
+//! Every image and video is projected through `CompiledPolicy` BEFORE serialization:
+//! locked items emit `"state": "locked"` with ZERO `name`, ZERO `url`, ZERO `cap`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -18,8 +21,272 @@ use axum::{
 use search_types::{BlurDeliveryMode, MaskMetadata, ProjectedImage, ProjectedVideo};
 use serde::{Deserialize, Serialize};
 
-/// Cap on how many unique items a single request may ask about.
+/// Cap on how many unique items a single request may ask about per kind.
 const MAX_ITEMS: usize = 100;
+
+fn resolve_ctx(
+    state: &AppState,
+    ctx_ext: Option<Extension<RequestSafetyContext>>,
+) -> Result<RequestSafetyContext, StatusCode> {
+    match ctx_ext {
+        Some(Extension(c)) => Ok(c),
+        None if state.mode.is_managed() => Err(StatusCode::FORBIDDEN),
+        None => Ok(RequestSafetyContext::standalone(
+            state.policy_store.current_standalone(),
+            state.trust_proxy,
+        )),
+    }
+}
+
+fn dedup_capped(ids: &[i64], cap: usize) -> Vec<i64> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for &id in ids {
+        if out.len() >= cap {
+            break;
+        }
+        if seen.insert(id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/like_previews (primary favorites SPA wire contract)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+pub struct LikePreviewsPostBody {
+    #[serde(default)]
+    pub posts: Vec<i64>,
+    #[serde(default)]
+    pub images: Vec<i64>,
+    #[serde(default)]
+    pub videos: Vec<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PostPreviewItem {
+    pub post_id: i64,
+    pub title: String,
+    pub image_count: usize,
+    pub video_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cover: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LikePreviewsPostResp {
+    pub posts: Vec<PostPreviewItem>,
+    pub images: Vec<ProjectedImage>,
+    pub videos: Vec<ProjectedVideo>,
+}
+
+pub(crate) fn video_cover_json(video: &ProjectedVideo) -> Option<serde_json::Value> {
+    let mut val = serde_json::to_value(video).ok()?;
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("kind".to_string(), serde_json::Value::String("video".into()));
+    }
+    Some(val)
+}
+
+pub(crate) fn build_post_preview_item(
+    post_id: i64,
+    title: String,
+    image_count: usize,
+    video_count: usize,
+    cover_image: Option<&ProjectedImage>,
+    cover_video: Option<&ProjectedVideo>,
+) -> PostPreviewItem {
+    let cover = if let Some(img) = cover_image {
+        serde_json::to_value(img).ok()
+    } else if let Some(vid) = cover_video {
+        video_cover_json(vid)
+    } else {
+        None
+    };
+    PostPreviewItem {
+        post_id,
+        title,
+        image_count,
+        video_count,
+        cover,
+    }
+}
+
+/// `POST /api/like_previews` with JSON body `{"posts":[...],"images":[...],"videos":[...]}`.
+pub async fn like_previews_post(
+    State(state): State<AppState>,
+    ctx_ext: Option<Extension<RequestSafetyContext>>,
+    Json(body): Json<LikePreviewsPostBody>,
+) -> Result<Json<LikePreviewsPostResp>, StatusCode> {
+    let ctx = resolve_ctx(&state, ctx_ext)?;
+
+    let post_ids = dedup_capped(&body.posts, MAX_ITEMS);
+    let image_ids = dedup_capped(&body.images, MAX_ITEMS);
+    let video_ids = dedup_capped(&body.videos, MAX_ITEMS);
+
+    if post_ids.is_empty() && image_ids.is_empty() && video_ids.is_empty() {
+        return Ok(Json(LikePreviewsPostResp {
+            posts: Vec::new(),
+            images: Vec::new(),
+            videos: Vec::new(),
+        }));
+    }
+
+    let engine = &state.engine;
+    let (raw_images, raw_videos, raw_posts) = tokio::try_join!(
+        engine.images_by_ids(&image_ids),
+        engine.videos_by_ids(&video_ids),
+        engine.post_gallery_covers_by_ids(&post_ids),
+    )
+    .map_err(|e| {
+        tracing::error!("like_previews_post query failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    // Deduplicate all images (standalone + post covers) and all videos (standalone + post covers)
+    // so safety evaluation & capability signing happen in two batched passes.
+    let mut all_images_map: HashMap<i64, search_types::Image> = HashMap::new();
+    for im in &raw_images {
+        all_images_map.insert(im.id, im.clone());
+    }
+    for p in &raw_posts {
+        if let Some(im) = &p.cover_image {
+            all_images_map.insert(im.id, im.clone());
+        }
+    }
+    let mut all_videos_map: HashMap<i64, search_types::Video> = HashMap::new();
+    for v in &raw_videos {
+        all_videos_map.insert(v.id, v.clone());
+    }
+    for p in &raw_posts {
+        if let Some(v) = &p.cover_video {
+            all_videos_map.insert(v.id, v.clone());
+        }
+    }
+
+    let all_images: Vec<search_types::Image> = all_images_map.into_values().collect();
+    let all_videos: Vec<search_types::Video> = all_videos_map.into_values().collect();
+
+    let (proj_images, proj_videos) = tokio::try_join!(
+        engine.project_images(&all_images, &ctx.policy, &ctx.caller, &ctx.signer),
+        engine.project_videos(&all_videos, &ctx.policy, &ctx.caller, &ctx.signer),
+    )
+    .map_err(|e| {
+        tracing::error!("like_previews_post projection failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let proj_img_map: HashMap<i64, ProjectedImage> =
+        proj_images.into_iter().map(|im| (im.id(), im)).collect();
+    let proj_vid_map: HashMap<i64, ProjectedVideo> =
+        proj_videos.into_iter().map(|v| (v.id(), v)).collect();
+    let post_map: HashMap<i64, _> = raw_posts.into_iter().map(|p| (p.post_id, p)).collect();
+
+    let posts = post_ids
+        .into_iter()
+        .filter_map(|pid| {
+            let p = post_map.get(&pid)?;
+            let cover_img = p
+                .cover_image
+                .as_ref()
+                .and_then(|c| proj_img_map.get(&c.id));
+            let cover_vid = p
+                .cover_video
+                .as_ref()
+                .and_then(|v| proj_vid_map.get(&v.id));
+            Some(build_post_preview_item(
+                pid,
+                p.title.clone(),
+                p.image_count,
+                p.video_count,
+                cover_img,
+                cover_vid,
+            ))
+        })
+        .collect();
+
+    let images = image_ids
+        .into_iter()
+        .filter_map(|iid| proj_img_map.get(&iid).cloned())
+        .collect();
+
+    let videos = video_ids
+        .into_iter()
+        .filter_map(|vid| proj_vid_map.get(&vid).cloned())
+        .collect();
+
+    Ok(Json(LikePreviewsPostResp {
+        posts,
+        images,
+        videos,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/post_images?post_id={id} (album lightbox contract for favorites SPA)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct PostImagesQuery {
+    pub post_id: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PostImagesResp {
+    pub title: String,
+    pub authors: Vec<String>,
+    pub images: Vec<ProjectedImage>,
+    pub videos: Vec<ProjectedVideo>,
+}
+
+/// `GET /api/post_images?post_id={id}` — returns projected album title, authors,
+/// images, and videos matching `user_worker/web/src/pages/favorites.rs`.
+pub async fn post_images(
+    State(state): State<AppState>,
+    ctx_ext: Option<Extension<RequestSafetyContext>>,
+    Query(q): Query<PostImagesQuery>,
+) -> Result<Json<PostImagesResp>, StatusCode> {
+    let ctx = resolve_ctx(&state, ctx_ext)?;
+    let engine = &state.engine;
+
+    let (title_opt, meta, raw_images, raw_videos) = tokio::try_join!(
+        engine.post_title_by_id(q.post_id),
+        engine.post_meta(q.post_id),
+        engine.list_post_images(q.post_id),
+        engine.list_post_videos(q.post_id),
+    )
+    .map_err(|e| {
+        tracing::error!(post_id = q.post_id, "post_images query failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let Some(title) = title_opt else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    let (images, videos) = tokio::try_join!(
+        engine.project_images(&raw_images, &ctx.policy, &ctx.caller, &ctx.signer),
+        engine.project_videos(&raw_videos, &ctx.policy, &ctx.caller, &ctx.signer),
+    )
+    .map_err(|e| {
+        tracing::error!(post_id = q.post_id, "post_images projection failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(PostImagesResp {
+        title,
+        authors: meta.authors.into_iter().map(|a| a.name).collect(),
+        images,
+        videos,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/like_previews?items=post:12,image:34 (legacy backwards-compat)
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 pub struct PreviewsQuery {
@@ -30,25 +297,16 @@ pub struct PreviewsQuery {
 
 #[derive(Debug, Serialize)]
 pub struct Preview {
-    /// `"post"` or `"image"` — echoes the requested kind so the client can
-    /// match previews back to the originating like.
     pub kind: &'static str,
-    /// The originally requested id (post_id for posts, image_id for images).
     pub target_id: i64,
-    /// The image id to link to (`/details/{image_id}`). Absent for video-only posts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_id: Option<i64>,
-    /// Raw image name — emitted ONLY for Clear images in Standalone Mode; ALWAYS omitted
-    /// in Managed Mode and ALWAYS omitted for Locked / Spoiler items.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Server-projected clear URL (`/images/{name}.webp` in Standalone, `/media/image/{id}?cap=...` in Managed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// Spoiler blurred preview URL (`/media/preview/{id}?cap=...` or clear preview).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview_url: Option<String>,
-    /// Spoiler reveal clear URL (`/media/image/{id}?cap=...` or standalone URL).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reveal_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -57,20 +315,16 @@ pub struct Preview {
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
-    /// True when the item is locked under the caller's safety policy (ZERO url/name/cap emitted).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub locked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mask: Option<MaskMetadata>,
     pub width: i32,
     pub height: i32,
-    /// Post title (omitted for single images).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// Total image count for a post preview (omitted for single images).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_count: Option<usize>,
-    /// Total video count for a post preview when > 0.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub video_count: Option<usize>,
 }
@@ -244,14 +498,7 @@ pub async fn like_previews(
     ctx_ext: Option<Extension<RequestSafetyContext>>,
     Query(q): Query<PreviewsQuery>,
 ) -> Result<Json<Vec<Preview>>, StatusCode> {
-    let ctx = match ctx_ext {
-        Some(Extension(c)) => c,
-        None if state.mode.is_managed() => return Err(StatusCode::FORBIDDEN),
-        None => RequestSafetyContext::standalone(
-            state.policy_store.current_standalone(),
-            state.trust_proxy,
-        ),
-    };
+    let ctx = resolve_ctx(&state, ctx_ext)?;
 
     let mut seen: HashSet<(&'static str, i64)> = HashSet::new();
     let mut order: Vec<(&'static str, i64)> = Vec::new();
@@ -297,7 +544,6 @@ pub async fn like_previews(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Deduplicate all images (standalone + post cover images) for a single batch projection.
     let mut all_images_map: HashMap<i64, search_types::Image> = HashMap::new();
     for im in &images {
         all_images_map.insert(im.id, im.clone());
@@ -372,20 +618,24 @@ pub async fn like_previews(
 mod tests {
     use super::*;
 
+    fn sample_mask() -> MaskMetadata {
+        MaskMetadata {
+            rule_id: "r18".into(),
+            label: "Adult 18+".into(),
+            preset: "r18".into(),
+            requires_login: true,
+            requires_age: true,
+            requires_terms: true,
+        }
+    }
+
     #[test]
     fn locked_preview_emits_zero_name_zero_url_zero_cap_while_preserving_counts() {
         let locked = ProjectedImage::Locked {
             id: 77,
             width: 1200,
             height: 1600,
-            mask: MaskMetadata {
-                rule_id: "r18".into(),
-                label: "Adult 18+".into(),
-                preset: "r18".into(),
-                requires_login: true,
-                requires_age: true,
-                requires_terms: true,
-            },
+            mask: sample_mask(),
         };
         let p = preview_from_projected_image(
             "post",
@@ -407,5 +657,92 @@ mod tests {
         assert!(json.contains("\"title\":\"My Album\""));
         assert!(json.contains("\"image_count\":9"));
         assert!(json.contains("\"video_count\":2"));
+    }
+
+    #[test]
+    fn post_like_previews_and_post_images_match_favorites_wire_contract_and_hide_locked_urls() {
+        let locked_img = ProjectedImage::Locked {
+            id: 501,
+            width: 1000,
+            height: 1500,
+            mask: sample_mask(),
+        };
+        let clear_img = ProjectedImage::Clear {
+            id: 502,
+            url: "/media/image/502?cap=tok1".into(),
+            name: None,
+            width: 800,
+            height: 600,
+        };
+        let locked_vid = ProjectedVideo::Locked {
+            id: 901,
+            width: 1920,
+            height: 1080,
+            duration: 30,
+            mask: sample_mask(),
+        };
+
+        let post_item = build_post_preview_item(
+            12,
+            "Locked Album".into(),
+            5,
+            1,
+            Some(&locked_img),
+            None,
+        );
+        let vid_only_post = build_post_preview_item(
+            13,
+            "Video Only".into(),
+            0,
+            1,
+            None,
+            Some(&locked_vid),
+        );
+
+        let resp = LikePreviewsPostResp {
+            posts: vec![post_item, vid_only_post],
+            images: vec![clear_img.clone(), locked_img.clone()],
+            videos: vec![locked_vid.clone()],
+        };
+        let val = serde_json::to_value(&resp).unwrap();
+
+        // Post 12 cover has tagged `"state":"locked"` and zero url/name/cap.
+        let p0 = &val["posts"][0];
+        assert_eq!(p0["post_id"], 12);
+        assert_eq!(p0["title"], "Locked Album");
+        assert_eq!(p0["image_count"], 5);
+        assert_eq!(p0["video_count"], 1);
+        assert_eq!(p0["cover"]["state"], "locked");
+        assert!(p0["cover"].get("url").is_none());
+        assert!(p0["cover"].get("name").is_none());
+
+        // Video-only Post 13 cover carries `"kind":"video"` and `"state":"locked"`.
+        let p1 = &val["posts"][1];
+        assert_eq!(p1["cover"]["kind"], "video");
+        assert_eq!(p1["cover"]["state"], "locked");
+        assert!(p1["cover"].get("url").is_none());
+
+        // Standalone images & videos use tagged `state`.
+        assert_eq!(val["images"][0]["state"], "clear");
+        assert_eq!(val["images"][0]["url"], "/media/image/502?cap=tok1");
+        assert_eq!(val["images"][1]["state"], "locked");
+        assert!(val["images"][1].get("url").is_none());
+        assert_eq!(val["videos"][0]["state"], "locked");
+        assert!(val["videos"][0].get("url").is_none());
+
+        // GET /api/post_images response matches `{title, authors, images, videos}`.
+        let album = PostImagesResp {
+            title: "Album Title".into(),
+            authors: vec!["Artist A".into()],
+            images: vec![clear_img, locked_img],
+            videos: vec![locked_vid],
+        };
+        let album_val = serde_json::to_value(&album).unwrap();
+        assert_eq!(album_val["title"], "Album Title");
+        assert_eq!(album_val["authors"][0], "Artist A");
+        assert_eq!(album_val["images"][1]["state"], "locked");
+        assert!(album_val["images"][1].get("url").is_none());
+        assert_eq!(album_val["videos"][0]["state"], "locked");
+        assert!(album_val["videos"][0].get("url").is_none());
     }
 }

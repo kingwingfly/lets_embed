@@ -65,11 +65,11 @@ impl Default for UrlSearchState {
 }
 
 #[cfg(feature = "hydrate")]
-async fn persist_safe_mode(enabled: bool) {
-    use web_sys::{Headers, RequestInit};
+async fn persist_safe_mode(enabled: bool) -> bool {
+    use web_sys::{Headers, RequestInit, Response};
 
     let Some(win) = web_sys::window() else {
-        return;
+        return false;
     };
     let opts = RequestInit::new();
     opts.set_method("POST");
@@ -78,13 +78,45 @@ async fn persist_safe_mode(enabled: bool) {
         let _ = headers.set(site_access::USER_CSRF_HEADER, "1");
         opts.set_headers(&headers);
     }
+    // Omit `enabled_switchers` so `user_worker` preserves the user's saved switchers
+    // while toggling only `safe_mode`.
     let body = serde_json::json!({ "safe_mode": enabled }).to_string();
     opts.set_body(&JsValue::from_str(&body));
-    let _ = JsFuture::from(win.fetch_with_str_and_init("/user/api/preferences", &opts)).await;
+    match JsFuture::from(win.fetch_with_str_and_init("/user/api/preferences", &opts)).await {
+        Ok(val) => val
+            .dyn_into::<Response>()
+            .map(|r| r.ok())
+            .unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
 #[cfg(not(feature = "hydrate"))]
-async fn persist_safe_mode(_enabled: bool) {}
+async fn persist_safe_mode(_enabled: bool) -> bool {
+    false
+}
+
+#[cfg(feature = "hydrate")]
+fn broadcast_safe_mode_synced(enabled: bool) {
+    if let Ok(ch) = web_sys::BroadcastChannel::new(lets_embed_ui::browser::SAFETY_CHANNEL_NAME) {
+        let payload = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &payload,
+            &JsValue::from_str("type"),
+            &JsValue::from_str("safe_mode_synced"),
+        );
+        let _ = js_sys::Reflect::set(
+            &payload,
+            &JsValue::from_str("enabled"),
+            &JsValue::from_bool(enabled),
+        );
+        let _ = ch.post_message(&payload);
+        ch.close();
+    }
+}
+
+#[cfg(not(feature = "hydrate"))]
+fn broadcast_safe_mode_synced(_enabled: bool) {}
 
 /// Summary descriptor rendered in the Active Advanced Query Summary Strip.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -601,14 +633,121 @@ pub fn SearchBar() -> impl IntoView {
 
     let density = use_context::<GalleryDensityState>().unwrap_or_default().0;
     let safety = expect_context::<SafetyUiState>();
+    // Monotonic generation counter to serialize rapid local Safe Mode toggles and
+    // ignore superseded `/user/api/preferences` responses.
+    let safe_persist_gen: StoredValue<u64> = StoredValue::new(0);
+    #[cfg(feature = "hydrate")]
+    let remote_reload_gen: StoredValue<u64> = StoredValue::new(0);
+
+    // Subscribe to cross-tab Safe Mode broadcasts directly so remote tabs immediately
+    // wipe media and refresh without firing redundant `POST /user/api/preferences` calls.
+    #[cfg(feature = "hydrate")]
+    {
+        use wasm_bindgen::closure::Closure;
+        struct LocalChannelCleanup(Option<Box<dyn FnOnce()>>);
+        impl Drop for LocalChannelCleanup {
+            fn drop(&mut self) {
+                if let Some(f) = self.0.take() {
+                    f();
+                }
+            }
+        }
+
+        if let Ok(ch) = web_sys::BroadcastChannel::new(lets_embed_ui::browser::SAFETY_CHANNEL_NAME)
+        {
+            let cb =
+                Closure::<dyn Fn(web_sys::MessageEvent)>::new(move |ev: web_sys::MessageEvent| {
+                    let data = ev.data();
+                    let (msg_type, enabled) = if let Some(b) = data.as_bool() {
+                        (Some("safe_mode".to_string()), Some(b))
+                    } else if data.is_object() {
+                        let t = js_sys::Reflect::get(&data, &JsValue::from_str("type"))
+                            .ok()
+                            .and_then(|v| v.as_string());
+                        let b = js_sys::Reflect::get(&data, &JsValue::from_str("enabled"))
+                            .ok()
+                            .and_then(|v| v.as_bool());
+                        (t, b)
+                    } else {
+                        (None, None)
+                    };
+                    let Some(enabled) = enabled else {
+                        return;
+                    };
+                    match msg_type.as_deref() {
+                        Some("safe_mode") => {
+                            let _ = safety.safe_mode.try_set(enabled);
+                            if enabled {
+                                let _ = safety
+                                    .panic_epoch
+                                    .try_update(|e| *e = e.wrapping_add(1));
+                                lets_embed_ui::browser::wipe_media_elements_in(None);
+                            }
+                            if safety.is_managed.try_get_untracked().unwrap_or(false) {
+                                // Wait briefly for the originating tab's `safe_mode_synced` signal
+                                // after its POST completes; fall back to reload if the broadcast
+                                // came from another SPA (e.g. `/user/favorites`).
+                                let rgen = remote_reload_gen
+                                    .try_get_value()
+                                    .unwrap_or(0)
+                                    .wrapping_add(1);
+                                let _ = remote_reload_gen.try_set_value(rgen);
+                                set_timeout(
+                                    move || {
+                                        if remote_reload_gen.try_get_value() == Some(rgen) {
+                                            let _ = safety
+                                                .reload_epoch
+                                                .try_update(|e| *e = e.wrapping_add(1));
+                                        }
+                                    },
+                                    std::time::Duration::from_millis(250),
+                                );
+                            } else {
+                                let _ = safety
+                                    .reload_epoch
+                                    .try_update(|e| *e = e.wrapping_add(1));
+                            }
+                        }
+                        Some("safe_mode_synced") => {
+                            let rgen = remote_reload_gen
+                                .try_get_value()
+                                .unwrap_or(0)
+                                .wrapping_add(1);
+                            let _ = remote_reload_gen.try_set_value(rgen);
+                            let _ = safety.safe_mode.try_set(enabled);
+                            let _ = safety
+                                .reload_epoch
+                                .try_update(|e| *e = e.wrapping_add(1));
+                        }
+                        _ => {}
+                    }
+                });
+            ch.set_onmessage(Some(cb.as_ref().unchecked_ref()));
+            let _ = StoredValue::new_local(LocalChannelCleanup(Some(Box::new(move || {
+                ch.set_onmessage(None);
+                ch.close();
+                drop(cb);
+            }))));
+        }
+    }
+
     let on_safe_mode_toggle = Callback::new(move |next: bool| {
         if next {
             lets_embed_ui::browser::wipe_media_elements_in(None);
         }
+        // Immediately notify sibling tabs so they wipe media and update UI synchronously.
+        lets_embed_ui::browser::broadcast_safe_mode(next);
+        let persist_gen = safe_persist_gen.get_value().wrapping_add(1);
+        safe_persist_gen.set_value(persist_gen);
+
         if safety.is_managed.get_untracked() {
             spawn_local(async move {
-                persist_safe_mode(next).await;
+                let _ok = persist_safe_mode(next).await;
+                if safe_persist_gen.try_get_value() != Some(persist_gen) {
+                    return;
+                }
                 let _ = safety.reload_epoch.try_update(|e| *e = e.wrapping_add(1));
+                broadcast_safe_mode_synced(next);
             });
         } else {
             safety.reload_epoch.update(|e| *e = e.wrapping_add(1));
@@ -951,6 +1090,7 @@ pub fn SearchBar() -> impl IntoView {
                         <SafeModeToggle
                             safe_mode=safety.safe_mode
                             panic_epoch=safety.panic_epoch
+                            sync_tabs=false
                             compact=true
                             on_toggle=on_safe_mode_toggle
                         />

@@ -5,8 +5,8 @@ pub mod safety;
 
 pub use advanced::{AdvancedSearchRequest, AdvancedSearchResult};
 pub use safety::{
-    CallerContext, CompiledPolicy, ImageFacts, MediaOutcome, MediaSigner, SafetyFilter,
-    SeedLockedError,
+    CallerContext, CompiledPolicy, ImageFacts, MediaOutcome, MediaSigner, ParentPostFacts,
+    SafetyFilter, SeedLockedError,
 };
 
 use std::{
@@ -245,6 +245,8 @@ impl Engine {
         idle_timeout: Option<Duration>,
     ) -> anyhow::Result<Self> {
         dotenvy::dotenv().ok();
+        let database_url = dotenvy::var("DATABASE_URL")
+            .map_err(|e| anyhow::anyhow!("DATABASE_URL environment variable must be set: {e}"))?;
         let pool = PgPoolOptions::new()
             .after_connect(|conn, _meta| {
                 Box::pin(async move {
@@ -256,7 +258,7 @@ impl Engine {
                     Ok(())
                 })
             })
-            .connect(&dotenvy::var("DATABASE_URL").unwrap())
+            .connect(&database_url)
             .await?;
 
         if clip_text_model_path.is_some() ^ tokenizer_config_path.is_some() {
@@ -1121,6 +1123,52 @@ impl Engine {
             })
             .try_collect()
             .map_err(Into::into)
+    }
+
+    /// Batch-fetch video metadata fields for a slice of video IDs in one query.
+    pub async fn videos_by_ids(&self, ids: &[i64]) -> anyhow::Result<Vec<Video>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT id, name::TEXT AS name, width, height, duration
+            FROM videos
+            WHERE id = ANY($1::BIGINT[])
+            "#,
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| -> sqlx::Result<Video> {
+                Ok(Video {
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    width: r.try_get("width")?,
+                    height: r.try_get("height")?,
+                    duration: r.try_get("duration")?,
+                })
+            })
+            .try_collect()
+            .map_err(Into::into)
+    }
+
+    /// Fetch the title of a single post by ID (`None` if the post does not exist).
+    pub async fn post_title_by_id(&self, post_id: i64) -> anyhow::Result<Option<String>> {
+        let row = sqlx::query(
+            r#"
+            SELECT title::TEXT AS title
+            FROM posts
+            WHERE id = $1
+            LIMIT 1
+            "#,
+        )
+        .bind(post_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| r.try_get("title")).transpose().map_err(Into::into)
     }
 
     /// Batch-fetch post titles, deterministic cover images (`MIN(image_id)`), and

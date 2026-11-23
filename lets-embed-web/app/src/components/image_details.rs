@@ -1521,7 +1521,7 @@ async fn fetch_image_details(id: Option<String>) -> Result<ProjectedImageDetails
 
     use axum::extract::State;
     use leptos_axum::extract_with_state;
-    use search_engine::{Engine, MediaOutcome};
+    use search_engine::Engine;
 
     let id = id
         .and_then(|id| id.parse().ok())
@@ -1540,12 +1540,10 @@ async fn fetch_image_details(id: Option<String>) -> Result<ProjectedImageDetails
         .evaluate_images(&[id], &ctx.policy, &ctx.caller)
         .await
         .map_err(to_err)?;
-    let outcome = outcomes
-        .get(&id)
-        .cloned()
-        .unwrap_or(MediaOutcome::Clear {
-            req_switchers: Vec::new(),
-        });
+    let outcome = outcomes.get(&id).cloned().unwrap_or_else(|| {
+        ctx.policy
+            .evaluate_image(&search_engine::ImageFacts::default(), &ctx.caller)
+    });
     let projected = ctx
         .policy
         .project_image(&details.image, outcome.clone(), &ctx.caller, &ctx.signer);

@@ -509,7 +509,9 @@ impl CompiledPolicy {
         }
 
         let has_any_completed = parent_images.iter().any(|img| img.is_completed);
-        let has_unclassified = parent_images.is_empty() || !has_any_completed || parent_images.iter().any(|img| !img.is_completed);
+        let has_unclassified = parent_images.is_empty()
+            || !has_any_completed
+            || parent_images.iter().any(|img| !img.is_completed);
 
         if has_unclassified
             && self.policy.unclassified_mode == UnclassifiedMode::LockFailClosed
@@ -523,7 +525,9 @@ impl CompiledPolicy {
         let mut all_req_switchers: BTreeSet<String> = BTreeSet::new();
         let mut locked_masks: Vec<MaskMetadata> = Vec::new();
 
-        // Evaluate post-level facts (covers video-only posts with UnclassifiedMode::Allow too).
+        // Always evaluate post-level tags and authors — both for video-only posts
+        // (under UnclassifiedMode::Allow) AND merged onto every parent image so rules
+        // referencing `post_tag:` or `author:` (alone or combined with `tag:`) always apply.
         if parent_images.is_empty() {
             let synthetic = ImageFacts {
                 is_completed: false,
@@ -533,7 +537,8 @@ impl CompiledPolicy {
             };
             match self.evaluate_image(&synthetic, caller) {
                 MediaOutcome::Locked { mask } => locked_masks.push(mask),
-                MediaOutcome::Clear { req_switchers } | MediaOutcome::Spoiler { req_switchers, .. } => {
+                MediaOutcome::Clear { req_switchers }
+                | MediaOutcome::Spoiler { req_switchers, .. } => {
                     for sw in req_switchers {
                         all_req_switchers.insert(sw);
                     }
@@ -541,13 +546,70 @@ impl CompiledPolicy {
             }
         } else {
             for img in parent_images {
-                match self.evaluate_image(img, caller) {
+                let mut merged = img.clone();
+                merged.post_tag_ids.extend(post_tag_ids.iter().copied());
+                merged.author_ids.extend(author_ids.iter().copied());
+                match self.evaluate_image(&merged, caller) {
                     MediaOutcome::Locked { mask } => locked_masks.push(mask),
                     MediaOutcome::Clear { req_switchers }
                     | MediaOutcome::Spoiler { req_switchers, .. } => {
                         for sw in req_switchers {
                             all_req_switchers.insert(sw);
                         }
+                    }
+                }
+            }
+        }
+
+        if let Some(merged) = merge_masks(&locked_masks) {
+            return MediaOutcome::Locked { mask: merged };
+        }
+
+        MediaOutcome::Clear {
+            req_switchers: all_req_switchers.into_iter().collect(),
+        }
+    }
+
+    /// Evaluate a video that may belong to zero, one, or multiple parent posts by
+    /// evaluating EVERY parent post independently and taking the strictest outcome
+    /// across all parent posts.
+    ///
+    /// A video belonging to a safe-image post AND a video-only (or restricted post-tag /
+    /// restricted author) post fails closed (`Locked`) whenever any parent post locks.
+    pub fn evaluate_video_posts(
+        &self,
+        posts: &[ParentPostFacts],
+        caller: &CallerContext,
+    ) -> MediaOutcome {
+        if !self.is_enabled() {
+            return MediaOutcome::Clear {
+                req_switchers: Vec::new(),
+            };
+        }
+
+        if posts.is_empty() {
+            if self.policy.unclassified_mode == UnclassifiedMode::LockFailClosed
+                && self.has_active_switcher_rules()
+            {
+                return MediaOutcome::Locked {
+                    mask: unclassified_mask(),
+                };
+            }
+            return MediaOutcome::Clear {
+                req_switchers: Vec::new(),
+            };
+        }
+
+        let mut all_req_switchers: BTreeSet<String> = BTreeSet::new();
+        let mut locked_masks: Vec<MaskMetadata> = Vec::new();
+
+        for post in posts {
+            match self.evaluate_video(&post.images, &post.post_tag_ids, &post.author_ids, caller) {
+                MediaOutcome::Locked { mask } => locked_masks.push(mask),
+                MediaOutcome::Clear { req_switchers }
+                | MediaOutcome::Spoiler { req_switchers, .. } => {
+                    for sw in req_switchers {
+                        all_req_switchers.insert(sw);
                     }
                 }
             }
@@ -828,6 +890,15 @@ impl<'a> SafetyFilter<'a> {
 pub struct ImageFacts {
     pub is_completed: bool,
     pub wd_tag_scores: HashMap<i64, f32>,
+    pub post_tag_ids: HashSet<i64>,
+    pub author_ids: HashSet<i64>,
+}
+
+/// Parent post metadata facts used to evaluate a video's inherited safety outcome
+/// independently per parent post.
+#[derive(Debug, Clone, Default)]
+pub struct ParentPostFacts {
+    pub images: Vec<ImageFacts>,
     pub post_tag_ids: HashSet<i64>,
     pub author_ids: HashSet<i64>,
 }
@@ -1315,28 +1386,25 @@ pub async fn evaluate_videos_batch(
     let img_facts_map = load_image_facts(pool, &img_ids_vec, policy).await?;
 
     for &vid in video_ids {
-        let mut parent_facts = Vec::new();
-        let mut union_post_tags = HashSet::new();
-        let mut union_authors = HashSet::new();
+        let mut parent_posts = Vec::new();
         if let Some(pids) = video_posts.get(&vid) {
             for pid in pids {
-                if let Some(tags) = post_tags.get(pid) {
-                    union_post_tags.extend(tags.iter().copied());
-                }
-                if let Some(aus) = post_authors.get(pid) {
-                    union_authors.extend(aus.iter().copied());
-                }
+                let mut images = Vec::new();
                 if let Some(iids) = post_image_ids.get(pid) {
                     for iid in iids {
                         if let Some(f) = img_facts_map.get(iid) {
-                            parent_facts.push(f.clone());
+                            images.push(f.clone());
                         }
                     }
                 }
+                parent_posts.push(ParentPostFacts {
+                    images,
+                    post_tag_ids: post_tags.get(pid).cloned().unwrap_or_default(),
+                    author_ids: post_authors.get(pid).cloned().unwrap_or_default(),
+                });
             }
         }
-        let outcome =
-            policy.evaluate_video(&parent_facts, &union_post_tags, &union_authors, caller);
+        let outcome = policy.evaluate_video_posts(&parent_posts, caller);
         out.insert(vid, outcome);
     }
 
@@ -1686,5 +1754,116 @@ mod tests {
         assert!(sql.contains("AND NOT (EXISTS (SELECT 1 FROM wd_tag_images wti WHERE wti.image_id = i.id AND wti.wd_tag_id = $1 AND wti.score >= $2)"));
         // Spoiler rule (`lingerie`, id=4) is NOT excluded from search; only Switcher rules (1, 2, 3) are.
         assert_eq!(sql.matches("wti.wd_tag_id =").count(), 3);
+    }
+
+    #[test]
+    fn video_multi_post_inheritance_evaluates_each_post_and_post_tags_independently() {
+        let policy = PublicSitePolicy {
+            revision: 9,
+            min_enforce_rev: 9,
+            safety_enabled: true,
+            unclassified_mode: UnclassifiedMode::LockFailClosed,
+            rules: vec![
+                SafetyRuleConfig {
+                    id: "post_nsfw".into(),
+                    name: "Post Tag NSFW".into(),
+                    mode: RuleMode::Switcher,
+                    query: "post_tag:nsfw_post".into(),
+                    default_min_score: 0.5,
+                    preset: PlaceholderPreset::R18,
+                    requires_login: true,
+                    requires_age_18: true,
+                    enabled: true,
+                },
+                SafetyRuleConfig {
+                    id: "restricted_author".into(),
+                    name: "Restricted Author".into(),
+                    mode: RuleMode::Switcher,
+                    query: "author:secret_artist".into(),
+                    default_min_score: 0.5,
+                    preset: PlaceholderPreset::Custom,
+                    requires_login: true,
+                    requires_age_18: false,
+                    enabled: true,
+                },
+            ],
+            ..PublicSitePolicy::default()
+        };
+
+        let mut pt_map = HashMap::new();
+        pt_map.insert("nsfw_post".to_string(), 101);
+        let mut au_map = HashMap::new();
+        au_map.insert("secret_artist".to_string(), 202);
+        let compiled = CompiledPolicy::compile_with_resolver(
+            policy,
+            &HashMap::new(),
+            &pt_map,
+            &au_map,
+        )
+        .expect("compile post_tag & author rules");
+
+        let anon = CallerContext::anonymous();
+        let safe_img = ImageFacts {
+            is_completed: true,
+            ..Default::default()
+        };
+
+        // 1. Single post with safe image + restricted post_tag -> Locked (post_tag NOT ignored!).
+        let tagged_post = ParentPostFacts {
+            images: vec![safe_img.clone()],
+            post_tag_ids: HashSet::from([101]),
+            author_ids: HashSet::new(),
+        };
+        assert!(matches!(
+            compiled.evaluate_video_posts(std::slice::from_ref(&tagged_post), &anon),
+            MediaOutcome::Locked { ref mask } if mask.rule_id == "post_nsfw"
+        ));
+
+        // 2. Single post with safe image + restricted author -> Locked (author NOT ignored!).
+        let author_post = ParentPostFacts {
+            images: vec![safe_img.clone()],
+            post_tag_ids: HashSet::new(),
+            author_ids: HashSet::from([202]),
+        };
+        assert!(matches!(
+            compiled.evaluate_video_posts(std::slice::from_ref(&author_post), &anon),
+            MediaOutcome::Locked { ref mask } if mask.rule_id == "restricted_author"
+        ));
+
+        // 3. Multi-post video: Post A (safe completed image) + Post B (video-only with 0 images) -> Locked!
+        let safe_post = ParentPostFacts {
+            images: vec![safe_img.clone()],
+            post_tag_ids: HashSet::new(),
+            author_ids: HashSet::new(),
+        };
+        let video_only_post = ParentPostFacts {
+            images: vec![],
+            post_tag_ids: HashSet::new(),
+            author_ids: HashSet::new(),
+        };
+        assert!(matches!(
+            compiled.evaluate_video_posts(&[safe_post.clone(), video_only_post], &anon),
+            MediaOutcome::Locked { ref mask } if mask.rule_id == "unclassified"
+        ));
+
+        // 4. Multi-post video: Post A (safe) + Post B (safe image + restricted post_tag) -> Locked for anon,
+        //    Clear with req_switchers = ["post_nsfw"] for authorized caller.
+        assert!(matches!(
+            compiled.evaluate_video_posts(&[safe_post.clone(), tagged_post.clone()], &anon),
+            MediaOutcome::Locked { ref mask } if mask.rule_id == "post_nsfw"
+        ));
+        let unlocked_caller = CallerContext {
+            sub: Some("u1".into()),
+            sid: Some("s1".into()),
+            switchers: HashSet::from(["post_nsfw".to_string()]),
+            safe_mode: false,
+            is_admin_view: false,
+        };
+        assert_eq!(
+            compiled.evaluate_video_posts(&[safe_post, tagged_post], &unlocked_caller),
+            MediaOutcome::Clear {
+                req_switchers: vec!["post_nsfw".to_string()],
+            }
+        );
     }
 }
