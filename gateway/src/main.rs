@@ -67,21 +67,34 @@ impl ProxyHttp for Ingress {
     where
         Self::CTX: Send + Sync,
     {
-        let existing_cache_controls: Vec<&str> = upstream_response
+        let existing_cache_controls: Vec<std::result::Result<&str, ()>> = upstream_response
             .headers
             .get_all(http::header::CACHE_CONTROL)
             .iter()
-            .filter_map(|v| v.to_str().ok())
+            .map(|v| v.to_str().map_err(|_| ()))
             .collect();
+
+        let has_set_cookie = upstream_response
+            .headers
+            .contains_key(http::header::SET_COOKIE);
 
         let content_type = upstream_response
             .headers
             .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok());
 
+        let method = &session.req_header().method;
+        let status = upstream_response.status;
         let path = session.req_header().uri.path();
 
-        if let Some(value) = decide_cache_control(path, content_type, &existing_cache_controls) {
+        if let Some(value) = decide_cache_control_for_response(
+            method,
+            status,
+            path,
+            content_type,
+            has_set_cookie,
+            &existing_cache_controls,
+        ) {
             upstream_response.insert_header(http::header::CACHE_CONTROL, value)?;
         }
 
@@ -89,19 +102,15 @@ impl ProxyHttp for Ingress {
     }
 }
 
-/// Returns `true` if any existing `Cache-Control` directive marks the response
-/// as `private`, `no-store`, or `no-cache`.
-fn has_protective_cache_control(existing: &[&str]) -> bool {
-    existing.iter().any(|header| {
-        header.split(',').any(|raw| {
-            let directive = raw
-                .split('=')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase();
-            matches!(directive.as_str(), "private" | "no-store" | "no-cache")
-        })
+/// Returns `true` if any existing `Cache-Control` header is non-UTF-8 (fail closed)
+/// or carries any non-empty directive (preserving `private`, `no-store`, `no-cache`,
+/// and any explicit upstream `max-age` untouched).
+fn should_preserve_existing_cache_control(
+    existing: &[std::result::Result<&str, ()>],
+) -> bool {
+    existing.iter().any(|header| match header {
+        Err(()) => true,
+        Ok(val) => !val.trim().is_empty(),
     })
 }
 
@@ -121,36 +130,67 @@ fn is_sensitive_path(path: &str) -> bool {
 }
 
 fn is_pkg_asset_path(path: &str) -> bool {
-    path.starts_with("/pkg/")
-        && !path.contains('\\')
-        && !path.split('/').any(|seg| seg == "." || seg == "..")
+    let Some(rest) = path.strip_prefix("/pkg/") else {
+        return false;
+    };
+    if rest.is_empty()
+        || path
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '%' | '\\' | '?' | '#'))
+    {
+        return false;
+    }
+    !rest
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
 }
 
-/// Decides whether Pingora should inject a `Cache-Control` header, or return
-/// `None` to leave the upstream response's caching semantics untouched.
+fn is_allowlisted_pkg_asset_mime(normalized_ct: &str, hashed: bool) -> bool {
+    match normalized_ct {
+        "application/javascript" | "text/javascript" | "text/css" | "application/wasm" => true,
+        t if t.starts_with("font/") => true,
+        t if hashed && t.starts_with("image/") => true,
+        _ => false,
+    }
+}
+
+/// Full response-level cache decision helper.
 ///
 /// Security invariants (H2):
-/// 1. Any upstream `Cache-Control` carrying `private`, `no-store`, or `no-cache`
-///    is ALWAYS preserved untouched.
-/// 2. `text/html`, `/api/*`, `/media/*`, `/user/*`, `/admin*`, `/images/*`, and
-///    `/videos/*` NEVER receive `public` or `s-maxage`.
-/// 3. `public, max-age=31536000, immutable` is applied ONLY to content-hashed
-///    non-HTML assets under `/pkg/*` (never blindly to all `image/*`).
-fn decide_cache_control(
+/// 1. Only `GET` / `HEAD` requests returning `200 OK` with zero `Set-Cookie` headers
+///    are eligible for proxy-injected `Cache-Control`.
+/// 2. Any non-UTF-8 or non-empty upstream `Cache-Control` (`private`, `no-store`,
+///    `no-cache`, or explicit `max-age`) is ALWAYS preserved untouched.
+/// 3. `text/html`, `application/xhtml+xml`, `/api/*`, `/media/*`, `/user/*`,
+///    `/admin*`, `/images/*`, and `/videos/*` NEVER receive `public` or `s-maxage`.
+/// 4. `public, max-age=31536000, immutable` is applied ONLY to content-hashed
+///    allowlisted static assets (`js`/`css`/`wasm`/`font/*`/`image/*`) strictly
+///    under `/pkg/*` (rejecting `%`, control chars, `//`, `.`, `..`).
+fn decide_cache_control_for_response(
+    method: &http::Method,
+    status: http::StatusCode,
     path: &str,
     content_type: Option<&str>,
-    existing_cache_controls: &[&str],
+    has_set_cookie: bool,
+    existing_cache_controls: &[std::result::Result<&str, ()>],
 ) -> Option<&'static str> {
-    if has_protective_cache_control(existing_cache_controls) {
+    if !matches!(*method, http::Method::GET | http::Method::HEAD) {
         return None;
     }
-
+    if status != http::StatusCode::OK || has_set_cookie {
+        return None;
+    }
+    if should_preserve_existing_cache_control(existing_cache_controls) {
+        return None;
+    }
     if is_sensitive_path(path) {
         return None;
     }
 
     let normalized_ct = content_type?.split(';').next()?.trim().to_ascii_lowercase();
-    if normalized_ct.is_empty() || normalized_ct == "text/html" {
+    if normalized_ct.is_empty()
+        || matches!(normalized_ct.as_str(), "text/html" | "application/xhtml+xml")
+    {
         return None;
     }
 
@@ -158,20 +198,15 @@ fn decide_cache_control(
         return None;
     }
 
-    if is_content_hashed(path) {
-        return Some(IMMUTABLE_PUBLIC_CACHE);
+    let hashed = is_content_hashed(path);
+    if !is_allowlisted_pkg_asset_mime(&normalized_ct, hashed) {
+        return None;
     }
 
-    if existing_cache_controls.is_empty() {
-        match normalized_ct.as_str() {
-            "application/javascript" | "text/javascript" | "text/css" | "application/wasm" => {
-                Some(REVALIDATED_PKG_CACHE)
-            }
-            t if t.starts_with("font/") => Some(REVALIDATED_PKG_CACHE),
-            _ => None,
-        }
+    if hashed {
+        Some(IMMUTABLE_PUBLIC_CACHE)
     } else {
-        None
+        Some(REVALIDATED_PKG_CACHE)
     }
 }
 
@@ -230,16 +265,31 @@ fn main() -> ExitCode {
 mod tests {
     use super::*;
 
+    fn decide_ok_get(
+        path: &str,
+        content_type: Option<&str>,
+        existing_cache_controls: &[&str],
+    ) -> Option<&'static str> {
+        let existing: Vec<std::result::Result<&str, ()>> =
+            existing_cache_controls.iter().copied().map(Ok).collect();
+        decide_cache_control_for_response(
+            &http::Method::GET,
+            http::StatusCode::OK,
+            path,
+            content_type,
+            false,
+            &existing,
+        )
+    }
+
     #[test]
-    fn preserves_private_no_store_and_no_cache_responses_untouched() {
-        // Private/no-store HTML is never overwritten
+    fn preserves_existing_and_non_utf8_cache_control_untouched() {
         assert_eq!(
-            decide_cache_control("/", Some("text/html; charset=utf-8"), &["private, no-store"]),
+            decide_ok_get("/", Some("text/html; charset=utf-8"), &["private, no-store"]),
             None
         );
-        // Even a hashed /pkg/* path with protective upstream headers is never overwritten
         assert_eq!(
-            decide_cache_control(
+            decide_ok_get(
                 "/pkg/app.deadbeef01.js",
                 Some("application/javascript"),
                 &["private, no-store"]
@@ -247,7 +297,7 @@ mod tests {
             None
         );
         assert_eq!(
-            decide_cache_control(
+            decide_ok_get(
                 "/pkg/app.deadbeef01.js",
                 Some("application/javascript"),
                 &["no-cache, must-revalidate"]
@@ -255,58 +305,176 @@ mod tests {
             None
         );
         assert_eq!(
-            decide_cache_control(
+            decide_ok_get(
                 "/pkg/app.deadbeef01.js",
                 Some("application/javascript"),
-                &["max-age=60", "Private=\"Set-Cookie\""]
+                &["max-age=60"]
+            ),
+            None
+        );
+        // Non-UTF-8 Cache-Control fails closed
+        assert_eq!(
+            decide_cache_control_for_response(
+                &http::Method::GET,
+                http::StatusCode::OK,
+                "/pkg/app.deadbeef01.js",
+                Some("application/javascript"),
+                false,
+                &[Err(())],
             ),
             None
         );
     }
 
     #[test]
-    fn never_injects_public_or_s_maxage_on_html_api_media_or_non_hashed_images() {
-        // Unlabelled HTML
-        assert_eq!(decide_cache_control("/", Some("text/html"), &[]), None);
+    fn gates_on_method_status_and_set_cookie() {
+        // Non-200 error responses under /pkg/* must never be cached as immutable
+        for status in [
+            http::StatusCode::FORBIDDEN,
+            http::StatusCode::NOT_FOUND,
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert_eq!(
+                decide_cache_control_for_response(
+                    &http::Method::GET,
+                    status,
+                    "/pkg/app.deadbeef01.js",
+                    Some("application/javascript"),
+                    false,
+                    &[],
+                ),
+                None
+            );
+        }
+
+        // POST / PUT must never get public cache headers
         assert_eq!(
-            decide_cache_control("/details/42", Some("text/html; charset=utf-8"), &[]),
+            decide_cache_control_for_response(
+                &http::Method::POST,
+                http::StatusCode::OK,
+                "/pkg/app.deadbeef01.js",
+                Some("application/javascript"),
+                false,
+                &[],
+            ),
             None
         );
-        // Hashed-looking HTML even under /pkg/
+
+        // Set-Cookie must never be publicly cached
         assert_eq!(
-            decide_cache_control("/pkg/index.deadbeef01.html", Some("text/html"), &[]),
+            decide_cache_control_for_response(
+                &http::Method::GET,
+                http::StatusCode::OK,
+                "/pkg/app.deadbeef01.js",
+                Some("application/javascript"),
+                true,
+                &[],
+            ),
+            None
+        );
+
+        // HEAD 200 without Set-Cookie IS eligible for hashed /pkg/* static asset
+        assert_eq!(
+            decide_cache_control_for_response(
+                &http::Method::HEAD,
+                http::StatusCode::OK,
+                "/pkg/app.deadbeef01.js",
+                Some("application/javascript"),
+                false,
+                &[],
+            ),
+            Some(IMMUTABLE_PUBLIC_CACHE)
+        );
+    }
+
+    #[test]
+    fn never_injects_public_or_s_maxage_on_html_xhtml_api_media_non_allowlisted_or_traversals() {
+        // HTML and XHTML
+        assert_eq!(decide_ok_get("/", Some("text/html"), &[]), None);
+        assert_eq!(
+            decide_ok_get("/details/42", Some("text/html; charset=utf-8"), &[]),
+            None
+        );
+        assert_eq!(
+            decide_ok_get("/pkg/index.deadbeef01.html", Some("text/html"), &[]),
+            None
+        );
+        assert_eq!(
+            decide_ok_get(
+                "/pkg/index.deadbeef01.xhtml",
+                Some("application/xhtml+xml"),
+                &[]
+            ),
+            None
+        );
+
+        // Arbitrary MIME types on hashed /pkg/* paths are NOT allowlisted
+        assert_eq!(
+            decide_ok_get(
+                "/pkg/data.deadbeef01.json",
+                Some("application/json"),
+                &[]
+            ),
+            None
+        );
+        assert_eq!(
+            decide_ok_get("/pkg/info.deadbeef01.txt", Some("text/plain"), &[]),
             None
         );
 
         // API & media paths
         assert_eq!(
-            decide_cache_control("/api/fetch_posts", Some("application/json"), &[]),
+            decide_ok_get("/api/fetch_posts", Some("application/json"), &[]),
             None
         );
         assert_eq!(
-            decide_cache_control("/media/image/42", Some("image/webp"), &[]),
+            decide_ok_get("/media/image/42", Some("image/webp"), &[]),
             None
         );
         assert_eq!(
-            decide_cache_control("/media/preview/42", Some("image/webp"), &[]),
+            decide_ok_get("/media/preview/42", Some("image/webp"), &[]),
             None
         );
 
-        // Non-hashed images & images outside /pkg/ (even if filename looks hashed)
+        // Non-hashed images & images outside /pkg/
         assert_eq!(
-            decide_cache_control("/images/album/pic.webp", Some("image/webp"), &[]),
+            decide_ok_get("/images/album/pic.webp", Some("image/webp"), &[]),
             None
         );
         assert_eq!(
-            decide_cache_control("/images/pic.12345678.webp", Some("image/webp"), &[]),
+            decide_ok_get("/images/pic.12345678.webp", Some("image/webp"), &[]),
+            None
+        );
+        assert_eq!(decide_ok_get("/avatar.png", Some("image/png"), &[]), None);
+        assert_eq!(decide_ok_get("/pkg/logo.png", Some("image/png"), &[]), None);
+
+        // Percent-encoding, traversal, empty segment, and control-char tricks under /pkg/
+        assert_eq!(
+            decide_ok_get(
+                "/pkg/%2e%2e/images/pic.12345678.webp",
+                Some("image/webp"),
+                &[]
+            ),
             None
         );
         assert_eq!(
-            decide_cache_control("/avatar.png", Some("image/png"), &[]),
+            decide_ok_get(
+                "/pkg/../images/pic.a1b2c3d4.webp",
+                Some("image/webp"),
+                &[]
+            ),
             None
         );
         assert_eq!(
-            decide_cache_control("/pkg/logo.png", Some("image/png"), &[]),
+            decide_ok_get("/pkg//app.a1b2c3d4.js", Some("application/javascript"), &[]),
+            None
+        );
+        assert_eq!(
+            decide_ok_get(
+                "/pkg/app\x00.a1b2c3d4.js",
+                Some("application/javascript"),
+                &[]
+            ),
             None
         );
     }
@@ -314,7 +482,7 @@ mod tests {
     #[test]
     fn applies_immutable_public_cache_only_to_content_hashed_pkg_assets() {
         assert_eq!(
-            decide_cache_control(
+            decide_ok_get(
                 "/pkg/lets-embed-web.a1b2c3d4.js",
                 Some("application/javascript; charset=utf-8"),
                 &[]
@@ -322,7 +490,7 @@ mod tests {
             Some(IMMUTABLE_PUBLIC_CACHE)
         );
         assert_eq!(
-            decide_cache_control(
+            decide_ok_get(
                 "/pkg/lets-embed-web.a1b2c3d4.wasm",
                 Some("application/wasm"),
                 &[]
@@ -330,29 +498,20 @@ mod tests {
             Some(IMMUTABLE_PUBLIC_CACHE)
         );
         assert_eq!(
-            decide_cache_control(
-                "/pkg/lets-embed-web.a1b2c3d4.css",
-                Some("text/css"),
-                &[]
-            ),
+            decide_ok_get("/pkg/lets-embed-web.a1b2c3d4.css", Some("text/css"), &[]),
             Some(IMMUTABLE_PUBLIC_CACHE)
         );
         assert_eq!(
-            decide_cache_control(
+            decide_ok_get(
                 "/pkg/placeholder.a1b2c3d4.svg",
                 Some("image/svg+xml"),
                 &[]
             ),
             Some(IMMUTABLE_PUBLIC_CACHE)
         );
-        // Traversal out of /pkg/ must be rejected
         assert_eq!(
-            decide_cache_control(
-                "/pkg/../images/pic.a1b2c3d4.webp",
-                Some("image/webp"),
-                &[]
-            ),
-            None
+            decide_ok_get("/pkg/inter.a1b2c3d4.woff2", Some("font/woff2"), &[]),
+            Some(IMMUTABLE_PUBLIC_CACHE)
         );
     }
 }
