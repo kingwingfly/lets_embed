@@ -1,0 +1,49 @@
+[workspace]
+
+[package]
+name = "admin_web"
+version = "0.1.0"
+edition = "2024"
+authors = ["Louis <836250617@qq.com>"]
+license = "MIT"
+repository = "https://github.com/kingwingfly/lets_embed"
+documentation = "https://github.com/kingwingfly/lets_embed"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+leptos = { version = "0.8", features = ["nightly", "csr"] }
+lets-embed-ui = { path = "../../lets-embed-ui", features = ["csr"] }
+site_access = { path = "../../site_access" }
+search_types = { path = "../../search_types", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Document",
+    "Element",
+    "Headers",
+    "HtmlElement",
+    "HtmlInputElement",
+    "HtmlSelectElement",
+    "HtmlTextAreaElement",
+    "Location",
+    "Request",
+    "RequestCredentials",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "Window",
+] }
+console_error_panic_hook = "0.1"
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
