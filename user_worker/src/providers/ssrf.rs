@@ -206,6 +206,9 @@ fn is_numeric_ip_label(lbl: &str) -> bool {
 /// Checks whether `endpoint_url` has an approved origin pinned to `issuer_url`.
 /// Allows exact host match, subdomains of `issuer_host`, or sibling subdomains
 /// under the same non-public-suffix parent domain (e.g. `id.vendor.com` + `api.vendor.com`).
+/// For Google's built-in OIDC issuer (`accounts.google.com`), explicitly pins only
+/// Google's official OIDC hosts (`oauth2.googleapis.com`, `www.googleapis.com`,
+/// `openidconnect.googleapis.com`).
 pub fn is_endpoint_origin_pinned(issuer_url: &Url, endpoint_url: &Url) -> bool {
     if issuer_url.scheme() != "https" || endpoint_url.scheme() != "https" {
         return false;
@@ -218,6 +221,17 @@ pub fn is_endpoint_origin_pinned(issuer_url: &Url, endpoint_url: &Url) -> bool {
     let iss = iss_h.to_ascii_lowercase();
     let ep = ep_h.to_ascii_lowercase();
     if iss == ep {
+        return true;
+    }
+    // Google's real OIDC discovery (`https://accounts.google.com`) publishes endpoints
+    // on these exact `googleapis.com` hosts. Pin them explicitly ONLY for Google while
+    // keeping `googleapis.com` in `NON_SHARED_PARENT_SUFFIXES` for all other issuers.
+    if iss == "accounts.google.com"
+        && matches!(
+            ep.as_str(),
+            "oauth2.googleapis.com" | "www.googleapis.com" | "openidconnect.googleapis.com"
+        )
+    {
         return true;
     }
     // Endpoint is a subdomain of issuer (e.g. issuer = yoti.com, ep = api.yoti.com)
@@ -448,6 +462,27 @@ mod tests {
         };
         assert_eq!(
             validate_discovery_document(mt_issuer, &mt_doc).unwrap_err(),
+            SsrfError::EndpointOriginNotPinned
+        );
+
+        // Google's real discovery document shape (accounts.google.com -> pinned googleapis.com hosts)
+        let google_issuer = "https://accounts.google.com";
+        let google_doc = OidcDiscoveryDoc {
+            issuer: google_issuer.into(),
+            authorization_endpoint: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+            token_endpoint: "https://oauth2.googleapis.com/token".into(),
+            jwks_uri: "https://www.googleapis.com/oauth2/v3/certs".into(),
+            userinfo_endpoint: Some("https://openidconnect.googleapis.com/v1/userinfo".into()),
+        };
+        assert!(validate_discovery_document(google_issuer, &google_doc).is_ok());
+
+        // Non-pinned googleapis host or third-party host on Google MUST still be rejected
+        let google_bad = OidcDiscoveryDoc {
+            jwks_uri: "https://storage.googleapis.com/attacker/jwks.json".into(),
+            ..google_doc
+        };
+        assert_eq!(
+            validate_discovery_document(google_issuer, &google_bad).unwrap_err(),
             SsrfError::EndpointOriginNotPinned
         );
     }

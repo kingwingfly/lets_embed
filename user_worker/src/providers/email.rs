@@ -222,20 +222,48 @@ pub async fn start(
         }
     };
 
-    let mail_from = st
-        .env
-        .var("EMAIL_FROM")
-        .ok()
-        .map(|v| v.to_string())
-        .filter(|s| !s.trim().is_empty())
+    let email_cfg = policy
+        .enabled_providers
+        .iter()
+        .find(|p| p.id == AuthProviderId::EmailOtp);
+
+    let mail_from = email_cfg
+        .and_then(|c| c.public_client_id.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            st.env
+                .var("EMAIL_FROM")
+                .ok()
+                .map(|v| v.to_string())
+                .filter(|s| !s.trim().is_empty())
+        })
         .unwrap_or_else(|| format!("noreply@{}", st.siwe_domain));
-    let mail_endpoint = st
-        .env
-        .var("EMAIL_API_URL")
-        .ok()
-        .map(|v| v.to_string())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_MAIL_ENDPOINT.to_string());
+
+    let mail_endpoint = match email_cfg
+        .and_then(|c| c.issuer.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(configured_url) => match crate::providers::ssrf::validate_oidc_url(configured_url) {
+            Ok(u) => u.to_string(),
+            Err(e) => {
+                worker::console_error!("email mail API URL rejected by SSRF policy: {e}");
+                return auth::api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Email mail API URL is invalid",
+                );
+            }
+        },
+        None => st
+            .env
+            .var("EMAIL_API_URL")
+            .ok()
+            .map(|v| v.to_string())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_MAIL_ENDPOINT.to_string()),
+    };
 
     let code = match generate_6_digit_otp() {
         Ok(c) => c,
@@ -413,6 +441,11 @@ pub async fn verify(
             return r;
         }
         if let Err(r) = identity::link_identity_atomic(&st, &active.user_id, &ident, "login").await
+        {
+            return r;
+        }
+        if let Err(r) =
+            identity::rotate_session_on_identity_link(&st, &cookies, &active, &ident).await
         {
             return r;
         }

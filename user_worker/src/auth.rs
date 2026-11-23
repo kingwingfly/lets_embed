@@ -40,16 +40,38 @@ pub(crate) fn display_address(addr: &str) -> String {
     }
 }
 
+fn single_header_str<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, ()> {
+    let mut vals = headers.get_all(name).iter();
+    let Some(first) = vals.next() else {
+        return Ok(None);
+    };
+    if vals.next().is_some() {
+        // Duplicate Origin or Sec-Fetch-Site headers are rejected fail-closed.
+        return Err(());
+    }
+    first.to_str().map(Some).map_err(|_| ())
+}
+
 /// Verify an `Origin` (or `Sec-Fetch-Site: same-origin` when `Origin` is absent
 /// or serialized as `"null"`, e.g. under a strict referrer policy) against
 /// `siwe_domain` / `public_url` to block cross-site / sibling-subdomain POST CSRF.
-pub(crate) fn same_origin(headers: &HeaderMap, domain: &str) -> bool {
-    let sec_fetch = headers.get("sec-fetch-site").and_then(|h| h.to_str().ok());
-    if let Some(origin) = headers.get("origin").and_then(|h| h.to_str().ok()) {
+/// Rejects duplicate `Origin` or `Sec-Fetch-Site` headers fail-closed.
+pub(crate) fn same_origin(headers: &HeaderMap, domain: &str, public_origin: Option<&str>) -> bool {
+    let Ok(sec_fetch) = single_header_str(headers, "sec-fetch-site") else {
+        return false;
+    };
+    let Ok(origin_opt) = single_header_str(headers, "origin") else {
+        return false;
+    };
+    if let Some(origin) = origin_opt {
         if origin.eq_ignore_ascii_case("null") {
             return sec_fetch.is_some_and(|v| v.eq_ignore_ascii_case("same-origin"));
         }
-        let origin_ok = origin.eq_ignore_ascii_case(&format!("https://{domain}"))
+        let origin_ok = public_origin
+            .map(|p| p.trim_end_matches('/'))
+            .filter(|p| !p.is_empty())
+            .is_some_and(|p| origin.eq_ignore_ascii_case(p))
+            || origin.eq_ignore_ascii_case(&format!("https://{domain}"))
             || (domain
                 .split(':')
                 .next()
@@ -61,7 +83,7 @@ pub(crate) fn same_origin(headers: &HeaderMap, domain: &str) -> bool {
 }
 
 pub(crate) fn require_same_origin(st: &AppState, headers: &HeaderMap) -> Result<(), Response> {
-    if !same_origin(headers, &st.siwe_domain) {
+    if !same_origin(headers, &st.siwe_domain, Some(st.public_origin())) {
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "cross-origin request rejected",
@@ -592,5 +614,31 @@ mod tests {
 
         let other = siws_challenge("evil.example.com", "nonce-xyz");
         assert!(!solana_link::verify_ed25519_b58(&pk_b58, &sig_b58, &other));
+    }
+
+    #[test]
+    fn same_origin_rejects_duplicate_headers_and_accepts_public_origin() {
+        use axum::http::HeaderValue;
+
+        let mut ok = HeaderMap::new();
+        ok.insert("origin", HeaderValue::from_static("https://pub.example.com"));
+        ok.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        assert!(same_origin(
+            &ok,
+            "siwe.example.com",
+            Some("https://pub.example.com")
+        ));
+
+        // Duplicate Origin header MUST fail closed
+        let mut dup_origin = HeaderMap::new();
+        dup_origin.append("origin", HeaderValue::from_static("https://siwe.example.com"));
+        dup_origin.append("origin", HeaderValue::from_static("https://evil.example.com"));
+        assert!(!same_origin(&dup_origin, "siwe.example.com", None));
+
+        // Duplicate Sec-Fetch-Site header MUST fail closed
+        let mut dup_sfs = HeaderMap::new();
+        dup_sfs.append("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        dup_sfs.append("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        assert!(!same_origin(&dup_sfs, "siwe.example.com", None));
     }
 }

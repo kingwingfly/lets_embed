@@ -675,12 +675,34 @@ pub async fn identity_link_wallet(
             if msg.domain != *st.siwe_domain || msg.version != "1" || msg.chain_id != st.chain_id {
                 return auth::api_error(StatusCode::UNAUTHORIZED, "SIWE domain or chain mismatch");
             }
+            if msg.uri.contains("/user/login/approve")
+                || msg
+                    .statement
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("Approve sign-in for another browser"))
+            {
+                return auth::api_error(
+                    StatusCode::UNAUTHORIZED,
+                    "handoff approval signature cannot be used for wallet linking",
+                );
+            }
             let now = session::now_secs();
             let Some(iat) = siwe::parse_rfc3339_epoch(&msg.issued_at) else {
                 return auth::api_error(StatusCode::UNAUTHORIZED, "invalid issued-at timestamp");
             };
             if now.abs_diff(iat) > config::SIWE_MAX_AGE_SECS {
                 return auth::api_error(StatusCode::UNAUTHORIZED, "message issued-at out of range");
+            }
+            if let Some(exp_str) = &msg.expiration_time {
+                let Some(exp) = siwe::parse_rfc3339_epoch(exp_str) else {
+                    return auth::api_error(
+                        StatusCode::UNAUTHORIZED,
+                        "invalid expiration timestamp",
+                    );
+                };
+                if exp <= now {
+                    return auth::api_error(StatusCode::UNAUTHORIZED, "message expired");
+                }
             }
             match challenge_do::consume_nonce(&st.env, &msg.nonce, "wallet").await {
                 Ok(true) => {}
@@ -716,6 +738,12 @@ pub async fn identity_link_wallet(
             };
             if let Err(r) =
                 identity::link_identity_atomic(&st, &active.user_id, &ident, purpose).await
+            {
+                return r;
+            }
+            if purpose == "login"
+                && let Err(r) =
+                    identity::rotate_session_on_identity_link(&st, &cookies, &active, &ident).await
             {
                 return r;
             }
@@ -774,6 +802,12 @@ pub async fn identity_link_wallet(
             };
             if let Err(r) =
                 identity::link_identity_atomic(&st, &active.user_id, &ident, purpose).await
+            {
+                return r;
+            }
+            if purpose == "login"
+                && let Err(r) =
+                    identity::rotate_session_on_identity_link(&st, &cookies, &active, &ident).await
             {
                 return r;
             }
