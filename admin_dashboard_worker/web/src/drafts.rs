@@ -490,27 +490,48 @@ impl SafetyDraft {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Similarity & Geo Draft
+// 3. Similarity Defaults Draft & Geo-Blocking Draft (Independent Tabs)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-pub struct SimilarityGeoDraft {
+pub struct SimilarityDraft {
     pub dirty: RwSignal<bool>,
     pub revision: RwSignal<u64>,
     pub dinov3_min: RwSignal<f32>,
     pub siglip2_min: RwSignal<f32>,
-    pub countries_text: RwSignal<String>,
-    pub block_unknown: RwSignal<bool>,
-    pub block_tor: RwSignal<bool>,
 }
 
-impl SimilarityGeoDraft {
+impl SimilarityDraft {
     fn new() -> Self {
         Self {
             dirty: RwSignal::new(false),
             revision: RwSignal::new(0u64),
             dinov3_min: RwSignal::new(0.0f32),
             siglip2_min: RwSignal::new(0.0f32),
+        }
+    }
+
+    pub fn hydrate(self, cfg: &SafetyConfigResp) {
+        self.revision.set(cfg.revision);
+        self.dinov3_min.set(cfg.similarity.dinov3_min);
+        self.siglip2_min.set(cfg.similarity.siglip2_min);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct GeoDraft {
+    pub dirty: RwSignal<bool>,
+    pub revision: RwSignal<u64>,
+    pub countries_text: RwSignal<String>,
+    pub block_unknown: RwSignal<bool>,
+    pub block_tor: RwSignal<bool>,
+}
+
+impl GeoDraft {
+    fn new() -> Self {
+        Self {
+            dirty: RwSignal::new(false),
+            revision: RwSignal::new(0u64),
             countries_text: RwSignal::new(String::new()),
             block_unknown: RwSignal::new(false),
             block_tor: RwSignal::new(false),
@@ -519,8 +540,6 @@ impl SimilarityGeoDraft {
 
     pub fn hydrate(self, cfg: &SafetyConfigResp) {
         self.revision.set(cfg.revision);
-        self.dinov3_min.set(cfg.similarity.dinov3_min);
-        self.siglip2_min.set(cfg.similarity.siglip2_min);
         self.countries_text.set(cfg.geo.blocked_countries.join(", "));
         self.block_unknown.set(cfg.geo.block_unknown);
         self.block_tor.set(cfg.geo.block_tor);
@@ -724,7 +743,8 @@ impl ProvidersDraft {
 pub struct AdminDraftStore {
     pub access: AccessDraft,
     pub safety: SafetyDraft,
-    pub similarity_geo: SimilarityGeoDraft,
+    pub geo: GeoDraft,
+    pub similarity: SimilarityDraft,
     pub age_legal: AgeLegalDraft,
     pub providers: ProvidersDraft,
 }
@@ -737,7 +757,8 @@ impl AdminDraftStore {
         Self {
             access: AccessDraft::new(),
             safety: SafetyDraft::new(owner),
-            similarity_geo: SimilarityGeoDraft::new(),
+            geo: GeoDraft::new(),
+            similarity: SimilarityDraft::new(),
             age_legal: AgeLegalDraft::new(),
             providers: ProvidersDraft::new(owner),
         }
@@ -747,7 +768,8 @@ impl AdminDraftStore {
         match tab {
             AdminTab::Access => self.access.dirty.get(),
             AdminTab::Safety => self.safety.dirty.get(),
-            AdminTab::SimilarityGeo => self.similarity_geo.dirty.get(),
+            AdminTab::Geo => self.geo.dirty.get(),
+            AdminTab::Similarity => self.similarity.dirty.get(),
             AdminTab::AgeLegal => self.age_legal.dirty.get(),
             AdminTab::Providers => self.providers.dirty.get(),
             AdminTab::Accounts | AdminTab::Reports => false,

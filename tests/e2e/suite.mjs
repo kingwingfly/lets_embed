@@ -100,8 +100,10 @@ const ORIGIN_HOSTNAME = new URL(ORIGIN).hostname;
 const OUT_DIR = cfg.screenshots;
 const CHROME = findChromeBinary();
 
+const TMP_ROOT = path.join(ROOT, 'target/tmp');
 fs.mkdirSync(OUT_DIR, { recursive: true });
-const PROFILE = fs.mkdtempSync(path.join(os.tmpdir(), 'lets-embed-e2e-chrome-'));
+fs.mkdirSync(TMP_ROOT, { recursive: true });
+const PROFILE = fs.mkdtempSync(path.join(TMP_ROOT, 'chrome-e2e-'));
 
 const results = [];
 function check(name, pass, detail = '') {
@@ -452,12 +454,24 @@ try {
     JSON.stringify(providersCheck)
   );
 
-  // 3c. Similarity & Geo: R-18 prohibited preset + live Cloudflare WAF Custom Rule + 1-click Copy + Save
+  // 3c. Geo-Blocking (dedicated tab separate from Similarity):
+  //     R-18 prohibited preset + live Cloudflare WAF Custom Rule + 1-click Copy + Save
   const geoWafCheck = await evalJs(`
-    const tab = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Similarity & Geo');
-    if (!tab) throw new Error('Similarity & Geo tab not found');
-    tab.click();
+    const tabs = [...document.querySelectorAll('[role="tab"]')].map(t => t.textContent.trim());
+    const simTab = [...document.querySelectorAll('[role="tab"]')].find(b => b.textContent.trim() === 'Similarity');
+    const geoTab = [...document.querySelectorAll('[role="tab"]')].find(b => b.textContent.trim() === 'Geo-Blocking');
+    if (!simTab || !geoTab) throw new Error('Expected separate Similarity and Geo-Blocking tabs, got: ' + JSON.stringify(tabs));
+
+    // Verify Similarity tab has ONLY vector similarity thresholds (no Geo card)
+    simTab.click();
+    await new Promise(r => setTimeout(r, 300));
+    const simText = document.body.innerText;
+    const simOnly = simText.includes('Default Vector Similarity Thresholds') && !simText.includes('Authoritative Geo-Restriction');
+
+    // Switch to dedicated Geo-Blocking tab (no Similarity card)
+    geoTab.click();
     await new Promise(r => setTimeout(r, 400));
+    const geoOnly = document.body.innerText.includes('Authoritative Geo-Restriction') && !document.body.innerText.includes('Default Vector Similarity Thresholds');
 
     // Clear any leftover countries first so preset check is idempotent
     const clearBtn = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Clear list');
@@ -499,14 +513,16 @@ try {
     const clipboardText = await navigator.clipboard.readText();
     const copyToast = (document.querySelector('.le-toast-host')?.innerText || '').trim();
 
-    // Save Similarity & Geo policy to verify backend validation accepts the 49-country preset
-    const saveGeoBtn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('Save Similarity & Geo'));
-    if (!saveGeoBtn) throw new Error('Save Similarity & Geo button not found');
+    // Save Geo-Blocking policy to verify backend validation accepts the 49-country preset
+    const saveGeoBtn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('Save Geo-Blocking'));
+    if (!saveGeoBtn) throw new Error('Save Geo-Blocking button not found');
     saveGeoBtn.click();
     await new Promise(r => setTimeout(r, 1000));
     const saveToast = (document.querySelector('.le-toast-host')?.innerText || '').trim();
 
     return {
+      simOnly,
+      geoOnly,
       codeCount: codes.length,
       wafBeforeLen: wafBeforeToggles.length,
       hasAdminExempt: wafWithExtras.includes('starts_with(http.request.uri.path, "/admin/")'),
@@ -521,15 +537,17 @@ try {
   `);
   await screenshot('e2e_admin_geo_waf.png');
   check(
-    '3c. Similarity & Geo R-18 preset (49 countries), live Cloudflare WAF rule (+XX/+T1), 1-click Copy & Save',
-    geoWafCheck.codeCount === 49 &&
+    '3c. Dedicated Geo-Blocking & Similarity tabs + R-18 preset (49), live WAF rule (+XX/+T1), 1-click Copy & Save',
+    geoWafCheck.simOnly &&
+      geoWafCheck.geoOnly &&
+      geoWafCheck.codeCount === 49 &&
       geoWafCheck.hasAdminExempt &&
       geoWafCheck.hasXX &&
       geoWafCheck.hasT1 &&
       geoWafCheck.hasCNandKRandSA &&
       geoWafCheck.copiedBtnText === 'Copied!' &&
       geoWafCheck.clipboardMatches &&
-      geoWafCheck.saveToast.includes('Published Similarity & Geo'),
+      geoWafCheck.saveToast.includes('Published Geo-Blocking'),
     JSON.stringify(geoWafCheck)
   );
 
@@ -543,7 +561,7 @@ try {
       if (s && s.getAttribute('aria-checked') === 'true') s.click();
       await new Promise(r => setTimeout(r, 80));
     }
-    const saveGeoBtn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('Save Similarity & Geo'));
+    const saveGeoBtn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('Save Geo-Blocking'));
     saveGeoBtn.click();
     await new Promise(r => setTimeout(r, 900));
   `);
@@ -763,6 +781,31 @@ try {
       loggedOutMaidSearch.leakedImgs === 0 &&
       loggedOutMaidSearch.firstCta.includes('Sign in'),
     JSON.stringify(loggedOutMaidSearch)
+  );
+
+  // Verify default legal & policy pages (/terms, /privacy, /dmca, /content-policy) render cleanly
+  const legalChecks = [];
+  for (const [route, expectedHeading] of [
+    ['/terms', 'Terms of Service'],
+    ['/privacy', 'Privacy Policy'],
+    ['/dmca', 'DMCA &amp; Copyright Policy'],
+    ['/content-policy', 'Content Policy'],
+  ]) {
+    const resp = await fetch(`${ORIGIN}${route}`);
+    const html = await resp.text();
+    const lower = html.toLowerCase();
+    legalChecks.push({
+      route,
+      status: resp.status,
+      hasHeading: html.includes(expectedHeading),
+      noStaleV2: !lower.includes('switcher rules') && !lower.includes('spoiler blur'),
+      noPlaceholder: !lower.includes('example.com') && !lower.includes('[insert'),
+    });
+  }
+  check(
+    '4c. Legal pages (/terms, /privacy, /dmca, /content-policy) return 200 with accurate Policy v3 copy',
+    legalChecks.every((c) => c.status === 200 && c.hasHeading && c.noStaleV2 && c.noPlaceholder),
+    JSON.stringify(legalChecks)
   );
 
   // =========================================================================
@@ -1011,5 +1054,23 @@ try {
   }
   ws.close();
   chrome.kill('SIGTERM');
-  fs.rmSync(PROFILE, { recursive: true, force: true });
+  await new Promise((resolve) => {
+    const t = setTimeout(() => {
+      try {
+        chrome.kill('SIGKILL');
+      } catch {
+        // Already exited
+      }
+      resolve();
+    }, 2000);
+    chrome.once('exit', () => {
+      clearTimeout(t);
+      resolve();
+    });
+  });
+  try {
+    fs.rmSync(PROFILE, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  } catch {
+    // Best-effort profile cleanup
+  }
 }

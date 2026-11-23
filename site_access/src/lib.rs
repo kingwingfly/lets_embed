@@ -941,6 +941,27 @@ mod tests {
         let privacy_lower = DEFAULT_PRIVACY_MD.to_ascii_lowercase();
         assert!(!privacy_lower.contains("safe mode"));
         assert!(!privacy_lower.contains("safe-mode"));
+        assert!(privacy_lower.contains("favorites"));
+
+        let content_lower = DEFAULT_CONTENT_POLICY_MD.to_ascii_lowercase();
+        assert!(!content_lower.contains("switcher rules"));
+        assert!(!content_lower.contains("spoiler blur"));
+        assert!(content_lower.contains("block"));
+        assert!(content_lower.contains("blur"));
+        assert!(content_lower.contains("/user/account"));
+
+        for doc in [
+            DEFAULT_TERMS_MD,
+            DEFAULT_PRIVACY_MD,
+            DEFAULT_DMCA_MD,
+            DEFAULT_CONTENT_POLICY_MD,
+        ] {
+            let lower = doc.to_ascii_lowercase();
+            assert!(!lower.contains("example.com"));
+            assert!(!lower.contains("[insert"));
+            assert!(!lower.contains("todo"));
+        }
+        assert!(DEFAULT_DMCA_MD.contains("Copyright / DMCA"));
 
         let mut legal = LegalDocConfig::default();
         assert!(legal.notice_banner_md.is_empty());

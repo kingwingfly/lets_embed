@@ -1,16 +1,13 @@
-//! Similarity & Geo tab:
-//! - Default DINOv3 & SigLIP2 cosine similarity cutoffs using keyboard-friendly
-//!   `lets_embed_ui::ScoreInput` (`0.00..=1.00`, `step=0.01`, zero native HTML5 step popups)
+//! Geo-Blocking tab:
 //! - Authoritative ISO-3166 country blocklist + R-18/Adult prohibited countries preset
-//!   + `XX` (unknown) & `T1` (Tor) `<ToggleSwitch>`
+//! - `XX` (unknown) & `T1` (Tor) `<ToggleSwitch>`
 //! - Live equivalent Cloudflare WAF Custom Rule generator with one-click clipboard copy
 //! - Root-level persistent draft (`AdminDraftStore`) + GCP top-right toasts via `use_toast_store()`
 
 use leptos::prelude::*;
-use lets_embed_ui::{ScoreInput, ToggleSwitch, use_toast_store};
+use lets_embed_ui::{ToggleSwitch, use_toast_store};
 use site_access::{
-    GeoPolicy, R18_PROHIBITED_COUNTRIES, SimilarityDefaults, is_valid_iso_country_code,
-    merge_country_codes,
+    GeoPolicy, R18_PROHIBITED_COUNTRIES, is_valid_iso_country_code, merge_country_codes,
 };
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -30,17 +27,18 @@ async fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
         return Err("Browser window unavailable".to_string());
     };
 
-    // Primary path: navigator.clipboard.writeText (HTTPS & localhost/127.0.0.1)
     let nav = window.navigator();
     let clip_prop = js_sys::Reflect::get(nav.as_ref(), &"clipboard".into()).ok();
-    if clip_prop.as_ref().is_some_and(|v| !v.is_undefined() && !v.is_null()) {
+    if clip_prop
+        .as_ref()
+        .is_some_and(|v| !v.is_undefined() && !v.is_null())
+    {
         let promise = nav.clipboard().write_text(text);
         if JsFuture::from(promise).await.is_ok() {
             return Ok(());
         }
     }
 
-    // Fallback path: hidden textarea + execCommand("copy")
     let document = window
         .document()
         .ok_or_else(|| "Document unavailable".to_string())?;
@@ -81,12 +79,12 @@ struct GeoDraftPreview {
 }
 
 #[component]
-pub fn SimilarityGeoTab(
+pub fn GeoTab(
     safety: RwSignal<Option<SafetyConfigResp>>,
     on_saved: Callback<()>,
 ) -> impl IntoView {
     let toasts = use_toast_store();
-    let draft = use_admin_drafts().similarity_geo;
+    let draft = use_admin_drafts().geo;
 
     let saving = RwSignal::new(false);
     let copied_waf = RwSignal::new(false);
@@ -132,7 +130,10 @@ pub fn SimilarityGeoTab(
                     if added == 1 { "country" } else { "countries" },
                     merged.len()
                 ),
-                Some("Review the list or copy the generated Cloudflare WAF rule below before saving.".to_string()),
+                Some(
+                    "Review the list or copy the generated Cloudflare WAF rule below before saving."
+                        .to_string(),
+                ),
             );
         } else {
             toasts.info(
@@ -189,7 +190,7 @@ pub fn SimilarityGeoTab(
         if let Some(cfg) = safety.get_untracked() {
             draft.hydrate(&cfg);
             draft.dirty.set(false);
-            toasts.info("Discarded unsaved Similarity & Geo changes", None);
+            toasts.info("Discarded unsaved Geo-Blocking changes", None);
         }
     };
 
@@ -214,10 +215,7 @@ pub fn SimilarityGeoTab(
             fixed_blur_enabled: current.fixed_blur_enabled,
             age_policy: current.age_policy,
             age_gate_trigger: current.age_gate_trigger,
-            similarity: SimilarityDefaults {
-                dinov3_min: draft.dinov3_min.get_untracked(),
-                siglip2_min: draft.siglip2_min.get_untracked(),
-            },
+            similarity: current.similarity,
             geo: GeoPolicy {
                 blocked_countries,
                 block_unknown: draft.block_unknown.get_untracked(),
@@ -236,7 +234,7 @@ pub fn SimilarityGeoTab(
                         toasts.info(format!("No changes to save (rev #{})", resp.revision), None);
                     } else {
                         toasts.success(
-                            format!("Published Similarity & Geo policy rev #{}", resp.revision),
+                            format!("Published Geo-Blocking policy rev #{}", resp.revision),
                             Some(format!(
                                 "min_enforce_rev #{} · tightened={}",
                                 resp.min_enforce_rev, resp.tightened
@@ -258,7 +256,7 @@ pub fn SimilarityGeoTab(
                     on_saved.run(());
                 }
                 Err(err) => {
-                    toasts.error("Failed to save Similarity & Geo policy", Some(err.message));
+                    toasts.error("Failed to save Geo-Blocking policy", Some(err.message));
                 }
             }
             saving.set(false);
@@ -267,101 +265,6 @@ pub fn SimilarityGeoTab(
 
     view! {
         <form class="adm-stack" on:submit=on_save>
-            <section class="adm-card">
-                <div class="adm-card-head">
-                    <div>
-                        <h2>"Default Vector Similarity Thresholds"</h2>
-                        <p class="adm-sub">
-                            "Site-wide default minimum cosine similarity (`1.0 - distance >= min_similarity`, 0.00 = no cutoff). Visitors can override per-condition thresholds in Advanced Search."
-                        </p>
-                    </div>
-                </div>
-
-                <div class="adm-grid-2">
-                    <div class="adm-subcard">
-                        <div class="adm-score-card-head">
-                            <div>
-                                <h3>"Default Image Similarity"</h3>
-                                <p class="adm-sub">"Applies to `dino:<id>` and `upload:` searches when no inline `>=` threshold is set."</p>
-                            </div>
-                            <span class="adm-pill">"DINOv3"</span>
-                        </div>
-                        <div class="adm-score-control-row">
-                            <input
-                                type="range"
-                                class="adm-range"
-                                min="0"
-                                max="1"
-                                step="0.01"
-                                prop:value=move || format!("{:.2}", draft.dinov3_min.get())
-                                on:input=move |ev| {
-                                    if let Ok(v) = event_target_value(&ev).parse::<f32>()
-                                        && v.is_finite()
-                                    {
-                                        draft.dinov3_min.set(v.clamp(0.0, 1.0));
-                                        draft.dirty.set(true);
-                                    }
-                                }
-                            />
-                            <div class="adm-score-input-box">
-                                <ScoreInput
-                                    value=Signal::derive(move || draft.dinov3_min.get())
-                                    on_change=Callback::new(move |v| {
-                                        draft.dinov3_min.set(v);
-                                        draft.dirty.set(true);
-                                    })
-                                    min=0.00
-                                    max=1.00
-                                    step=0.01
-                                    aria_label="DINOv3 default minimum similarity"
-                                />
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="adm-subcard">
-                        <div class="adm-score-card-head">
-                            <div>
-                                <h3>"Default Description Similarity"</h3>
-                                <p class="adm-sub">"Applies to `clip:` natural-language searches when no inline `>=` threshold is set."</p>
-                            </div>
-                            <span class="adm-pill">"SigLIP2"</span>
-                        </div>
-                        <div class="adm-score-control-row">
-                            <input
-                                type="range"
-                                class="adm-range"
-                                min="0"
-                                max="1"
-                                step="0.01"
-                                prop:value=move || format!("{:.2}", draft.siglip2_min.get())
-                                on:input=move |ev| {
-                                    if let Ok(v) = event_target_value(&ev).parse::<f32>()
-                                        && v.is_finite()
-                                    {
-                                        draft.siglip2_min.set(v.clamp(0.0, 1.0));
-                                        draft.dirty.set(true);
-                                    }
-                                }
-                            />
-                            <div class="adm-score-input-box">
-                                <ScoreInput
-                                    value=Signal::derive(move || draft.siglip2_min.get())
-                                    on_change=Callback::new(move |v| {
-                                        draft.siglip2_min.set(v);
-                                        draft.dirty.set(true);
-                                    })
-                                    min=0.00
-                                    max=1.00
-                                    step=0.01
-                                    aria_label="SigLIP2 default minimum similarity"
-                                />
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </section>
-
             <section class="adm-card">
                 <div class="adm-card-head">
                     <div>
@@ -511,7 +414,7 @@ pub fn SimilarityGeoTab(
                         </button>
                     })}
                     <button type="submit" class="adm-btn adm-btn--primary" disabled=move || saving.get()>
-                        {move || if saving.get() { "Publishing…" } else { "Save Similarity & Geo Policy" }}
+                        {move || if saving.get() { "Publishing…" } else { "Save Geo-Blocking Policy" }}
                     </button>
                 </div>
             </div>

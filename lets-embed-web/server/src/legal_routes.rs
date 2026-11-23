@@ -185,7 +185,7 @@ pub async fn dmca(
         ctx,
         &headers,
         "dmca",
-        "DMCA & Takedown Policy",
+        "DMCA & Copyright Policy",
         |l| &l.dmca_md,
     )
 }
@@ -200,7 +200,7 @@ pub async fn content_policy(
         ctx,
         &headers,
         "content-policy",
-        "Content & Safety Policy",
+        "Content Policy",
         |l| &l.content_policy_md,
     )
 }

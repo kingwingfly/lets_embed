@@ -19,9 +19,8 @@ use crate::{
     },
     drafts::provide_admin_drafts,
     tabs::{
-        AdminTab, access::AccessTab, accounts::AccountsTab, age_legal::AgeLegalTab,
-        providers::ProvidersTab, reports::ReportsTab, safety::SafetyTab,
-        similarity_geo::SimilarityGeoTab,
+        AdminTab, access::AccessTab, accounts::AccountsTab, age_legal::AgeLegalTab, geo::GeoTab,
+        providers::ProvidersTab, reports::ReportsTab, safety::SafetyTab, similarity::SimilarityTab,
     },
 };
 
@@ -115,10 +114,16 @@ pub fn AdminApp() -> impl IntoView {
                 drafts.safety.sync_revision(&cfg);
             }
 
-            if !drafts.similarity_geo.dirty.get_untracked() {
-                drafts.similarity_geo.hydrate(&cfg);
+            if !drafts.geo.dirty.get_untracked() {
+                drafts.geo.hydrate(&cfg);
             } else {
-                drafts.similarity_geo.revision.set(cfg.revision);
+                drafts.geo.revision.set(cfg.revision);
+            }
+
+            if !drafts.similarity.dirty.get_untracked() {
+                drafts.similarity.hydrate(&cfg);
+            } else {
+                drafts.similarity.revision.set(cfg.revision);
             }
 
             if !drafts.age_legal.dirty.get_untracked() {
@@ -364,11 +369,14 @@ pub fn AdminApp() -> impl IntoView {
                                 on_navigate=navigate_to
                             />
                         }.into_any(),
-                        AdminTab::SimilarityGeo => view! {
-                            <SimilarityGeoTab safety=safety on_saved=on_settings_saved />
+                        AdminTab::Geo => view! {
+                            <GeoTab safety=safety on_saved=on_settings_saved />
                         }.into_any(),
                         AdminTab::AgeLegal => view! {
                             <AgeLegalTab safety=safety on_saved=on_settings_saved />
+                        }.into_any(),
+                        AdminTab::Similarity => view! {
+                            <SimilarityTab safety=safety on_saved=on_settings_saved />
                         }.into_any(),
                         AdminTab::Providers => view! {
                             <ProvidersTab refresh_epoch=providers_refresh on_saved=on_settings_saved />

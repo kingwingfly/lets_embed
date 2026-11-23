@@ -1,29 +1,32 @@
 pub mod access;
 pub mod accounts;
 pub mod age_legal;
+pub mod geo;
 pub mod providers;
 pub mod reports;
 pub mod safety;
-pub mod similarity_geo;
+pub mod similarity;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdminTab {
     Access,
     Accounts,
     Safety,
-    SimilarityGeo,
+    Geo,
     AgeLegal,
+    Similarity,
     Providers,
     Reports,
 }
 
 impl AdminTab {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Access,
         Self::Accounts,
         Self::Safety,
-        Self::SimilarityGeo,
+        Self::Geo,
         Self::AgeLegal,
+        Self::Similarity,
         Self::Providers,
         Self::Reports,
     ];
@@ -33,8 +36,9 @@ impl AdminTab {
             Self::Access => "access",
             Self::Accounts => "accounts",
             Self::Safety => "safety",
-            Self::SimilarityGeo => "similarity-geo",
+            Self::Geo => "geo",
             Self::AgeLegal => "age-legal",
+            Self::Similarity => "similarity",
             Self::Providers => "providers",
             Self::Reports => "reports",
         }
@@ -45,10 +49,11 @@ impl AdminTab {
             Self::Access => "Access & Pricing",
             Self::Accounts => "Accounts & Payments",
             Self::Safety => "Content Safety",
-            Self::SimilarityGeo => "Similarity & Geo",
+            Self::Geo => "Geo-Blocking",
             Self::AgeLegal => "Age & Legal",
+            Self::Similarity => "Similarity",
             Self::Providers => "Auth Providers",
-            Self::Reports => "Reports Queue",
+            Self::Reports => "Reports",
         }
     }
 
@@ -56,8 +61,9 @@ impl AdminTab {
         match raw.trim().trim_start_matches('#') {
             "accounts" => Self::Accounts,
             "safety" => Self::Safety,
-            "similarity-geo" | "geo" => Self::SimilarityGeo,
+            "geo" | "geo-blocking" | "similarity-geo" => Self::Geo,
             "age-legal" | "legal" => Self::AgeLegal,
+            "similarity" | "search-similarity" => Self::Similarity,
             "providers" => Self::Providers,
             "reports" => Self::Reports,
             _ => Self::Access,
