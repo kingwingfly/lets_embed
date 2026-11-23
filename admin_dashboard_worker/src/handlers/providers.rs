@@ -223,10 +223,11 @@ pub async fn save_providers(
         }
     }
 
-    // Persist strictly non-secret provider config into `site_settings` (CAS) + `SitePolicyDO`.
+    // Step 1: Commit strictly non-secret provider config via D1 CAS (do NOT publish
+    // to SitePolicyDO yet until encrypted `provider_secrets` writes succeed).
     loaded.doc.public.enabled_providers = public_configs.clone();
-    let (new_rev, digest) =
-        match LoadedSettings::save_and_publish(&st.env, req.revision, &loaded.doc, admin).await {
+    let (new_rev, stored_public, digest) =
+        match LoadedSettings::save_d1_cas(&st.env, req.revision, &loaded.doc, admin).await {
             Ok(Some(res)) => res,
             Ok(None) => {
                 return conflict(
@@ -239,7 +240,7 @@ pub async fn save_providers(
             }
         };
 
-    // Persist any submitted write-only secrets ONLY in encrypted `provider_secrets` table.
+    // Step 2: Persist any submitted write-only secrets ONLY in encrypted `provider_secrets` table.
     let db = match st.env.d1(D1_BINDING) {
         Ok(db) => db,
         Err(e) => {
@@ -313,6 +314,12 @@ pub async fn save_providers(
         && let Err(e) = db.batch(secret_writes).await
     {
         worker::console_error!("write provider_secrets batch failed: {e:?}");
+        return internal_error();
+    }
+
+    // Step 3: Publish to SitePolicyDO ONLY AFTER both D1 CAS and `provider_secrets` succeed.
+    if let Err(e) = crate::do_client::publish_site_policy(&st.env, &stored_public, &digest).await {
+        worker::console_error!("SitePolicyDO publish after provider save failed: {e:?}");
         return internal_error();
     }
 

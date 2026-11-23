@@ -57,6 +57,7 @@ struct BindingProps {
 pub struct AppState {
     pub env: Arc<Env>,
     pub admin_binding: bool,
+    pub admin_domain: Option<Arc<String>>,
     pub siwe_domain: Arc<String>,
     pub public_url: Option<Arc<String>>,
     pub deployment_id: Arc<String>,
@@ -64,6 +65,12 @@ pub struct AppState {
 }
 
 fn build_state(env: Env, admin_binding: bool) -> Result<AppState> {
+    let admin_domain = env
+        .var("ADMIN_DOMAIN")
+        .ok()
+        .map(|v| v.to_string().trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(Arc::new);
     let siwe_domain = env
         .var("SIWE_DOMAIN")
         .map(|v| v.to_string())
@@ -100,6 +107,7 @@ fn build_state(env: Env, admin_binding: bool) -> Result<AppState> {
     Ok(AppState {
         env: Arc::new(env),
         admin_binding,
+        admin_domain,
         siwe_domain: Arc::new(siwe_domain),
         public_url,
         deployment_id: Arc::new(deployment_id),
@@ -190,6 +198,13 @@ async fn serve_static_asset(env: &Env, method: &Method, req_path: &str) -> Respo
     };
 
     let mut resp: Response = worker_resp.into();
+    if resp.status().is_redirection() {
+        worker::console_error!(
+            "ASSETS binding returned unexpected redirect {} for {asset_path} (ensure html_handling = \"none\")",
+            resp.status()
+        );
+        return json_error(StatusCode::BAD_GATEWAY, "Unexpected static asset redirect");
+    }
     apply_security_headers(resp.headers_mut());
     resp
 }
@@ -226,6 +241,7 @@ async fn fetch(req: HttpRequest, env: Env, ctx: Context) -> Result<Response> {
             && let Err(msg) = verify_admin_mutation(
                 state.admin_binding,
                 req.headers(),
+                state.admin_domain.as_deref().map(String::as_str),
                 state.public_url.as_deref().map(String::as_str),
                 &state.siwe_domain,
             )

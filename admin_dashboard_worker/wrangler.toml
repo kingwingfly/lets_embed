@@ -15,13 +15,18 @@ invocation_logs = true
 
 # Mandatory: run_worker_first = true ensures static /admin HTML/JS/WASM assets NEVER
 # serve before the Worker verifies `gallery_admin == true` + `x-gallery-admin-email`.
+# html_handling = "none" prevents Cloudflare Assets from issuing 307 redirects on `/index.html`.
 [assets]
 directory = "./assets"
 binding = "ASSETS"
 run_worker_first = true
+html_handling = "none"
 
 [vars]
-# Public hostname for strict same-origin CSRF verification.
+# Optional dedicated admin hostname (split-host deployments). When set, ONLY
+# `https://{ADMIN_DOMAIN}` is trusted as a CSRF Origin for `/admin/api/*` mutations.
+# ADMIN_DOMAIN = "admin.lets-embed.louisfly.icu"
+# Public hostname fallback for same-origin CSRF verification when ADMIN_DOMAIN is unset.
 SIWE_DOMAIN = "lets-embed.louisfly.icu"
 # Canonical public origin (optional; takes precedence over SIWE_DOMAIN when set).
 PUBLIC_URL = "https://lets-embed.louisfly.icu"

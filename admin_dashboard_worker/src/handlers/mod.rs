@@ -26,6 +26,7 @@ pub fn guard_mutation<'a>(st: &AppState, headers: &'a HeaderMap) -> Result<&'a s
     verify_admin_mutation(
         st.admin_binding,
         headers,
+        st.admin_domain.as_deref().map(String::as_str),
         st.public_url.as_deref().map(String::as_str),
         &st.siwe_domain,
     )

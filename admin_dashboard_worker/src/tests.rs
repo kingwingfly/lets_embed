@@ -401,6 +401,9 @@ fn oidc_url_validator_blocks_ssrf_and_accepts_public_https() {
         "https://idp.example.com/oidc?foo=bar",
         "https://idp.example.com/oidc#frag",
         "https://idp.example.com/a/../secret",
+        "Https://idp.example.com/a/../secret",
+        "hTtPs://idp.example.com/./secret",
+        "https://idp.example.com/%2e%2e/secret",
     ];
     for bad in rejected {
         assert!(
@@ -584,16 +587,61 @@ fn admin_guard_and_csrf_enforce_binding_header_origin_sec_fetch_and_custom_heade
     headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
     headers.insert(ADMIN_CSRF_HEADER, HeaderValue::from_static("1"));
 
-    // Valid binding + headers pass
+    // Valid binding + headers pass (single-host fallback when ADMIN_DOMAIN is unset)
     assert_eq!(require_admin_identity(true, &headers), Some("admin@example.com"));
     assert_eq!(
         verify_admin_mutation(
             true,
             &headers,
+            None,
             Some("https://gallery.example.com"),
             "gallery.example.com"
         ),
         Ok("admin@example.com")
+    );
+
+    // Split-host ADMIN_DOMAIN: accepts ONLY https://{ADMIN_DOMAIN} and rejects SIWE_DOMAIN/PUBLIC_URL
+    let mut split_headers = headers.clone();
+    split_headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://admin.example.com"),
+    );
+    assert_eq!(
+        verify_admin_mutation(
+            true,
+            &split_headers,
+            Some("admin.example.com"),
+            Some("https://gallery.example.com"),
+            "gallery.example.com"
+        ),
+        Ok("admin@example.com")
+    );
+    // Gallery origin MUST be rejected when dedicated ADMIN_DOMAIN is set
+    assert!(
+        verify_admin_mutation(
+            true,
+            &headers,
+            Some("admin.example.com"),
+            Some("https://gallery.example.com"),
+            "gallery.example.com"
+        )
+        .is_err()
+    );
+    // Local dev ADMIN_DOMAIN allows http://127.0.0.1:8788 while still rejecting gallery origin
+    let mut local_admin_headers = headers.clone();
+    local_admin_headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("http://127.0.0.1:8788"),
+    );
+    assert!(
+        verify_admin_mutation(
+            true,
+            &local_admin_headers,
+            Some("127.0.0.1:8788"),
+            Some("https://gallery.example.com"),
+            "gallery.example.com"
+        )
+        .is_ok()
     );
 
     // Missing gallery_admin binding prop ALWAYS fails even with valid ADMIN_HEADER
@@ -602,6 +650,7 @@ fn admin_guard_and_csrf_enforce_binding_header_origin_sec_fetch_and_custom_heade
         verify_admin_mutation(
             false,
             &headers,
+            None,
             Some("https://gallery.example.com"),
             "gallery.example.com"
         )
@@ -615,6 +664,7 @@ fn admin_guard_and_csrf_enforce_binding_header_origin_sec_fetch_and_custom_heade
         verify_admin_mutation(
             true,
             &no_csrf,
+            None,
             Some("https://gallery.example.com"),
             "gallery.example.com"
         )
@@ -628,6 +678,7 @@ fn admin_guard_and_csrf_enforce_binding_header_origin_sec_fetch_and_custom_heade
         verify_admin_mutation(
             true,
             &evil_origin,
+            None,
             Some("https://gallery.example.com"),
             "gallery.example.com"
         )
@@ -641,6 +692,7 @@ fn admin_guard_and_csrf_enforce_binding_header_origin_sec_fetch_and_custom_heade
         verify_admin_mutation(
             true,
             &null_origin,
+            None,
             Some("https://gallery.example.com"),
             "gallery.example.com"
         )
@@ -654,6 +706,7 @@ fn admin_guard_and_csrf_enforce_binding_header_origin_sec_fetch_and_custom_heade
         verify_admin_mutation(
             true,
             &cross_site,
+            None,
             Some("https://gallery.example.com"),
             "gallery.example.com"
         )
@@ -667,6 +720,7 @@ fn admin_guard_and_csrf_enforce_binding_header_origin_sec_fetch_and_custom_heade
         verify_admin_mutation(
             true,
             &dup_origin,
+            None,
             Some("https://gallery.example.com"),
             "gallery.example.com"
         )
@@ -686,6 +740,7 @@ fn admin_guard_and_csrf_enforce_binding_header_origin_sec_fetch_and_custom_heade
         verify_admin_mutation(
             true,
             &local_headers,
+            None,
             Some("http://127.0.0.1:8787"),
             "127.0.0.1:8787"
         )
@@ -695,6 +750,7 @@ fn admin_guard_and_csrf_enforce_binding_header_origin_sec_fetch_and_custom_heade
         verify_admin_mutation(
             true,
             &local_headers,
+            None,
             Some("https://gallery.example.com"),
             "gallery.example.com"
         )
