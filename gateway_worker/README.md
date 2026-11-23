@@ -14,7 +14,7 @@ The edge gateway enforces Policy v3 content safety, authoritative geo-blocking, 
    - Loads `{ policy, digest }` from singleton `SITE_POLICY` DO (`"global"`, `GET /policy`) and strictly decodes with `site_access::decode_active_policy_v3` + digest verification (failing closed with `503` on unsupported schema, legacy `"rules"`, malformed policy, or digest mismatch).
    - Evaluates `policy.geo.is_blocked(request.cf().country())` (never trusting incoming `CF-IPCountry`). Blocked visitors receive `451 Unavailable For Legal Reasons`.
 4. **`/user/admin*` retired (`404`) & `/user/*` routing**:
-   - `/user/admin` and `/user/admin/*` unconditionally return `404 Not Found`. All other `/user/*` routes forward to `USER_WORKER` with all privileged headers stripped.
+   - `/user/admin` and `/user/admin/*` unconditionally return `404 Not Found`. All other `/user/*` routes forward to `USER_WORKER` with all privileged headers and untrusted client `cf-ipcountry` stripped, injecting trusted `cf-ipcountry` from Cloudflare runtime `request.cf().country()` when present.
 5. **Raw `/images/*`, `/videos/*`, and `/internal/*` blocked (`404`)**:
    - Media bytes are only served via signed Policy v3 capability URLs at `/media/{image,video,preview}/{id}?cap=...`.
    - Strictly verifies `MediaCapability` v3 (`mc3.`, rejecting all v1/v2 tokens!), `(kind, asset_id)`, expiry, and `min_enforce_rev <= cap.policy_rev <= active_rev` BEFORE billing, cache delivery, or upstream fetch on `GET`, `HEAD`, and `Range` requests.
@@ -25,7 +25,7 @@ The edge gateway enforces Policy v3 content safety, authoritative geo-blocking, 
    - `Image`/`Video` settle against canonical `MediaBillingKey` (`media:image:{id}` / `media:video:{id}`, `HEAD` -> `can-charge`, `GET` -> `charge`).
    - Upstream media fetches use `redirect: "manual"` (rejecting any `3xx` with `502`), `cf.cacheTtl = 0`, and `Cache-Control: private, no-store`.
 6. **Gallery / web forwarding (`API_UPSTREAM`) & `POST /api/safety/reveal`**:
-   - Strips all `site_access::is_privileged_request_header` headers and `STRIPPED_ORIGIN_COOKIES`, and attaches a freshly signed short-lived `X-Gateway-Assertion` v3 (`ga3.`, 30s TTL, audience `"lets-embed-web"`) carrying `{ actor, rev, min_enforce_rev, digest, direct_grants, click_eligible, is_billing_waived }`.
+   - Strips all `site_access::is_privileged_request_header` headers and `STRIPPED_ORIGIN_COOKIES`, and attaches a freshly signed short-lived `X-Gateway-Assertion` v3 (`ga3.`, 30s TTL, audience `"lets-embed-web"`) carrying `{ actor, rev, min_enforce_rev, digest, direct_grants, click_eligible, is_billing_waived, caller_age_verified, caller_terms_accepted }`.
    - `__Host-ue_admin_view` waives ONLY the login wall and quota/payment metering (`is_billing_waived: true`); it NEVER grants `LiveAdmin` bypass or Switcher unlocks and still enforces geo, CSRF, and media capability verification.
    - `POST /api/safety/reveal` enforces same-origin + `X-Requested-With: fetch`; if caller has no `User`/`LiveAdmin` actor and no valid `le_guest_sid` cookie, mints a fresh signed `GuestSessionToken` (`le_guest_sid`, `HttpOnly; SameSite=Lax; Path=/; Secure` on https), passes `ActorBinding::GuestSession` in `X-Gateway-Assertion`, forwards to `API_UPSTREAM`, and attaches `Set-Cookie` + `Cache-Control: private, no-store`.
 
@@ -43,7 +43,7 @@ The edge gateway enforces Policy v3 content safety, authoritative geo-blocking, 
   - `JWT_SECRET`, `SESSION_V2_SECRET` (or `SESSION_SECRET`), `MEDIA_CAP_SECRET`, `GATEWAY_ASSERTION_SECRET`, `INTERNAL_API_SECRET`, `GUEST_SESSION_SECRET`, `ADMIN_ASSERTION_SECRET`
   - `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`
   - `ADMIN_ALLOWED_EMAILS` (comma-separated, case-insensitive)
-- **Never bound**: `SETTINGS_ENCRYPTION_KEY` / `PROVIDER_SECRETS_KEY` must never be bound to `gateway_worker`.
+- **Never bound**: `PROVIDER_SECRETS_KEY` must never be bound to `gateway_worker`.
 
 ## Verification
 

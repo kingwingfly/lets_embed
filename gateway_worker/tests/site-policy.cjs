@@ -386,6 +386,7 @@ export default {
       adminAssertionHeader: request.headers.get('x-gallery-admin-assertion'),
       assertionHeader: request.headers.get('x-gateway-assertion'),
       cfAccessJwt: request.headers.get('cf-access-jwt-assertion'),
+      cfIpCountry: request.headers.get('cf-ipcountry'),
       cookie: request.headers.get('cookie'),
     });
   },
@@ -930,13 +931,15 @@ test('Policy v3 gateway enforces HKDF SITE_SECRET, zero implicit admin unlock, f
     assert.equal(r.status, 403, `expected 403 for ${label}`);
   }
 
-  // 5. Privileged header stripping (including X-Gallery-Admin-Assertion) & raw/internal 404 blocking
+  // 5. Privileged header stripping (including X-Gallery-Admin-Assertion), trusted cf-ipcountry
+  //    forwarding to USER_WORKER, & raw/internal 404 blocking
   const userFwd = await site('/user/account', {
     headers: {
       'x-gallery-admin-email': 'spoof@example.test',
       'x-gallery-admin-assertion': validAa2,
       'x-gateway-assertion': 'ga3.spoof.sig',
       'cf-access-jwt-assertion': 'spoof',
+      'cf-ipcountry': 'FR',
       cookie: `${adminViewCookie}; ${signedSessionV2()}`,
     },
   });
@@ -946,6 +949,23 @@ test('Policy v3 gateway enforces HKDF SITE_SECRET, zero implicit admin unlock, f
   assert.equal(userFwdJson.adminAssertionHeader, null);
   assert.equal(userFwdJson.assertionHeader, null);
   assert.equal(userFwdJson.cfAccessJwt, null);
+  assert.equal(userFwdJson.cfIpCountry, 'US');
+
+  // Trusted cf.country overrides spoofed client cf-ipcountry on /user/*, and absent/empty
+  // cf.country results in no cf-ipcountry header forwarded to USER_WORKER.
+  const userFwdGb = await site('/user/account', {
+    cf: { country: 'GB', httpProtocol: 'HTTP/1.1' },
+    headers: { 'cf-ipcountry': 'US' },
+  });
+  assert.equal(userFwdGb.status, 200);
+  assert.equal((await userFwdGb.json()).cfIpCountry, 'GB');
+
+  const userFwdEmptyCountry = await site('/user/account', {
+    cf: { country: '', httpProtocol: 'HTTP/1.1' },
+    headers: { 'cf-ipcountry': 'US' },
+  });
+  assert.equal(userFwdEmptyCountry.status, 200);
+  assert.equal((await userFwdEmptyCountry.json()).cfIpCountry, null);
 
   for (const blocked of ['/images/one.webp', '/videos/a.mp4', '/internal/facts-rev/image/42', '/user/admin']) {
     const r = await visit(adminHost, blocked, { headers: { cookie: adminViewCookie } });
@@ -968,6 +988,8 @@ test('Policy v3 gateway enforces HKDF SITE_SECRET, zero implicit admin unlock, f
   assert.equal(browsePassSearch.status, 200);
   const browsePassGa = verifyGatewayAssertionV3Header(browsePassSearch.headers.get('x-test-assertion'));
   assert.equal(browsePassGa.is_billing_waived, true);
+  assert.equal(browsePassGa.caller_age_verified, false);
+  assert.equal(browsePassGa.caller_terms_accepted, false);
   assert.deepEqual(browsePassGa.actor, { kind: 'anon' });
   assert.deepEqual(browsePassGa.direct_grants, []);
   assert.deepEqual(browsePassGa.click_eligible, [{ id: 'sensitive', grant_generation: 1 }]);
@@ -978,6 +1000,8 @@ test('Policy v3 gateway enforces HKDF SITE_SECRET, zero implicit admin unlock, f
   assert.equal(staffHome.status, 200);
   const staffGa = verifyGatewayAssertionV3Header(staffHome.headers.get('x-test-assertion'));
   assert.equal(staffGa.is_billing_waived, true);
+  assert.equal(staffGa.caller_age_verified, false);
+  assert.equal(staffGa.caller_terms_accepted, false);
   assert.deepEqual(staffGa.actor, { kind: 'live_admin', email: 'operator@example.test' });
   assert.deepEqual(staffGa.direct_grants, [{ id: 'staff_only', grant_generation: 1 }]);
 
@@ -1101,6 +1125,36 @@ test('Policy v3 gateway enforces HKDF SITE_SECRET, zero implicit admin unlock, f
       terms_digest_accepted: policy.legal.terms_digest,
       enabled_switchers: [{ id: 'r18', grant_generation: 1 }],
       pref_version: 2,
+    },
+  });
+
+  // Verify GatewayAssertion v3 carries caller_age_verified & caller_terms_accepted accurately
+  const authedHome = await site('/', { headers: { cookie: signedSessionV2() } });
+  assert.equal(authedHome.status, 200);
+  const authedGa = verifyGatewayAssertionV3Header(authedHome.headers.get('x-test-assertion'));
+  assert.equal(authedGa.caller_age_verified, true);
+  assert.equal(authedGa.caller_terms_accepted, true);
+  await configureAccount(userDoKey, {
+    resetCalls: true,
+    sessionCtx: {
+      assurance_level: 'self_attestation',
+      strict_age_ok: false,
+      terms_version_accepted: null,
+      terms_digest_accepted: null,
+    },
+  });
+  const unverifiedHome = await site('/', { headers: { cookie: signedSessionV2() } });
+  assert.equal(unverifiedHome.status, 200);
+  const unverifiedGa = verifyGatewayAssertionV3Header(unverifiedHome.headers.get('x-test-assertion'));
+  assert.equal(unverifiedGa.caller_age_verified, false);
+  assert.equal(unverifiedGa.caller_terms_accepted, false);
+  await configureAccount(userDoKey, {
+    resetCalls: true,
+    sessionCtx: {
+      assurance_level: 'verified18',
+      strict_age_ok: true,
+      terms_version_accepted: 1,
+      terms_digest_accepted: policy.legal.terms_digest,
     },
   });
   const userCap = signMediaCapV3({

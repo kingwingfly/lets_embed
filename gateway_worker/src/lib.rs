@@ -716,6 +716,7 @@ fn build_service_headers(
     headers: &HeaderMap,
     target: ServiceTarget,
     admin_auth: Option<(&str, &str)>,
+    visitor_country: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (k, v) in headers {
@@ -740,6 +741,12 @@ fn build_service_headers(
         ServiceTarget::UserWorker => {
             if let Some(cookie) = sanitize_user_worker_cookie(headers) {
                 out.push(("cookie".to_string(), cookie));
+            }
+            if let Some(country) = visitor_country
+                .map(str::trim)
+                .filter(|c| !c.is_empty() && !c.chars().any(char::is_control))
+            {
+                out.push(("cf-ipcountry".to_string(), country.to_string()));
             }
         }
         ServiceTarget::AdminDashboard => {
@@ -831,13 +838,33 @@ fn build_media_headers(
     out
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AssertionFlags {
+    is_billing_waived: bool,
+    caller_age_verified: bool,
+    caller_terms_accepted: bool,
+}
+
+fn caller_assertion_flags(
+    auth: Option<&LiveSession>,
+    policy: &PublicSitePolicy,
+    is_billing_waived: bool,
+) -> AssertionFlags {
+    AssertionFlags {
+        is_billing_waived,
+        caller_age_verified: auth
+            .is_some_and(|live| live.ctx.satisfies_age_18(policy.age_policy)),
+        caller_terms_accepted: auth.is_some_and(|live| live.ctx.satisfies_terms(&policy.legal)),
+    }
+}
+
 fn sign_assertion_v3(
     cfg: &GatewayConfig,
     snapshot: &SitePolicySnapshot,
     now: u64,
     actor: ActorBinding,
     access: PolicyAccessResult,
-    is_billing_waived: bool,
+    flags: AssertionFlags,
 ) -> std::result::Result<String, site_access::TokenError> {
     let assertion = GatewayAssertion {
         v: GATEWAY_ASSERTION_VERSION,
@@ -848,7 +875,9 @@ fn sign_assertion_v3(
         digest: snapshot.digest.clone(),
         direct_grants: access.direct_grants,
         click_eligible: access.click_eligible,
-        is_billing_waived,
+        is_billing_waived: flags.is_billing_waived,
+        caller_age_verified: flags.caller_age_verified,
+        caller_terms_accepted: flags.caller_terms_accepted,
         exp: now.saturating_add(GATEWAY_ASSERTION_TTL),
     };
     sign_gateway_assertion(&assertion, &cfg.gateway_assertion_secret)
@@ -990,6 +1019,7 @@ async fn handle_admin_route(
                 headers,
                 ServiceTarget::AdminDashboard,
                 Some((email, &signed_admin_assertion)),
+                None,
             ),
             body: effective_body,
         };
@@ -1141,7 +1171,7 @@ async fn handle_media_route(
             now,
             live_actor.clone(),
             live_access.clone(),
-            is_billing_waived,
+            caller_assertion_flags(auth.as_ref(), &snapshot.policy, is_billing_waived),
         ) else {
             return maybe_clear_session_cookie(assertion_sign_error_response(), clear_cookie);
         };
@@ -1384,7 +1414,7 @@ async fn forward_gallery_request(
     now: u64,
     mut actor: ActorBinding,
     access: PolicyAccessResult,
-    is_billing_waived: bool,
+    flags: AssertionFlags,
     is_reveal_route: bool,
     clear_cookie: bool,
     allow_public_cache: bool,
@@ -1420,9 +1450,7 @@ async fn forward_gallery_request(
         ));
     }
 
-    let Ok(signed_assertion) =
-        sign_assertion_v3(cfg, snapshot, now, actor, access, is_billing_waived)
-    else {
+    let Ok(signed_assertion) = sign_assertion_v3(cfg, snapshot, now, actor, access, flags) else {
         return assertion_sign_error_response();
     };
 
@@ -1507,7 +1535,12 @@ async fn handle_gateway_request(
         let req = ForwardedServiceReq {
             path_and_query: pq,
             method: worker_method,
-            headers: build_service_headers(&headers, ServiceTarget::UserWorker, None),
+            headers: build_service_headers(
+                &headers,
+                ServiceTarget::UserWorker,
+                None,
+                cfg.visitor_country.as_deref(),
+            ),
             body,
         };
         return match backend.forward_service(ServiceTarget::UserWorker, req).await {
@@ -1571,7 +1604,7 @@ async fn handle_gateway_request(
             now,
             ActorBinding::Anon,
             PolicyAccessResult::default(),
-            false,
+            AssertionFlags::default(),
         ) else {
             return assertion_sign_error_response();
         };
@@ -1656,11 +1689,15 @@ async fn handle_gateway_request(
 
     let metered_post = method == Method::POST && item.is_some();
 
-    // Compute live Policy v3 ActorBinding & PolicyAccessResult.
+    // Compute live Policy v3 ActorBinding, PolicyAccessResult & caller verification flags.
     // Sitemaps are always projected strictly as the anonymous safe view.
     let effective_live_admin = if clear_cookie { None } else { live_admin_email };
-    let (actor, access, assertion_billing_waived) = if is_sitemap_path(path) {
-        (ActorBinding::Anon, PolicyAccessResult::default(), false)
+    let (actor, access, assertion_flags) = if is_sitemap_path(path) {
+        (
+            ActorBinding::Anon,
+            PolicyAccessResult::default(),
+            AssertionFlags::default(),
+        )
     } else {
         let guest_cookie = cookies.get(GUEST_SESSION_COOKIE);
         let resolved_actor = resolve_actor_binding(
@@ -1680,7 +1717,8 @@ async fn handle_gateway_request(
                 country: cfg.visitor_country.clone(),
             },
         );
-        (resolved_actor, resolved_access, is_billing_waived)
+        let flags = caller_assertion_flags(auth.as_ref(), &snapshot.policy, is_billing_waived);
+        (resolved_actor, resolved_access, flags)
     };
 
     // Browse pass / live staff waives login wall & quota/payment metering ONLY —
@@ -1698,7 +1736,7 @@ async fn handle_gateway_request(
             now,
             actor,
             access,
-            assertion_billing_waived,
+            assertion_flags,
             is_reveal_route,
             clear_cookie,
             false,
@@ -1710,7 +1748,7 @@ async fn handle_gateway_request(
     let guest = auth.is_none();
     if metered_post {
         let Ok(signed_assertion) =
-            sign_assertion_v3(cfg, &snapshot, now, actor, access, assertion_billing_waived)
+            sign_assertion_v3(cfg, &snapshot, now, actor, access, assertion_flags)
         else {
             return maybe_clear_session_cookie(assertion_sign_error_response(), clear_cookie);
         };
@@ -1814,7 +1852,7 @@ async fn handle_gateway_request(
             now,
             actor,
             access,
-            assertion_billing_waived,
+            assertion_flags,
             is_reveal_route,
             clear_cookie,
             false,
@@ -1850,7 +1888,7 @@ async fn handle_gateway_request(
                 now,
                 actor,
                 access,
-                assertion_billing_waived,
+                assertion_flags,
                 is_reveal_route,
                 clear_cookie,
                 allow_public_cache,
@@ -3740,5 +3778,406 @@ mod tests {
         let decoded_resp: HoldResp =
             serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
         assert_eq!(decoded_resp.hold_id.as_deref(), Some("hold-123"));
+    }
+
+    // -----------------------------------------------------------------------
+    // 8. GatewayAssertion v3 Caller Age/Terms Flags & Trusted `cf-ipcountry`
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gateway_assertion_populates_caller_age_verified_and_caller_terms_accepted() {
+        let do_key = "usr:550e8400-e29b-41d4-a716-446655440000";
+        let user_id = "user-age-terms";
+        let sid = "sid-age-terms";
+
+        let decode_last_ga = |backend: &MockBackend, cfg: &GatewayConfig| -> GatewayAssertion {
+            let up = backend.upstream_calls.borrow();
+            let raw = header_value(&up.last().expect("upstream call").headers, GATEWAY_ASSERTION_HEADER)
+                .expect("X-Gateway-Assertion header");
+            verify_gateway_assertion(
+                raw,
+                &cfg.gateway_assertion_secret,
+                GATEWAY_ASSERTION_AUDIENCE,
+                TEST_NOW,
+                5,
+            )
+            .expect("valid GatewayAssertion v3")
+        };
+
+        let mut policy = sample_safety_policy();
+        policy.age_policy = AgeVerificationPolicy::SelfAttestation;
+        policy.refresh_policy_digest();
+        let terms_v = policy.legal.terms_version;
+        let terms_d = policy.legal.terms_digest.clone();
+
+        let mut backend = MockBackend::with_policy(policy.clone());
+        let mut cfg = test_cfg();
+
+        // 1. Unauthenticated anonymous guest -> false / false
+        let resp_anon = dispatch(&backend, &cfg, Method::GET, "/", HeaderMap::new(), Bytes::new());
+        assert_eq!(resp_anon.status(), StatusCode::OK);
+        let ga_anon = decode_last_ga(&backend, &cfg);
+        assert_eq!(ga_anon.actor, ActorBinding::Anon);
+        assert!(!ga_anon.caller_age_verified);
+        assert!(!ga_anon.caller_terms_accepted);
+
+        // 2. Guest session cookie (`le_guest_sid`) -> false / false
+        let mut guest_hdrs = HeaderMap::new();
+        guest_hdrs.insert(
+            "cookie",
+            make_guest_cookie(&cfg, "gs_0123456789abcdef0123456789abcdef")
+                .parse()
+                .unwrap(),
+        );
+        let resp_guest = dispatch(&backend, &cfg, Method::GET, "/", guest_hdrs, Bytes::new());
+        assert_eq!(resp_guest.status(), StatusCode::OK);
+        let ga_guest = decode_last_ga(&backend, &cfg);
+        assert!(!ga_guest.caller_age_verified);
+        assert!(!ga_guest.caller_terms_accepted);
+
+        // 3. Browse pass (`ADMIN_VIEW_COOKIE`) without user session -> false / false
+        let mut pass_hdrs = HeaderMap::new();
+        pass_hdrs.insert("cookie", make_admin_view_cookie(&cfg).parse().unwrap());
+        let resp_pass = dispatch(&backend, &cfg, Method::GET, "/", pass_hdrs, Bytes::new());
+        assert_eq!(resp_pass.status(), StatusCode::OK);
+        let ga_pass = decode_last_ga(&backend, &cfg);
+        assert!(ga_pass.is_billing_waived);
+        assert!(!ga_pass.caller_age_verified);
+        assert!(!ga_pass.caller_terms_accepted);
+
+        // 4. Live CF Access staff without gallery session -> false / false
+        cfg.admin_email = Some("staff@gallery.test".into());
+        let resp_staff = dispatch(&backend, &cfg, Method::GET, "/", HeaderMap::new(), Bytes::new());
+        assert_eq!(resp_staff.status(), StatusCode::OK);
+        let ga_staff = decode_last_ga(&backend, &cfg);
+        assert_eq!(
+            ga_staff.actor,
+            ActorBinding::LiveAdmin {
+                email: "staff@gallery.test".into()
+            }
+        );
+        assert!(!ga_staff.caller_age_verified);
+        assert!(!ga_staff.caller_terms_accepted);
+        cfg.admin_email = None;
+
+        let make_user_hdrs = || {
+            let mut h = HeaderMap::new();
+            h.insert(
+                "cookie",
+                make_v2_cookie(&cfg, user_id, do_key, sid).parse().unwrap(),
+            );
+            h
+        };
+
+        // 5. Authenticated user with AssuranceLevel::None and no terms -> false / false
+        let base_ctx = SessionContext {
+            active: true,
+            banned: false,
+            suspended: false,
+            sid_valid: true,
+            assurance_level: AssuranceLevel::None,
+            strict_age_ok: false,
+            terms_version_accepted: None,
+            terms_digest_accepted: None,
+            enabled_switchers: vec![],
+            pref_version: 1,
+        };
+        backend.session_contexts.insert(do_key.into(), base_ctx.clone());
+        let resp_unattested = dispatch(&backend, &cfg, Method::GET, "/", make_user_hdrs(), Bytes::new());
+        assert_eq!(resp_unattested.status(), StatusCode::OK);
+        let ga_unattested = decode_last_ga(&backend, &cfg);
+        assert!(!ga_unattested.caller_age_verified);
+        assert!(!ga_unattested.caller_terms_accepted);
+
+        // 6. SelfAttestation policy: SelfAttestation + current terms -> true / true
+        let self_attested_ctx = SessionContext {
+            assurance_level: AssuranceLevel::SelfAttestation,
+            terms_version_accepted: Some(terms_v),
+            terms_digest_accepted: Some(terms_d.clone()),
+            ..base_ctx.clone()
+        };
+        backend
+            .session_contexts
+            .insert(do_key.into(), self_attested_ctx.clone());
+        let resp_self = dispatch(&backend, &cfg, Method::GET, "/", make_user_hdrs(), Bytes::new());
+        assert_eq!(resp_self.status(), StatusCode::OK);
+        let ga_self = decode_last_ga(&backend, &cfg);
+        assert!(ga_self.caller_age_verified);
+        assert!(ga_self.caller_terms_accepted);
+
+        // 7. SelfAttestation + stale terms version OR wrong terms digest -> true / false
+        for (label, stale_ctx) in [
+            (
+                "stale terms version",
+                SessionContext {
+                    terms_version_accepted: Some(terms_v + 1),
+                    ..self_attested_ctx.clone()
+                },
+            ),
+            (
+                "wrong terms digest",
+                SessionContext {
+                    terms_digest_accepted: Some("0".repeat(64)),
+                    ..self_attested_ctx.clone()
+                },
+            ),
+        ] {
+            backend.session_contexts.insert(do_key.into(), stale_ctx);
+            let r = dispatch(&backend, &cfg, Method::GET, "/", make_user_hdrs(), Bytes::new());
+            assert_eq!(r.status(), StatusCode::OK, "case: {label}");
+            let ga = decode_last_ga(&backend, &cfg);
+            assert!(ga.caller_age_verified, "case: {label}");
+            assert!(!ga.caller_terms_accepted, "case: {label}");
+        }
+
+        // 8. StrictProviderVerified18 policy:
+        //    - SelfAttestation -> false / true
+        //    - Verified18 with strict_age_ok=false -> false / true
+        //    - Verified18 with strict_age_ok=true -> true / true
+        policy.age_policy = AgeVerificationPolicy::StrictProviderVerified18;
+        policy.refresh_policy_digest();
+        backend.policy_envelope = Ok(policy_envelope_json(&policy));
+
+        backend
+            .session_contexts
+            .insert(do_key.into(), self_attested_ctx.clone());
+        assert_eq!(
+            dispatch(&backend, &cfg, Method::GET, "/", make_user_hdrs(), Bytes::new()).status(),
+            StatusCode::OK
+        );
+        let ga_strict_self = decode_last_ga(&backend, &cfg);
+        assert!(!ga_strict_self.caller_age_verified);
+        assert!(ga_strict_self.caller_terms_accepted);
+
+        backend.session_contexts.insert(
+            do_key.into(),
+            SessionContext {
+                assurance_level: AssuranceLevel::Verified18,
+                strict_age_ok: false,
+                ..self_attested_ctx.clone()
+            },
+        );
+        assert_eq!(
+            dispatch(&backend, &cfg, Method::GET, "/", make_user_hdrs(), Bytes::new()).status(),
+            StatusCode::OK
+        );
+        let ga_strict_flag_false = decode_last_ga(&backend, &cfg);
+        assert!(!ga_strict_flag_false.caller_age_verified);
+        assert!(ga_strict_flag_false.caller_terms_accepted);
+
+        let strict_verified_ctx = SessionContext {
+            assurance_level: AssuranceLevel::Verified18,
+            strict_age_ok: true,
+            enabled_switchers: vec![PolicyRef::new("r18", 1)],
+            ..self_attested_ctx.clone()
+        };
+        backend
+            .session_contexts
+            .insert(do_key.into(), strict_verified_ctx.clone());
+        assert_eq!(
+            dispatch(&backend, &cfg, Method::GET, "/", make_user_hdrs(), Bytes::new()).status(),
+            StatusCode::OK
+        );
+        let ga_strict_ok = decode_last_ga(&backend, &cfg);
+        assert!(ga_strict_ok.caller_age_verified);
+        assert!(ga_strict_ok.caller_terms_accepted);
+
+        // 9. Metered POST search carries caller_age_verified & caller_terms_accepted
+        let mut post_hdrs = form_headers();
+        post_hdrs.insert("origin", "https://gallery.test".parse().unwrap());
+        post_hdrs.insert(
+            "cookie",
+            make_v2_cookie(&cfg, user_id, do_key, sid).parse().unwrap(),
+        );
+        let post_resp = dispatch(
+            &backend,
+            &cfg,
+            Method::POST,
+            "https://gallery.test/api/search_by_desc",
+            post_hdrs,
+            Bytes::from_static(b"q=nebula"),
+        );
+        assert_eq!(post_resp.status(), StatusCode::OK);
+        let ga_post = decode_last_ga(&backend, &cfg);
+        assert!(ga_post.caller_age_verified);
+        assert!(ga_post.caller_terms_accepted);
+
+        // 10. Sitemap path stays strictly anonymous safe view (false / false) even for verified user
+        let sitemap_resp = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "/sitemap/1.xml",
+            make_user_hdrs(),
+            Bytes::new(),
+        );
+        assert_eq!(sitemap_resp.status(), StatusCode::OK);
+        let ga_sitemap = decode_last_ga(&backend, &cfg);
+        assert_eq!(ga_sitemap.actor, ActorBinding::Anon);
+        assert!(!ga_sitemap.caller_age_verified);
+        assert!(!ga_sitemap.caller_terms_accepted);
+
+        // 11. Media `/internal/facts-rev/*` assertion also carries caller_age_verified & caller_terms_accepted
+        backend.upstream_calls.borrow_mut().clear();
+        let cap = MediaCapability {
+            v: MEDIA_CAP_VERSION,
+            aud: MEDIA_CAP_AUDIENCE.into(),
+            kind: MediaCapKind::Image,
+            asset_id: 77,
+            immutable_locator: "2026/01/pic_77.webp".into(),
+            facts_rev: 7,
+            policy_rev: policy.revision,
+            actor_binding: ActorBinding::User {
+                sub: user_id.into(),
+                sid: sid.into(),
+            },
+            matched_blocks: vec![PolicyRef::new("r18", 1)],
+            matched_blurs: vec![],
+            revealed_refs: vec![],
+            exp: TEST_NOW + 300,
+        };
+        let cap_tok = sign_media_capability(&cap, &cfg.media_cap_secret).unwrap();
+        let media_resp = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            &format!("/media/image/77?cap={cap_tok}"),
+            make_user_hdrs(),
+            Bytes::new(),
+        );
+        assert_eq!(media_resp.status(), StatusCode::OK);
+        {
+            let up = backend.upstream_calls.borrow();
+            let facts_call = up
+                .iter()
+                .find(|c| c.url.contains("/internal/facts-rev/"))
+                .expect("facts-rev upstream call");
+            let ga_facts = verify_gateway_assertion(
+                header_value(&facts_call.headers, GATEWAY_ASSERTION_HEADER).unwrap(),
+                &cfg.gateway_assertion_secret,
+                GATEWAY_ASSERTION_AUDIENCE,
+                TEST_NOW,
+                5,
+            )
+            .unwrap();
+            assert!(ga_facts.caller_age_verified);
+            assert!(ga_facts.caller_terms_accepted);
+        }
+
+        // 12. AgeVerificationPolicy::Off -> caller_age_verified MUST be false even for Verified18!
+        for rule in &mut policy.policies {
+            rule.bypass.require_age_18 = false;
+        }
+        policy.age_policy = AgeVerificationPolicy::Off;
+        policy.age_gate_trigger = AgeGateTrigger::Off;
+        policy.refresh_policy_digest();
+        backend.policy_envelope = Ok(policy_envelope_json(&policy));
+        assert_eq!(
+            dispatch(&backend, &cfg, Method::GET, "/", make_user_hdrs(), Bytes::new()).status(),
+            StatusCode::OK
+        );
+        let ga_off = decode_last_ga(&backend, &cfg);
+        assert!(!ga_off.caller_age_verified);
+        assert!(ga_off.caller_terms_accepted);
+
+        // 13. Revoked session -> false / false
+        backend.session_contexts.insert(
+            do_key.into(),
+            SessionContext {
+                sid_valid: false,
+                ..strict_verified_ctx
+            },
+        );
+        let revoked_resp = dispatch(&backend, &cfg, Method::GET, "/", make_user_hdrs(), Bytes::new());
+        assert_eq!(revoked_resp.status(), StatusCode::OK);
+        let ga_revoked = decode_last_ga(&backend, &cfg);
+        assert_eq!(ga_revoked.actor, ActorBinding::Anon);
+        assert!(!ga_revoked.caller_age_verified);
+        assert!(!ga_revoked.caller_terms_accepted);
+    }
+
+    #[test]
+    fn user_worker_forwarding_strips_spoofed_cf_ipcountry_and_sets_trusted_cf_country() {
+        let backend = MockBackend::with_policy(sample_safety_policy());
+        let mut cfg = test_cfg();
+        cfg.visitor_country = Some("GB".into());
+
+        // Spoofed (including duplicate) client cf-ipcountry headers are stripped and replaced
+        // with the single authoritative Cloudflare runtime `cf.country` value on `/user/*`.
+        let mut spoofed = HeaderMap::new();
+        spoofed.append("cf-ipcountry", "FR".parse().unwrap());
+        spoofed.append("cf-ipcountry", "JP".parse().unwrap());
+        let resp = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "/user/account",
+            spoofed.clone(),
+            Bytes::new(),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        {
+            let calls = backend.service_calls.borrow();
+            let last = calls.last().expect("USER_WORKER service call");
+            assert_eq!(last.target, ServiceTarget::UserWorker);
+            let country_headers: Vec<&str> = last
+                .headers
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("cf-ipcountry"))
+                .map(|(_, v)| v.as_str())
+                .collect();
+            assert_eq!(country_headers, vec!["GB"]);
+        }
+
+        // Absent or blank `cf.country` -> spoofed client header stripped and NO `cf-ipcountry` set.
+        for absent in [None, Some(""), Some("   ")] {
+            cfg.visitor_country = absent.map(str::to_string);
+            let r = dispatch(
+                &backend,
+                &cfg,
+                Method::GET,
+                "/user/account",
+                spoofed.clone(),
+                Bytes::new(),
+            );
+            assert_eq!(r.status(), StatusCode::OK);
+            let calls = backend.service_calls.borrow();
+            let last = calls.last().expect("USER_WORKER service call");
+            assert_eq!(
+                header_value(&last.headers, "cf-ipcountry"),
+                None,
+                "absent/blank cf.country must not forward cf-ipcountry"
+            );
+        }
+
+        // Non-USER_WORKER targets (`/admin` and `API_UPSTREAM`) still NEVER receive `cf-ipcountry`.
+        cfg.visitor_country = Some("US".into());
+        cfg.admin_email = Some("ops@gallery.test".into());
+        let admin_resp = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "/admin",
+            spoofed.clone(),
+            Bytes::new(),
+        );
+        assert_eq!(admin_resp.status(), StatusCode::OK);
+        assert_eq!(
+            header_value(
+                &backend.service_calls.borrow().last().unwrap().headers,
+                "cf-ipcountry"
+            ),
+            None
+        );
+
+        let gallery_resp = dispatch(&backend, &cfg, Method::GET, "/", spoofed, Bytes::new());
+        assert_eq!(gallery_resp.status(), StatusCode::OK);
+        assert_eq!(
+            header_value(
+                &backend.upstream_calls.borrow().last().unwrap().headers,
+                "cf-ipcountry"
+            ),
+            None
+        );
     }
 }
