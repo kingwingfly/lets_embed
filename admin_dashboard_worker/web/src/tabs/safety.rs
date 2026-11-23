@@ -131,7 +131,7 @@ pub fn SafetyTab(
         pol.id = candidate;
         pol.grant_generation = 1;
         pol.priority = max_prio.saturating_add(10);
-        pol.enabled = !pol.match_expr.trim().is_empty();
+        pol.enabled = true;
         // Ensure new policies never silently default to live admin bypass!
         pol.bypass.include_live_admin = false;
         let label = pol.name.clone();
@@ -148,7 +148,7 @@ pub fn SafetyTab(
         add_policy_template(ContentPolicy {
             id: "custom".to_string(),
             grant_generation: 1,
-            enabled: false,
+            enabled: true,
             priority: 40,
             name: "Custom Policy".to_string(),
             preset: PlaceholderPreset::Custom,
