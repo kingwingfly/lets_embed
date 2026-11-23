@@ -337,7 +337,7 @@ fn parse_threshold_value(raw: &str, pos: usize) -> Result<f32, SafetyRuleError> 
 }
 
 fn is_regex_literal(s: &str) -> bool {
-    s.len() >= 2 && s.starts_with('/') && s.ends_with('/')
+    s.starts_with('/')
 }
 
 fn parse_quoted(chars: &[(usize, char)], i: &mut usize) -> Result<String, SafetyRuleError> {
@@ -557,6 +557,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SafetyRuleError> {
                                     || after.starts_with("==")
                                     || after.starts_with('>')
                                     || after.starts_with('<')
+                                    || after.starts_with('=')
                                 {
                                     let num_part = after.trim_start_matches(['>', '<', '=']);
                                     if !num_part.is_empty() && num_part.parse::<f32>().is_ok() {
@@ -576,6 +577,15 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SafetyRuleError> {
                         return Err(SafetyRuleError::new(
                             format!(
                                 "Exact name after '{}:' cannot be empty or padded with whitespace",
+                                field.as_str()
+                            ),
+                            Some(start),
+                        ));
+                    }
+                    if name.chars().any(char::is_control) {
+                        return Err(SafetyRuleError::new(
+                            format!(
+                                "Exact name after '{}:' cannot contain control characters",
                                 field.as_str()
                             ),
                             Some(start),
@@ -883,11 +893,20 @@ mod tests {
         assert!(parse_safety_rule(r#""explicit""#).is_err());
         assert!(parse_safety_rule("tag:blood gore").is_err());
 
-        // Regexes
+        // Regexes (including regexes with trailing flags)
         assert!(parse_safety_rule("/blood.*/").is_err());
         assert!(parse_safety_rule("tag:/blood.*/").is_err());
+        assert!(parse_safety_rule("tag:/blood.*/i").is_err());
+        assert!(parse_safety_rule("tag:/blood/gimsu").is_err());
         assert!(parse_safety_rule("regex:blood.*").is_err());
         assert!(parse_safety_rule("tag:blood~=0.5").is_err());
+
+        // Control chars and NUL bytes in quoted or unquoted names
+        assert!(parse_safety_rule("tag:\"blood\0\"").is_err());
+        assert!(parse_safety_rule("tag:\"blood\nline\"").is_err());
+        assert!(parse_safety_rule("tag:blood\x00").is_err());
+        assert!(parse_safety_rule("post_tag:\"foo\x07bar\"").is_err());
+        assert!(parse_safety_rule("author:\"bob\r\"").is_err());
 
         // Empty names
         assert!(parse_safety_rule("tag:").is_err());
@@ -903,6 +922,14 @@ mod tests {
         assert!(parse_safety_rule("tag:blood>=0.001").is_ok());
         assert!(parse_safety_rule("tag:blood>=1.0").is_ok());
         assert!(parse_safety_rule("tag:blood>=1").is_ok());
+        // Kaomoji tags containing '=' without numeric suffix remain valid
+        assert_eq!(
+            parse_safety_rule("tag:=_=").unwrap(),
+            SafetyExpr::Predicate(SafetyPredicate::WdTag {
+                name: "=_=".to_string(),
+                min_score: None,
+            })
+        );
 
         // Out of range or non-finite
         assert!(parse_safety_rule("tag:blood>=0").is_err());
@@ -915,6 +942,8 @@ mod tests {
         assert!(parse_safety_rule("tag:blood>=").is_err());
         assert!(parse_safety_rule("tag:blood>0.5").is_err());
         assert!(parse_safety_rule("tag:blood<=0.5").is_err());
+        assert!(parse_safety_rule("tag:blood=0.5").is_err());
+        assert!(parse_safety_rule("tag:blood==0.5").is_err());
         assert!(parse_safety_rule("tag:blood>=0.5>=0.6").is_err());
 
         // Score threshold disallowed on post_tag / author
