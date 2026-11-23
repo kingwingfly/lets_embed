@@ -86,6 +86,14 @@ fn ViewerOverlay(
         }
     };
 
+    // Also wipe active <video>/<img> elements on unmount so parent-driven close
+    // (e.g. Lightbox closing Viewer on panic_epoch) never leaves media decoding/playing.
+    on_cleanup(move || {
+        if let Some(el) = dialog_ref.get_untracked() {
+            wipe_media_elements_in(Some(el.as_ref()));
+        }
+    });
+
     // Focus dialog on client mount for immediate keyboard support.
     #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
     Effect::new(move |_| {
@@ -112,10 +120,12 @@ fn ViewerOverlay(
         items.with(|list| list.get(idx).cloned())
     });
 
-    // Reset zoom when navigating to another slide.
+    // Reset zoom and spoiler reveal tracking when navigating to another slide so
+    // revisiting an unrevealed ServerTransform spoiler never exposes reveal_url.
     Effect::new(move |_| {
         let _ = index.get();
         zoom_idx.set(0);
+        revealed_spoiler_id.set(None);
     });
 
     let has_prev = move || matches!(index.get(), Some(i) if i > 0);
@@ -534,6 +544,11 @@ fn ViewerOverlay(
                                     blur_mode=blur_mode
                                     panic_epoch=panic_epoch.unwrap_or_else(|| Signal::derive(|| 0))
                                     on_reveal=Callback::new(move |rid| revealed_spoiler_id.set(Some(rid)))
+                                    on_hide=Callback::new(move |hid| {
+                                        if revealed_spoiler_id.get_untracked() == Some(hid) {
+                                            revealed_spoiler_id.set(None);
+                                        }
+                                    })
                                 />
                             </div>
                         }

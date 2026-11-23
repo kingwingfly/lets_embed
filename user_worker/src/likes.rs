@@ -1,19 +1,14 @@
-//! UNIT 5: Like/Favorite API over D1 (`likes` table).
+//! Like/Favorite API over D1 (`likes` table), authenticated via revocable `v2` sessions.
 //!
-//! - POST   /user/api/like          Json(LikeReq)          -> LikedResp{liked:true} (INSERT OR IGNORE)
-//! - DELETE /user/api/like          Json(LikeReq)          -> LikedResp{liked:false}
-//! - GET    /user/api/like          Query(LikeQuery)       -> LikedResp
-//! - GET    /user/api/likes         Query(LikesQuery)      -> LikesResp, keyset on created_at DESC
-//! - GET    /user/api/likes/status  Query(LikesStatusQuery)-> {"liked": ["post:1", "image:2"]}
-//!
-//! All require a session (401 otherwise); bad `kind` is a 400.
+//! Migrated legacy wallet users keep `user_id == legacy_address`, preserving 100% of
+//! existing `likes` rows without losing a single favorite!
 
 use std::collections::{BTreeMap, HashSet};
 
 use axum::{
     Json,
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -21,7 +16,7 @@ use tower_cookies::Cookies;
 use wasm_bindgen::JsValue;
 
 use crate::{
-    AppState, do_client, session,
+    AppState, auth, identity, session,
     types::{ApiError, LikeReq, LikeRow, LikedResp, LikesResp, valid_like_kind},
 };
 
@@ -30,7 +25,6 @@ const MAX_RAW_STATUS_SEGMENTS: usize = 200;
 
 #[derive(Debug, Deserialize)]
 pub struct LikesStatusQuery {
-    /// Comma-separated `kind:target_id` pairs (capped at 100 unique valid pairs).
     #[serde(default)]
     pub items: String,
 }
@@ -40,8 +34,6 @@ struct LikesStatusResp {
     liked: Vec<String>,
 }
 
-/// Parse up to `MAX_STATUS_ITEMS` unique valid `(kind, target_id)` pairs grouped by kind.
-/// Returns `Err` if the caller exceeds the raw segment cap or unique item cap.
 fn parse_status_items(raw: &str) -> Result<BTreeMap<&'static str, Vec<i64>>, &'static str> {
     let mut seen: HashSet<(&'static str, i64)> = HashSet::new();
     let mut grouped: BTreeMap<&'static str, Vec<i64>> = BTreeMap::new();
@@ -85,12 +77,10 @@ pub struct LikesQuery {
     pub kind: Option<String>,
     #[serde(default, deserialize_with = "empty_as_none")]
     pub limit: Option<u32>,
-    /// created_at keyset cursor from the previous page's next_cursor.
     #[serde(default, deserialize_with = "empty_as_none")]
     pub cursor: Option<i64>,
 }
 
-/// Treat present-but-empty query params (`?cursor=&limit=`) as absent.
 fn empty_as_none<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -112,39 +102,12 @@ fn db_err(e: worker::Error) -> Response {
     err(StatusCode::INTERNAL_SERVER_ERROR, "database error")
 }
 
-/// Verified, non-suspended session address, or a ready 401/403/502 response.
-async fn auth_active(st: &AppState, cookies: &Cookies) -> Result<String, Response> {
-    let address = session::session_address(cookies, &st.jwt_secret)
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "not signed in"))?;
-    let resp = do_client::call_do::<()>(
-        &st.env,
-        &address,
-        worker::Method::Post,
-        "/check-active",
-        None,
-    )
-    .await
-    .map_err(|e| {
-        worker::console_error!("likes: active check failed: {e:?}");
-        err(StatusCode::BAD_GATEWAY, "account service unavailable")
-    })?;
-    match resp.status_code() {
-        200 => Ok(address),
-        403 => Err(err(StatusCode::FORBIDDEN, "account suspended")),
-        code => {
-            worker::console_error!("likes: unexpected active check status {code}");
-            Err(err(StatusCode::BAD_GATEWAY, "account service unavailable"))
-        }
-    }
-}
-
 fn check_kind(kind: &str) -> Result<(), Response> {
     valid_like_kind(kind)
         .then_some(())
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "invalid kind"))
 }
 
-/// Keyset cursor: last row's created_at, only when the page came back full.
 fn page_cursor(items: &[LikeRow], limit: usize) -> Option<i64> {
     match items.last() {
         Some(last) if items.len() == limit => Some(last.created_at),
@@ -155,10 +118,14 @@ fn page_cursor(items: &[LikeRow], limit: usize) -> Option<i64> {
 #[worker::send]
 pub async fn like(
     State(st): State<AppState>,
+    headers: HeaderMap,
     cookies: Cookies,
     Json(req): Json<LikeReq>,
 ) -> Response {
-    let address = match auth_active(&st, &cookies).await {
+    if let Err(r) = auth::require_same_origin(&st, &headers) {
+        return r;
+    }
+    let active = match identity::require_active_session(&st, &cookies).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -173,7 +140,7 @@ pub async fn like(
                  VALUES (?, ?, CAST(? AS INTEGER), ?)",
             )
             .bind(&[
-                address.into(),
+                active.user_id.into(),
                 req.kind.into(),
                 req.target_id.to_string().into(),
                 (session::now_secs() as f64).into(),
@@ -191,10 +158,14 @@ pub async fn like(
 #[worker::send]
 pub async fn unlike(
     State(st): State<AppState>,
+    headers: HeaderMap,
     cookies: Cookies,
     Json(req): Json<LikeReq>,
 ) -> Response {
-    let address = match auth_active(&st, &cookies).await {
+    if let Err(r) = auth::require_same_origin(&st, &headers) {
+        return r;
+    }
+    let active = match identity::require_active_session(&st, &cookies).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -208,7 +179,7 @@ pub async fn unlike(
                 "DELETE FROM likes WHERE address = ? AND kind = ? AND target_id = CAST(? AS INTEGER)",
             )
             .bind(&[
-                address.into(),
+                active.user_id.into(),
                 req.kind.into(),
                 req.target_id.to_string().into(),
             ])?
@@ -228,7 +199,7 @@ pub async fn liked(
     cookies: Cookies,
     Query(q): Query<LikeQuery>,
 ) -> Response {
-    let address = match auth_active(&st, &cookies).await {
+    let active = match identity::require_active_session(&st, &cookies).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -242,7 +213,11 @@ pub async fn liked(
             .prepare(
                 "SELECT 1 AS x FROM likes WHERE address = ? AND kind = ? AND target_id = CAST(? AS INTEGER)",
             )
-            .bind(&[address.into(), q.kind.into(), q.target_id.to_string().into()])?
+            .bind(&[
+                active.user_id.into(),
+                q.kind.into(),
+                q.target_id.to_string().into(),
+            ])?
             .first::<i64>(Some("x"))
             .await
     }
@@ -262,7 +237,7 @@ pub async fn list(
     cookies: Cookies,
     Query(q): Query<LikesQuery>,
 ) -> Response {
-    let address = match auth_active(&st, &cookies).await {
+    let active = match identity::require_active_session(&st, &cookies).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -283,7 +258,7 @@ pub async fn list(
     let mut sql = String::from(
         "SELECT kind, CAST(target_id AS TEXT) AS target_id, created_at FROM likes WHERE address = ?",
     );
-    let mut binds: Vec<JsValue> = vec![address.into()];
+    let mut binds: Vec<JsValue> = vec![active.user_id.into()];
     if let Some(kind) = q.kind {
         sql.push_str(" AND kind = ?");
         binds.push(kind.into());
@@ -334,7 +309,7 @@ pub async fn status_batch(
     cookies: Cookies,
     Query(q): Query<LikesStatusQuery>,
 ) -> Response {
-    let address = match auth_active(&st, &cookies).await {
+    let active = match identity::require_active_session(&st, &cookies).await {
         Ok(a) => a,
         Err(r) => return r,
     };
@@ -352,10 +327,6 @@ pub async fn status_batch(
         target_id: String,
     }
 
-    // Stay well below Cloudflare D1's 100-bound-parameter-per-statement limit
-    // by chunking each kind to <= 45 ids and executing all chunks in one batch.
-    // Bind and select target_id as decimal strings so full 64-bit ids never lose
-    // precision through JS f64 conversion.
     let res = async {
         let db = st.env.d1(crate::D1_BINDING)?;
         let mut stmts = Vec::new();
@@ -367,7 +338,7 @@ pub async fn status_batch(
                      WHERE address = ? AND kind = ? AND target_id IN ({placeholders})"
                 );
                 let mut binds: Vec<JsValue> = Vec::with_capacity(2 + chunk.len());
-                binds.push(address.as_str().into());
+                binds.push(active.user_id.as_str().into());
                 binds.push(kind.into());
                 for &id in chunk {
                     binds.push(id.to_string().into());
@@ -405,7 +376,6 @@ mod tests {
 
     #[test]
     fn empty_query_params_are_none() {
-        // query-string values arrive as strings; empty means absent
         let q: LikesQuery = serde_json::from_str(r#"{"kind":"","limit":"","cursor":""}"#).unwrap();
         assert!(q.kind.is_none() && q.limit.is_none() && q.cursor.is_none());
         let q: LikesQuery =
@@ -416,11 +386,8 @@ mod tests {
 
     #[test]
     fn cursor_only_on_full_page() {
-        // partial page -> no cursor
         assert_eq!(page_cursor(&[row(30), row(20)], 3), None);
-        // full page -> last (oldest) created_at
         assert_eq!(page_cursor(&[row(30), row(20), row(10)], 3), Some(10));
-        // empty
         assert_eq!(page_cursor(&[], 3), None);
     }
 

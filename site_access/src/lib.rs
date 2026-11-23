@@ -113,6 +113,9 @@ pub fn admin_view_pass(secret: &[u8], expiry: u64) -> String {
     format!("{expiry}.{}", URL_SAFE_NO_PAD.encode(signature))
 }
 pub fn valid_admin_view(secret: &[u8], value: &str, now: u64) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
     let Some((exp, signature)) = value.split_once('.') else {
         return false;
     };
@@ -468,5 +471,187 @@ mod tests {
         assert!(p.legal.dmca_md.contains("DMCA"));
         assert!(p.legal.content_policy_md.contains("Content Policy"));
         assert_eq!(p.legal.terms_digest.len(), 64);
+    }
+
+    #[test]
+    fn media_capability_rejects_percent_encoding_scheme_colon_and_whitespace_traps() {
+        let secret = b"media-cap-secret";
+        let base = MediaCapability {
+            v: MEDIA_CAP_VERSION,
+            kind: MediaCapKind::Image,
+            id: 42,
+            path: "2026/01/ok.webp".to_string(),
+            rev: 1,
+            sub: "user-1".to_string(),
+            sid: Some("sid-1".to_string()),
+            req_switchers: vec!["r18".to_string()],
+            exp: 5000,
+        };
+
+        let oversized_path = format!("{}.webp", "a".repeat(1025));
+        let bad_paths = [
+            "%2e%2e/secret.webp",
+            "%2E%2E/secret.webp",
+            ".%2e/secret.webp",
+            "..%2fsecret.webp",
+            "a%5c..%5cb",
+            "img%00.webp",
+            "img%3fx=1",
+            "img%23frag",
+            "%252e%252e/x",
+            "bad%2",
+            "http:evil.com/x.webp",
+            "https://evil.com/x.webp",
+            " 2026/ok.webp",
+            "2026/ok.webp ",
+            "2026//ok.webp",
+            "2026/ok\x00.webp",
+            oversized_path.as_str(),
+        ];
+
+        for bad in bad_paths {
+            let cap = MediaCapability {
+                path: bad.to_string(),
+                ..base.clone()
+            };
+            assert!(
+                sign_media_capability(&cap, secret).is_err(),
+                "sign must reject unsafe path: {bad:?}"
+            );
+
+            // Also verify that even a manually HMAC-signed payload with an unsafe path is rejected on verify!
+            let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cap).unwrap());
+            let mut m = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+            m.update(b"media-cap/v1\0");
+            m.update(payload.as_bytes());
+            let forged = format!(
+                "{payload}.{}",
+                URL_SAFE_NO_PAD.encode(m.finalize().into_bytes())
+            );
+            assert!(
+                verify_media_capability(&forged, secret, MediaCapKind::Image, 42, 4000, 1)
+                    .is_err(),
+                "verify must reject unsafe path: {bad:?}"
+            );
+        }
+
+        // Padded " anon " must NOT bypass anon switcher check
+        let padded_anon = MediaCapability {
+            sub: " anon ".to_string(),
+            sid: None,
+            req_switchers: vec!["r18".to_string()],
+            ..base.clone()
+        };
+        assert!(sign_media_capability(&padded_anon, secret).is_err());
+
+        // Empty / padded / control-char switchers rejected
+        for bad_sw in ["", " ", " r18", "r18 ", "r18\n"] {
+            let cap = MediaCapability {
+                req_switchers: vec![bad_sw.to_string()],
+                ..base.clone()
+            };
+            assert!(sign_media_capability(&cap, secret).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_empty_secrets_far_future_assertions_safe_mode_switchers_and_dirty_claims() {
+        let secret = b"real-secret";
+        let valid_v2 = SessionV2Claims {
+            v: SESSION_V2_VERSION,
+            sub: "usr-123".to_string(),
+            do_key: "usr:550e8400-e29b-41d4-a716-446655440000".to_string(),
+            sid: "sid-123".to_string(),
+            iat: 1000,
+            exp: 2000,
+        };
+        assert!(sign_session_v2(&valid_v2, b"").is_err());
+        let tok_v2 = sign_session_v2(&valid_v2, secret).unwrap();
+        assert!(verify_session_v2(&tok_v2, b"", 1500).is_err());
+
+        // Leading/trailing whitespace & control chars in SessionV2Claims rejected
+        assert!(
+            sign_session_v2(
+                &SessionV2Claims {
+                    sub: " usr-123 ".to_string(),
+                    ..valid_v2.clone()
+                },
+                secret
+            )
+            .is_err()
+        );
+        assert!(
+            sign_session_v2(
+                &SessionV2Claims {
+                    sid: "sid\x001".to_string(),
+                    ..valid_v2.clone()
+                },
+                secret
+            )
+            .is_err()
+        );
+
+        // Legacy session empty secret rejected
+        let valid_legacy = LegacySessionClaims {
+            sub: ETH_ADDR.to_string(),
+            iat: 1000,
+            exp: 2000,
+        };
+        assert!(sign_legacy_session(&valid_legacy, b"").is_err());
+        let tok_legacy = sign_legacy_session(&valid_legacy, secret).unwrap();
+        assert!(verify_legacy_session(&tok_legacy, b"", 1500).is_err());
+
+        // valid_admin_view rejects empty secret
+        let pass = admin_view_pass(b"", 600);
+        assert!(!valid_admin_view(b"", &pass, 500));
+
+        // GatewayAssertion: empty secret, safe_mode + non-empty switchers, far-future exp
+        let base_assertion = GatewayAssertion {
+            v: GATEWAY_ASSERTION_VERSION,
+            aud: GATEWAY_ASSERTION_AUDIENCE.to_string(),
+            rev: 1,
+            min_enforce_rev: 1,
+            policy_digest: SAMPLE_DIGEST.to_string(),
+            sub: Some("user-1".to_string()),
+            sid: Some("sid-1".to_string()),
+            switchers: vec!["r18".to_string()],
+            safe_mode: false,
+            is_admin_view: false,
+            exp: 1030,
+        };
+        assert!(sign_gateway_assertion(&base_assertion, b"").is_err());
+
+        let bad_safe_mode = GatewayAssertion {
+            safe_mode: true,
+            ..base_assertion.clone()
+        };
+        assert!(sign_gateway_assertion(&bad_safe_mode, secret).is_err());
+
+        let dirty_sw = GatewayAssertion {
+            switchers: vec![" r18 ".to_string()],
+            ..base_assertion.clone()
+        };
+        assert!(sign_gateway_assertion(&dirty_sw, secret).is_err());
+
+        // Far-future exp exceeds now + GATEWAY_ASSERTION_TTL + max_skew
+        let far_future = GatewayAssertion {
+            exp: 1000 + GATEWAY_ASSERTION_TTL + 5 + 1,
+            ..base_assertion.clone()
+        };
+        let far_hdr = sign_gateway_assertion(&far_future, secret).unwrap();
+        assert!(
+            verify_gateway_assertion(&far_hdr, secret, GATEWAY_ASSERTION_AUDIENCE, 1000, 5)
+                .is_err()
+        );
+        // At exact boundary (now + TTL + max_skew) succeeds
+        let boundary = GatewayAssertion {
+            exp: 1000 + GATEWAY_ASSERTION_TTL + 5,
+            ..base_assertion
+        };
+        let boundary_hdr = sign_gateway_assertion(&boundary, secret).unwrap();
+        assert!(
+            verify_gateway_assertion(&boundary_hdr, secret, GATEWAY_ASSERTION_AUDIENCE, 1000, 5)
+                .is_ok()
+        );
     }
 }

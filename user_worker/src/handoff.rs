@@ -1,20 +1,11 @@
 //! Cross-device QR / one-time-code sign-in and mobile wallet-app handoff.
 //!
-//! Two complementary flows backed by a strongly-consistent singleton SQLite
-//! Durable Object (`__auth_handoff__` inside `USER_ACCOUNT`):
-//!
-//! 1. **Wallet app handoff** (`start` -> `approve_eth`/`approve_sol` -> `poll`):
-//!    A mobile browser without an injected wallet starts a 5-minute handoff
-//!    session and deep-links to `/user/login/approve?s=<session_id>` inside
-//!    MetaMask / Phantom (or shows a QR code). The approval signature is
-//!    cryptographically bound to `session_id`, the 4-digit `verify_code`, and a
-//!    DO-owned single-use `approve_nonce`. Once approved, the originating
-//!    browser's poll receives `ue_session`.
-//! 2. **Signed-in device transfer** (`transfer_create` -> `transfer_claim`):
-//!    A user already signed in on desktop generates a single-use 3-minute QR
-//!    token (carried in URL fragment `#transfer=...`, never logged in server
-//!    queries) + 8-char one-time code (`XXXX-XXXX`, 40 bits + per-IP lockout)
-//!    on `/user/account` to sign in on their phone's native browser.
+//! Security upgrades (H7, H8):
+//! - Enforces `AgeVerificationPolicy` provider eligibility uniformly across
+//!   `handoff/approve_eth`, `handoff/approve_sol`, `handoff/poll`, AND `transfer/claim`!
+//! - Issues revocable `v2` sessions (`identity::issue_v2_session`) addressed via
+//!   `users_v2.account_do_key` across both QR handoff and transfer claim.
+//! - Uses pinned `PUBLIC_URL` origin for QR approval & transfer URLs (L2).
 
 use std::net::IpAddr;
 
@@ -27,11 +18,14 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use site_access::{AssuranceLevel, AuthProviderId};
 use tower_cookies::Cookies;
 use worker::{Method, Request, RequestInit, wasm_bindgen::JsValue};
 
 use crate::{
     AppState, auth, config, do_client,
+    identity::{self, VerifiedExternalIdentity},
+    policy_do,
     qr::{self, QrMatrix},
     session, siwe, solana_link,
 };
@@ -40,8 +34,6 @@ const HANDOFF_DO_ID: &str = "__auth_handoff__";
 const HANDOFF_TTL_SECS: u64 = 300; // 5 minutes
 const TRANSFER_TTL_SECS: u64 = 180; // 3 minutes
 
-/// 32-character uppercase alphabet omitting ambiguous `0`, `O`, `1`, `I`
-/// (24 letters + 8 digits = exact power of two for unbiased 5-bit indexing).
 const SHORT_CODE_ALPH: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 // ---------------------------------------------------------------------------
@@ -116,6 +108,50 @@ pub struct DoTransferClaimResp {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DoTransferRevokeReq {
     pub principal: String,
+}
+
+/// Structured envelope stored in `handoff_sessions_v2.principal` / `transfer_codes.principal`
+/// carrying full `users_v2` provenance while staying backwards-compatible with legacy DO rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredPrincipalEnvelope {
+    user_id: String,
+    auth_method: String,
+    identity_key: String,
+    display_address: String,
+}
+
+const ENVELOPE_PREFIX: &str = "v2json:";
+
+fn encode_envelope(env: &StoredPrincipalEnvelope) -> String {
+    format!(
+        "{ENVELOPE_PREFIX}{}",
+        serde_json::to_string(env).unwrap_or_default()
+    )
+}
+
+fn decode_envelope(raw: &str) -> Option<StoredPrincipalEnvelope> {
+    if let Some(json_str) = raw.strip_prefix(ENVELOPE_PREFIX) {
+        serde_json::from_str(json_str).ok()
+    } else if session::is_valid_principal(raw) {
+        let provider = if session::is_eth_address(raw) {
+            AuthProviderId::Siwe
+        } else {
+            AuthProviderId::Siws
+        };
+        let issuer = if provider == AuthProviderId::Siwe {
+            "eip155:1"
+        } else {
+            "solana:mainnet"
+        };
+        Some(StoredPrincipalEnvelope {
+            user_id: raw.to_string(),
+            auth_method: provider.as_str().to_string(),
+            identity_key: format!("{}|{}|{}", provider.as_str(), issuer, raw),
+            display_address: auth::display_address(raw),
+        })
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,16 +230,12 @@ pub struct TransferClaimReq {
 // Pure helpers & challenge templates (host-testable)
 // ---------------------------------------------------------------------------
 
-/// Exact SIWE statement required for handoff approvals (binds both pairing code
-/// and session id; MUST match `approve.html` byte for byte).
 pub fn handoff_siwe_statement(session_id: &str, verify_code: &str) -> String {
     format!(
         "Approve sign-in for another browser on lets_embed (Code: {verify_code}, Session: {session_id})"
     )
 }
 
-/// Exact SIWE URI required for handoff approvals (scheme-agnostic check allows
-/// `http://localhost...` in dev while pinning host + `/user/login/approve`).
 pub fn valid_handoff_siwe_uri(uri: &str, domain: &str) -> bool {
     uri == format!("https://{domain}/user/login/approve")
         || (domain
@@ -213,9 +245,6 @@ pub fn valid_handoff_siwe_uri(uri: &str, domain: &str) -> bool {
             && uri == format!("http://{domain}/user/login/approve"))
 }
 
-/// Exact SIWS challenge signed inside a Solana wallet to approve a handoff
-/// session (distinct from direct login `auth::siws_challenge`; binds domain,
-/// session id, pairing code, and DO-owned single-use nonce).
 pub fn handoff_siws_challenge(
     domain: &str,
     session_id: &str,
@@ -292,8 +321,6 @@ pub fn format_short_code(raw8: &str) -> String {
     }
 }
 
-/// Normalize a user-entered 8-character one-time code: strips spaces/hyphens,
-/// uppercases, and verifies every character belongs to `SHORT_CODE_ALPH`.
 pub fn normalize_short_code(input: &str) -> Option<String> {
     let mut out = String::with_capacity(8);
     for ch in input.chars() {
@@ -318,8 +345,6 @@ fn valid_id_token(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Normalize IPv6 addresses to `/64` prefix so rotating interface identifiers
-/// cannot bypass per-IP rate limits.
 fn normalize_ip(raw: &str) -> String {
     match raw.trim().parse::<IpAddr>() {
         Ok(IpAddr::V4(v4)) => v4.to_string(),
@@ -409,6 +434,21 @@ pub async fn start(State(st): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = auth::require_same_origin(&st, &headers) {
         return r;
     }
+    let policy = match policy_do::load_site_policy(&st.env).await {
+        Ok(e) => e.policy,
+        Err(_) => return auth::internal_error(),
+    };
+    let eth_ok =
+        identity::check_login_provider_eligibility(&policy, AuthProviderId::Siwe, None).is_ok();
+    let sol_ok =
+        identity::check_login_provider_eligibility(&policy, AuthProviderId::Siws, None).is_ok();
+    if !eth_ok && !sol_ok {
+        return auth::api_error(
+            StatusCode::FORBIDDEN,
+            "Wallet sign-in handoff is disabled under the active site age/auth policy.",
+        );
+    }
+
     let session_id = match random_b64url(16) {
         Ok(s) => s,
         Err(r) => return r,
@@ -443,10 +483,7 @@ pub async fn start(State(st): State<AppState>, headers: HeaderMap) -> Response {
         }
         Err(r) => return r,
     }
-    let approve_url = format!(
-        "https://{}/user/login/approve?s={session_id}",
-        st.siwe_domain
-    );
+    let approve_url = format!("{}/user/login/approve?s={session_id}", st.public_origin());
     let qr = qr::encode(approve_url.as_bytes());
     Json(HandoffStartResp {
         session_id,
@@ -493,11 +530,18 @@ pub async fn approve_eth(
     if let Err(r) = auth::require_same_origin(&st, &headers) {
         return r;
     }
+    let policy = match policy_do::load_site_policy(&st.env).await {
+        Ok(e) => e.policy,
+        Err(_) => return auth::internal_error(),
+    };
+    if let Err(msg) = identity::check_login_provider_eligibility(&policy, AuthProviderId::Siwe, None)
+    {
+        return auth::api_error(StatusCode::FORBIDDEN, msg);
+    }
     if !valid_id_token(&req.session_id) {
         return auth::api_error(StatusCode::BAD_REQUEST, "invalid session id");
     }
 
-    // 1) Look up the DO-owned handoff session BEFORE verifying signature or writing D1.
     let ip_key = Some(ip_rate_key(&headers, &st.jwt_secret));
     let info = match fetch_pending_session(&st, &req.session_id, ip_key).await {
         Ok(i) => i,
@@ -507,7 +551,6 @@ pub async fn approve_eth(
         return auth::api_error(StatusCode::CONFLICT, "sign-in session already approved");
     }
 
-    // 2) Parse & strictly bind the EIP-4361 message to domain, URI, pairing code, session_id, and DO nonce.
     let msg = match siwe::parse_siwe(&req.message) {
         Ok(m) => m,
         Err(e) => return auth::api_error(StatusCode::BAD_REQUEST, e.to_string()),
@@ -532,7 +575,6 @@ pub async fn approve_eth(
         return auth::api_error(StatusCode::UNAUTHORIZED, "unknown or expired nonce");
     }
 
-    // 3) Timestamps: issued-at freshness + optional expiration.
     let now = session::now_secs();
     let Some(iat) = siwe::parse_rfc3339_epoch(&msg.issued_at) else {
         return auth::api_error(StatusCode::UNAUTHORIZED, "invalid issued-at timestamp");
@@ -549,23 +591,43 @@ pub async fn approve_eth(
         }
     }
 
-    // 4) Recover signer & verify against claimed address.
     let addr = match siwe::recover_address(&req.message, &req.signature) {
         Ok(a) => a,
         Err(e) => return auth::api_error(StatusCode::UNAUTHORIZED, e.to_string()),
     };
     if addr != msg.address.to_lowercase() {
-        return auth::api_error(StatusCode::UNAUTHORIZED, "signature does not match address");
+        return auth::api_error(
+            StatusCode::UNAUTHORIZED,
+            "signature does not match address",
+        );
     }
 
-    // 5) Upsert user, check ban, ensure DO initialized, then atomically approve.
-    if let Err(r) = auth::finalize_eth_principal(&st, &addr).await {
-        return r;
-    }
+    let ident = VerifiedExternalIdentity {
+        provider_id: AuthProviderId::Siwe,
+        issuer: format!("eip155:{}", st.chain_id),
+        subject: addr.clone(),
+        label: Some("Ethereum wallet".to_string()),
+        verified_email: None,
+        assurance_level: AssuranceLevel::None,
+        assurance_method: None,
+        assurance_verified_at: None,
+        assurance_expires_at: None,
+    };
+    let account = match identity::resolve_or_create_login_account(&st, &policy, &ident).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+
+    let envelope = StoredPrincipalEnvelope {
+        user_id: account.user_id,
+        auth_method: AuthProviderId::Siwe.as_str().to_string(),
+        identity_key: ident.identity_key(),
+        display_address: auth::display_address(&addr),
+    };
     let do_req = DoHandoffApproveReq {
         session_id: req.session_id,
         approve_nonce: info.approve_nonce,
-        principal: addr.clone(),
+        principal: encode_envelope(&envelope),
     };
     match call_handoff_do(&st, "/handoff-approve", &do_req).await {
         Ok((200, _)) => Json(crate::types::VerifyResp {
@@ -592,6 +654,14 @@ pub async fn approve_sol(
     if let Err(r) = auth::require_same_origin(&st, &headers) {
         return r;
     }
+    let policy = match policy_do::load_site_policy(&st.env).await {
+        Ok(e) => e.policy,
+        Err(_) => return auth::internal_error(),
+    };
+    if let Err(msg) = identity::check_login_provider_eligibility(&policy, AuthProviderId::Siws, None)
+    {
+        return auth::api_error(StatusCode::FORBIDDEN, msg);
+    }
     if !valid_id_token(&req.session_id) {
         return auth::api_error(StatusCode::BAD_REQUEST, "invalid session id");
     }
@@ -599,7 +669,6 @@ pub async fn approve_sol(
         return auth::api_error(StatusCode::BAD_REQUEST, "invalid solana address");
     }
 
-    // 1) Look up pending session and DO-owned nonce before verifying signature.
     let ip_key = Some(ip_rate_key(&headers, &st.jwt_secret));
     let info = match fetch_pending_session(&st, &req.session_id, ip_key).await {
         Ok(i) => i,
@@ -612,7 +681,6 @@ pub async fn approve_sol(
         return auth::api_error(StatusCode::UNAUTHORIZED, "unknown or expired nonce");
     }
 
-    // 2) Verify ed25519 signature over the handoff-specific SIWS challenge.
     let msg = handoff_siws_challenge(
         st.siwe_domain.as_str(),
         &req.session_id,
@@ -625,17 +693,38 @@ pub async fn approve_sol(
         &msg,
         req.signed_message.as_deref(),
     ) {
-        return auth::api_error(StatusCode::UNAUTHORIZED, "signature verification failed");
+        return auth::api_error(
+            StatusCode::UNAUTHORIZED,
+            "signature verification failed",
+        );
     }
 
-    // 3) Check linked-wallet coexistence, upsert D1, check ban, init DO, then approve.
-    if let Err(r) = auth::finalize_sol_principal(&st, &req.solana_address).await {
-        return r;
-    }
+    let ident = VerifiedExternalIdentity {
+        provider_id: AuthProviderId::Siws,
+        issuer: "solana:mainnet".to_string(),
+        subject: req.solana_address.clone(),
+        label: Some("Solana wallet".to_string()),
+        verified_email: None,
+        assurance_level: AssuranceLevel::None,
+        assurance_method: None,
+        assurance_verified_at: None,
+        assurance_expires_at: None,
+    };
+    let account = match identity::resolve_or_create_login_account(&st, &policy, &ident).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+
+    let envelope = StoredPrincipalEnvelope {
+        user_id: account.user_id,
+        auth_method: AuthProviderId::Siws.as_str().to_string(),
+        identity_key: ident.identity_key(),
+        display_address: req.solana_address.clone(),
+    };
     let do_req = DoHandoffApproveReq {
         session_id: req.session_id,
         approve_nonce: info.approve_nonce,
-        principal: req.solana_address.clone(),
+        principal: encode_envelope(&envelope),
     };
     match call_handoff_do(&st, "/handoff-approve", &do_req).await {
         Ok((200, _)) => Json(crate::types::VerifyResp {
@@ -687,15 +776,35 @@ pub async fn poll(
         }
         Err(r) => return r,
     };
+
     if parsed.status == "approved"
-        && let Some(principal) = parsed.principal
+        && let Some(raw_principal) = parsed.principal
     {
-        // Check ban BEFORE consuming so transient D1 500s do not burn the approval.
-        if let Err(r) = auth::ensure_not_banned(&st, &principal).await {
-            return r;
+        let Some(env) = decode_envelope(&raw_principal) else {
+            return auth::internal_error();
+        };
+        let policy = match policy_do::load_site_policy(&st.env).await {
+            Ok(e) => e.policy,
+            Err(_) => return auth::internal_error(),
+        };
+        let Some(provider_id) = identity::provider_from_str(&env.auth_method) else {
+            return auth::api_error(StatusCode::FORBIDDEN, "unsupported provider");
+        };
+        if let Err(msg) = identity::check_login_provider_eligibility(&policy, provider_id, None) {
+            return auth::api_error(StatusCode::FORBIDDEN, msg);
         }
-        // Atomically consume the approved row; if a concurrent poll already
-        // claimed it, refuse to issue a duplicate session cookie.
+
+        let Some(account) = (match identity::load_account_by_id(&st, &env.user_id).await {
+            Ok(a) => a,
+            Err(r) => return r,
+        }) else {
+            return auth::api_error(StatusCode::UNAUTHORIZED, "account not found");
+        };
+        if account.banned {
+            return auth::api_error(StatusCode::FORBIDDEN, "account banned");
+        }
+
+        // Atomically consume approval BEFORE issuing revocable `v2` session!
         let consume_req = DoHandoffPollReq {
             ip_key,
             session_id: req.session_id,
@@ -712,13 +821,27 @@ pub async fn poll(
             }
             Err(r) => return r,
         }
-        let resp = auth::issue_session(&st, &cookies, &principal);
+
+        if let Err(r) = identity::issue_v2_session(
+            &st,
+            &cookies,
+            &account,
+            &env.auth_method,
+            &env.identity_key,
+            AssuranceLevel::None,
+            false,
+        )
+        .await
+        {
+            return r;
+        }
         return Json(HandoffPollResp {
             status: "approved".to_string(),
-            address: Some(resp.address),
+            address: Some(env.display_address),
         })
         .into_response();
     }
+
     Json(HandoffPollResp {
         status: "pending".to_string(),
         address: None,
@@ -739,12 +862,46 @@ pub async fn transfer_create(
     if let Err(r) = auth::require_same_origin(&st, &headers) {
         return r;
     }
-    let Some(principal) = session::session_address(&cookies, &st.jwt_secret) else {
-        return auth::api_error(StatusCode::UNAUTHORIZED, "not signed in");
+    let active = match identity::require_active_session(&st, &cookies).await {
+        Ok(a) => a,
+        Err(r) => return r,
     };
-    if let Err(r) = auth::ensure_not_banned(&st, &principal).await {
-        return r;
+
+    let session_info = if let Some(sid) = active.sid.as_deref() {
+        do_client::do_session_info(&st.env, &active.do_key, sid)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
+    let (auth_method, identity_key) = match session_info {
+        Some(info) => (info.auth_method, info.identity_key),
+        None => {
+            let p = if session::is_eth_address(&active.user_id) {
+                "siwe"
+            } else {
+                "siws"
+            };
+            (p.to_string(), format!("{p}|legacy|{}", active.user_id))
+        }
+    };
+
+    let policy = match policy_do::load_site_policy(&st.env).await {
+        Ok(e) => e.policy,
+        Err(_) => return auth::internal_error(),
+    };
+    if let Some(pid) = identity::provider_from_str(&auth_method)
+        && let Err(msg) = identity::check_login_provider_eligibility(
+            &policy,
+            pid,
+            Some(active.ctx.assurance_level),
+        )
+    {
+        return auth::api_error(StatusCode::FORBIDDEN, msg);
     }
+
     let code = match generate_short_code() {
         Ok(c) => c,
         Err(r) => return r,
@@ -755,8 +912,14 @@ pub async fn transfer_create(
         Err(r) => return r,
     };
     let now = session::now_secs();
+    let envelope = StoredPrincipalEnvelope {
+        user_id: active.user_id.clone(),
+        auth_method,
+        identity_key,
+        display_address: auth::display_address(&active.user_id),
+    };
     let do_req = DoTransferCreateReq {
-        principal,
+        principal: encode_envelope(&envelope),
         code_hash: sha256_hex(&format!("code:{normalized}")),
         token_hash: sha256_hex(&format!("tok:{qr_token}")),
         expires_at: now + TRANSFER_TTL_SECS,
@@ -770,9 +933,7 @@ pub async fn transfer_create(
         }
         Err(r) => return r,
     }
-    // Use URL fragment `#transfer=...` so the single-use bearer token is never
-    // transmitted in HTTP query strings, server logs, or Referer headers.
-    let login_url = format!("https://{}/user/login#transfer={qr_token}", st.siwe_domain);
+    let login_url = format!("{}/user/login#transfer={qr_token}", st.public_origin());
     let qr = qr::encode(login_url.as_bytes());
     Json(TransferCreateResp {
         code,
@@ -836,21 +997,77 @@ pub async fn transfer_claim(
         Err(r) => return r,
     };
 
-    if !session::is_valid_principal(&claimed.principal) {
+    let Some(env) = decode_envelope(&claimed.principal) else {
         return auth::internal_error();
+    };
+    let policy = match policy_do::load_site_policy(&st.env).await {
+        Ok(e) => e.policy,
+        Err(_) => return auth::internal_error(),
+    };
+    let Some(provider_id) = identity::provider_from_str(&env.auth_method) else {
+        return auth::api_error(StatusCode::FORBIDDEN, "unsupported provider");
+    };
+
+    let Some(account) = (match identity::load_account_by_id(&st, &env.user_id).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    }) else {
+        return auth::api_error(StatusCode::UNAUTHORIZED, "account not found");
+    };
+    if account.banned {
+        return auth::api_error(StatusCode::FORBIDDEN, "account banned");
     }
-    if let Err(r) = auth::ensure_not_banned(&st, &claimed.principal).await {
-        return r;
-    }
+
+    // Re-check linked identity provenance from D1 (unlinked or expired Verified18 loses strict privilege!).
     let now = session::now_secs();
-    if let Err(r) = auth::touch_user_login(&st, &claimed.principal, now).await {
+    let identities = identity::list_user_identities(&st, &account.user_id)
+        .await
+        .unwrap_or_default();
+    let Some(mi) = identities.iter().find(|i| {
+        i.purpose == "login"
+            && format!("{}|{}|{}", i.provider_id, i.issuer, i.subject) == env.identity_key
+    }) else {
+        return auth::api_error(
+            StatusCode::FORBIDDEN,
+            "The sign-in identity for this transfer code is no longer linked.",
+        );
+    };
+    let strict_age_ok = provider_id.supports_strict_age_verification()
+        && mi.assurance_level == AssuranceLevel::Verified18
+        && mi.assurance_expires_at.is_none_or(|e| e > now);
+    let assurance_level = if strict_age_ok {
+        AssuranceLevel::Verified18
+    } else if mi.assurance_level == AssuranceLevel::Verified18 {
+        AssuranceLevel::None
+    } else {
+        mi.assurance_level
+    };
+
+    // Enforce `AgeVerificationPolicy` uniformly on transfer claim (H7)!
+    if let Err(msg) =
+        identity::check_login_provider_eligibility(&policy, provider_id, Some(assurance_level))
+    {
+        return auth::api_error(StatusCode::FORBIDDEN, msg);
+    }
+
+    if let Err(r) = identity::issue_v2_session(
+        &st,
+        &cookies,
+        &account,
+        &env.auth_method,
+        &env.identity_key,
+        assurance_level,
+        strict_age_ok,
+    )
+    .await
+    {
         return r;
     }
-    if let Err(e) = do_client::do_init(&st.env, &claimed.principal).await {
-        worker::console_error!("do init failed on transfer claim: {e:?}");
-        return auth::internal_error();
-    }
-    Json(auth::issue_session(&st, &cookies, &claimed.principal)).into_response()
+
+    Json(crate::types::VerifyResp {
+        address: env.display_address,
+    })
+    .into_response()
 }
 
 #[worker::send]
@@ -862,18 +1079,53 @@ pub async fn transfer_revoke(
     if let Err(r) = auth::require_same_origin(&st, &headers) {
         return r;
     }
-    let Some(principal) = session::session_address(&cookies, &st.jwt_secret) else {
-        return auth::api_error(StatusCode::UNAUTHORIZED, "not signed in");
+    let active = match identity::require_active_session(&st, &cookies).await {
+        Ok(a) => a,
+        Err(r) => return r,
     };
-    let do_req = DoTransferRevokeReq { principal };
-    match call_handoff_do(&st, "/transfer-revoke", &do_req).await {
-        Ok((200, _)) => StatusCode::OK.into_response(),
-        Ok((code, msg)) => {
-            worker::console_error!("transfer-revoke DO error {code}: {msg}");
-            auth::internal_error()
+    let session_info = if let Some(sid) = active.sid.as_deref() {
+        do_client::do_session_info(&st.env, &active.do_key, sid)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let (auth_method, identity_key) = match session_info {
+        Some(info) => (info.auth_method, info.identity_key),
+        None => {
+            let p = if session::is_eth_address(&active.user_id) {
+                "siwe"
+            } else {
+                "siws"
+            };
+            (p.to_string(), format!("{p}|legacy|{}", active.user_id))
         }
-        Err(r) => r,
-    }
+    };
+    let envelope = StoredPrincipalEnvelope {
+        user_id: active.user_id.clone(),
+        auth_method,
+        identity_key,
+        display_address: auth::display_address(&active.user_id),
+    };
+    let _ = call_handoff_do(
+        &st,
+        "/transfer-revoke",
+        &DoTransferRevokeReq {
+            principal: encode_envelope(&envelope),
+        },
+    )
+    .await;
+    // Also clean any legacy raw-principal entry.
+    let _ = call_handoff_do(
+        &st,
+        "/transfer-revoke",
+        &DoTransferRevokeReq {
+            principal: active.user_id,
+        },
+    )
+    .await;
+    StatusCode::OK.into_response()
 }
 
 #[cfg(test)]

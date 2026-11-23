@@ -1,6 +1,6 @@
 use leptos::{ev, html, prelude::*};
 
-use crate::browser::{observe_element_width, read_window_width};
+use crate::browser::{observe_element_width, read_window_width, wipe_media_elements_in};
 use crate::components::{ContentMaskCard, LikeButton, SpoilerOverlay};
 use crate::layout::{column_gap_for, column_pixel_width, format_duration, layout_masonry};
 use crate::models::{
@@ -26,6 +26,23 @@ pub fn MediaTile(
 ) -> impl IntoView {
     let is_post = card.kind == GalleryCardKind::Post;
     let is_locked = card.media.is_locked();
+    let is_clear = card.media.is_clear();
+    let frame_ref = NodeRef::<html::Div>::new();
+
+    // Security finding L1: immediately wipe Clear <img>/<video> tiles when Safe Mode triggers,
+    // without waiting for the host application's refetch to complete.
+    if is_clear && let Some(epoch_sig) = panic_epoch {
+        let initial_epoch = StoredValue::new(epoch_sig.get_untracked());
+        Effect::new(move |_| {
+            let cur = epoch_sig.get();
+            if cur != initial_epoch.get_value() {
+                initial_epoch.set_value(cur);
+                if let Some(el) = frame_ref.get_untracked() {
+                    wipe_media_elements_in(Some(el.as_ref()));
+                }
+            }
+        });
+    }
     let (w, h) = card.dimensions();
     let aspect_style = format!("aspect-ratio: {w} / {h};");
     let media_badge = card.media_badge();
@@ -229,7 +246,7 @@ pub fn MediaTile(
 
     view! {
         <article class=tile_cls data-card-id=target_id>
-            <div class="gallery-frame le-tile-frame" style=frame_style>
+            <div node_ref=frame_ref class="gallery-frame le-tile-frame" style=frame_style>
                 {media_view}
 
                 {(media_badge.is_some() || duration_badge.is_some()).then(|| view! {

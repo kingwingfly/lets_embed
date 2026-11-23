@@ -13,7 +13,10 @@ use crate::models::{
     ReportTargetKind, RuleBlock, RuleBlockKind, RuleClause, RuleConnector, RuleDraft, RuleField,
     RuleGroupCombinator, SelectOption, SelectVariant, ViewerItem,
 };
-use crate::rule_syntax::{format_rule_blocks, parse_safety_rule_to_blocks};
+use crate::rule_syntax::{
+    MAX_RULE_LEN, MAX_TERMS_PER_RULE, format_rule_blocks, format_score,
+    parse_safety_rule_to_blocks,
+};
 
 fn sample_locked_mask(preset: GalleryMaskPreset) -> GalleryMask {
     GalleryMask {
@@ -109,9 +112,9 @@ fn rule_syntax_round_trips_presets_scores_and_rejects_vectors() {
         }
     }
 
-    // Score threshold + OR group + NOT clause round-trip
+    // Score threshold + OR group + explicit AND NOT clause round-trip
     let blocks = parse_safety_rule_to_blocks(
-        "(tag:explicit>=0.45 OR tag:nude>=0.6) NOT post_tag:approved",
+        "(tag:explicit>=0.45 OR tag:nude>=0.6) AND NOT post_tag:approved",
         &mut alloc,
     )
     .expect("valid rule parses");
@@ -126,6 +129,138 @@ fn rule_syntax_round_trips_presets_scores_and_rejects_vectors() {
     assert!(parse_safety_rule_to_blocks("clip:sunset", &mut alloc).is_err());
     assert!(parse_safety_rule_to_blocks("dino:12345", &mut alloc).is_err());
     assert!(parse_safety_rule_to_blocks("upload:0", &mut alloc).is_err());
+}
+
+#[test]
+fn rule_syntax_enforces_strict_grammar_scores_limits_and_or_not_semantics() {
+    let mut id = 100u64;
+    let mut alloc = || {
+        id += 1;
+        id
+    };
+
+    // Preserve small positive thresholds without rounding to "0"
+    assert_eq!(format_score(0.001), "0.001");
+    assert_eq!(format_score(0.45), "0.45");
+    assert_eq!(format_score(1.0), "1");
+    let small = parse_safety_rule_to_blocks("tag:explicit>=0.001", &mut alloc).unwrap();
+    assert_eq!(format_rule_blocks(&small), "tag:explicit>=0.001");
+
+    // Preserve OR NOT logic rather than collapsing to AND NOT
+    let or_not = parse_safety_rule_to_blocks("tag:a OR NOT tag:b", &mut alloc).unwrap();
+    assert_eq!(or_not.len(), 2);
+    assert_eq!(or_not[1].connector, RuleConnector::Or);
+    assert_eq!(format_rule_blocks(&or_not), "tag:a OR NOT tag:b");
+
+    // Negated OR-group fails explicitly instead of corrupting OR -> AND
+    assert!(parse_safety_rule_to_blocks("tag:a OR NOT (tag:b OR tag:c)", &mut alloc).is_err());
+
+    // Kaomoji tags like `=_=` remain valid while numeric `=` thresholds are rejected
+    let kaomoji = parse_safety_rule_to_blocks("tag:=_=", &mut alloc).unwrap();
+    assert_eq!(kaomoji.len(), 1);
+
+    // Score bounds: (0.0, 1.0]
+    for bad in [
+        "tag:blood>=0",
+        "tag:blood>=0.0",
+        "tag:blood>=-0.2",
+        "tag:blood>=1.1",
+        "tag:blood>=NaN",
+        "tag:blood>=0.5>=0.6",
+        // Regex literals
+        "tag:/blood.*/",
+        "tag:/blood/i",
+        "post_tag:/nsfw/",
+        // Unsupported / fuzzy comparators
+        "tag:blood~=0.5",
+        "tag:blood>0.5",
+        "tag:blood<0.5",
+        "tag:blood<=0.5",
+        "tag:blood=0.5",
+        // Thresholds disallowed on post_tag / author
+        "post_tag:nsfw>=0.5",
+        "author:alice>=0.5",
+        "post_tag:\"nsfw\">=0.5",
+        // unclassified takes no value
+        "unclassified:garbage",
+        "unclassified:",
+        // Control / NUL bytes
+        "tag:blood\0",
+        "tag:\"blood\0\"",
+        // Missing explicit AND/OR operators
+        "tag:a tag:b",
+        "(tag:a) tag:b",
+        "(tag:a OR tag:b) NOT post_tag:safe",
+        "(tag:a tag:b)",
+        // Trailing / leading / consecutive operators
+        "tag:a OR",
+        "tag:a AND",
+        "OR tag:a",
+        "AND tag:a",
+        "tag:a AND OR tag:b",
+        "tag:a AND NOT",
+        "(tag:a OR)",
+    ] {
+        assert!(
+            parse_safety_rule_to_blocks(bad, &mut alloc).is_err(),
+            "expected error for invalid safety rule: {bad:?}"
+        );
+    }
+
+    // Length cap (> MAX_RULE_LEN)
+    let too_long = format!("tag:{}", "a".repeat(MAX_RULE_LEN));
+    assert!(parse_safety_rule_to_blocks(&too_long, &mut alloc).is_err());
+
+    // Term count cap (> MAX_TERMS_PER_RULE)
+    let too_many_terms = (0..=MAX_TERMS_PER_RULE)
+        .map(|i| format!("tag:t{i}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    assert!(parse_safety_rule_to_blocks(&too_many_terms, &mut alloc).is_err());
+}
+
+#[test]
+fn notice_content_pre_sanitized_html_cannot_be_deserialized_from_json() {
+    let text: NoticeContent = serde_json::from_str(r#"{"Text":"Hello"}"#).expect("Text deserializes");
+    assert_eq!(text, NoticeContent::Text("Hello".into()));
+
+    let malicious = r#"{"PreSanitizedHtml":"<img src=x onerror=alert(1)>"}"#;
+    assert!(
+        serde_json::from_str::<NoticeContent>(malicious).is_err(),
+        "PreSanitizedHtml must NEVER deserialize from untrusted JSON"
+    );
+}
+
+#[test]
+fn viewer_item_effective_download_url_gates_spoiler_and_locked_media() {
+    let spoiler = ViewerItem {
+        id: 55,
+        kind: GalleryMediaKind::Image,
+        title: "Spoiler".into(),
+        media: GalleryMedia::Spoiler {
+            id: 55,
+            kind: GalleryMediaKind::Image,
+            width: 800,
+            height: 600,
+            preview_url: "/media/preview/55?cap=blur".into(),
+            reveal_url: "/media/image/55?cap=SECRET".into(),
+            alt: String::new(),
+            duration_secs: None,
+            rule_id: "r1".into(),
+            label: "Sensitive".into(),
+            preset: GalleryMaskPreset::Sensitive,
+            blur_mode: GalleryBlurMode::ServerTransform,
+        },
+        details_href: None,
+        download_url: Some("/media/image/55?cap=SECRET".into()),
+        download_filename: None,
+        liked: None,
+    };
+    assert_eq!(spoiler.effective_download_url(false), None);
+    assert_eq!(
+        spoiler.effective_download_url(true),
+        Some("/media/image/55?cap=SECRET")
+    );
 }
 
 #[test]
@@ -368,6 +503,74 @@ mod ssr_render_tests {
         assert!(html.contains("le-rule-remove-btn"));
         assert!(html.contains("0.45"));
         assert!(html.contains("le-score-input"));
+        assert!(html.contains(r#"min="0.01""#));
+        assert!(html.contains("AND NOT post_tag:safe"));
+
+        // Multiple QueryRuleBuilder instances must not collide on hardcoded raw input IDs
+        let two_html = render_ssr(|| {
+            let d1 = RwSignal::new(RuleDraft::default());
+            let d2 = RwSignal::new(RuleDraft::default());
+            view! {
+                <div>
+                    <QueryRuleBuilder draft=d1 />
+                    <QueryRuleBuilder draft=d2 />
+                </div>
+            }
+        });
+        assert!(!two_html.contains(r#"id="le-rule-raw-input""#));
+        assert_eq!(two_html.matches("id=\"le-rule-raw-input-").count(), 2);
+    }
+
+    #[test]
+    fn notice_banner_pre_sanitized_html_uses_div_wrapper_for_block_elements() {
+        let html = render_ssr(|| {
+            view! {
+                <NoticeBanner
+                    content=NoticeContent::PreSanitizedHtml("<p>Safe paragraph</p>".into())
+                    tone=NoticeTone::Info
+                />
+            }
+        });
+        assert!(html.contains(r#"<div class="le-notice-html"><p>Safe paragraph</p></div>"#));
+        assert!(!html.contains(r#"<span class="le-notice-html""#));
+    }
+
+    #[test]
+    fn viewer_ssr_spoiler_does_not_leak_reveal_download_url() {
+        let html = render_ssr(|| {
+            let items = Signal::derive(|| {
+                vec![ViewerItem {
+                    id: 77,
+                    kind: GalleryMediaKind::Image,
+                    title: "Spoiler Slide".into(),
+                    media: GalleryMedia::Spoiler {
+                        id: 77,
+                        kind: GalleryMediaKind::Image,
+                        width: 1000,
+                        height: 800,
+                        preview_url: "/media/preview/77?cap=blur_ok".into(),
+                        reveal_url: "/media/image/77?cap=SECRET_NEVER_LEAK".into(),
+                        alt: String::new(),
+                        duration_secs: None,
+                        rule_id: "r1".into(),
+                        label: "Sensitive".into(),
+                        preset: GalleryMaskPreset::Sensitive,
+                        blur_mode: GalleryBlurMode::ServerTransform,
+                    },
+                    details_href: None,
+                    download_url: Some("/media/image/77?cap=SECRET_NEVER_LEAK".into()),
+                    download_filename: None,
+                    liked: None,
+                }]
+            });
+            let idx = RwSignal::new(Some(0usize));
+            view! { <Viewer items=items index=idx /> }
+        });
+        assert!(html.contains("/media/preview/77?cap=blur_ok"));
+        assert!(
+            !html.contains("SECRET_NEVER_LEAK"),
+            "Viewer must never emit reveal_url in href/download before click"
+        );
     }
 
     #[test]

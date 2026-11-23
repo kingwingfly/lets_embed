@@ -1,308 +1,300 @@
-//! Server-rendered gallery pages. Wallet and payment actions use the existing user APIs.
+//! Leptos CSR SPA shell & static asset serving for `/user/*` (plus retired
+//! `/user/admin*` 404 handler per H13).
+//!
+//! All `/user/*` HTML views are rendered client-side by the Leptos CSR SPA
+//! (`user_worker/web/`, built into `user_worker/assets/` and served via
+//! Cloudflare Workers Static Assets `[assets]` binding `ASSETS` with
+//! `run_worker_first = true`).
 
 use axum::{
-    extract::State,
-    http::{StatusCode, header},
-    response::{Html, IntoResponse, Redirect, Response},
+    body::Body,
+    extract::{Path, State},
+    http::{HeaderName, HeaderValue, StatusCode, header},
+    response::{Html, IntoResponse, Response},
 };
 use tower_cookies::Cookies;
 
-use crate::{AppState, config, session::session_address};
+use crate::{AppState, identity};
 
-// ---------------------------------------------------------------------------
-// shared shell
-// ---------------------------------------------------------------------------
+const ROBOTS_HEADER: HeaderName = HeaderName::from_static("x-robots-tag");
+const NO_STORE: &str = "private, no-store";
+const NO_INDEX: &str = "noindex, nofollow";
 
-/// Outer HTML document. `__TITLE__`, `__STYLE__` and `__BODY__` are substituted
-/// per request.
-const SHELL: &str = include_str!("pages/shell.html");
-/// Shared stylesheet, inlined into the shell's `<style>`.
-const STYLE: &str = include_str!("pages/style.css");
+/// Strict CSP allowing same-origin ES modules, Leptos CSR WASM instantiation
+/// (`'wasm-unsafe-eval'`), and optional Telegram Login Widget frames/scripts.
+const SPA_CSP: &str = concat!(
+    "default-src 'self'; ",
+    "script-src 'self' 'wasm-unsafe-eval' https://telegram.org; ",
+    "style-src 'self' 'unsafe-inline'; ",
+    "img-src 'self' data: blob: https:; ",
+    "media-src 'self' blob:; ",
+    "connect-src 'self' https:; ",
+    "frame-src https://oauth.telegram.org; ",
+    "frame-ancestors 'none'; ",
+    "base-uri 'self'; ",
+    "object-src 'none'"
+);
 
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum Page {
-    Login,
-    Approve,
-    Upgrade,
-    Account,
-    Favorites,
-    Admin,
+/// Minimal SPA HTML shell fallback if the `ASSETS` binding is unavailable.
+const FALLBACK_SPA_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Account — Gallery</title>
+  <script src="/user/assets/wallet-bridge.js" defer></script>
+  <script type="module" src="/user/assets/boot.js"></script>
+</head>
+<body>
+  <div id="user-app-root"><noscript>JavaScript is required for account management.</noscript></div>
+</body>
+</html>
+"#;
+
+fn apply_html_security_headers(resp: &mut Response) {
+    let h = resp.headers_mut();
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static(NO_STORE));
+    h.insert(ROBOTS_HEADER, HeaderValue::from_static(NO_INDEX));
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("same-origin"),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(SPA_CSP),
+    );
 }
 
-impl Page {
-    pub(crate) fn render(self, body: &str) -> String {
-        let title = match self {
-            Self::Login => "Sign in",
-            Self::Approve => "Approve sign-in",
-            Self::Upgrade => "Continue exploring",
-            Self::Account => "Your account",
-            Self::Favorites => "Favorites",
-            Self::Admin => "Gallery controls",
-        };
-        let gallery = if self == Self::Admin {
-            "View gallery"
-        } else {
-            "Gallery"
-        };
-        let mut nav = format!(r#"<a href="/">{gallery}</a>"#);
-        if matches!(self, Self::Account | Self::Favorites) {
-            for (screen, path, label) in [
-                (Self::Account, "/user/account", "Account"),
-                (Self::Favorites, "/user/favorites", "Favorites"),
-            ] {
-                let current = if self == screen {
-                    r#" aria-current="page""#
-                } else {
-                    ""
-                };
-                nav.push_str(&format!(r#"<a href="{path}"{current}>{label}</a>"#));
-            }
-        } else if self == Self::Admin {
-            nav.push_str(r#"<a href="/user/admin" aria-current="page">Admin</a>"#);
-        }
-        let extra_css = match self {
-            Self::Admin => include_str!("pages/admin.css"),
-            Self::Favorites => include_str!("pages/favorites.css"),
-            _ => "",
-        };
-        let media_script = if self == Self::Favorites {
-            include_str!("../../assets/gallery-allowance.js")
-        } else {
-            ""
-        };
-        SHELL
-            .replace("__TITLE__", title)
-            .replace("__STYLE__", STYLE)
-            .replace("__EXTRA_STYLE__", extra_css)
-            .replace("__MEDIA_SCRIPT__", media_script)
-            .replace("__NAV__", &nav)
-            .replace("__BODY__", body)
-    }
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-fn html_page(html: String) -> Response {
-    (
-        [
-            (header::REFERRER_POLICY, "same-origin"),
-            (header::X_FRAME_OPTIONS, "DENY"),
-            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
-            (
-                header::HeaderName::from_static("x-robots-tag"),
-                "noindex, nofollow",
-            ),
-        ],
-        Html(html),
-    )
-        .into_response()
-}
-
-/// 302 to the login page with a `next` back-reference.
-fn redirect_to_login(next: &str) -> Response {
-    (
+fn redirect_no_store(location: &str) -> Response {
+    let mut resp = (
         StatusCode::FOUND,
-        [(header::LOCATION, format!("/user/login?next={next}"))],
+        [(header::LOCATION, location.to_string())],
     )
-        .into_response()
+        .into_response();
+    apply_html_security_headers(&mut resp);
+    resp
 }
 
-// ---------------------------------------------------------------------------
-// GET /user/login
-// ---------------------------------------------------------------------------
+/// Sanitize a relative static asset path under `/user/assets/{*path}`.
+pub fn sanitize_asset_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_start_matches('/');
+    if trimmed.is_empty()
+        || trimmed.len() > 256
+        || trimmed.contains('\\')
+        || trimmed.contains('%')
+        || trimmed.contains('\0')
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+        || trimmed.chars().any(char::is_control)
+    {
+        return None;
+    }
+    for seg in trimmed.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return None;
+        }
+    }
+    Some(trimmed.to_string())
+}
 
-/// `__CHAIN_ID__` and `__SIWE_DOMAIN__` are substituted server-side.
-const LOGIN_BODY: &str = include_str!("pages/login.html");
-const APPROVE_BODY: &str = include_str!("pages/approve.html");
+async fn serve_spa_shell(st: &AppState) -> Response {
+    if let Ok(assets) = st.env.assets(crate::ASSETS_BINDING)
+        && let Ok(http_resp) = assets.fetch("https://assets.local/index.html", None).await
+        && http_resp.status() == StatusCode::OK
+    {
+        let mut resp: Response = http_resp.map(Body::new);
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        apply_html_security_headers(&mut resp);
+        return resp;
+    }
+    let mut resp = Html(FALLBACK_SPA_HTML).into_response();
+    apply_html_security_headers(&mut resp);
+    resp
+}
+
+/// Retired `/user/admin*` handler (H13): admin lives exclusively in `admin_dashboard_worker`.
+#[worker::send]
+pub async fn admin_retired() -> Response {
+    let mut resp = (StatusCode::NOT_FOUND, "Not Found").into_response();
+    apply_html_security_headers(&mut resp);
+    resp
+}
 
 #[worker::send]
 pub async fn login_page(State(st): State<AppState>) -> Response {
-    wallet_page(&st, Page::Login, "")
+    serve_spa_shell(&st).await
 }
 
 #[worker::send]
 pub async fn approve_page(State(st): State<AppState>) -> Response {
-    let body = APPROVE_BODY
-        .replace("__CHAIN_ID__", &st.chain_id.to_string())
-        .replace("__SIWE_DOMAIN__", &st.siwe_domain);
-    html_page(Page::Approve.render(&body))
+    serve_spa_shell(&st).await
 }
 
 #[worker::send]
 pub async fn upgrade_page(State(st): State<AppState>, cookies: Cookies) -> Response {
-    if session_address(&cookies, &st.jwt_secret).is_some() {
-        return Redirect::to("/user/account#topup").into_response();
+    if identity::optional_active_session(&st, &cookies)
+        .await
+        .is_some()
+    {
+        return redirect_no_store("/user/account#topup");
     }
-    let terms = match crate::settings::load(&st.env).await {
-        Ok(p)
-            if !crate::settings::valid_deposit_address(config::Chain::Ethereum, &p.eth_deposit)
-                && !crate::settings::valid_deposit_address(
-                    config::Chain::Solana,
-                    &p.sol_deposit,
-                ) =>
-        {
-            "<p class=\"hint\">New deposits are currently closed. You can still use existing points.</p>".to_owned()
-        }
-        Ok(p) => format!(
-            r#"<dl class="wallet-terms"><div><dt>Points per USD</dt><dd>{}</dd></div><div><dt>Minimum top-up</dt><dd>{}</dd></div></dl>"#,
-            p.points_per_usd, points(p.minimum_topup)
-        ),
-        Err(_) => String::new(),
-    };
-    wallet_page(&st, Page::Upgrade, &terms)
+    serve_spa_shell(&st).await
 }
-
-fn wallet_page(st: &AppState, screen: Page, terms: &str) -> Response {
-    let (heading, intro) = if screen == Page::Upgrade {
-        (
-            "Continue exploring",
-            "This item is outside your free allowance. Sign in to use your wallet’s points and see your payment options.",
-        )
-    } else {
-        ("Sign in", "Choose a wallet to open your gallery account.")
-    };
-    let body = LOGIN_BODY
-        .replace("__HEADING__", heading)
-        .replace("__INTRO__", intro)
-        .replace("__TERMS__", terms)
-        .replace("__CHAIN_ID__", &st.chain_id.to_string())
-        .replace("__SIWE_DOMAIN__", &st.siwe_domain);
-    html_page(screen.render(&body))
-}
-
-// ---------------------------------------------------------------------------
-// GET /user/account
-// ---------------------------------------------------------------------------
-
-fn points(amount: i64) -> String {
-    let unit = if amount == 1 { "point" } else { "points" };
-    format!("{amount} {unit}")
-}
-
-/// Render the plan terms currently offered to customers.
-fn plans_table(policy: &crate::settings::Policy) -> String {
-    let mut rows = String::new();
-    for p in config::PLANS.iter().filter_map(|p| policy.plan(p.id)) {
-        let id = html_escape(p.id);
-        let views = p
-            .views_per_window
-            .map_or_else(|| "unlimited".to_string(), |v| v.to_string());
-        rows.push_str(&format!(
-            r#"<div class="plan-offer"><div><h3>{id}</h3><strong>{display_price} · {days} days</strong>
-<p>{views} view units · {searches} searches per 5h</p></div>
-<button class="btn small secondary subscribe-btn" type="button" aria-label="Subscribe to {id}" data-plan="{id}" data-price="{price}">Subscribe</button></div>"#,
-            price = p.price_points,
-            display_price = points(p.price_points),
-            searches = p.searches_per_window,
-            days = p.period_secs / 86_400,
-        ));
-    }
-    rows
-}
-
-/// Display prices and free allowances from the same revision used by the account service.
-fn pricing_table(policy: &crate::settings::Policy) -> String {
-    use std::fmt::Write;
-    let mut rows = String::new();
-    for kind in site_access::ChargeKind::ALL {
-        let item = policy.item(kind);
-        let free = match item.daily_free {
-            -1 => "Unlimited".to_owned(),
-            n => n.to_string(),
-        };
-        let usd = item.price as f64 / policy.points_per_usd as f64;
-        write!(
-            rows,
-            "<tr><th>{}</th><td>{}</td><td>${usd:.4}</td><td>{free}</td></tr>",
-            kind.label(),
-            item.price
-        )
-        .unwrap();
-    }
-    format!(
-        r#"<dl class="stats"><dt>Points per USD</dt><dd>{}</dd><dt>Minimum top-up</dt><dd>{}</dd><dt>New wallet grant</dt><dd>{}</dd></dl>
-<div class="tablewrap"><table><thead><tr><th>Item</th><th>Points</th><th>USD</th><th>Free per UTC day</th></tr></thead><tbody>{rows}</tbody></table></div>
-<p class="sub meta">Repeat views of the same item within {} hours are free.</p>"#,
-        policy.points_per_usd,
-        points(policy.minimum_topup),
-        points(policy.signup_points),
-        config::DEDUPE_WINDOW_SECS / 3600
-    )
-}
-
-const ACCOUNT_BODY: &str = include_str!("pages/account.html");
 
 #[worker::send]
 pub async fn account_page(State(st): State<AppState>, cookies: Cookies) -> Response {
-    let Some(account) = session_address(&cookies, &st.jwt_secret) else {
-        return redirect_to_login("/user/account");
-    };
-    let policy = match crate::settings::load(&st.env).await {
-        Ok(p) => p,
-        Err(_) => {
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "Account settings unavailable",
-            )
-                .into_response();
-        }
-    };
-    let options: String = config::TOKENS
-        .iter()
-        .map(|spec| {
-            format!(
-                r#"<option data-chain="{}" data-decimals="{}" value="{}">{}</option>"#,
-                spec.chain.as_str(),
-                spec.decimals,
-                spec.symbol,
-                spec.symbol.to_ascii_uppercase()
-            )
-        })
-        .collect();
-    let eth_deposit =
-        if crate::settings::valid_deposit_address(config::Chain::Ethereum, &policy.eth_deposit) {
-            policy.eth_deposit.as_str()
-        } else {
-            ""
-        };
-    let sol_deposit =
-        if crate::settings::valid_deposit_address(config::Chain::Solana, &policy.sol_deposit) {
-            policy.sol_deposit.as_str()
-        } else {
-            ""
-        };
-    let body = ACCOUNT_BODY
-        .replace("__ACCOUNT__", &html_escape(&account))
-        .replace("__ASSET_OPTIONS__", &options)
-        .replace("__POINTS_PER_USD__", &policy.points_per_usd.to_string())
-        .replace("__MINIMUM__", &points(policy.minimum_topup))
-        .replace("__DEPOSIT_ADDRESS__", &html_escape(eth_deposit))
-        .replace("__SOL_DEPOSIT_ADDRESS__", &html_escape(sol_deposit))
-        .replace("__PRICING__", &pricing_table(&policy))
-        .replace("__PLANS_TABLE__", &plans_table(&policy))
-        .replace("__TOPUP_SCRIPT__", include_str!("pages/topup.js"));
-    html_page(Page::Account.render(&body))
+    if identity::optional_active_session(&st, &cookies)
+        .await
+        .is_none()
+    {
+        return redirect_no_store("/user/login?next=/user/account");
+    }
+    serve_spa_shell(&st).await
 }
-
-// ---------------------------------------------------------------------------
-// GET /user/favorites
-// ---------------------------------------------------------------------------
-
-// Thumbnails are resolved via the search server's /api/like_previews endpoint;
-// loading them (and post covers) may consume points. Preview links carry
-// `?mode=similar&q=<image_id>` so the /details page shows similar images.
-const FAVORITES_BODY: &str = include_str!("pages/favorites.html");
 
 #[worker::send]
 pub async fn favorites_page(State(st): State<AppState>, cookies: Cookies) -> Response {
-    if session_address(&cookies, &st.jwt_secret).is_none() {
-        return redirect_to_login("/user/favorites");
+    if identity::optional_active_session(&st, &cookies)
+        .await
+        .is_none()
+    {
+        return redirect_no_store("/user/login?next=/user/favorites");
     }
-    let body = FAVORITES_BODY.replace("__FAVORITES_SCRIPT__", include_str!("pages/favorites.js"));
-    html_page(Page::Favorites.render(&body))
+    serve_spa_shell(&st).await
+}
+
+/// Serve compiled Leptos CSR SPA assets (`/user/assets/pkg/*`, `/user/assets/wallet-bridge.js`, etc.)
+/// via the Workers Static Assets `ASSETS` binding.
+#[worker::send]
+pub async fn serve_asset(
+    State(st): State<AppState>,
+    Path(rel_path): Path<String>,
+) -> Response {
+    let Some(clean) = sanitize_asset_path(&rel_path) else {
+        let mut resp = (StatusCode::BAD_REQUEST, "Invalid asset path").into_response();
+        apply_html_security_headers(&mut resp);
+        return resp;
+    };
+    let Ok(assets) = st.env.assets(crate::ASSETS_BINDING) else {
+        let mut resp = (StatusCode::NOT_FOUND, "Assets unavailable").into_response();
+        apply_html_security_headers(&mut resp);
+        return resp;
+    };
+    let url = format!("https://assets.local/{clean}");
+    match assets.fetch(url, None).await {
+        Ok(http_resp) => {
+            if http_resp.status().is_redirection() {
+                let mut resp = (StatusCode::BAD_GATEWAY, "Unexpected asset redirect").into_response();
+                apply_html_security_headers(&mut resp);
+                return resp;
+            }
+            let mut resp: Response = http_resp.map(Body::new);
+            let is_ok = resp.status() == StatusCode::OK;
+            let h = resp.headers_mut();
+            h.insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            );
+            h.insert(ROBOTS_HEADER, HeaderValue::from_static(NO_INDEX));
+            if is_ok {
+                h.insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("public, max-age=300"),
+                );
+                if clean.ends_with(".wasm") {
+                    h.insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/wasm"),
+                    );
+                } else if clean.ends_with(".js") || clean.ends_with(".mjs") {
+                    h.insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/javascript; charset=utf-8"),
+                    );
+                } else if clean.ends_with(".css") {
+                    h.insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/css; charset=utf-8"),
+                    );
+                }
+            } else {
+                h.insert(header::CACHE_CONTROL, HeaderValue::from_static(NO_STORE));
+            }
+            resp
+        }
+        Err(e) => {
+            worker::console_error!("ASSETS fetch failed for {clean}: {e:?}");
+            let mut resp = (StatusCode::NOT_FOUND, "Not Found").into_response();
+            apply_html_security_headers(&mut resp);
+            resp
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_asset_path_rejects_traversal_and_accepts_bundle_files() {
+        assert_eq!(
+            sanitize_asset_path("pkg/user_worker_web.js").as_deref(),
+            Some("pkg/user_worker_web.js")
+        );
+        assert_eq!(
+            sanitize_asset_path("/pkg/user_worker_web_bg.wasm").as_deref(),
+            Some("pkg/user_worker_web_bg.wasm")
+        );
+        assert_eq!(
+            sanitize_asset_path("wallet-bridge.js").as_deref(),
+            Some("wallet-bridge.js")
+        );
+        assert_eq!(
+            sanitize_asset_path("boot.js").as_deref(),
+            Some("boot.js")
+        );
+        for bad in [
+            "",
+            "/",
+            "../secret",
+            "pkg/../../etc/passwd",
+            "pkg/%2e%2e/index.html",
+            "pkg/a%20b.js",
+            "pkg\\foo.js",
+            "pkg/a?b=1",
+            "pkg/a\0.js",
+        ] {
+            assert!(sanitize_asset_path(bad).is_none(), "expected rejection for {bad}");
+        }
+        // SPA shell must use external module boot script (no inline script blocked by CSP)
+        assert!(FALLBACK_SPA_HTML.contains(r#"src="/user/assets/boot.js""#));
+        assert!(!FALLBACK_SPA_HTML.contains("<script type=\"module\">\n"));
+    }
+
+    #[test]
+    fn admin_retired_returns_404_no_store_and_noindex() {
+        let rt = futures::executor::block_on(admin_retired());
+        assert_eq!(rt.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            rt.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("private, no-store")
+        );
+        assert_eq!(
+            rt.headers()
+                .get("x-robots-tag")
+                .and_then(|v| v.to_str().ok()),
+            Some("noindex, nofollow")
+        );
+    }
 }

@@ -51,3 +51,6 @@ default = []
 ssr = ["leptos/ssr"]
 hydrate = ["leptos/hydrate", "dep:wasm-bindgen", "dep:js-sys"]
 csr = ["leptos/csr", "dep:wasm-bindgen", "dep:js-sys"]
+
+[dev-dependencies]
+serde_json.workspace = true

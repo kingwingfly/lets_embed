@@ -121,13 +121,23 @@ impl fmt::Display for TokenError {
 
 impl std::error::Error for TokenError {}
 
-fn domain_mac(secret: &[u8], domain: &[u8], parts: &[&[u8]]) -> HmacSha256 {
+fn domain_mac(secret: &[u8], domain: &[u8], parts: &[&[u8]]) -> Result<HmacSha256, TokenError> {
+    if secret.is_empty() {
+        return Err(TokenError::InvalidClaims("HMAC secret must not be empty"));
+    }
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts variable length keys");
     mac.update(domain);
     for part in parts {
         mac.update(part);
     }
-    mac
+    Ok(mac)
+}
+
+fn is_clean_identifier(s: &str, max_len: usize) -> bool {
+    !s.is_empty()
+        && s.len() <= max_len
+        && s == s.trim()
+        && !s.chars().any(char::is_control)
 }
 
 pub(crate) fn is_valid_sha256_hex(s: &str) -> bool {
@@ -201,14 +211,18 @@ impl SessionV2Claims {
         if self.v != SESSION_V2_VERSION {
             return Err(TokenError::UnsupportedVersion(self.v));
         }
-        if self.sub.trim().is_empty() || self.sub.len() > 128 {
-            return Err(TokenError::InvalidClaims("sub must be non-empty"));
+        if !is_clean_identifier(&self.sub, 128) {
+            return Err(TokenError::InvalidClaims(
+                "sub must be a clean non-empty identifier",
+            ));
         }
         if !is_valid_do_key(&self.do_key) {
             return Err(TokenError::InvalidClaims("invalid do_key"));
         }
-        if self.sid.trim().is_empty() || self.sid.len() > 128 {
-            return Err(TokenError::InvalidClaims("sid must be non-empty"));
+        if !is_clean_identifier(&self.sid, 128) {
+            return Err(TokenError::InvalidClaims(
+                "sid must be a clean non-empty identifier",
+            ));
         }
         if self.exp == 0 || self.iat > self.exp {
             return Err(TokenError::InvalidClaims("invalid iat/exp window"));
@@ -227,7 +241,7 @@ pub fn sign_session_v2(claims: &SessionV2Claims, secret: &[u8]) -> Result<String
         secret,
         SESSION_V2_MAC_DOMAIN,
         &[SESSION_V2_PREFIX.as_bytes(), payload.as_bytes()],
-    )
+    )?
     .finalize()
     .into_bytes();
     Ok(format!("{SESSION_V2_PREFIX}{payload}.{}", B64.encode(sig)))
@@ -251,7 +265,7 @@ pub fn verify_session_v2(
         secret,
         SESSION_V2_MAC_DOMAIN,
         &[SESSION_V2_PREFIX.as_bytes(), payload.as_bytes()],
-    )
+    )?
     .verify_slice(&sig)
     .map_err(|_| TokenError::InvalidSignature)?;
 
@@ -278,8 +292,13 @@ pub fn sign_legacy_session(
     claims: &LegacySessionClaims,
     secret: &[u8],
 ) -> Result<String, TokenError> {
+    if secret.is_empty() {
+        return Err(TokenError::InvalidClaims("HMAC secret must not be empty"));
+    }
     if !is_valid_legacy_principal(&claims.sub) {
-        return Err(TokenError::InvalidClaims("legacy sub must be eth or sol principal"));
+        return Err(TokenError::InvalidClaims(
+            "legacy sub must be eth or sol principal",
+        ));
     }
     if claims.exp == 0 || claims.iat > claims.exp {
         return Err(TokenError::InvalidClaims("invalid iat/exp window"));
@@ -299,6 +318,9 @@ pub fn verify_legacy_session(
     secret: &[u8],
     now: u64,
 ) -> Result<LegacySessionClaims, TokenError> {
+    if secret.is_empty() {
+        return Err(TokenError::InvalidClaims("HMAC secret must not be empty"));
+    }
     if token.starts_with(SESSION_V2_PREFIX) {
         return Err(TokenError::MalformedFormat);
     }
@@ -316,7 +338,9 @@ pub fn verify_legacy_session(
     let claims: LegacySessionClaims =
         serde_json::from_slice(&raw).map_err(|_| TokenError::InvalidPayload)?;
     if !is_valid_legacy_principal(&claims.sub) {
-        return Err(TokenError::InvalidClaims("legacy sub must be eth or sol principal"));
+        return Err(TokenError::InvalidClaims(
+            "legacy sub must be eth or sol principal",
+        ));
     }
     if claims.exp == 0 || claims.iat > claims.exp {
         return Err(TokenError::InvalidClaims("invalid iat/exp window"));
@@ -420,8 +444,10 @@ impl GatewayAssertion {
         if self.v != GATEWAY_ASSERTION_VERSION {
             return Err(TokenError::UnsupportedVersion(self.v));
         }
-        if self.aud.trim().is_empty() {
-            return Err(TokenError::InvalidClaims("aud must be non-empty"));
+        if !is_clean_identifier(&self.aud, 128) {
+            return Err(TokenError::InvalidClaims(
+                "aud must be a clean non-empty identifier",
+            ));
         }
         if self.min_enforce_rev > self.rev {
             return Err(TokenError::InvalidClaims("min_enforce_rev exceeds rev"));
@@ -432,17 +458,31 @@ impl GatewayAssertion {
             ));
         }
         if let Some(sub) = &self.sub
-            && sub.trim().is_empty()
+            && !is_clean_identifier(sub, 128)
         {
-            return Err(TokenError::InvalidClaims("sub cannot be empty when present"));
+            return Err(TokenError::InvalidClaims(
+                "sub must be a clean non-empty identifier when present",
+            ));
         }
         if let Some(sid) = &self.sid {
-            if sid.trim().is_empty() {
-                return Err(TokenError::InvalidClaims("sid cannot be empty when present"));
+            if !is_clean_identifier(sid, 128) {
+                return Err(TokenError::InvalidClaims(
+                    "sid must be a clean non-empty identifier when present",
+                ));
             }
             if self.sub.is_none() {
                 return Err(TokenError::InvalidClaims("sid requires sub"));
             }
+        }
+        if self.safe_mode && !self.switchers.is_empty() {
+            return Err(TokenError::InvalidClaims(
+                "safe_mode assertion cannot enable switchers",
+            ));
+        }
+        if self.switchers.iter().any(|sw| !is_clean_identifier(sw, 64)) {
+            return Err(TokenError::InvalidClaims(
+                "switchers must contain clean non-empty identifiers",
+            ));
         }
         if self.exp == 0 {
             return Err(TokenError::InvalidClaims("exp must be non-zero"));
@@ -463,7 +503,7 @@ pub fn sign_gateway_assertion(
         secret,
         GATEWAY_ASSERTION_MAC_DOMAIN,
         &[GATEWAY_ASSERTION_PREFIX.as_bytes(), payload.as_bytes()],
-    )
+    )?
     .finalize()
     .into_bytes();
     Ok(format!(
@@ -473,8 +513,9 @@ pub fn sign_gateway_assertion(
 }
 
 /// Verifies an `X-Gateway-Assertion` header value with constant-time HMAC
-/// verification, exact audience match, and expiry check allowing `max_skew`
-/// seconds of clock skew.
+/// verification, exact audience match, and bounded expiry checks allowing
+/// `max_skew` seconds of clock skew (`now <= exp + max_skew` and
+/// `exp <= now + GATEWAY_ASSERTION_TTL + max_skew`).
 pub fn verify_gateway_assertion(
     header_value: &str,
     secret: &[u8],
@@ -494,7 +535,7 @@ pub fn verify_gateway_assertion(
         secret,
         GATEWAY_ASSERTION_MAC_DOMAIN,
         &[GATEWAY_ASSERTION_PREFIX.as_bytes(), payload.as_bytes()],
-    )
+    )?
     .verify_slice(&sig)
     .map_err(|_| TokenError::InvalidSignature)?;
 
@@ -507,6 +548,11 @@ pub fn verify_gateway_assertion(
     }
     if now > assertion.exp.saturating_add(max_skew) {
         return Err(TokenError::Expired);
+    }
+    if assertion.exp > now.saturating_add(GATEWAY_ASSERTION_TTL).saturating_add(max_skew) {
+        return Err(TokenError::InvalidClaims(
+            "assertion exp exceeds maximum TTL",
+        ));
     }
     Ok(assertion)
 }
@@ -648,13 +694,20 @@ pub struct MediaCapability {
     pub exp: u64,
 }
 
+const MAX_MEDIA_PATH_LEN: usize = 1024;
+
 fn is_safe_media_path(path: &str) -> bool {
-    if path.is_empty() || path.starts_with('/') || path.ends_with('/') {
+    if path.is_empty()
+        || path.len() > MAX_MEDIA_PATH_LEN
+        || path != path.trim()
+        || path.starts_with('/')
+        || path.ends_with('/')
+    {
         return false;
     }
     if path
         .chars()
-        .any(|c| c.is_control() || matches!(c, '\\' | '?' | '#'))
+        .any(|c| c.is_control() || matches!(c, '%' | ':' | '\\' | '?' | '#'))
     {
         return false;
     }
@@ -674,8 +727,10 @@ impl MediaCapability {
         if !is_safe_media_path(&self.path) {
             return Err(TokenError::InvalidClaims("unsafe media path"));
         }
-        if self.sub.trim().is_empty() {
-            return Err(TokenError::InvalidClaims("sub must be non-empty"));
+        if !is_clean_identifier(&self.sub, 128) {
+            return Err(TokenError::InvalidClaims(
+                "sub must be a clean non-empty identifier",
+            ));
         }
         if self.sub == MEDIA_CAP_ANON_SUB {
             if self.sid.is_some() {
@@ -687,9 +742,20 @@ impl MediaCapability {
                 ));
             }
         } else if let Some(sid) = &self.sid
-            && sid.trim().is_empty()
+            && !is_clean_identifier(sid, 128)
         {
-            return Err(TokenError::InvalidClaims("sid cannot be empty when present"));
+            return Err(TokenError::InvalidClaims(
+                "sid must be a clean non-empty identifier when present",
+            ));
+        }
+        if self
+            .req_switchers
+            .iter()
+            .any(|sw| !is_clean_identifier(sw, 64))
+        {
+            return Err(TokenError::InvalidClaims(
+                "req_switchers must contain clean non-empty identifiers",
+            ));
         }
         if self.exp == 0 {
             return Err(TokenError::InvalidClaims("exp must be non-zero"));
@@ -722,7 +788,7 @@ pub fn sign_media_capability(
     cap.validate()?;
     let json = serde_json::to_vec(cap).map_err(|_| TokenError::InvalidPayload)?;
     let payload = B64.encode(json);
-    let sig = domain_mac(secret, MEDIA_CAP_MAC_DOMAIN, &[payload.as_bytes()])
+    let sig = domain_mac(secret, MEDIA_CAP_MAC_DOMAIN, &[payload.as_bytes()])?
         .finalize()
         .into_bytes();
     Ok(format!("{payload}.{}", B64.encode(sig)))
@@ -743,7 +809,7 @@ pub fn verify_media_capability(
         return Err(TokenError::MalformedFormat);
     }
     let sig = B64.decode(sig_b64).map_err(|_| TokenError::InvalidEncoding)?;
-    domain_mac(secret, MEDIA_CAP_MAC_DOMAIN, &[payload.as_bytes()])
+    domain_mac(secret, MEDIA_CAP_MAC_DOMAIN, &[payload.as_bytes()])?
         .verify_slice(&sig)
         .map_err(|_| TokenError::InvalidSignature)?;
 

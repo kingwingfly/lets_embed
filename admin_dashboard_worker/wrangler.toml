@@ -1,0 +1,52 @@
+name = "lets-embed-admin-dashboard-worker"
+main = "build/index.js"
+compatibility_date = "2026-06-01"
+# Public *.workers.dev and preview URLs MUST stay disabled; reachable ONLY via
+# gateway_worker's privileged `ADMIN_DASHBOARD_WORKER` service binding (`gallery_admin = true`).
+workers_dev = false
+preview_urls = false
+
+[build]
+command = "./build-web.sh && cargo install -q \"worker-build@^0.9\" && worker-build --profile wasm-release"
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# Mandatory: run_worker_first = true ensures static /admin HTML/JS/WASM assets NEVER
+# serve before the Worker verifies `gallery_admin == true` + `x-gallery-admin-email`.
+# html_handling = "none" prevents Cloudflare Assets from issuing 307 redirects on `/index.html`.
+[assets]
+directory = "./assets"
+binding = "ASSETS"
+run_worker_first = true
+html_handling = "none"
+
+[vars]
+# Optional dedicated admin hostname (split-host deployments). When set, ONLY
+# `https://{ADMIN_DOMAIN}` is trusted as a CSRF Origin for `/admin/api/*` mutations.
+# ADMIN_DOMAIN = "admin.lets-embed.louisfly.icu"
+# Public hostname fallback for same-origin CSRF verification when ADMIN_DOMAIN is unset.
+SIWE_DOMAIN = "lets-embed.louisfly.icu"
+# Canonical public origin (optional; takes precedence over SIWE_DOMAIN when set).
+PUBLIC_URL = "https://lets-embed.louisfly.icu"
+# Deployment identifier bound into AES-256-GCM AAD for `provider_secrets`.
+DEPLOYMENT_ID = "lets-embed-prod"
+
+# Worker secrets; deploy fails until required secrets are set via `wrangler secret put`:
+#   SETTINGS_ENCRYPTION_KEY      — 32-byte base64 or 64-char hex AES-256-GCM key for `provider_secrets`
+#                                  (MUST be dedicated; NEVER reuse JWT_SECRET!).
+#   SETTINGS_ENCRYPTION_KEY_PREV — (optional) previous 32-byte key during zero-downtime key rotation.
+[secrets]
+required = ["SETTINGS_ENCRYPTION_KEY"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "lets-embed"
+database_id = "ee6985fc-ed13-414f-8f85-8727c86f3b48"
+
+[durable_objects]
+bindings = [
+  { name = "USER_ACCOUNT", class_name = "UserAccount", script_name = "lets-embed-user-worker" },
+  { name = "SITE_POLICY", class_name = "SitePolicyDO", script_name = "lets-embed-user-worker" },
+]

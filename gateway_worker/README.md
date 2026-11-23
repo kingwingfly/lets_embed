@@ -1,24 +1,46 @@
 # Gallery gateway (`lets-embed-gateway-worker`)
 
-The gateway applies the visitor policy published at `/user/admin`. New installations require a wallet. In public mode guests can browse the gallery and use the configured free allowances. Personal accounts, payments and favorites still require a wallet session.
+The edge gateway enforces authoritative geo-blocking, Cloudflare Access admin routing, revocable `v2` sessions, capability-based media authorization, locked server-side blurred previews, and search/view metering in front of `lets-embed-web`, `lets-embed-user-worker`, `lets-embed-admin-dashboard-worker`, and private media origins.
 
-The gateway meters image views, video views, by-ID similarity searches (`/api/search_similar`, `/api/search_advanced_embed`), uploaded-image searches (`/api/search_by_image`, `/api/search_advanced_image`) and description/CLIP searches (`/api/search_by_desc`, `/api/search_advanced_clip`) through the account Durable Object. Metadata-only advanced search (`/api/search_advanced`) and other read-only metadata requests do not spend points. Guests receive one allowance per client IP and item type each UTC day. The gateway derives the guest key from Cloudflare's client IP and the shared secret. Clients without an IP share a fallback allowance. Signed-in accounts use their wallet's allowance, then their subscription quota and points balance.
+## Enforcement Pipeline
 
-When an allowance or balance runs out, browser navigation goes to `/user/upgrade`. Embedded gallery media and search requests receive HTTP 402. The gallery reads the response’s Server Timing marker and opens the same page. Guests can sign in there, and wallets with a session go directly to the account top-up form.
+1. **Canonical path check**: Rejects traversal-bearing or non-canonical request paths (`400 Bad Request`).
+2. **`/admin` & `/admin/*` (geo-exempt)**: Verified via Cloudflare Access (`CF_ACCESS_AUD` + identity email) and forwarded to `ADMIN_DASHBOARD_WORKER` (`props = { gallery_admin = true }`) with `X-Gallery-Admin-Email` and `Cache-Control: private, no-store`. `GET /admin/browse` issues the 15-minute `__Host-ue_admin_view` browsing pass and redirects to `/`.
+3. **Authoritative policy & geo-block (`SitePolicyDO`)**: Loads `{ policy, digest }` from singleton `SITE_POLICY` DO (`"global"`, `GET /policy`), verifies SHA-256 digest (failing closed with `503` if unreachable or invalid), and evaluates `policy.geo.is_blocked(request.cf().country())` (never trusting incoming `CF-IPCountry`). Blocked visitors receive `451 Unavailable For Legal Reasons`.
+4. **`/user/admin*` retired (`404`) & `/user/*` routing**: `/user/admin` and `/user/admin/*` unconditionally return `404 Not Found`. All other `/user/*` routes forward to `USER_WORKER` with all privileged headers stripped.
+5. **Raw `/images/*` and `/videos/*` blocked (`404`)**: Media bytes are only served via signed capability URLs at `/media/{image,video,preview}/{id}?cap=...`.
+   - Verifies HMAC-SHA256 `cap` (`MEDIA_CAP_SECRET`), `(kind, id)`, expiry, and `cap.rev >= policy.min_enforce_rev` (`403` on failure).
+   - Authorizes caller live against `USER_ACCOUNT` DO (`POST /session-context`), `safe_mode`, Terms acceptance, age policy (`SelfAttestation` / `StrictProviderVerified18`), and eligible active switchers **before** any billing or budget check (denied requests incur zero charge).
+   - `Preview` checks `POST /preview-budget` (`preview:{id}`) and never deducts clear-view balance; requires `policy.cloudflare_images_blur = true` (fails closed `403` when disabled) and attaches hardcoded Worker `cf.image` parameters (`blur: 80, width: 360, quality: 30, format: "webp"`).
+   - `Image`/`Video` settle against canonical `MediaBillingKey` (`media:image:{id}` / `media:video:{id}`, `HEAD` -> `can-charge`, `GET` -> `charge`).
+   - Upstream media fetches use `redirect: "manual"` (rejecting any `3xx` with `502`), `cf.cacheTtl = 0`, and `Cache-Control: private, no-store`.
+6. **Gallery / web forwarding (`API_UPSTREAM`)**:
+   - Strips all `site_access::is_privileged_request_header` headers and `STRIPPED_ORIGIN_COOKIES`, and attaches a freshly signed short-lived `X-Gateway-Assertion` (`GATEWAY_ASSERTION_SECRET`, 30s TTL, audience `"lets-embed-web"`).
+   - `__Host-ue_admin_view` only waives the login wall and metering; it still runs Step 0 geo checks, signs `X-Gateway-Assertion` (`is_admin_view: true`), enforces `/media/*` capabilities, and enforces same-origin CSRF on all `POST` requests to `API_UPSTREAM`.
+   - Keeps `/robots.txt`, `/terms`, `/privacy`, `/dmca`, `/content-policy`, `/pkg/*`, and `/favicon.ico` publicly accessible (after geo check); preserves public caching only on `/pkg/*`, `/robots.txt`, and anonymous `/sitemap.xml` / `/sitemap/*`.
 
-## Cloudflare Access and deployment
+## Bindings & Secrets (`wrangler.toml`)
 
-1. Restrict `/user/admin` and its descendants on the public gallery hostname to your administrator group in Cloudflare Access. Set the application's audience in this Worker's `CF_ACCESS_AUD`. Leave the gallery paths public at the Access layer if the dashboard should control guest access. A matching administrator identity must have an email. [Cloudflare Worker identity and path protection](https://developers.cloudflare.com/workers/configuration/cloudflare-access/)
-2. Configure the upstream origin variables in `gateway_worker/wrangler.toml` under `[vars]`: `API_UPSTREAM`, `IMAGE_UPSTREAM` and `VIDEO_UPSTREAM` (trailing slashes are trimmed at runtime).
-3. Keep the two service bindings in `wrangler.toml` targeting `lets-embed-user-worker`. Only `ADMIN_WORKER` carries the `gallery_admin` property. The gateway checks the runtime Access audience and identity before using it. `lets-embed-user-worker` checks the binding on every admin operation. Browser-submitted settings and account changes also require the gallery's own origin, configured in `SIWE_DOMAIN`. [Service binding properties](https://developers.cloudflare.com/workers/runtime-apis/context/)
-4. Set `JWT_SECRET` to the same secret as `lets-embed-user-worker`. Set `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` to the service token authorized for the API and media origins.
-5. Apply the D1 migration and deploy `lets-embed-user-worker` first, then deploy `lets-embed-gateway-worker`. [User Worker deployment](../user_worker/README.md#setup--deployment)
-6. Because `workers_dev = false` and `preview_urls = false` disable the default `*.workers.dev` and preview hostnames, bind your public gallery hostname to `lets-embed-gateway-worker` using a Custom Domain or Zone Route in the Cloudflare Dashboard (or configure `routes = [...]` in `gateway_worker/wrangler.toml`).
+- **Service bindings**:
+  - `USER_WORKER` -> `lets-embed-user-worker` (no `gallery_admin` prop)
+  - `ADMIN_DASHBOARD_WORKER` -> `lets-embed-admin-dashboard-worker` (`props = { gallery_admin = true }`)
+- **Durable Objects**:
+  - `USER_ACCOUNT` -> `UserAccount` on `lets-embed-user-worker`
+  - `SITE_POLICY` -> `SitePolicyDO` on `lets-embed-user-worker`
+- **Required secrets**:
+  - `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`
+  - `JWT_SECRET`
+  - `GATEWAY_ASSERTION_SECRET`
+  - `MEDIA_CAP_SECRET`
+- **Optional cutover secret**:
+  - `SESSION_V2_SECRET` — dedicated secret for revocable `v2.` session cookies. When unset or empty during cutover, `gateway_worker` verifies `v2.` tokens using `JWT_SECRET` with `site_access`'s built-in `"session/v2\0"` HMAC domain separation.
+- **Never bound**: `SETTINGS_ENCRYPTION_KEY` must never be bound to `gateway_worker`.
 
-Administrators can open **View gallery** from the dashboard or **Browse as administrator** on the login page without connecting a wallet. Opening the dashboard grants a 15-minute, host-only browsing cookie for gallery pages, searches and media. Reopen the dashboard to refresh it. Admin actions always require Cloudflare Access. Personal wallet actions require a wallet session.
+## Verification
 
-For tunnel-only origins, `cloudflared` can validate the application token with **Protect with Access**. Keep origin validation for Cloud Run or any origin also reachable outside that tunnel. [Cloudflare origin validation](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/)
-
-## Local development
-
-Use a local-only gateway Wrangler configuration with a matching `[access.dev]` audience and `[access.dev.identity]` email to exercise admin access. Remove the local Access simulation to test a guest. The integration test builds on the same runtime identities, service bindings, SQLite Durable Objects and D1 migrations used by the deployed Workers. From the repository root, after `npm ci` and building both Workers, run `node --test gateway_worker/tests/site-policy.cjs`.
+```bash
+cargo test -p gateway_worker
+cargo clippy -p gateway_worker --target wasm32-unknown-unknown --all-targets -- -D warnings
+worker-build --profile wasm-release
+node --test gateway_worker/tests/site-policy.cjs
+```
