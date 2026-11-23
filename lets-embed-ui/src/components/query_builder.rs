@@ -3,14 +3,107 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::components::SkySelect;
+use crate::components::{OptionalScoreInput, SkySelect};
 use crate::models::{PresetTemplate, SelectOption, SelectVariant};
-use crate::rule_syntax::{MAX_RULE_LEN, MAX_TERMS_PER_RULE, format_score};
+use crate::rule_syntax::{MAX_RULE_LEN, MAX_TERMS_PER_RULE};
 
 static NEXT_QB_NODE_ID: AtomicU64 = AtomicU64::new(1000);
 
 fn alloc_qb_id() -> u64 {
     NEXT_QB_NODE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Strictly parse a score/similarity threshold at hundredths precision in `0.01..=1.00`.
+///
+/// Accepts `0.01`, `0.45`, `0.5`, `0.50`, `.45`, `1`, `1.0`, `1.00`.
+/// Rejects `0`, `0.005`, `0.456` (>2 decimal places), `> 1.00`, negative numbers,
+/// scientific notation, `NaN`, `Inf`, and trailing garbage.
+pub fn parse_threshold_hundredths(raw: &str) -> Result<f32, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Missing threshold after `>=`".to_string());
+    }
+    if trimmed.contains(">=") {
+        return Err("Multiple `>=` thresholds in one condition".to_string());
+    }
+    if trimmed.starts_with('-') {
+        return Err(format!(
+            "Threshold `{trimmed}` out of range (must be between 0.01 and 1.00)"
+        ));
+    }
+
+    let hundredths: u32 = match trimmed.split_once('.') {
+        None => {
+            if !trimmed.chars().all(|c| c.is_ascii_digit()) {
+                return Err(format!(
+                    "Invalid threshold `{trimmed}` (expected hundredths in 0.01..=1.00)"
+                ));
+            }
+            let int_val = trimmed.parse::<u32>().map_err(|_| {
+                format!("Threshold `{trimmed}` out of range (must be between 0.01 and 1.00)")
+            })?;
+            int_val.saturating_mul(100)
+        }
+        Some((int_part, frac_part)) => {
+            if frac_part.contains('.') {
+                return Err(format!(
+                    "Invalid threshold `{trimmed}` (expected hundredths in 0.01..=1.00)"
+                ));
+            }
+            if frac_part.is_empty() || frac_part.len() > 2 {
+                return Err(format!(
+                    "Threshold `{trimmed}` must have 1 or 2 decimal places (0.01..=1.00)"
+                ));
+            }
+            if !int_part.chars().all(|c| c.is_ascii_digit())
+                || !frac_part.chars().all(|c| c.is_ascii_digit())
+            {
+                return Err(format!(
+                    "Invalid threshold `{trimmed}` (expected hundredths in 0.01..=1.00)"
+                ));
+            }
+            let int_val: u32 = if int_part.is_empty() {
+                0
+            } else {
+                int_part.parse::<u32>().map_err(|_| {
+                    format!("Threshold `{trimmed}` out of range (must be between 0.01 and 1.00)")
+                })?
+            };
+            let frac_raw = frac_part.parse::<u32>().map_err(|_| {
+                format!("Invalid threshold `{trimmed}` (expected hundredths in 0.01..=1.00)")
+            })?;
+            let frac_val = if frac_part.len() == 1 {
+                frac_raw * 10
+            } else {
+                frac_raw
+            };
+            int_val.saturating_mul(100).saturating_add(frac_val)
+        }
+    };
+
+    if !(1..=100).contains(&hundredths) {
+        return Err(format!(
+            "Threshold `{trimmed}` out of range (must be between 0.01 and 1.00)"
+        ));
+    }
+
+    Ok((hundredths as f32) / 100.0)
+}
+
+/// Clamp and quantize a floating-point threshold to hundredths precision in `0.01..=1.00`.
+pub fn quantize_threshold(v: f32) -> Option<f32> {
+    if !v.is_finite() || v <= 0.0 {
+        return None;
+    }
+    let hundredths = (v.clamp(0.01, 1.0) * 100.0).round().clamp(1.0, 100.0);
+    Some(hundredths / 100.0)
+}
+
+/// Format a score/similarity threshold at exact hundredths precision in `0.01..=1.00`
+/// (e.g. `0.45` -> `"0.45"`, `0.5` -> `"0.50"`, `1.0` -> `"1.00"`).
+pub fn format_threshold(v: f32) -> String {
+    let hundredths = (v.clamp(0.01, 1.0) * 100.0).round().clamp(1.0, 100.0) as u32;
+    format!("{}.{:02}", hundredths / 100, hundredths % 100)
 }
 
 /// Operating mode for the unified visual [`QueryBuilder`].
@@ -248,7 +341,7 @@ impl QueryCombinator {
 }
 
 /// Single query condition with optional negation (`NOT`) and optional per-condition
-/// score/similarity threshold (`>=0.01..=1.00`).
+/// score/similarity threshold (`>=0.01..=1.00`, hundredths precision).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QueryCondition {
     pub id: u64,
@@ -329,19 +422,21 @@ pub struct QueryThresholdDefaults {
 impl QueryThresholdDefaults {
     pub fn placeholder_for(self, field: QueryFieldKind, mode: QueryBuilderMode) -> String {
         match field {
-            QueryFieldKind::Tag => match self.tag_min_score {
-                Some(v) if is_valid_threshold(v) => format_score(v),
-                _ if mode == QueryBuilderMode::SafetyPolicy => "0.45".to_string(),
-                _ => "default".to_string(),
+            QueryFieldKind::Tag => match self.tag_min_score.and_then(quantize_threshold) {
+                Some(v) => format_threshold(v),
+                None if mode == QueryBuilderMode::SafetyPolicy => "0.45".to_string(),
+                None => "default".to_string(),
             },
-            QueryFieldKind::ClipText => match self.clip_min_sim {
-                Some(v) if is_valid_threshold(v) => format_score(v),
-                _ => "default".to_string(),
+            QueryFieldKind::ClipText => match self.clip_min_sim.and_then(quantize_threshold) {
+                Some(v) => format_threshold(v),
+                None => "default".to_string(),
             },
-            QueryFieldKind::SimilarId | QueryFieldKind::UploadImage => match self.dino_min_sim {
-                Some(v) if is_valid_threshold(v) => format_score(v),
-                _ => "default".to_string(),
-            },
+            QueryFieldKind::SimilarId | QueryFieldKind::UploadImage => {
+                match self.dino_min_sim.and_then(quantize_threshold) {
+                    Some(v) => format_threshold(v),
+                    None => "default".to_string(),
+                }
+            }
             _ => String::new(),
         }
     }
@@ -432,22 +527,6 @@ impl QueryBuilderDraft {
     }
 }
 
-fn is_valid_threshold(v: f32) -> bool {
-    v.is_finite() && v > 0.0 && v <= 1.0
-}
-
-fn parse_optional_threshold(raw: &str) -> Option<f32> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    trimmed
-        .parse::<f32>()
-        .ok()
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .map(|v| v.clamp(0.01, 1.0))
-}
-
 fn quote_query_value_if_needed(raw: &str) -> String {
     let needs_quote = raw.is_empty()
         || raw.starts_with('/')
@@ -465,8 +544,8 @@ fn quote_query_value_if_needed(raw: &str) -> String {
     format!("\"{escaped}\"")
 }
 
-/// Format a single [`QueryCondition`] into canonical query syntax (including `>=threshold`
-/// when set on `Tag`, `ClipText`, `SimilarId`, or `UploadImage`).
+/// Format a single [`QueryCondition`] into canonical query syntax (including `>=0.45`
+/// hundredths-precision threshold when set on `Tag`, `ClipText`, `SimilarId`, or `UploadImage`).
 pub fn format_query_condition(cond: &QueryCondition) -> Option<String> {
     let base = match cond.field {
         QueryFieldKind::Unclassified => "unclassified".to_string(),
@@ -478,9 +557,9 @@ pub fn format_query_condition(cond: &QueryCondition) -> Option<String> {
             let encoded = quote_query_value_if_needed(trimmed);
             let prefix = cond.field.as_prefix();
             if cond.field.supports_threshold()
-                && let Some(score) = cond.threshold.filter(|&v| is_valid_threshold(v))
+                && let Some(score) = cond.threshold.and_then(quantize_threshold)
             {
-                format!("{prefix}:{encoded}>={}", format_score(score))
+                format!("{prefix}:{encoded}>={}", format_threshold(score))
             } else {
                 format!("{prefix}:{encoded}")
             }
@@ -588,7 +667,13 @@ enum QbToken {
     And,
     Or,
     Not,
+    Minus,
+    Gte,
     Atom(QbAtom),
+}
+
+fn is_gte_at(chars: &[char], i: usize) -> bool {
+    chars.get(i) == Some(&'>') && chars.get(i + 1) == Some(&'=')
 }
 
 fn tokenize_qb(input: &str, mode: QueryBuilderMode) -> Result<Vec<QbToken>, String> {
@@ -624,6 +709,22 @@ fn tokenize_qb(input: &str, mode: QueryBuilderMode) -> Result<Vec<QbToken>, Stri
             i += 1;
             continue;
         }
+        if is_gte_at(&chars, i) {
+            tokens.push(QbToken::Gte);
+            i += 2;
+            continue;
+        }
+        if ch == '-' {
+            if i + 1 < chars.len() && !chars[i + 1].is_whitespace() {
+                tokens.push(QbToken::Minus);
+                i += 1;
+                continue;
+            }
+            return Err("Expected a predicate or '(' after '-'".to_string());
+        }
+        if ch == '/' && mode == QueryBuilderMode::SafetyPolicy {
+            return Err("Regular expressions are not allowed in safety policies".to_string());
+        }
         if ch == '"' {
             if mode == QueryBuilderMode::SafetyPolicy {
                 return Err(
@@ -632,12 +733,24 @@ fn tokenize_qb(input: &str, mode: QueryBuilderMode) -> Result<Vec<QbToken>, Stri
                 );
             }
             let quoted = read_quoted_qb(&chars, &mut i)?;
+            let mut trailing = String::new();
+            while i < chars.len() {
+                let c = chars[i];
+                if c.is_whitespace() || c == '(' || c == ')' || is_gte_at(&chars, i) {
+                    break;
+                }
+                if c == '"' {
+                    return Err("Unexpected extra quote after value".to_string());
+                }
+                trailing.push(c);
+                i += 1;
+            }
             tokens.push(QbToken::Atom(QbAtom {
                 prefix: "all".to_string(),
                 rest: Some(QbAtomValue {
                     text: quoted,
                     quoted: true,
-                    trailing: String::new(),
+                    trailing,
                 }),
             }));
             continue;
@@ -646,7 +759,7 @@ fn tokenize_qb(input: &str, mode: QueryBuilderMode) -> Result<Vec<QbToken>, Stri
         let mut prefix = String::new();
         while i < chars.len() {
             let c = chars[i];
-            if c == ':' || c.is_whitespace() || c == '(' || c == ')' {
+            if c == ':' || c.is_whitespace() || c == '(' || c == ')' || is_gte_at(&chars, i) {
                 break;
             }
             if c == '"' {
@@ -657,13 +770,16 @@ fn tokenize_qb(input: &str, mode: QueryBuilderMode) -> Result<Vec<QbToken>, Stri
         }
 
         if i < chars.len() && chars[i] == ':' {
+            if prefix.is_empty() {
+                return Err("Missing field name before `:`".to_string());
+            }
             i += 1;
             let rest = if i < chars.len() && chars[i] == '"' {
                 let text = read_quoted_qb(&chars, &mut i)?;
                 let mut trailing = String::new();
                 while i < chars.len() {
                     let c = chars[i];
-                    if c.is_whitespace() || c == '(' || c == ')' {
+                    if c.is_whitespace() || c == '(' || c == ')' || is_gte_at(&chars, i) {
                         break;
                     }
                     if c == '"' {
@@ -681,7 +797,7 @@ fn tokenize_qb(input: &str, mode: QueryBuilderMode) -> Result<Vec<QbToken>, Stri
                 let mut text = String::new();
                 while i < chars.len() {
                     let c = chars[i];
-                    if c.is_whitespace() || c == '(' || c == ')' {
+                    if c.is_whitespace() || c == '(' || c == ')' || is_gte_at(&chars, i) {
                         break;
                     }
                     if c == '"' {
@@ -751,27 +867,8 @@ fn read_quoted_qb(chars: &[char], i: &mut usize) -> Result<String, String> {
     Ok(text)
 }
 
-fn parse_threshold_strict(raw: &str) -> Result<f32, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err("Missing threshold after `>=`".to_string());
-    }
-    if trimmed.contains(">=") {
-        return Err("Multiple `>=` thresholds in one condition".to_string());
-    }
-    let val = trimmed
-        .parse::<f32>()
-        .map_err(|_| format!("Invalid threshold `{trimmed}` (expected number in (0.0, 1.0])"))?;
-    if !is_valid_threshold(val) {
-        return Err(format!(
-            "Threshold `{trimmed}` out of range (must be > 0.0 and <= 1.0)"
-        ));
-    }
-    Ok(val)
-}
-
 fn reject_safety_disallowed_syntax(raw: &str, field_name: &str) -> Result<(), String> {
-    if raw.starts_with('/') && raw.len() >= 2 && raw[1..].contains('/') {
+    if raw.starts_with('/') {
         return Err(format!(
             "Regex patterns are not allowed in safety policies (`{field_name}:{raw}`)"
         ));
@@ -794,10 +891,49 @@ fn reject_safety_disallowed_syntax(raw: &str, field_name: &str) -> Result<(), St
         && rhs.parse::<f32>().is_ok_and(f32::is_finite)
     {
         return Err(format!(
-            "Invalid `=` threshold in `{field_name}:{raw}` (use `>=`, e.g. tag:blood>=0.5)"
+            "Invalid `=` threshold in `{field_name}:{raw}` (use `>=`, e.g. tag:blood>=0.50)"
         ));
     }
     Ok(())
+}
+
+fn consume_optional_threshold(
+    tokens: &[QbToken],
+    pos: &mut usize,
+    field: QueryFieldKind,
+) -> Result<Option<f32>, String> {
+    if !matches!(tokens.get(*pos), Some(QbToken::Gte)) {
+        return Ok(None);
+    }
+    if !field.supports_threshold() {
+        return Err(format!(
+            "Thresholds (`>=`) are not supported on `{}`",
+            field.as_prefix()
+        ));
+    }
+    *pos += 1; // consume `>=`
+
+    let threshold = match tokens.get(*pos) {
+        Some(QbToken::Atom(atom)) if atom.rest.is_none() => {
+            *pos += 1;
+            parse_threshold_hundredths(&atom.prefix)?
+        }
+        Some(QbToken::Minus) => {
+            return Err("Threshold out of range (must be between 0.01 and 1.00)".to_string());
+        }
+        Some(QbToken::Gte) => {
+            return Err("Multiple `>=` thresholds in one condition".to_string());
+        }
+        _ => {
+            return Err("Missing threshold after `>=`".to_string());
+        }
+    };
+
+    if matches!(tokens.get(*pos), Some(QbToken::Gte)) {
+        return Err("Multiple `>=` thresholds in one condition".to_string());
+    }
+
+    Ok(Some(threshold))
 }
 
 fn parse_qb_atom(
@@ -851,70 +987,11 @@ fn parse_qb_atom(
         return Err("`unclassified` takes no value (write bare `unclassified`)".to_string());
     }
 
-    if field.supports_threshold() {
-        if rest.quoted {
-            let trimmed = rest.text.trim();
-            if trimmed.is_empty() {
-                return Err(format!("Missing value after `{}:`", field.as_prefix()));
-            }
-            let threshold = if rest.trailing.is_empty() {
-                None
-            } else if let Some(score_raw) = rest.trailing.strip_prefix(">=") {
-                Some(parse_threshold_strict(score_raw)?)
-            } else {
-                return Err(format!(
-                    "Unexpected suffix `{}` after quoted value (only `>=score` is supported)",
-                    rest.trailing
-                ));
-            };
-            return Ok(QueryCondition {
-                id: next_id(),
-                field,
-                value: trimmed.to_string(),
-                negated,
-                threshold,
-            });
-        }
-
-        let raw = rest.text.trim();
-        if raw.is_empty() {
-            return Err(format!("Missing value after `{}:`", field.as_prefix()));
-        }
-        if let Some((val_part, score_part)) = raw.split_once(">=") {
-            let val_trimmed = val_part.trim();
-            if val_trimmed.is_empty() {
-                return Err("Value cannot be empty before `>=`".to_string());
-            }
-            if mode == QueryBuilderMode::SafetyPolicy {
-                reject_safety_disallowed_syntax(val_trimmed, field.as_prefix())?;
-            }
-            let threshold = parse_threshold_strict(score_part)?;
-            return Ok(QueryCondition {
-                id: next_id(),
-                field,
-                value: val_trimmed.to_string(),
-                negated,
-                threshold: Some(threshold),
-            });
-        }
-        if mode == QueryBuilderMode::SafetyPolicy {
-            reject_safety_disallowed_syntax(raw, field.as_prefix())?;
-        }
-        return Ok(QueryCondition {
-            id: next_id(),
-            field,
-            value: raw.to_string(),
-            negated,
-            threshold: None,
-        });
-    }
-
-    // Fields without thresholds (`all:`, `title:`, `author:`, `post_tag:`).
     let field_name = field.as_prefix();
     if rest.quoted {
         if !rest.trailing.is_empty() {
             return Err(format!(
-                "Thresholds or suffixes (`{}`) are not supported on `{field_name}:`",
+                "Unexpected suffix `{}` after quoted value for `{field_name}:`",
                 rest.trailing
             ));
         }
@@ -935,11 +1012,6 @@ fn parse_qb_atom(
     if raw.is_empty() {
         return Err(format!("Missing value after `{field_name}:`"));
     }
-    if raw.contains(">=") {
-        return Err(format!(
-            "Thresholds (`>=`) are not supported on `{field_name}:`"
-        ));
-    }
     if mode == QueryBuilderMode::SafetyPolicy {
         reject_safety_disallowed_syntax(raw, field_name)?;
     }
@@ -955,6 +1027,12 @@ fn parse_qb_atom(
 
 /// Parse a flat or single-level-parenthesized query string into visual [`QueryBuilderNode`] items
 /// for the given [`QueryBuilderMode`].
+///
+/// Supports:
+/// - Optional whitespace around `>=` outside quotes (`tag:maid>=0.45`, `tag:maid>= 0.45`,
+///   `tag:maid >=0.45`, `tag:maid >= 0.45`, `clip:"sunlit sky" >= 0.25`)
+/// - Hundredths-precision thresholds `0.01..=1.00` on `tag:`, `clip:`, `dino:`, `upload:`
+/// - Unary `-` (`-tag:monochrome`, `-(tag:a OR tag:b)`) as equivalent to `NOT`
 pub fn parse_query_to_nodes(
     mode: QueryBuilderMode,
     query: &str,
@@ -988,7 +1066,10 @@ pub fn parse_query_to_nodes(
                     pos += 1;
                 }
                 QbToken::RParen => return Err("Unexpected `)` in query".to_string()),
-                QbToken::Not | QbToken::Atom(_) | QbToken::LParen => {
+                QbToken::Gte => {
+                    return Err("Unexpected `>=` threshold operator".to_string());
+                }
+                QbToken::Not | QbToken::Minus | QbToken::Atom(_) | QbToken::LParen => {
                     if mode == QueryBuilderMode::SafetyPolicy {
                         return Err(
                             "Missing explicit `AND` or `OR` operator between predicates"
@@ -1011,9 +1092,10 @@ pub fn parse_query_to_nodes(
                 );
             }
             QbToken::RParen => return Err("Unexpected `)` in query".to_string()),
-            QbToken::Not => {
+            QbToken::Gte => return Err("Unexpected `>=` threshold without predicate".to_string()),
+            QbToken::Not | QbToken::Minus => {
                 if pending_neg {
-                    return Err("Duplicate `NOT` operator is not allowed".to_string());
+                    return Err("Duplicate `NOT`/`-` operator is not allowed".to_string());
                 }
                 pending_neg = true;
                 pos += 1;
@@ -1058,7 +1140,11 @@ pub fn parse_query_to_nodes(
                                 inner_neg = false;
                                 pos += 1;
                             }
-                            QbToken::Not | QbToken::Atom(_) | QbToken::LParen => {
+                            QbToken::Gte => {
+                                return Err("Unexpected `>=` threshold operator inside group"
+                                    .to_string());
+                            }
+                            QbToken::Not | QbToken::Minus | QbToken::Atom(_) | QbToken::LParen => {
                                 if mode == QueryBuilderMode::SafetyPolicy {
                                     return Err(
                                         "Missing explicit `AND` or `OR` inside `(...)` group"
@@ -1095,9 +1181,17 @@ pub fn parse_query_to_nodes(
                         QbToken::And | QbToken::Or => {
                             return Err("Unexpected `AND`/`OR` operator inside group".to_string());
                         }
-                        QbToken::Not => {
+                        QbToken::Gte => {
+                            return Err(
+                                "Unexpected `>=` threshold without predicate inside group"
+                                    .to_string(),
+                            );
+                        }
+                        QbToken::Not | QbToken::Minus => {
                             if inner_neg {
-                                return Err("Duplicate `NOT` operator inside group".to_string());
+                                return Err(
+                                    "Duplicate `NOT`/`-` operator inside group".to_string()
+                                );
                             }
                             inner_neg = true;
                             pos += 1;
@@ -1109,10 +1203,14 @@ pub fn parse_query_to_nodes(
                                     "Query exceeds maximum of {MAX_TERMS_PER_RULE} terms"
                                 ));
                             }
-                            conditions.push(parse_qb_atom(atom, mode, true, inner_neg, next_id)?);
+                            let mut cond =
+                                parse_qb_atom(atom, mode, true, inner_neg, next_id)?;
+                            pos += 1;
+                            cond.threshold =
+                                consume_optional_threshold(&tokens, &mut pos, cond.field)?;
+                            conditions.push(cond);
                             inner_neg = false;
                             inner_expect_operand = false;
-                            pos += 1;
                         }
                     }
                 }
@@ -1122,6 +1220,11 @@ pub fn parse_query_to_nodes(
                 }
                 if conditions.is_empty() {
                     return Err("Empty `()` group in query".to_string());
+                }
+                if matches!(tokens.get(pos), Some(QbToken::Gte)) {
+                    return Err(
+                        "Threshold (`>=`) cannot be applied to a parenthesized group".to_string(),
+                    );
                 }
                 nodes.push(QueryBuilderNode::Group(QueryGroup {
                     id: next_id(),
@@ -1141,7 +1244,9 @@ pub fn parse_query_to_nodes(
                         "Query exceeds maximum of {MAX_TERMS_PER_RULE} terms"
                     ));
                 }
-                let cond = parse_qb_atom(atom, mode, false, pending_neg, next_id)?;
+                let mut cond = parse_qb_atom(atom, mode, false, pending_neg, next_id)?;
+                pos += 1;
+                cond.threshold = consume_optional_threshold(&tokens, &mut pos, cond.field)?;
                 nodes.push(QueryBuilderNode::Condition {
                     connector: pending_conn,
                     condition: cond,
@@ -1149,7 +1254,6 @@ pub fn parse_query_to_nodes(
                 pending_conn = QueryConnector::And;
                 pending_neg = false;
                 expect_operand = false;
-                pos += 1;
             }
         }
     }
@@ -1179,58 +1283,27 @@ fn ThresholdPillInput(
     defaults: Signal<QueryThresholdDefaults>,
     on_change: Callback<Option<f32>>,
 ) -> impl IntoView {
-    let initial_text = threshold
-        .get_untracked()
-        .map(format_score)
-        .unwrap_or_default();
-    let raw_text = RwSignal::new(initial_text);
-
-    Effect::new(move |_| {
-        let external = threshold.get();
-        let current_parsed = parse_optional_threshold(&raw_text.get_untracked());
-        let differs = match (external, current_parsed) {
-            (Some(a), Some(b)) => (a - b).abs() > 0.0005,
-            (None, None) => false,
-            _ => true,
-        };
-        if differs {
-            raw_text.set(external.map(format_score).unwrap_or_default());
-        }
-    });
-
     let label_text = field.threshold_label();
     let aria_label = format!("{label_text} threshold");
     let title_text = match field {
         QueryFieldKind::Tag => "Minimum WD-Tagger confidence score (0.01–1.00)",
         _ => "Minimum similarity score (0.01–1.00)",
     };
+    let placeholder_sig = Signal::derive(move || defaults.get().placeholder_for(field, mode));
 
     view! {
         <label class="le-qb-threshold" title=title_text>
             <span class="le-qb-threshold-label">{label_text}</span>
             <span class="le-qb-threshold-op" aria-hidden="true">">="</span>
-            <input
-                type="number"
+            <OptionalScoreInput
+                value=threshold
+                on_change=on_change
+                min=0.01
+                max=1.00
+                step=0.01
+                placeholder=placeholder_sig
+                aria_label=aria_label
                 class="le-qb-threshold-input"
-                aria-label=aria_label
-                min="0.01"
-                max="1.00"
-                step="0.01"
-                inputmode="decimal"
-                placeholder=move || defaults.get().placeholder_for(field, mode)
-                value=move || raw_text.get()
-                prop:value=move || raw_text.get()
-                on:input=move |ev| {
-                    let next_raw = event_target_value(&ev);
-                    raw_text.set(next_raw.clone());
-                    let parsed = parse_optional_threshold(&next_raw);
-                    on_change.run(parsed);
-                }
-                on:blur=move |_| {
-                    let parsed = parse_optional_threshold(&raw_text.get_untracked());
-                    raw_text.set(parsed.map(format_score).unwrap_or_default());
-                    on_change.run(parsed);
-                }
             />
         </label>
     }
@@ -1244,10 +1317,11 @@ fn ThresholdPillInput(
 /// - Self-contained bordered condition cards (`le-qb-card`) with top-right `×` close
 ///   buttons unambiguously bound to each card.
 /// - Distinct nested group cards (`le-qb-group`) with a crisp single-row header
-///   (`[AND/OR] [NOT] ( ... ) [Match ANY / ALL]` + `[+ Row]` + `[×]`) and distinct
+///   (`[AND/OR] [NOT] ( ... ) [ANY | ALL]` + `[+ Row]` + `[×]`) and distinct
 ///   inner mini-cards (`le-qb-subcard`) with their own top-right `×` buttons.
-/// - Per-condition score/similarity thresholds (`min="0.01" max="1.00" step="0.01"`)
-///   on every `Tag`, `CLIP Text`, `Similar ID`, and `Upload Image` condition.
+/// - Keyboard-friendly per-condition score/similarity thresholds (`0.01..=1.00`,
+///   hundredths precision via [`OptionalScoreInput`]) on every `Tag`, `CLIP Text`,
+///   `Similar ID`, and `Upload Image` condition.
 /// - Zero vector fields in `SafetyPolicy` mode; zero CLIP/DINO weight sliders in `AdvancedSearch` mode.
 #[component]
 pub fn QueryBuilder(
@@ -1290,6 +1364,7 @@ pub fn QueryBuilder(
         raw_parse_error.set(None);
         draft.update(|d| {
             d.mode = effective_mode;
+            d.active_preset = None;
             d.sync_query();
         });
         emit_change();
@@ -1571,7 +1646,7 @@ pub fn QueryBuilder(
                                     if let Some(QueryBuilderNode::Condition { condition, .. }) =
                                         d.nodes.iter_mut().find(|n| n.id() == node_id)
                                     {
-                                        condition.threshold = next;
+                                        condition.threshold = next.and_then(quantize_threshold);
                                     }
                                 });
                                 sync_from_nodes();
@@ -1877,12 +1952,12 @@ pub fn QueryBuilder(
                                                         "le-qb-comb-btn"
                                                     }
                                                     aria-pressed=move || (comb_sig.get() == QueryCombinator::Or).to_string()
+                                                    aria-label="Match ANY (OR)"
                                                     title="Match ANY condition in this group (OR)"
                                                     on:click=move |_| set_combinator(QueryCombinator::Or)
                                                 >
-                                                    <span class="le-qb-hide-sm">"Match "</span>
                                                     "ANY"
-                                                    <span class="le-qb-hide-xs">" (OR)"</span>
+                                                    <span class="le-qb-hide-narrow">" (OR)"</span>
                                                 </button>
                                                 <button
                                                     type="button"
@@ -1892,12 +1967,12 @@ pub fn QueryBuilder(
                                                         "le-qb-comb-btn"
                                                     }
                                                     aria-pressed=move || (comb_sig.get() == QueryCombinator::And).to_string()
+                                                    aria-label="Match ALL (AND)"
                                                     title="Match ALL conditions in this group (AND)"
                                                     on:click=move |_| set_combinator(QueryCombinator::And)
                                                 >
-                                                    <span class="le-qb-hide-sm">"Match "</span>
                                                     "ALL"
-                                                    <span class="le-qb-hide-xs">" (AND)"</span>
+                                                    <span class="le-qb-hide-narrow">" (AND)"</span>
                                                 </button>
                                             </div>
                                         </div>
@@ -2005,7 +2080,7 @@ pub fn QueryBuilder(
                                                             && let Some(c) =
                                                                 g.conditions.iter_mut().find(|c| c.id == cid)
                                                         {
-                                                            c.threshold = next;
+                                                            c.threshold = next.and_then(quantize_threshold);
                                                         }
                                                     });
                                                     sync_from_nodes();
@@ -2206,6 +2281,7 @@ pub fn QueryBuilder(
                                         raw_parse_error.set(None);
                                         draft.update(|d| {
                                             d.mode = effective_mode;
+                                            d.active_preset = None;
                                             d.query = next_raw;
                                             d.nodes = parsed;
                                         });
@@ -2213,7 +2289,10 @@ pub fn QueryBuilder(
                                     }
                                     Err(err) => {
                                         raw_parse_error.set(Some(err));
-                                        draft.update(|d| d.query = next_raw);
+                                        draft.update(|d| {
+                                            d.active_preset = None;
+                                            d.query = next_raw;
+                                        });
                                         emit_change();
                                     }
                                 }

@@ -10,6 +10,7 @@ mod query_builder;
 mod query_rule_builder;
 mod report_dialog;
 mod safe_mode_toggle;
+mod score_input;
 mod sky_select;
 mod spoiler_overlay;
 mod toast;
@@ -28,11 +29,16 @@ pub use notice_banner::NoticeBanner;
 pub use query_builder::{
     QueryBuilder, QueryBuilderDraft, QueryBuilderMode, QueryBuilderNode, QueryCombinator,
     QueryCondition, QueryConnector, QueryFieldKind, QueryGroup, QueryThresholdDefaults,
-    format_query_condition, format_query_nodes, parse_query_to_nodes,
+    format_query_condition, format_query_nodes, format_threshold, parse_query_to_nodes,
+    parse_threshold_hundredths, quantize_threshold,
 };
 pub use query_rule_builder::QueryRuleBuilder;
 pub use report_dialog::ReportDialog;
 pub use safe_mode_toggle::{SafeModeToggle, apply_safe_mode_change};
+pub use score_input::{
+    OptionalScoreInput, ScoreInput, format_score_for_step, parse_committed_score, parse_live_score,
+    quantize_score,
+};
 pub use sky_select::SkySelect;
 pub use spoiler_overlay::SpoilerOverlay;
 pub use toast::{

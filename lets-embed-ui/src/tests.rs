@@ -1,7 +1,8 @@
 use crate::components::{
     QueryBuilderDraft, QueryBuilderMode, QueryBuilderNode, QueryCombinator, QueryFieldKind,
-    clamp_chars, compute_menu_placement_from_metrics, format_query_nodes, next_enabled_index,
-    parse_query_to_nodes,
+    clamp_chars, compute_menu_placement_from_metrics, format_query_nodes, format_score_for_step,
+    format_threshold, next_enabled_index, parse_committed_score, parse_live_score,
+    parse_query_to_nodes, parse_threshold_hundredths, quantize_score, quantize_threshold,
 };
 use crate::layout::{format_duration, layout_masonry};
 use crate::models::{
@@ -260,6 +261,8 @@ fn ui_css_is_bundled_and_contains_mobile_density_breakpoints() {
     assert!(crate::UI_CSS.contains(".le-toggle-row"));
     assert!(crate::UI_CSS.contains(".le-toggle-track"));
     assert!(crate::UI_CSS.contains(".le-header"));
+    assert!(crate::UI_CSS.contains(".le-score-field"));
+    assert!(crate::UI_CSS.contains("@container le-qb"));
     assert!(crate::UI_CSS.contains(r#".gallery-ssr-grid[data-density="compact"]"#));
     assert!(crate::UI_CSS.contains(r#".gallery-ssr-grid[data-density="medium"]"#));
     assert!(crate::UI_CSS.contains(r#".gallery-ssr-grid[data-density="large"]"#));
@@ -273,7 +276,7 @@ fn query_builder_advanced_search_round_trips_per_condition_thresholds() {
         id
     };
 
-    let raw = r#"tag:maid>=0.45 AND clip:"sunlit breeze">=0.25 AND dino:42>=0.7 AND upload:0>=0.65 AND (title:spring OR NOT author:alice)"#;
+    let raw = r#"tag:maid>=0.45 AND clip:"sunlit breeze">=0.25 AND dino:42>=0.70 AND upload:0>=0.65 AND (title:spring OR NOT author:alice)"#;
     let nodes = parse_query_to_nodes(QueryBuilderMode::AdvancedSearch, raw, &mut alloc)
         .expect("advanced search query parses");
     assert_eq!(nodes.len(), 5);
@@ -326,6 +329,176 @@ fn query_builder_advanced_search_round_trips_per_condition_thresholds() {
 }
 
 #[test]
+fn query_builder_supports_all_whitespace_combos_around_gte_and_rejects_invalid_targets() {
+    let mut id = 200u64;
+    let mut alloc = || {
+        id += 1;
+        id
+    };
+
+    // All 4 whitespace combinations around `>=` on unquoted & quoted threshold fields
+    for (mode, expr, expected) in [
+        (QueryBuilderMode::AdvancedSearch, "tag:maid>=0.45", "tag:maid>=0.45"),
+        (QueryBuilderMode::AdvancedSearch, "tag:maid>= 0.45", "tag:maid>=0.45"),
+        (QueryBuilderMode::AdvancedSearch, "tag:maid >=0.45", "tag:maid>=0.45"),
+        (QueryBuilderMode::AdvancedSearch, "tag:maid >= 0.45", "tag:maid>=0.45"),
+        (
+            QueryBuilderMode::AdvancedSearch,
+            r#"clip:"sunlit sky">=0.25"#,
+            r#"clip:"sunlit sky">=0.25"#,
+        ),
+        (
+            QueryBuilderMode::AdvancedSearch,
+            r#"clip:"sunlit sky">= 0.25"#,
+            r#"clip:"sunlit sky">=0.25"#,
+        ),
+        (
+            QueryBuilderMode::AdvancedSearch,
+            r#"clip:"sunlit sky" >=0.25"#,
+            r#"clip:"sunlit sky">=0.25"#,
+        ),
+        (
+            QueryBuilderMode::AdvancedSearch,
+            r#"clip:"sunlit sky" >= 0.25"#,
+            r#"clip:"sunlit sky">=0.25"#,
+        ),
+        (
+            QueryBuilderMode::AdvancedSearch,
+            r#"tag:"long hair" >=0.45 AND dino:42 >= 0.7 AND upload:0>= 0.65"#,
+            r#"tag:"long hair">=0.45 AND dino:42>=0.70 AND upload:0>=0.65"#,
+        ),
+        (QueryBuilderMode::SafetyPolicy, "tag:explicit >= 0.5", "tag:explicit>=0.50"),
+        (QueryBuilderMode::SafetyPolicy, "tag:explicit>= 0.45", "tag:explicit>=0.45"),
+        (
+            QueryBuilderMode::SafetyPolicy,
+            r#"(tag:"long hair" >= 0.45 OR tag:nude >=0.60)"#,
+            r#"(tag:"long hair">=0.45 OR tag:nude>=0.60)"#,
+        ),
+    ] {
+        let nodes = parse_query_to_nodes(mode, expr, &mut alloc)
+            .unwrap_or_else(|e| panic!("failed to parse {expr:?} in {mode:?}: {e}"));
+        assert_eq!(format_query_nodes(&nodes), expected, "input={expr:?}");
+    }
+
+    // `>=` on non-threshold fields MUST be rejected even when preceded by whitespace
+    for (mode, bad) in [
+        (QueryBuilderMode::AdvancedSearch, "title:foo>=0.5"),
+        (QueryBuilderMode::AdvancedSearch, "title:foo >= 0.5"),
+        (QueryBuilderMode::AdvancedSearch, "title:foo >=0.5"),
+        (QueryBuilderMode::AdvancedSearch, "author:alice >= 0.5"),
+        (QueryBuilderMode::AdvancedSearch, "all:hello >= 0.5"),
+        (QueryBuilderMode::AdvancedSearch, "(tag:a) >= 0.5"),
+        (QueryBuilderMode::AdvancedSearch, "tag:maid >= 0.45 >= 0.60"),
+        (QueryBuilderMode::AdvancedSearch, "tag:maid >="),
+        (QueryBuilderMode::AdvancedSearch, ">= 0.5"),
+        (QueryBuilderMode::SafetyPolicy, "post_tag:safe >= 0.5"),
+        (QueryBuilderMode::SafetyPolicy, "author:alice >= 0.5"),
+        (QueryBuilderMode::SafetyPolicy, "unclassified >= 0.5"),
+    ] {
+        assert!(
+            parse_query_to_nodes(mode, bad, &mut alloc).is_err(),
+            "expected error for {bad:?} in {mode:?}"
+        );
+    }
+}
+
+#[test]
+fn query_builder_enforces_hundredths_precision_unary_minus_and_leading_slash() {
+    let mut id = 300u64;
+    let mut alloc = || {
+        id += 1;
+        id
+    };
+
+    // Strict hundredths parsing (`0.01..=1.00`)
+    assert_eq!(parse_threshold_hundredths("0.01").unwrap(), 0.01);
+    assert_eq!(parse_threshold_hundredths("0.45").unwrap(), 0.45);
+    assert_eq!(parse_threshold_hundredths("0.5").unwrap(), 0.50);
+    assert_eq!(parse_threshold_hundredths("0.50").unwrap(), 0.50);
+    assert_eq!(parse_threshold_hundredths(".45").unwrap(), 0.45);
+    assert_eq!(parse_threshold_hundredths("1").unwrap(), 1.00);
+    assert_eq!(parse_threshold_hundredths("1.0").unwrap(), 1.00);
+    assert_eq!(parse_threshold_hundredths("1.00").unwrap(), 1.00);
+
+    for bad in [
+        "", "0", "0.0", "0.00", "0.005", "0.456", "1.01", "2", "-0.5", "+0.5", "0.", ".", "NaN",
+        "inf", "1e-1", "0.5abc",
+    ] {
+        assert!(
+            parse_threshold_hundredths(bad).is_err(),
+            "parse_threshold_hundredths must reject {bad:?}"
+        );
+    }
+
+    assert_eq!(quantize_threshold(0.456), Some(0.46));
+    assert_eq!(quantize_threshold(0.005), Some(0.01));
+    assert_eq!(quantize_threshold(1.5), Some(1.0));
+    assert_eq!(quantize_threshold(0.0), None);
+    assert_eq!(format_threshold(0.456), "0.46");
+    assert_eq!(format_threshold(0.5), "0.50");
+    assert_eq!(format_threshold(0.001), "0.01");
+
+    // Raw query rejects <0.01 and >2 decimals
+    assert!(parse_query_to_nodes(QueryBuilderMode::AdvancedSearch, "tag:maid>=0.005", &mut alloc).is_err());
+    assert!(parse_query_to_nodes(QueryBuilderMode::AdvancedSearch, "tag:maid>=0.456", &mut alloc).is_err());
+    assert!(parse_query_to_nodes(QueryBuilderMode::SafetyPolicy, "tag:explicit>=0.005", &mut alloc).is_err());
+    assert!(parse_query_to_nodes(QueryBuilderMode::SafetyPolicy, "tag:explicit>=0.456", &mut alloc).is_err());
+
+    // Unary `-` parity with `search_types::{query,safety}`
+    let neg_adv = parse_query_to_nodes(
+        QueryBuilderMode::AdvancedSearch,
+        "tag:maid -tag:monochrome -(title:sketch OR -author:bob)",
+        &mut alloc,
+    )
+    .expect("unary minus parses in AdvancedSearch");
+    assert_eq!(
+        format_query_nodes(&neg_adv),
+        "tag:maid AND NOT tag:monochrome AND NOT (title:sketch OR NOT author:bob)"
+    );
+
+    let neg_safety = parse_query_to_nodes(
+        QueryBuilderMode::SafetyPolicy,
+        "tag:explicit AND -post_tag:approved AND -(tag:safe OR -author:alice)",
+        &mut alloc,
+    )
+    .expect("unary minus parses in SafetyPolicy");
+    assert_eq!(
+        format_query_nodes(&neg_safety),
+        "tag:explicit AND NOT post_tag:approved AND NOT (tag:safe OR NOT author:alice)"
+    );
+
+    // Any unquoted leading `/` rejected in SafetyPolicy
+    for slash_bad in ["tag:/blood", "post_tag:/nsfw", "author:/bob", "/foo"] {
+        assert!(
+            parse_query_to_nodes(QueryBuilderMode::SafetyPolicy, slash_bad, &mut alloc).is_err(),
+            "SafetyPolicy must reject leading slash {slash_bad:?}"
+        );
+    }
+}
+
+#[test]
+fn score_input_helpers_preserve_intermediate_typing_and_quantize_on_commit() {
+    // Intermediate typing never forces snap-back while user is mid-edit
+    assert_eq!(parse_live_score("", 0.01, 1.00, 0.01), None);
+    assert_eq!(parse_live_score("0", 0.01, 1.00, 0.01), None);
+    assert_eq!(parse_live_score("0.", 0.01, 1.00, 0.01), None);
+    assert_eq!(parse_live_score(".", 0.01, 1.00, 0.01), None);
+    assert_eq!(parse_live_score("-", 0.01, 1.00, 0.01), None);
+    assert_eq!(parse_live_score(".4", 0.01, 1.00, 0.01), Some(0.40));
+    assert_eq!(parse_live_score("0.45", 0.01, 1.00, 0.01), Some(0.45));
+    assert_eq!(parse_live_score("0.456", 0.01, 1.00, 0.01), Some(0.46));
+
+    // Committed blur clamps & quantizes cleanly to step
+    assert_eq!(parse_committed_score("", 0.01, 1.00, 0.01), None);
+    assert_eq!(parse_committed_score("0.001", 0.01, 1.00, 0.01), Some(0.01));
+    assert_eq!(parse_committed_score("2.5", 0.01, 1.00, 0.01), Some(1.00));
+    assert_eq!(parse_committed_score("0.456", 0.01, 1.00, 0.01), Some(0.46));
+    assert_eq!(quantize_score(0.5, 0.01, 1.00, 0.01), 0.50);
+    assert_eq!(format_score_for_step(0.5, 0.01, 1.00, 0.01), "0.50");
+    assert_eq!(format_score_for_step(0.456, 0.01, 1.00, 0.01), "0.46");
+}
+
+#[test]
 fn query_builder_safety_policy_mode_rejects_vectors_and_supports_or_not_groups() {
     let mut id = 50u64;
     let mut alloc = || {
@@ -366,7 +539,7 @@ fn query_builder_safety_policy_mode_rejects_vectors_and_supports_or_not_groups()
     }
 
     // Round-trip OR NOT group and per-tag thresholds cleanly
-    let valid = "tag:explicit>=0.5 OR NOT (tag:safe OR post_tag:verified)";
+    let valid = "tag:explicit>=0.50 OR NOT (tag:safe OR post_tag:verified)";
     let nodes = parse_query_to_nodes(QueryBuilderMode::SafetyPolicy, valid, &mut alloc)
         .expect("valid safety policy parses");
     assert_eq!(format_query_nodes(&nodes), valid);
@@ -378,7 +551,7 @@ fn query_builder_safety_policy_mode_rejects_vectors_and_supports_or_not_groups()
     .expect("draft parses");
     assert_eq!(
         draft.format_query(),
-        "(tag:explicit>=0.45 OR tag:nude>=0.6) AND NOT post_tag:approved"
+        "(tag:explicit>=0.45 OR tag:nude>=0.60) AND NOT post_tag:approved"
     );
 }
 
@@ -389,10 +562,10 @@ mod ssr_render_tests {
 
     use crate::components::{
         ContentMaskCard, DensityPicker, FloatingHeader, Lightbox, LikeButton, MAX_VISIBLE_TOASTS,
-        MasonryGallery, MinSimilaritySlider, NoticeBanner, QueryBuilder, QueryCondition,
-        QueryConnector, QueryGroup, QueryRuleBuilder, QueryThresholdDefaults, ReportDialog,
-        SafeModeToggle, SkySelect, SpoilerOverlay, ToastHost, ToastKind, ToggleSwitch, Viewer,
-        provide_toast_store, use_toast_store,
+        MasonryGallery, MinSimilaritySlider, NoticeBanner, OptionalScoreInput, QueryBuilder,
+        QueryCondition, QueryConnector, QueryGroup, QueryRuleBuilder, QueryThresholdDefaults,
+        ReportDialog, SafeModeToggle, ScoreInput, SkySelect, SpoilerOverlay, ToastHost, ToastKind,
+        ToggleSwitch, Viewer, provide_toast_store, use_toast_store,
     };
     use crate::models::{
         GalleryCard, GalleryCardKind, GalleryMask, LightboxAlbum, LikeTargetKind, LikeVariant,
@@ -639,7 +812,11 @@ mod ssr_render_tests {
         assert!(html.contains("le-rule-remove-btn"));
         assert!(html.contains("0.45"));
         assert!(html.contains("le-score-input"));
-        assert!(html.contains(r#"min="0.01""#));
+        assert!(html.contains(r#"inputmode="decimal""#));
+        assert!(html.contains(r#"data-min="0.01""#));
+        assert!(html.contains(r#"data-max="1.00""#));
+        assert!(html.contains(r#"data-step="0.01""#));
+        assert!(!html.contains(r#"step="0.05""#));
         assert!(html.contains("AND NOT post_tag:safe"));
 
         // Multiple QueryRuleBuilder instances must not collide on hardcoded raw input IDs
@@ -825,8 +1002,11 @@ mod ssr_render_tests {
         assert!(html.contains("Signed in"));
         assert!(!html.contains("Temporary"));
         assert!(html.contains(r#"role="alert""#));
+        assert!(html.contains(r#"aria-live="assertive""#));
         assert!(html.contains(r#"role="status""#));
         assert!(html.contains("le-toast-close"));
+        // Outer toast host must NOT set aria-live="polite" (avoids nesting assertive alerts)
+        assert!(!html.contains(r#"class="le-toast-host" role="region" aria-label="Notifications" aria-live="polite""#));
 
         // Verify queue cap keeps the latest MAX_VISIBLE_TOASTS entries
         let owner = Owner::new();
@@ -936,12 +1116,17 @@ mod ssr_render_tests {
         assert!(html.contains("( ... )"));
         assert!(html.contains("Min score"));
         assert!(html.contains("Min sim"));
-        assert!(html.contains(r#"min="0.01""#));
-        assert!(html.contains(r#"max="1.00""#));
-        assert!(html.contains(r#"step="0.01""#));
+        assert!(html.contains(r#"inputmode="decimal""#));
+        assert!(html.contains(r#"data-min="0.01""#));
+        assert!(html.contains(r#"data-max="1.00""#));
+        assert!(html.contains(r#"data-step="0.01""#));
         assert!(
             !html.contains(r#"step="0.05""#),
-            "Must never emit step=0.05 with min=0.01"
+            "Must never emit step=0.05"
+        );
+        assert!(
+            !html.contains(r#"type="number""#),
+            "Score inputs must use type=text + inputmode=decimal for fluid keyboard editing"
         );
         // 4 threshold inputs (Tag, ClipText, SimilarId, UploadImage)
         assert_eq!(html.matches("le-qb-threshold-input").count(), 4);
@@ -994,7 +1179,7 @@ mod ssr_render_tests {
                         },
                     },
                 ],
-                query: "(tag:explicit>=0.5 OR post_tag:r18) AND unclassified".into(),
+                query: "(tag:explicit>=0.50 OR post_tag:r18) AND unclassified".into(),
                 active_preset: Some("r18".into()),
             });
             view! {
@@ -1011,10 +1196,13 @@ mod ssr_render_tests {
         assert!(html.contains("Post Tag"));
         assert!(html.contains("Unclassified"));
         assert!(html.contains("Min score"));
-        assert!(html.contains(r#"min="0.01""#));
-        assert!(html.contains(r#"max="1.00""#));
-        assert!(html.contains(r#"step="0.01""#));
+        assert!(html.contains("0.50"));
+        assert!(html.contains(r#"inputmode="decimal""#));
+        assert!(html.contains(r#"data-min="0.01""#));
+        assert!(html.contains(r#"data-max="1.00""#));
+        assert!(html.contains(r#"data-step="0.01""#));
         assert!(!html.contains(r#"step="0.05""#));
+        assert!(!html.contains(r#"type="number""#));
         // Zero vector fields or vector operators in SafetyPolicy mode
         assert!(!html.contains("CLIP Text"));
         assert!(!html.contains("Similar ID"));
@@ -1022,6 +1210,48 @@ mod ssr_render_tests {
         assert!(!html.contains("clip:"));
         assert!(!html.contains("dino:"));
         assert!(!html.contains("upload:"));
+    }
+
+    #[test]
+    fn score_input_ssr_renders_keyboard_friendly_decimal_inputs() {
+        let html = render_ssr(|| {
+            let score = RwSignal::new(0.5f32);
+            let opt = RwSignal::new(Some(0.456f32));
+            view! {
+                <div>
+                    <ScoreInput
+                        id="default-min-score"
+                        value=score
+                        on_change=Callback::new(move |v| score.set(v))
+                        min=0.01
+                        max=1.00
+                        step=0.01
+                        placeholder="0.45"
+                        aria_label="Default Min Score"
+                        class="adm-score"
+                    />
+                    <OptionalScoreInput
+                        id="optional-min-sim"
+                        value=opt
+                        on_change=Callback::new(move |v| opt.set(v))
+                        placeholder=Signal::derive(|| "default".to_string())
+                        aria_label="Min similarity"
+                    />
+                </div>
+            }
+        });
+
+        assert!(html.contains(r#"id="default-min-score""#));
+        assert!(html.contains(r#"id="optional-min-sim""#));
+        assert!(html.contains(r#"type="text""#));
+        assert!(html.contains(r#"inputmode="decimal""#));
+        assert!(html.contains(r#"data-min="0.01""#));
+        assert!(html.contains(r#"data-max="1.00""#));
+        assert!(html.contains(r#"data-step="0.01""#));
+        assert!(html.contains(r#"value="0.50""#));
+        assert!(html.contains(r#"value="0.46""#));
+        assert!(html.contains("le-score-field adm-score"));
+        assert!(!html.contains(r#"type="number""#));
     }
 
     #[test]

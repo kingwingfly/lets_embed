@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use leptos::prelude::*;
+use leptos::{ev, html, prelude::*};
 use serde::{Deserialize, Serialize};
 
 static NEXT_TOAST_ID: AtomicU64 = AtomicU64::new(1);
@@ -204,7 +204,10 @@ fn ToastCard(item: ToastItem, store: ToastStore) -> impl IntoView {
     let id = item.id;
     let kind = item.kind;
     let duration_ms = kind.default_duration_ms();
-    let paused = RwSignal::new(false);
+    let card_ref = NodeRef::<html::Div>::new();
+    let hovered = RwSignal::new(false);
+    let focused = RwSignal::new(false);
+    let paused = Memo::new(move |_| hovered.get() || focused.get());
 
     #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
     {
@@ -250,11 +253,34 @@ fn ToastCard(item: ToastItem, store: ToastStore) -> impl IntoView {
         });
     }
 
+    let on_focusout = move |ev: ev::FocusEvent| {
+        #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+        {
+            use wasm_bindgen::JsCast;
+
+            let related = ev
+                .related_target()
+                .and_then(|t| t.dyn_into::<web_sys::Node>().ok());
+            let stays_inside = card_ref
+                .get_untracked()
+                .is_some_and(|card| related.as_ref().is_some_and(|n| card.contains(Some(n))));
+            if !stays_inside {
+                focused.set(false);
+            }
+        }
+        #[cfg(not(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr"))))]
+        {
+            let _ = ev;
+            focused.set(false);
+        }
+    };
+
     let kind_slug = kind.as_str();
     let progress_style = format!("--le-toast-duration: {duration_ms}ms;");
 
     view! {
         <div
+            node_ref=card_ref
             class=move || {
                 if paused.get() {
                     format!("le-toast le-toast--{kind_slug} is-paused")
@@ -266,10 +292,10 @@ fn ToastCard(item: ToastItem, store: ToastStore) -> impl IntoView {
             aria-live=kind.aria_live()
             aria-atomic="true"
             style=progress_style
-            on:mouseenter=move |_| paused.set(true)
-            on:mouseleave=move |_| paused.set(false)
-            on:focusin=move |_| paused.set(true)
-            on:focusout=move |_| paused.set(false)
+            on:mouseenter=move |_| hovered.set(true)
+            on:mouseleave=move |_| hovered.set(false)
+            on:focusin=move |_| focused.set(true)
+            on:focusout=on_focusout
         >
             <span class="le-toast-accent" aria-hidden="true"></span>
             <div class="le-toast-icon-wrap">
@@ -309,7 +335,6 @@ pub fn ToastHost(#[prop(optional)] store: Option<ToastStore>) -> impl IntoView {
             class="le-toast-host"
             role="region"
             aria-label="Notifications"
-            aria-live="polite"
         >
             <For
                 each=move || items_sig.get()

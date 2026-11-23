@@ -2,29 +2,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use leptos::prelude::*;
 
-use crate::components::SkySelect;
+use crate::components::{OptionalScoreInput, SkySelect};
 use crate::models::{
     PresetTemplate, RuleBlock, RuleBlockKind, RuleClause, RuleConnector, RuleDraft, RuleField,
     RuleGroupCombinator, SelectOption, SelectVariant,
 };
-use crate::rule_syntax::{format_rule_blocks, format_score, parse_safety_rule_to_blocks};
+use crate::rule_syntax::{format_rule_blocks, parse_safety_rule_to_blocks};
 
 static NEXT_RULE_NODE_ID: AtomicU64 = AtomicU64::new(100);
 
 fn alloc_node_id() -> u64 {
     NEXT_RULE_NODE_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-fn parse_optional_score(raw: &str) -> Option<f32> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    trimmed
-        .parse::<f32>()
-        .ok()
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .map(|v| v.min(1.0))
 }
 
 /// Visual boolean rule builder for metadata-only content safety rules.
@@ -366,18 +354,9 @@ pub fn QueryRuleBuilder(
                                         {move || (field_sig.get() == RuleField::Tag).then(|| view! {
                                             <label class="le-score-box" title="Minimum WD-Tagger confidence score (0.01–1.00)">
                                                 <span class="le-score-prefix">">="</span>
-                                                <input
-                                                    type="number"
-                                                    class="le-score-input"
-                                                    aria-label="Minimum tag confidence score"
-                                                    min="0.01"
-                                                    max="1.00"
-                                                    step="0.01"
-                                                    placeholder="0.45"
-                                                    value=move || score_sig.get().map(format_score).unwrap_or_default()
-                                                    prop:value=move || score_sig.get().map(format_score).unwrap_or_default()
-                                                    on:input=move |ev| {
-                                                        let parsed = parse_optional_score(&event_target_value(&ev));
+                                                <OptionalScoreInput
+                                                    value=score_sig
+                                                    on_change=Callback::new(move |parsed: Option<f32>| {
                                                         draft.update(|d| {
                                                             if let Some(b) = d.blocks.iter_mut().find(|b| b.id == block_id)
                                                                 && let RuleBlockKind::Clause(c) = &mut b.kind
@@ -386,7 +365,13 @@ pub fn QueryRuleBuilder(
                                                             }
                                                         });
                                                         sync_query_from_blocks();
-                                                    }
+                                                    })
+                                                    min=0.01
+                                                    max=1.00
+                                                    step=0.01
+                                                    placeholder=Signal::derive(|| "0.45".to_string())
+                                                    aria_label="Minimum tag confidence score"
+                                                    class="le-score-input"
                                                 />
                                             </label>
                                         })}
@@ -710,18 +695,9 @@ pub fn QueryRuleBuilder(
                                                             {move || (c_field.get() == RuleField::Tag).then(|| view! {
                                                                 <label class="le-score-box" title="Minimum WD-Tagger confidence score (0.01–1.00)">
                                                                     <span class="le-score-prefix">">="</span>
-                                                                    <input
-                                                                        type="number"
-                                                                        class="le-score-input"
-                                                                        aria-label="Minimum tag confidence score"
-                                                                        min="0.01"
-                                                                        max="1.00"
-                                                                        step="0.01"
-                                                                        placeholder="0.45"
-                                                                        value=move || c_score.get().map(format_score).unwrap_or_default()
-                                                                        prop:value=move || c_score.get().map(format_score).unwrap_or_default()
-                                                                        on:input=move |ev| {
-                                                                            let parsed = parse_optional_score(&event_target_value(&ev));
+                                                                    <OptionalScoreInput
+                                                                        value=c_score
+                                                                        on_change=Callback::new(move |parsed: Option<f32>| {
                                                                             draft.update(|d| {
                                                                                 if let Some(b) = d.blocks.iter_mut().find(|b| b.id == block_id)
                                                                                     && let RuleBlockKind::Group { clauses, .. } = &mut b.kind
@@ -731,7 +707,13 @@ pub fn QueryRuleBuilder(
                                                                                 }
                                                                             });
                                                                             sync_query_from_blocks();
-                                                                        }
+                                                                        })
+                                                                        min=0.01
+                                                                        max=1.00
+                                                                        step=0.01
+                                                                        placeholder=Signal::derive(|| "0.45".to_string())
+                                                                        aria_label="Minimum tag confidence score"
+                                                                        class="le-score-input"
                                                                     />
                                                                 </label>
                                                             })}
