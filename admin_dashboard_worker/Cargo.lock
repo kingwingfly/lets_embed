@@ -963,6 +963,7 @@ dependencies = [
  "base64",
  "bs58",
  "hmac",
+ "search_types",
  "serde",
  "serde_json",
  "sha2",

@@ -1,4 +1,4 @@
-//! JSON wire DTOs for `/admin/api/*`.
+//! JSON wire DTOs for `/admin/api/*` (Policy v3 + Two-Phase Activation + Catalog Validation).
 //!
 //! Secret values are write-only on `ProviderUpdateItem` (never included in any
 //! `GET` response struct or redacted `Debug` output).
@@ -7,15 +7,81 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use site_access::{
-    AgeGateTrigger, AgeVerificationPolicy, AuthProviderId, AuthProviderPublicConfig, GeoPolicy,
-    LegalDocConfig, SafetyRuleConfig, SimilarityDefaults, UnclassifiedMode,
+    AgeGateTrigger, AgeVerificationPolicy, AuthProviderId, AuthProviderPublicConfig, ContentPolicy,
+    GeoPolicy, LegalDocConfig, SimilarityDefaults, UnclassifiedMode,
 };
 
 use crate::settings::AccessPolicy;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldValidationError {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_id: Option<String>,
+    pub field: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiError {
     pub error: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<FieldValidationError>,
+}
+
+/// D1 `site_settings.activation_status` two-phase publication state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivationStatus {
+    #[default]
+    Active,
+    PendingDoAck,
+    Failed,
+}
+
+impl ActivationStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::PendingDoAck => "pending_do_ack",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim() {
+            "pending_do_ack" => Self::PendingDoAck,
+            "failed" => Self::Failed,
+            _ => Self::Active,
+        }
+    }
+
+    pub const fn is_pending(self) -> bool {
+        !matches!(self, Self::Active)
+    }
+}
+
+/// Returned when D1 saved the revision as `pending_do_ack` but `SitePolicyDO`
+/// failed to acknowledge exact `(revision, policy_digest)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingActivationResp {
+    pub ok: bool,
+    pub pending_activation: bool,
+    pub activation_status: String,
+    pub revision: u64,
+    pub min_enforce_rev: u64,
+    pub policy_digest: String,
+    pub error: String,
+}
+
+/// Returned by idempotent `POST /admin/api/policy/retry-activation` on ACK success.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryActivationResp {
+    pub ok: bool,
+    pub pending_activation: bool,
+    pub activation_status: String,
+    pub revision: u64,
+    pub min_enforce_rev: u64,
+    pub policy_digest: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -44,38 +110,48 @@ pub struct PaymentsSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SafetyOverview {
     pub safety_enabled: bool,
-    pub rule_count: usize,
+    pub policy_count: usize,
     pub active_switcher_count: usize,
+    pub active_blur_count: usize,
     pub age_policy: AgeVerificationPolicy,
     pub age_gate_trigger: AgeGateTrigger,
     pub blocked_country_count: usize,
-    pub cloudflare_images_blur: bool,
+    pub fixed_blur_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverviewResp {
     pub admin_email: String,
-    pub revision: u32,
-    pub min_enforce_rev: u32,
+    pub schema_version: u32,
+    pub revision: u64,
+    pub min_enforce_rev: u64,
     pub policy_digest: String,
+    pub vocab_digest: String,
+    pub activation_status: String,
     pub access: AccessPolicy,
     pub safety: SafetyOverview,
     pub accounts_summary: AccountsSummary,
     pub payments_summary: PaymentsSummary,
     pub open_report_count: i64,
     pub legacy_unclassified_note: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_upgrade_notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveAccessReq {
-    pub revision: u32,
+    pub revision: u64,
     pub access: AccessPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveAccessResp {
-    pub revision: u32,
-    pub min_enforce_rev: u32,
+    pub ok: bool,
+    pub pending_activation: bool,
+    pub activation_status: String,
+    pub revision: u64,
+    pub min_enforce_rev: u64,
+    pub policy_digest: String,
     pub digest: String,
     pub access: AccessPolicy,
 }
@@ -210,51 +286,59 @@ pub struct PaymentsListResp {
 }
 
 // ---------------------------------------------------------------------------
-// Content Safety, Similarity, Geo, Age & Legal
+// Content Safety (Policy v3), Similarity, Geo, Age & Legal
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SafetyConfigResp {
-    pub revision: u32,
-    pub min_enforce_rev: u32,
-    pub digest: String,
+    pub schema_version: u32,
+    pub revision: u64,
+    pub min_enforce_rev: u64,
+    pub policy_digest: String,
+    pub vocab_digest: String,
+    pub activation_status: String,
     pub safety_enabled: bool,
-    pub rules: Vec<SafetyRuleConfig>,
-    pub presets: Vec<SafetyRuleConfig>,
+    pub policies: Vec<ContentPolicy>,
+    pub presets: Vec<ContentPolicy>,
     pub unclassified_mode: UnclassifiedMode,
-    pub cloudflare_images_blur: bool,
+    pub fixed_blur_enabled: bool,
     pub age_policy: AgeVerificationPolicy,
     pub age_gate_trigger: AgeGateTrigger,
     pub similarity: SimilarityDefaults,
     pub geo: GeoPolicy,
     pub legal: LegalDocConfig,
-    pub panic_shortcut: String,
     pub legacy_unclassified_note: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_upgrade_notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveSafetyReq {
-    pub revision: u32,
+    pub revision: u64,
     pub safety_enabled: bool,
-    pub rules: Vec<SafetyRuleConfig>,
+    pub policies: Vec<ContentPolicy>,
     pub unclassified_mode: UnclassifiedMode,
-    pub cloudflare_images_blur: bool,
+    pub fixed_blur_enabled: bool,
     pub age_policy: AgeVerificationPolicy,
     pub age_gate_trigger: AgeGateTrigger,
     pub similarity: SimilarityDefaults,
     pub geo: GeoPolicy,
     pub legal: LegalDocConfig,
-    pub panic_shortcut: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveSafetyResp {
-    pub revision: u32,
-    pub min_enforce_rev: u32,
+    pub ok: bool,
+    pub pending_activation: bool,
+    pub activation_status: String,
+    pub revision: u64,
+    pub min_enforce_rev: u64,
     pub tightened: bool,
     pub terms_bumped: bool,
     pub auto_disabled_providers: Vec<AuthProviderId>,
-    pub digest: String,
+    pub policy_digest: String,
+    pub vocab_digest: String,
+    pub policies: Vec<ContentPolicy>,
     pub legal: LegalDocConfig,
 }
 
@@ -276,8 +360,12 @@ pub struct ProviderView {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvidersResp {
-    pub revision: u32,
-    pub min_enforce_rev: u32,
+    pub ok: bool,
+    pub pending_activation: bool,
+    pub activation_status: String,
+    pub revision: u64,
+    pub min_enforce_rev: u64,
+    pub policy_digest: String,
     pub digest: String,
     pub age_policy: AgeVerificationPolicy,
     pub current_kid: String,
@@ -326,7 +414,7 @@ impl fmt::Debug for ProviderUpdateItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveProvidersReq {
-    pub revision: u32,
+    pub revision: u64,
     pub providers: Vec<ProviderUpdateItem>,
 }
 

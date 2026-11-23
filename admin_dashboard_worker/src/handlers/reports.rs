@@ -4,7 +4,7 @@
 //! - `POST /admin/api/reports/{id}/resolve` (`status = resolved|dismissed|reviewing`)
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::{Path, Query, State},
     http::HeaderMap,
     response::{IntoResponse, Response},
@@ -18,6 +18,7 @@ use crate::{
         ContentReportItem, ReportCounts, ReportsListResp, ResolveReportReq, ResolveReportResp,
     },
     handlers::{bad_request, guard_mutation, guard_read, internal_error, not_found},
+    security::AdminIdentity,
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -36,10 +37,10 @@ struct StatusCountRow {
 #[worker::send]
 pub async fn list_reports(
     State(st): State<AppState>,
-    headers: HeaderMap,
+    Extension(admin): Extension<AdminIdentity>,
     Query(q): Query<ReportsQuery>,
 ) -> Response {
-    if let Err(resp) = guard_read(&st, &headers) {
+    if let Err(resp) = guard_read(&st, &admin) {
         return resp;
     }
 
@@ -146,11 +147,12 @@ pub async fn list_reports(
 #[worker::send]
 pub async fn resolve_report(
     State(st): State<AppState>,
+    Extension(admin): Extension<AdminIdentity>,
     headers: HeaderMap,
     Path(report_id): Path<String>,
     Json(req): Json<ResolveReportReq>,
 ) -> Response {
-    let admin = match guard_mutation(&st, &headers) {
+    let editor = match guard_mutation(&st, &admin, &headers) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -178,7 +180,7 @@ pub async fn resolve_report(
     let now = (worker::Date::now().as_millis() / 1000) as i64;
     let is_reviewing = next_status == "reviewing";
     let resolved_at = (!is_reviewing).then_some(now);
-    let resolved_by = (!is_reviewing).then(|| admin.to_string());
+    let resolved_by = (!is_reviewing).then(|| editor.to_string());
     let resolved_at_val: JsValue = resolved_at
         .map(|ts| (ts as f64).into())
         .unwrap_or(JsValue::NULL);
@@ -217,7 +219,7 @@ pub async fn resolve_report(
         return not_found("Report not found");
     }
 
-    worker::console_log!("Admin {admin} marked content_report {id} as {next_status}");
+    worker::console_log!("Admin {editor} marked content_report {id} as {next_status}");
 
     Json(ResolveReportResp {
         id: id.to_string(),

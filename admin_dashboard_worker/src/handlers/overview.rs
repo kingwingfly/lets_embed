@@ -1,22 +1,26 @@
 //! `GET /admin/api/overview` and `POST /admin/api/settings/access`.
 
 use axum::{
-    Json,
+    Extension, Json,
     extract::State,
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
-use site_access::{RuleMode, compute_policy_digest};
+use site_access::{PolicyAction, compute_policy_digest};
 
 use crate::{
     AppState, D1_BINDING,
     api::{
-        AccountsSummary, OverviewResp, PaymentsSummary, SafetyOverview, SaveAccessReq,
-        SaveAccessResp,
+        AccountsSummary, ActivationStatus, OverviewResp, PaymentsSummary, SafetyOverview,
+        SaveAccessReq, SaveAccessResp,
     },
-    handlers::{bad_request, conflict, guard_mutation, guard_read, internal_error},
-    settings::{LEGACY_UNCLASSIFIED_NOTE, LoadedSettings},
+    handlers::{
+        bad_request, conflict, guard_mutation, guard_read, internal_error,
+        pending_activation_response,
+    },
+    security::AdminIdentity,
+    settings::{ActivationOutcome, LEGACY_UNCLASSIFIED_NOTE, LoadedSettings},
 };
 
 #[derive(Default, Deserialize)]
@@ -52,8 +56,11 @@ pub(crate) async fn load_accounts_summary(env: &worker::Env) -> worker::Result<A
 }
 
 #[worker::send]
-pub async fn get_overview(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let admin_email = match guard_read(&st, &headers) {
+pub async fn get_overview(
+    State(st): State<AppState>,
+    Extension(admin): Extension<AdminIdentity>,
+) -> Response {
+    let admin_email = match guard_read(&st, &admin) {
         Ok(email) => email.to_string(),
         Err(resp) => return resp,
     };
@@ -114,25 +121,34 @@ pub async fn get_overview(State(st): State<AppState>, headers: HeaderMap) -> Res
 
     let public = &loaded.doc.public;
     let active_switcher_count = public
-        .rules
+        .policies
         .iter()
-        .filter(|r| r.enabled && r.mode == RuleMode::Switcher)
+        .filter(|p| p.enabled && p.bypass.include_switcher)
+        .count();
+    let active_blur_count = public
+        .policies
+        .iter()
+        .filter(|p| p.enabled && p.action == PolicyAction::Blur)
         .count();
 
     Json(OverviewResp {
         admin_email,
+        schema_version: public.schema_version,
         revision: loaded.revision,
         min_enforce_rev: public.min_enforce_rev,
         policy_digest: compute_policy_digest(public),
+        vocab_digest: public.vocab_digest.clone(),
+        activation_status: loaded.activation_status.as_str().to_string(),
         access: loaded.doc.access,
         safety: SafetyOverview {
             safety_enabled: public.safety_enabled,
-            rule_count: public.rules.len(),
+            policy_count: public.policies.len(),
             active_switcher_count,
+            active_blur_count,
             age_policy: public.age_policy,
             age_gate_trigger: public.age_gate_trigger,
             blocked_country_count: public.geo.blocked_countries.len(),
-            cloudflare_images_blur: public.cloudflare_images_blur,
+            fixed_blur_enabled: public.fixed_blur_enabled,
         },
         accounts_summary,
         payments_summary: PaymentsSummary {
@@ -146,6 +162,7 @@ pub async fn get_overview(State(st): State<AppState>, headers: HeaderMap) -> Res
         },
         open_report_count,
         legacy_unclassified_note: LEGACY_UNCLASSIFIED_NOTE.to_string(),
+        legacy_upgrade_notice: loaded.legacy_upgrade_notice,
     })
     .into_response()
 }
@@ -153,10 +170,11 @@ pub async fn get_overview(State(st): State<AppState>, headers: HeaderMap) -> Res
 #[worker::send]
 pub async fn save_access_settings(
     State(st): State<AppState>,
+    Extension(admin): Extension<AdminIdentity>,
     headers: HeaderMap,
     Json(req): Json<SaveAccessReq>,
 ) -> Response {
-    let admin = match guard_mutation(&st, &headers) {
+    let editor = match guard_mutation(&st, &admin, &headers) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
@@ -180,14 +198,34 @@ pub async fn save_access_settings(
     }
 
     loaded.doc.access = normalized_access.clone();
-    match LoadedSettings::save_and_publish(&st.env, req.revision, &loaded.doc, admin).await {
-        Ok(Some((new_rev, digest))) => Json(SaveAccessResp {
-            revision: new_rev,
-            min_enforce_rev: loaded.doc.public.min_enforce_rev,
-            digest,
-            access: normalized_access,
-        })
-        .into_response(),
+    match LoadedSettings::save_and_activate(&st.env, req.revision, &loaded.doc, editor).await {
+        Ok(Some(ActivationOutcome::Active {
+            ack,
+            min_enforce_rev,
+        })) => {
+            worker::console_log!(
+                "Admin {editor} saved & activated access settings rev={} digest={}",
+                ack.revision,
+                ack.policy_digest
+            );
+            Json(SaveAccessResp {
+                ok: true,
+                pending_activation: false,
+                activation_status: ActivationStatus::Active.as_str().to_string(),
+                revision: ack.revision,
+                min_enforce_rev,
+                digest: ack.policy_digest.clone(),
+                policy_digest: ack.policy_digest,
+                access: normalized_access,
+            })
+            .into_response()
+        }
+        Ok(Some(ActivationOutcome::PendingDoAck {
+            revision,
+            min_enforce_rev,
+            policy_digest,
+            error,
+        })) => pending_activation_response(revision, min_enforce_rev, policy_digest, error),
         Ok(None) => conflict(
             "Settings were updated concurrently. Reload the dashboard and reapply your changes.",
         ),

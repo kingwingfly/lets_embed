@@ -1,8 +1,12 @@
-/* Standalone Admin Dashboard layout styling complementing lets_embed_ui::UI_CSS */
+/* Standalone Admin Dashboard layout styling complementing lets_embed_ui::UI_CSS
+ * Strictly left-aligned cards, Cloudflare Access-style Policy v3 builder,
+ * ToggleSwitch & ScoreInput integration, and prominent pending-activation banner.
+ */
 :root {
   --adm-bg: #eef7fd;
-  --adm-surface: rgba(255, 255, 255, 0.94);
+  --adm-surface: rgba(255, 255, 255, 0.96);
   --adm-line: #cfe4f5;
+  --adm-line-strong: #aed2ee;
   --adm-ink: #0f2c44;
   --adm-muted: #4b6c87;
   --adm-blue: #0479ad;
@@ -11,8 +15,12 @@
   --adm-ok-fg: #146243;
   --adm-warn-bg: #fff7e6;
   --adm-warn-fg: #925400;
+  --adm-warn-line: #f4d08a;
   --adm-err-bg: #fff1f2;
   --adm-err-fg: #b91c1c;
+  --adm-info-bg: #eff8ff;
+  --adm-info-fg: #0c4a6e;
+  --adm-info-line: #bae6fd;
 }
 
 * {
@@ -25,6 +33,7 @@ body {
   color: var(--adm-ink);
   background: radial-gradient(circle at top left, #e1f3ff, var(--adm-bg) 55%, #f5f9ff);
   min-height: 100vh;
+  text-align: left;
 }
 
 .adm-boot-loading {
@@ -34,20 +43,31 @@ body {
   font-weight: 600;
 }
 
+.adm-root-mounted {
+  padding: 0;
+  text-align: left;
+}
+
 .adm-page {
   max-width: 1240px;
   margin: 0 auto;
-  padding: 14px 16px 48px;
+  padding: 14px 16px 56px;
+  text-align: left;
 }
 
 .adm-main {
   margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
 }
 
+/* Header */
 .adm-brand {
   display: flex;
   align-items: center;
   gap: 10px;
+  text-align: left;
 }
 
 .adm-brand-dot {
@@ -56,6 +76,7 @@ body {
   border-radius: 50%;
   background: linear-gradient(135deg, var(--adm-blue), var(--adm-indigo));
   box-shadow: 0 0 0 4px rgba(4, 121, 173, 0.16);
+  flex-shrink: 0;
 }
 
 .adm-brand-title {
@@ -88,7 +109,7 @@ body {
   align-items: center;
   padding: 4px 10px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.9);
+  background: rgba(255, 255, 255, 0.92);
   border: 1px solid var(--adm-line);
   font-size: 12px;
   font-weight: 650;
@@ -103,8 +124,47 @@ body {
 
 .adm-chip--warn {
   background: var(--adm-warn-bg);
-  border-color: #f4d08a;
+  border-color: var(--adm-warn-line);
   color: var(--adm-warn-fg);
+}
+
+/* Pending DO Activation Banner */
+.adm-pending-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 14px 18px;
+  border-radius: 16px;
+  background: linear-gradient(180deg, #fffbeb, #fff5d6);
+  border: 1.5px solid #f59e0b;
+  box-shadow: 0 6px 20px rgba(217, 119, 6, 0.14);
+  text-align: left;
+}
+
+.adm-pending-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1 1 320px;
+}
+
+.adm-pending-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 14.5px;
+  color: #78350f;
+}
+
+.adm-pending-desc {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.45;
+  color: #92400e;
 }
 
 /* Horizontal pill tabs */
@@ -112,7 +172,6 @@ body {
   display: flex;
   gap: 6px;
   padding: 6px;
-  margin-bottom: 16px;
   background: var(--adm-surface);
   border: 1px solid var(--adm-line);
   border-radius: 16px;
@@ -167,10 +226,12 @@ body {
   color: #ffffff;
 }
 
+/* Cards & Grids — strictly left-aligned */
 .adm-stack {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  text-align: left;
 }
 
 .adm-card {
@@ -182,6 +243,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  text-align: left;
 }
 
 .adm-card--highlight {
@@ -193,10 +255,11 @@ body {
   background: #f7fbff;
   border: 1px solid #d9ebf8;
   border-radius: 14px;
-  padding: 14px;
+  padding: 14px 16px;
   display: flex;
   flex-direction: column;
   gap: 12px;
+  text-align: left;
 }
 
 .adm-card-head {
@@ -204,20 +267,27 @@ body {
   align-items: flex-start;
   justify-content: space-between;
   flex-wrap: wrap;
-  gap: 10px;
+  gap: 10px 14px;
+  text-align: left;
 }
 
 .adm-card-head h2,
 .adm-card-head h3,
-.adm-subcard h3 {
+.adm-subcard h3,
+.adm-policy-section-head h3 {
   margin: 0;
-  font-size: 17px;
+  font-size: 16.5px;
+  font-weight: 700;
+  color: var(--adm-ink);
+  text-align: left;
 }
 
 .adm-sub {
   margin: 4px 0 0;
   font-size: 13px;
+  line-height: 1.45;
   color: var(--adm-muted);
+  text-align: left;
 }
 
 .adm-mono {
@@ -235,6 +305,7 @@ body {
   color: #095287;
   font-size: 12.5px;
   font-weight: 700;
+  white-space: nowrap;
 }
 
 .adm-grid-2 {
@@ -251,56 +322,109 @@ body {
 
 .adm-toggle-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
   gap: 12px;
 }
 
-.adm-radio-card,
-.adm-switch-row {
+/* Left-aligned Radio Choice Cards (Fixing Screenshot 3!) */
+.adm-radio-card {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
-  padding: 12px 14px;
-  border: 1px solid var(--adm-line);
+  justify-content: flex-start;
+  gap: 12px;
+  padding: 13px 15px;
+  border: 1.5px solid var(--adm-line);
   border-radius: 14px;
   background: #ffffff;
   cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
 }
 
-.adm-radio-card:has(:checked),
-.adm-switch-row:has(:checked) {
-  background: #edf8ff;
-  border-color: #68b0df;
+.adm-radio-card:hover {
+  border-color: var(--adm-line-strong);
+  background: #f8fcff;
 }
 
-.adm-radio-card strong,
-.adm-switch-row strong {
+.adm-radio-card:has(:checked) {
+  background: linear-gradient(180deg, #ffffff, #eff8ff);
+  border-color: #3898d8;
+  box-shadow: 0 2px 10px rgba(4, 121, 173, 0.1);
+}
+
+.adm-radio-card input[type="radio"] {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  margin: 2px 0 0;
+  accent-color: var(--adm-blue);
+  cursor: pointer;
+}
+
+.adm-radio-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  min-width: 0;
+  flex: 1 1 auto;
+  text-align: left;
+}
+
+.adm-radio-copy strong {
   display: block;
   font-size: 14px;
+  font-weight: 650;
+  color: var(--adm-ink);
+  text-align: left;
 }
 
-.adm-radio-card small,
-.adm-switch-row small {
+.adm-radio-copy small {
   display: block;
-  margin-top: 2px;
   font-size: 12.5px;
+  line-height: 1.42;
   color: var(--adm-muted);
+  text-align: left;
 }
 
+/* Form Fields */
 .adm-field {
   display: flex;
   flex-direction: column;
+  align-items: stretch;
   gap: 5px;
   font-size: 13px;
   font-weight: 600;
+  color: var(--adm-ink);
+  text-align: left;
 }
 
-.adm-field input,
+.adm-field-label-inline {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.adm-field-hint {
+  font-size: 12px;
+  font-weight: 450;
+  line-height: 1.4;
+  color: var(--adm-muted);
+  text-align: left;
+}
+
+.adm-field--narrow {
+  max-width: 110px;
+}
+
+.adm-field input:not([type="radio"]):not([type="checkbox"]),
 .adm-field select,
 .adm-field textarea,
 .adm-filter-bar input,
 .adm-filter-bar select,
-.adm-table input {
+.adm-table input,
+.adm-select-inline {
   width: 100%;
   padding: 8px 11px;
   border-radius: 10px;
@@ -309,6 +433,18 @@ body {
   color: var(--adm-ink);
   font: inherit;
   font-weight: 450;
+  text-align: left;
+}
+
+.adm-select-inline {
+  width: auto;
+  min-width: 140px;
+}
+
+.adm-field input.is-immutable {
+  background: #f1f7fc;
+  color: var(--adm-muted);
+  cursor: default;
 }
 
 .adm-field textarea {
@@ -318,15 +454,33 @@ body {
   resize: vertical;
 }
 
-.adm-check {
-  display: inline-flex;
+/* Similarity ScoreInput Cards */
+.adm-score-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.adm-score-control-row {
+  display: flex;
   align-items: center;
-  gap: 7px;
-  font-size: 13px;
-  font-weight: 600;
+  gap: 12px;
+}
+
+.adm-range {
+  flex: 1 1 auto;
+  min-width: 0;
+  accent-color: var(--adm-blue);
   cursor: pointer;
 }
 
+.adm-score-input-box {
+  width: 96px;
+  flex: none;
+}
+
+/* Buttons */
 .adm-btn {
   display: inline-flex;
   align-items: center;
@@ -341,6 +495,8 @@ body {
   font-weight: 650;
   text-decoration: none;
   cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.14s ease, filter 0.14s ease;
 }
 
 .adm-btn:hover:not(:disabled) {
@@ -364,14 +520,30 @@ body {
   background: linear-gradient(105deg, var(--adm-blue), var(--adm-indigo));
 }
 
+.adm-btn--warn {
+  border-color: #d97706;
+  background: linear-gradient(105deg, #f59e0b, #d97706);
+  color: #ffffff;
+  box-shadow: 0 3px 10px rgba(217, 119, 6, 0.24);
+}
+
+.adm-btn--warn:hover:not(:disabled) {
+  filter: brightness(1.06);
+  background: linear-gradient(105deg, #f59e0b, #d97706);
+}
+
 .adm-btn--danger {
   border-color: #f6b9c0;
   background: #fff1f2;
   color: #b91c1c;
 }
 
+.adm-btn--danger:hover:not(:disabled) {
+  background: #ffe4e6;
+}
+
 .adm-btn--sm {
-  padding: 5px 10px;
+  padding: 6px 11px;
   font-size: 12.5px;
 }
 
@@ -381,6 +553,7 @@ body {
   gap: 6px;
 }
 
+/* Sticky Save Bar */
 .adm-save-bar {
   position: sticky;
   bottom: 12px;
@@ -398,17 +571,25 @@ body {
   box-shadow: 0 8px 24px rgba(24, 100, 151, 0.14);
 }
 
+/* Alerts & Notes */
 .adm-alert {
   padding: 11px 15px;
   border-radius: 13px;
   font-size: 13.5px;
   font-weight: 600;
+  text-align: left;
 }
 
 .adm-alert--ok {
   background: var(--adm-ok-bg);
   border: 1px solid #a9e5c6;
   color: var(--adm-ok-fg);
+}
+
+.adm-alert--warn {
+  background: var(--adm-warn-bg);
+  border: 1px solid var(--adm-warn-line);
+  color: var(--adm-warn-fg);
 }
 
 .adm-alert--err {
@@ -418,14 +599,323 @@ body {
 }
 
 .adm-note-box {
-  padding: 10px 14px;
+  padding: 11px 14px;
   border-radius: 12px;
   background: #f2f8fd;
   border: 1px solid #cfe4f5;
   font-size: 13px;
+  line-height: 1.48;
+  color: var(--adm-muted);
+  text-align: left;
+}
+
+.adm-inline-warn {
+  padding: 9px 12px;
+  border-radius: 11px;
+  background: var(--adm-warn-bg);
+  border: 1px solid var(--adm-warn-line);
+  color: var(--adm-warn-fg);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.42;
+  text-align: left;
+}
+
+.adm-inline-info {
+  padding: 9px 12px;
+  border-radius: 11px;
+  background: var(--adm-info-bg);
+  border: 1px solid var(--adm-info-line);
+  color: var(--adm-info-fg);
+  font-size: 12.5px;
+  font-weight: 550;
+  line-height: 1.42;
+  text-align: left;
+}
+
+/* Cloudflare Access-Style Policy v3 Builder Card */
+.adm-policy-card {
+  border: 1.5px solid #bddbf0;
+  border-radius: 18px;
+  background: #fbfdff;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  box-shadow: 0 4px 16px rgba(15, 76, 129, 0.06);
+  text-align: left;
+}
+
+.adm-policy-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid #dcebf7;
+}
+
+.adm-policy-head-fields {
+  display: grid;
+  grid-template-columns: minmax(170px, 1.3fr) minmax(160px, 1fr) 96px minmax(170px, 1.1fr);
+  gap: 10px;
+  flex: 1 1 560px;
+  min-width: 0;
+}
+
+.adm-policy-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+
+.adm-policy-section {
+  background: #ffffff;
+  border: 1px solid #d7e9f7;
+  border-radius: 14px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  text-align: left;
+}
+
+.adm-policy-section-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  text-align: left;
+}
+
+.adm-step-num {
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, var(--adm-blue), var(--adm-indigo));
+  color: #ffffff;
+  font-size: 12.5px;
+  font-weight: 750;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  margin-top: 1px;
+}
+
+.adm-default-score-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 11px 14px;
+  border-radius: 12px;
+  background: #f5faff;
+  border: 1px solid #d5e8f7;
+}
+
+.adm-default-score-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+}
+
+.adm-default-score-copy strong {
+  font-size: 13.5px;
+  color: var(--adm-ink);
+}
+
+.adm-default-score-copy small {
+  font-size: 12.5px;
   color: var(--adm-muted);
 }
 
+.adm-default-score-input {
+  width: 104px;
+  flex: none;
+}
+
+/* Collapsible Exclude / Exception (`except_expr`) */
+.adm-except-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.adm-except-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.adm-except-panel {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: #f7f8ff;
+  border: 1px dashed #a5b4fc;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.adm-except-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 13px;
+}
+
+/* Policy Lower Grid: Sections 2 & 3 on Left + Balanced Live Preview on Right */
+.adm-policy-lower-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 260px;
+  gap: 16px;
+  align-items: start;
+}
+
+.adm-policy-lower-main {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+.adm-policy-preview-col {
+  background: #ffffff;
+  border: 1px solid #d7e9f7;
+  border-radius: 14px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  position: sticky;
+  top: 86px;
+}
+
+.adm-preview-caption {
+  font-size: 11.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--adm-muted);
+  text-align: left;
+}
+
+.adm-preview-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* Segmented Action Selector (Block vs Blur) */
+.adm-segmented {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.adm-seg-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1.5px solid var(--adm-line);
+  background: #ffffff;
+  color: var(--adm-ink);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.adm-seg-btn:hover {
+  border-color: var(--adm-line-strong);
+  background: #f8fcff;
+}
+
+.adm-seg-btn.is-active {
+  border-color: var(--adm-blue);
+  background: linear-gradient(180deg, #ffffff, #e8f5ff);
+  box-shadow: 0 3px 12px rgba(4, 121, 173, 0.14);
+}
+
+.adm-seg-btn strong {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.adm-seg-btn small {
+  font-size: 12px;
+  line-height: 1.38;
+  color: var(--adm-muted);
+}
+
+/* Cloudflare Access Bypass Groups (Include / Require / Exclude) */
+.adm-bypass-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.adm-bypass-group {
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: #f8fbfe;
+  border: 1px solid #d7e8f6;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.adm-bypass-group-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.adm-bypass-group-head .adm-sub {
+  margin: 0;
+}
+
+.adm-bypass-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.adm-bypass-tag--include {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.adm-bypass-tag--require {
+  background: #e0e7ff;
+  color: #3730a3;
+}
+
+.adm-bypass-tag--exclude {
+  background: #ffe4e6;
+  color: #9f1239;
+}
+
+.adm-bypass-toggles {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Tables, KPIs, Filters, Badges */
 .adm-table-wrap {
   overflow-x: auto;
 }
@@ -465,6 +955,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  text-align: left;
 }
 
 .adm-kpi span {
@@ -543,46 +1034,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 8px;
-}
-
-.adm-rule-card {
-  border: 1px solid #c3dff2;
-  border-radius: 16px;
-  background: #fbfdff;
-  padding: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.adm-rule-meta-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
-  gap: 10px;
-  margin-bottom: 10px;
-}
-
-.adm-rule-flags {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 14px;
-}
-
-.adm-rule-card-body {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 250px;
-  gap: 16px;
-  align-items: start;
-}
-
-.adm-preview-caption {
-  font-size: 12px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--adm-muted);
-  margin-bottom: 8px;
+  text-align: left;
 }
 
 .adm-provider-grid {
@@ -596,18 +1048,8 @@ body {
   background: #f6f8fa;
 }
 
-.adm-inline-warn {
-  padding: 8px 10px;
-  border-radius: 10px;
-  background: var(--adm-warn-bg);
-  border: 1px solid #f4d08a;
-  color: var(--adm-warn-fg);
-  font-size: 12.5px;
-  font-weight: 600;
-}
-
 .adm-secret-box {
-  padding: 10px 12px;
+  padding: 12px 14px;
   border-radius: 12px;
   background: #f4f9fe;
   border: 1px solid #d5e8f7;
@@ -658,6 +1100,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  text-align: left;
 }
 
 .adm-report-head,
@@ -679,14 +1122,18 @@ body {
   word-break: break-word;
   font-size: 13.5px;
   line-height: 1.45;
+  text-align: left;
 }
 
 .adm-empty,
 .adm-empty-card {
-  text-align: center;
-  padding: 24px 16px;
+  text-align: left;
+  padding: 20px 16px;
+  border-radius: 12px;
+  background: #f7fbff;
+  border: 1px dashed var(--adm-line-strong);
   color: var(--adm-muted);
-  font-size: 14px;
+  font-size: 13.5px;
 }
 
 .adm-link {
@@ -700,11 +1147,27 @@ body {
   text-decoration: underline;
 }
 
-@media (max-width: 820px) {
+@media (max-width: 960px) {
+  .adm-policy-lower-grid {
+    grid-template-columns: 1fr;
+  }
+  .adm-policy-preview-col {
+    position: static;
+  }
+  .adm-policy-head-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 780px) {
   .adm-grid-2,
   .adm-grid-3,
   .adm-filter-bar,
-  .adm-rule-card-body {
+  .adm-segmented,
+  .adm-policy-head-fields {
     grid-template-columns: 1fr;
+  }
+  .adm-field--narrow {
+    max-width: none;
   }
 }

@@ -14,7 +14,7 @@ enabled = true
 invocation_logs = true
 
 # Mandatory: run_worker_first = true ensures static /admin HTML/JS/WASM assets NEVER
-# serve before the Worker verifies `gallery_admin == true` + `x-gallery-admin-email`.
+# serve before the Worker verifies `X-Gallery-Admin-Assertion` (`aa2.`) + `x-gallery-admin-email`.
 # html_handling = "none" prevents Cloudflare Assets from issuing 307 redirects on `/index.html`.
 [assets]
 directory = "./assets"
@@ -32,16 +32,32 @@ SIWE_DOMAIN = "lets-embed.louisfly.icu"
 PUBLIC_URL = "https://lets-embed.louisfly.icu"
 # Deployment identifier bound into AES-256-GCM AAD for `provider_secrets`.
 DEPLOYMENT_ID = "lets-embed-prod"
+# Optional origin URL for publish-time catalog validation (`POST {APP_ORIGIN}/internal/validate-safety-catalog`)
+# of `post_tag:` and `author:` predicates. Can also be provided as a service binding named `APP_ORIGIN`.
+# APP_ORIGIN = "https://origin.lets-embed.louisfly.icu"
 
-# Worker secrets; deploy fails until required secrets are set via `wrangler secret put`:
-#   ADMIN_ASSERTION_SECRET       — dedicated secret shared ONLY with gateway_worker to verify
-#                                  short-lived HMAC-signed X-Gallery-Admin-Assertion headers
-#                                  across Cloudflare's [assets] router hop.
-#   SETTINGS_ENCRYPTION_KEY      — 32-byte base64 or 64-char hex AES-256-GCM key for `provider_secrets`
-#                                  (MUST be dedicated; NEVER reuse JWT_SECRET!).
-#   SETTINGS_ENCRYPTION_KEY_PREV — (optional) previous 32-byte key during zero-downtime key rotation.
+# Worker secrets (configured via `wrangler secret put`):
+#
+# RECOMMENDED SINGLE SECRET:
+#   SITE_SECRET                  — High-entropy (>= 32 bytes) master secret shared across
+#                                  gateway_worker, user_worker, admin_dashboard_worker, and
+#                                  lets-embed-web. RFC 5869 HKDF-SHA256 automatically derives
+#                                  cryptographically isolated keys for:
+#                                    - KeyDomain::AdminAssertion   (`aa2.` verification)
+#                                    - KeyDomain::InternalApi      (`/internal/validate-safety-catalog`)
+#                                    - KeyDomain::ProviderSecrets  (32-byte AES-256-GCM key)
+#
+# OPTIONAL PER-DOMAIN OVERRIDES (take precedence over `SITE_SECRET` for independent rotation):
+#   ADMIN_ASSERTION_SECRET       — explicit override for `X-Gallery-Admin-Assertion` (`aa2.`) HMAC verification.
+#   INTERNAL_API_SECRET          — explicit override for origin `/internal/*` calls.
+#   PROVIDER_SECRETS_KEY         — explicit 32-byte base64/hex AES-256-GCM key for `provider_secrets`
+#                                  (also accepts legacy alias `SETTINGS_ENCRYPTION_KEY`).
+#   PROVIDER_SECRETS_KEY_PREV    — previous 32-byte key during zero-downtime secret rotation
+#                                  (also accepts legacy alias `SETTINGS_ENCRYPTION_KEY_PREV` or `SITE_SECRET_PREV`).
+#   CF_ACCESS_CLIENT_ID          — optional Cloudflare Access service token ID for `APP_ORIGIN`.
+#   CF_ACCESS_CLIENT_SECRET      — optional Cloudflare Access service token secret for `APP_ORIGIN`.
 [secrets]
-required = ["ADMIN_ASSERTION_SECRET", "SETTINGS_ENCRYPTION_KEY"]
+required = ["SITE_SECRET"]
 
 [[d1_databases]]
 binding = "DB"

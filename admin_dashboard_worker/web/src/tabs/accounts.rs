@@ -1,7 +1,10 @@
 //! Accounts & Payments tab: filterable `users_v2` list, linked identities & age
 //! assurance badges, live `UserAccount` DO balance/plan/ban controls, and payments ledger.
+//!
+//! Uses GCP top-right toasts via `use_toast_store()` for all mutations and errors.
 
 use leptos::prelude::*;
+use lets_embed_ui::use_toast_store;
 use site_access::AuthProviderId;
 use wasm_bindgen_futures::spawn_local;
 
@@ -21,6 +24,8 @@ fn assurance_badge_cls(level: &str) -> &'static str {
 
 #[component]
 pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
+    let toasts = use_toast_store();
+
     let search_q = RwSignal::new(String::new());
     let plan_filter = RwSignal::new("all".to_string());
     let status_filter = RwSignal::new("all".to_string());
@@ -33,7 +38,6 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
     let payments_data = RwSignal::new(Option::<PaymentsListResp>::None);
     let payments_status = RwSignal::new("all".to_string());
     let loading = RwSignal::new(false);
-    let feedback = RwSignal::new(Option::<(bool, String)>::None);
 
     // Inspector form signals
     let credit_points = RwSignal::new(1_000i64);
@@ -76,7 +80,9 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                     }
                     accounts_data.set(Some(resp));
                 }
-                Err(err) => feedback.set(Some((false, err))),
+                Err(err) => {
+                    toasts.error("Failed to load accounts", Some(err));
+                }
             }
             loading.set(false);
         });
@@ -88,7 +94,9 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
         spawn_local(async move {
             match get_json::<PaymentsListResp>(&url).await {
                 Ok(resp) => payments_data.set(Some(resp)),
-                Err(err) => feedback.set(Some((false, err))),
+                Err(err) => {
+                    toasts.error("Failed to load payments", Some(err));
+                }
             }
         });
     };
@@ -117,18 +125,20 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
             match post_json::<_, AdminCreditMutationResp>("/admin/api/accounts/credit", &req).await
             {
                 Ok(resp) => {
-                    feedback.set(Some((
-                        true,
-                        format!(
-                            "Updated {} balance to {} pts (applied={}).",
-                            resp.user_id, resp.balance, resp.applied
-                        ),
-                    )));
+                    toasts.success(
+                        format!("Updated {} balance", resp.user_id),
+                        Some(format!(
+                            "New balance: {} pts (applied={})",
+                            resp.balance, resp.applied
+                        )),
+                    );
                     credit_reason.set(String::new());
                     load_accounts();
                     on_mutated.run(());
                 }
-                Err(err) => feedback.set(Some((false, err))),
+                Err(err) => {
+                    toasts.error("Credit adjustment failed", Some(err));
+                }
             }
             busy.set(false);
         });
@@ -157,19 +167,20 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
         spawn_local(async move {
             match post_json::<_, AdminPlanMutationResp>("/admin/api/accounts/plan", &req).await {
                 Ok(resp) => {
-                    feedback.set(Some((
-                        true,
-                        format!(
-                            "Plan for {} updated to {:?} (period_end={}).",
-                            resp.user_id,
+                    toasts.success(
+                        format!("Updated plan for {}", resp.user_id),
+                        Some(format!(
+                            "Plan: {} · period_end: {}",
                             resp.plan.as_deref().unwrap_or("none"),
                             format_ts_utc(resp.period_end as i64)
-                        ),
-                    )));
+                        )),
+                    );
                     load_accounts();
                     on_mutated.run(());
                 }
-                Err(err) => feedback.set(Some((false, err))),
+                Err(err) => {
+                    toasts.error("Plan update failed", Some(err));
+                }
             }
             busy.set(false);
         });
@@ -187,19 +198,23 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
         spawn_local(async move {
             match post_json::<_, AdminBanMutationResp>("/admin/api/accounts/ban", &req).await {
                 Ok(resp) => {
-                    let action = if resp.banned {
-                        "Banned and revoked all active v2 sessions"
+                    let title = if resp.banned {
+                        format!("Banned {}", resp.user_id)
                     } else {
-                        "Unbanned"
+                        format!("Unbanned {}", resp.user_id)
                     };
-                    feedback.set(Some((
-                        true,
-                        format!("{action} for {} (sessions_revoked={}).", resp.user_id, resp.sessions_revoked),
-                    )));
+                    let detail = if resp.sessions_revoked {
+                        "All active v2 sessions were immediately revoked.".to_string()
+                    } else {
+                        "Account access restored.".to_string()
+                    };
+                    toasts.success(title, Some(detail));
                     load_accounts();
                     on_mutated.run(());
                 }
-                Err(err) => feedback.set(Some((false, err))),
+                Err(err) => {
+                    toasts.error("Ban status update failed", Some(err));
+                }
             }
             busy.set(false);
         });
@@ -207,12 +222,6 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
 
     view! {
         <div class="adm-stack">
-            {move || feedback.get().map(|(ok, msg)| view! {
-                <div class=if ok { "adm-alert adm-alert--ok" } else { "adm-alert adm-alert--err" } role="status">
-                    {msg}
-                </div>
-            })}
-
             {move || accounts_data.get().map(|d| view! {
                 <div class="adm-kpi-row">
                     <div class="adm-kpi"><span>"Total Accounts"</span><strong>{d.summary.total}</strong></div>
@@ -384,7 +393,7 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                         <div class="adm-card-head">
                             <div>
                                 <h2>"Account Inspector"</h2>
-                                <p class="adm-mono">{format!("id: {} · do_key: {}", acc.id, acc.account_do_key)}</p>
+                                <p class="adm-mono adm-sub">{format!("id: {} · do_key: {}", acc.id, acc.account_do_key)}</p>
                             </div>
                             <button type="button" class="adm-btn" on:click=move |_| selected_account.set(None)>
                                 "Close"
@@ -507,6 +516,7 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                         <p class="adm-sub">"On-chain top-up ledger (`payments` table with global tx_hash replay guard)."</p>
                     </div>
                     <select
+                        class="adm-select-inline"
                         prop:value=move || payments_status.get()
                         on:change=move |ev| {
                             payments_status.set(event_target_value(&ev));

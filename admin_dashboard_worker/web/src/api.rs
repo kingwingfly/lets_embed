@@ -1,4 +1,4 @@
-//! Typed browser fetch client for `/admin/api/*`.
+//! Typed browser fetch client for `/admin/api/*` (Policy v3 + Two-Phase Activation).
 //!
 //! Attaches `X-Admin-CSRF: 1` (`site_access::ADMIN_CSRF_HEADER`) and same-origin
 //! credentials on every mutation request.
@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use site_access::{
     ADMIN_CSRF_HEADER, AgeGateTrigger, AgeVerificationPolicy, AuthProviderId,
-    AuthProviderPublicConfig, GeoPolicy, LegalDocConfig, SafetyRuleConfig, SimilarityDefaults,
+    AuthProviderPublicConfig, ContentPolicy, GeoPolicy, LegalDocConfig, SimilarityDefaults,
     UnclassifiedMode,
 };
 use wasm_bindgen::JsCast;
@@ -17,9 +17,64 @@ use web_sys::{Headers, Request, RequestCredentials, RequestInit, RequestMode, Re
 // Shared Wire DTOs (mirrors admin_dashboard_worker/src/api.rs)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct FieldValidationError {
+    #[serde(default)]
+    pub policy_id: Option<String>,
+    pub field: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ApiErrorBody {
     error: String,
+    #[serde(default)]
+    field_errors: Vec<FieldValidationError>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiCallError {
+    pub message: String,
+    pub field_errors: Vec<FieldValidationError>,
+}
+
+impl ApiCallError {
+    pub fn plain(msg: impl Into<String>) -> Self {
+        Self {
+            message: msg.into(),
+            field_errors: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PendingActivationResp {
+    pub ok: bool,
+    pub pending_activation: bool,
+    #[serde(default)]
+    pub activation_status: String,
+    pub revision: u64,
+    #[serde(default)]
+    pub min_enforce_rev: u64,
+    pub policy_digest: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetryActivationResp {
+    pub ok: bool,
+    pub pending_activation: bool,
+    pub activation_status: String,
+    pub revision: u64,
+    pub min_enforce_rev: u64,
+    pub policy_digest: String,
+}
+
+/// Outcome of a settings save or retry-activation endpoint supporting two-phase DO activation.
+#[derive(Debug, Clone)]
+pub enum ActivationResult<T> {
+    Active(T),
+    PendingActivation(PendingActivationResp),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,38 +125,48 @@ pub struct PaymentsSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SafetyOverview {
     pub safety_enabled: bool,
-    pub rule_count: usize,
+    pub policy_count: usize,
     pub active_switcher_count: usize,
+    pub active_blur_count: usize,
     pub age_policy: AgeVerificationPolicy,
     pub age_gate_trigger: AgeGateTrigger,
     pub blocked_country_count: usize,
-    pub cloudflare_images_blur: bool,
+    pub fixed_blur_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverviewResp {
     pub admin_email: String,
-    pub revision: u32,
-    pub min_enforce_rev: u32,
+    pub schema_version: u32,
+    pub revision: u64,
+    pub min_enforce_rev: u64,
     pub policy_digest: String,
+    pub vocab_digest: String,
+    pub activation_status: String,
     pub access: AccessPolicy,
     pub safety: SafetyOverview,
     pub accounts_summary: AccountsSummary,
     pub payments_summary: PaymentsSummary,
     pub open_report_count: i64,
     pub legacy_unclassified_note: String,
+    #[serde(default)]
+    pub legacy_upgrade_notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SaveAccessReq {
-    pub revision: u32,
+    pub revision: u64,
     pub access: AccessPolicy,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SaveAccessResp {
-    pub revision: u32,
-    pub min_enforce_rev: u32,
+    pub ok: bool,
+    pub pending_activation: bool,
+    pub activation_status: String,
+    pub revision: u64,
+    pub min_enforce_rev: u64,
+    pub policy_digest: String,
     pub digest: String,
     pub access: AccessPolicy,
 }
@@ -228,46 +293,54 @@ pub struct PaymentsListResp {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SafetyConfigResp {
-    pub revision: u32,
-    pub min_enforce_rev: u32,
-    pub digest: String,
+    pub schema_version: u32,
+    pub revision: u64,
+    pub min_enforce_rev: u64,
+    pub policy_digest: String,
+    pub vocab_digest: String,
+    pub activation_status: String,
     pub safety_enabled: bool,
-    pub rules: Vec<SafetyRuleConfig>,
-    pub presets: Vec<SafetyRuleConfig>,
+    pub policies: Vec<ContentPolicy>,
+    pub presets: Vec<ContentPolicy>,
     pub unclassified_mode: UnclassifiedMode,
-    pub cloudflare_images_blur: bool,
+    pub fixed_blur_enabled: bool,
     pub age_policy: AgeVerificationPolicy,
     pub age_gate_trigger: AgeGateTrigger,
     pub similarity: SimilarityDefaults,
     pub geo: GeoPolicy,
     pub legal: LegalDocConfig,
-    pub panic_shortcut: String,
     pub legacy_unclassified_note: String,
+    #[serde(default)]
+    pub legacy_upgrade_notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SaveSafetyReq {
-    pub revision: u32,
+    pub revision: u64,
     pub safety_enabled: bool,
-    pub rules: Vec<SafetyRuleConfig>,
+    pub policies: Vec<ContentPolicy>,
     pub unclassified_mode: UnclassifiedMode,
-    pub cloudflare_images_blur: bool,
+    pub fixed_blur_enabled: bool,
     pub age_policy: AgeVerificationPolicy,
     pub age_gate_trigger: AgeGateTrigger,
     pub similarity: SimilarityDefaults,
     pub geo: GeoPolicy,
     pub legal: LegalDocConfig,
-    pub panic_shortcut: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SaveSafetyResp {
-    pub revision: u32,
-    pub min_enforce_rev: u32,
+    pub ok: bool,
+    pub pending_activation: bool,
+    pub activation_status: String,
+    pub revision: u64,
+    pub min_enforce_rev: u64,
     pub tightened: bool,
     pub terms_bumped: bool,
     pub auto_disabled_providers: Vec<AuthProviderId>,
-    pub digest: String,
+    pub policy_digest: String,
+    pub vocab_digest: String,
+    pub policies: Vec<ContentPolicy>,
     pub legal: LegalDocConfig,
 }
 
@@ -285,8 +358,12 @@ pub struct ProviderView {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProvidersResp {
-    pub revision: u32,
-    pub min_enforce_rev: u32,
+    pub ok: bool,
+    pub pending_activation: bool,
+    pub activation_status: String,
+    pub revision: u64,
+    pub min_enforce_rev: u64,
+    pub policy_digest: String,
     pub digest: String,
     pub age_policy: AgeVerificationPolicy,
     pub current_kid: String,
@@ -308,7 +385,7 @@ pub struct ProviderUpdateItem {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SaveProvidersReq {
-    pub revision: u32,
+    pub revision: u64,
     pub providers: Vec<ProviderUpdateItem>,
 }
 
@@ -368,30 +445,32 @@ pub struct ResolveReportResp {
 // Low-level Fetch Helpers
 // ---------------------------------------------------------------------------
 
-async fn send_request<T: DeserializeOwned>(
+async fn send_raw(
     method: &str,
     url: &str,
     body_json: Option<String>,
-) -> Result<T, String> {
-    let window = web_sys::window().ok_or_else(|| "Browser window unavailable".to_string())?;
+) -> Result<(u16, String), ApiCallError> {
+    let window =
+        web_sys::window().ok_or_else(|| ApiCallError::plain("Browser window unavailable"))?;
 
     let init = RequestInit::new();
     init.set_method(method);
     init.set_mode(RequestMode::SameOrigin);
     init.set_credentials(RequestCredentials::SameOrigin);
 
-    let headers = Headers::new().map_err(|e| format!("Failed to construct headers: {e:?}"))?;
+    let headers = Headers::new()
+        .map_err(|e| ApiCallError::plain(format!("Failed to construct headers: {e:?}")))?;
     headers
         .set("Accept", "application/json")
-        .map_err(|e| format!("Header error: {e:?}"))?;
+        .map_err(|e| ApiCallError::plain(format!("Header error: {e:?}")))?;
 
     if method != "GET" && method != "HEAD" {
         headers
             .set(ADMIN_CSRF_HEADER, "1")
-            .map_err(|e| format!("CSRF header error: {e:?}"))?;
+            .map_err(|e| ApiCallError::plain(format!("CSRF header error: {e:?}")))?;
         headers
             .set("Content-Type", "application/json")
-            .map_err(|e| format!("Content-Type header error: {e:?}"))?;
+            .map_err(|e| ApiCallError::plain(format!("Content-Type header error: {e:?}")))?;
     }
 
     init.set_headers(&headers);
@@ -400,43 +479,50 @@ async fn send_request<T: DeserializeOwned>(
     }
 
     let request = Request::new_with_str_and_init(url, &init)
-        .map_err(|e| format!("Failed to build request: {e:?}"))?;
+        .map_err(|e| ApiCallError::plain(format!("Failed to build request: {e:?}")))?;
 
     let resp_val = JsFuture::from(window.fetch_with_request(&request))
         .await
-        .map_err(|e| format!("Network request failed: {e:?}"))?;
+        .map_err(|e| ApiCallError::plain(format!("Network request failed: {e:?}")))?;
     let resp: Response = resp_val
         .dyn_into()
-        .map_err(|_| "Unexpected response object".to_string())?;
+        .map_err(|_| ApiCallError::plain("Unexpected response object"))?;
 
     let status = resp.status();
     let text_promise = resp
         .text()
-        .map_err(|e| format!("Failed to read response body: {e:?}"))?;
+        .map_err(|e| ApiCallError::plain(format!("Failed to read response body: {e:?}")))?;
     let text = JsFuture::from(text_promise)
         .await
-        .map_err(|e| format!("Failed to await response text: {e:?}"))?
+        .map_err(|e| ApiCallError::plain(format!("Failed to await response text: {e:?}")))?
         .as_string()
         .unwrap_or_default();
 
-    if !(200..300).contains(&status) {
-        if let Ok(api_err) = serde_json::from_str::<ApiErrorBody>(&text) {
-            return Err(format!("HTTP {status}: {}", api_err.error));
-        }
-        let msg = if text.trim().is_empty() {
-            format!("HTTP {status}")
-        } else {
-            format!("HTTP {status}: {}", text.trim())
-        };
-        return Err(msg);
-    }
+    Ok((status, text))
+}
 
-    serde_json::from_str::<T>(&text)
-        .map_err(|e| format!("Failed to decode JSON response: {e}"))
+fn decode_api_error(status: u16, text: &str) -> ApiCallError {
+    if let Ok(api_err) = serde_json::from_str::<ApiErrorBody>(text) {
+        return ApiCallError {
+            message: format!("HTTP {status}: {}", api_err.error),
+            field_errors: api_err.field_errors,
+        };
+    }
+    let msg = if text.trim().is_empty() {
+        format!("HTTP {status}")
+    } else {
+        format!("HTTP {status}: {}", text.trim())
+    };
+    ApiCallError::plain(msg)
 }
 
 pub async fn get_json<T: DeserializeOwned>(url: &str) -> Result<T, String> {
-    send_request("GET", url, None).await
+    let (status, text) = send_raw("GET", url, None).await.map_err(|e| e.message)?;
+    if !(200..300).contains(&status) {
+        return Err(decode_api_error(status, &text).message);
+    }
+    serde_json::from_str::<T>(&text)
+        .map_err(|e| format!("Failed to decode JSON response: {e}"))
 }
 
 pub async fn post_json<B: Serialize, T: DeserializeOwned>(
@@ -445,7 +531,42 @@ pub async fn post_json<B: Serialize, T: DeserializeOwned>(
 ) -> Result<T, String> {
     let encoded =
         serde_json::to_string(body).map_err(|e| format!("Failed to serialize request: {e}"))?;
-    send_request("POST", url, Some(encoded)).await
+    let (status, text) = send_raw("POST", url, Some(encoded))
+        .await
+        .map_err(|e| e.message)?;
+    if !(200..300).contains(&status) {
+        return Err(decode_api_error(status, &text).message);
+    }
+    serde_json::from_str::<T>(&text)
+        .map_err(|e| format!("Failed to decode JSON response: {e}"))
+}
+
+/// Posts a settings/activation request and distinguishes:
+/// - `Ok(ActivationResult::Active(T))` on 2xx activation ACK
+/// - `Ok(ActivationResult::PendingActivation(PendingActivationResp))` when D1 saved
+///   as `pending_do_ack` and `SitePolicyDO` failed to acknowledge
+/// - `Err(ApiCallError)` on validation/conflict/network errors (preserving `field_errors`).
+pub async fn post_json_activatable<B: Serialize, T: DeserializeOwned>(
+    url: &str,
+    body: &B,
+) -> Result<ActivationResult<T>, ApiCallError> {
+    let encoded = serde_json::to_string(body)
+        .map_err(|e| ApiCallError::plain(format!("Failed to serialize request: {e}")))?;
+    let (status, text) = send_raw("POST", url, Some(encoded)).await?;
+
+    if (200..300).contains(&status) {
+        let parsed = serde_json::from_str::<T>(&text)
+            .map_err(|e| ApiCallError::plain(format!("Failed to decode JSON response: {e}")))?;
+        return Ok(ActivationResult::Active(parsed));
+    }
+
+    if let Ok(pending) = serde_json::from_str::<PendingActivationResp>(&text)
+        && pending.pending_activation
+    {
+        return Ok(ActivationResult::PendingActivation(pending));
+    }
+
+    Err(decode_api_error(status, &text))
 }
 
 pub fn url_encode_component(raw: &str) -> String {
