@@ -1,7 +1,8 @@
 //! `/user/favorites` — Favorites gallery reusing `lets-embed-ui` components
-//! (`FloatingHeader`, `DensityPicker`, `SafeModeToggle`, `MasonryGallery`,
-//! `Lightbox`, `Viewer`, `ReportDialog`, `NoticeBanner`) with full `Clear` /
-//! `Spoiler` / `Locked` mask support and instant Safe Mode L1 media eviction.
+//! (`FloatingHeader`, `DensityPicker`, `MasonryGallery`, `Lightbox`, `Viewer`,
+//! `ReportDialog`, `ToastHost`) with Policy v3 `Clear` / `Blurred` / `Placeholder`
+//! mask support, object-bound click-to-reveal (`POST /api/safety/reveal`), and
+//! cross-tab `BroadcastChannel` media eviction on logout/opt-out/policy changes.
 
 use std::collections::HashMap;
 
@@ -9,14 +10,15 @@ use leptos::{prelude::*, task::spawn_local};
 use lets_embed_ui::{
     AuthorChip, Density, DensityPicker, FloatingHeader, GalleryBlurMode, GalleryCard,
     GalleryCardKind, GalleryMask, GalleryMaskPreset, GalleryMedia, GalleryMediaKind, HeaderVariant,
-    Lightbox, LightboxAlbum, LikeTargetKind, MasonryGallery, NoticeBanner, NoticeContent,
-    NoticeTone, ReportDialog, ReportSubmission, ReportTargetKind, SafeModeToggle, Viewer,
-    ViewerItem,
+    Lightbox, LightboxAlbum, LikeTargetKind, MasonryGallery, ReportDialog, ReportSubmission,
+    ReportTargetKind, Viewer, ViewerItem, browser::wipe_media_elements_in, use_toast_store,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::api::{self, LikeRow, LikesResp, MeResp, PreferencesResp};
+use crate::api::{self, LikeRow, LikesResp, RevealResponse};
+
+const REVEAL_SENTINEL_PREFIX: &str = "__reveal__:";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FavFilter {
@@ -46,11 +48,36 @@ impl FavFilter {
     }
 }
 
+fn encode_reveal_rule_id(kind: GalleryMediaKind, asset_id: i64, policy_rev: u64) -> String {
+    let k = match kind {
+        GalleryMediaKind::Image => "image",
+        GalleryMediaKind::Video => "video",
+    };
+    format!("{REVEAL_SENTINEL_PREFIX}{k}:{asset_id}:{policy_rev}")
+}
+
+fn parse_reveal_rule_id(rule_id: &str) -> Option<(&'static str, i64, u64)> {
+    let rest = rule_id.strip_prefix(REVEAL_SENTINEL_PREFIX)?;
+    let mut parts = rest.split(':');
+    let kind = match parts.next()? {
+        "image" => "image",
+        "video" => "video",
+        _ => return None,
+    };
+    let asset_id = parts.next()?.parse::<i64>().ok()?;
+    let policy_rev = parts.next()?.parse::<u64>().ok()?;
+    Some((kind, asset_id, policy_rev))
+}
+
 /// Parse a flexible `/api/like_previews` or `/api/post_images` JSON item into
-/// a `lets_embed_ui::GalleryMedia`, supporting both projected safety states
-/// (`clear` / `spoiler` / `locked`) and legacy `{ id, name, width, height }` shapes.
+/// a `lets_embed_ui::GalleryMedia`, supporting Policy v3 (`clear` / `blurred` /
+/// `placeholder`) as well as legacy (`locked` / `spoiler`) shapes.
 fn parse_media_value(val: &Value, fallback_id: i64, fallback_kind: GalleryMediaKind) -> GalleryMedia {
-    let id = val.get("id").and_then(Value::as_i64).unwrap_or(fallback_id);
+    let id = val
+        .get("id")
+        .or_else(|| val.get("asset_id"))
+        .and_then(Value::as_i64)
+        .unwrap_or(fallback_id);
     let width = val.get("width").and_then(Value::as_i64).unwrap_or(400) as i32;
     let height = val.get("height").and_then(Value::as_i64).unwrap_or(300) as i32;
     let duration_secs = val
@@ -65,10 +92,11 @@ fn parse_media_value(val: &Value, fallback_id: i64, fallback_kind: GalleryMediaK
     };
 
     match val.get("state").and_then(Value::as_str) {
-        Some("locked") => {
+        Some("placeholder") | Some("locked") => {
             let mask_val = val.get("mask").unwrap_or(val);
             let rule_id = mask_val
-                .get("rule_id")
+                .get("policy_id")
+                .or_else(|| mask_val.get("rule_id"))
                 .and_then(Value::as_str)
                 .unwrap_or("restricted")
                 .to_string();
@@ -111,6 +139,57 @@ fn parse_media_value(val: &Value, fallback_id: i64, fallback_kind: GalleryMediaK
                         .get("cta_label")
                         .and_then(Value::as_str)
                         .map(str::to_string),
+                },
+            }
+        }
+        Some("blurred") => {
+            let label = val
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or("Blurred Content")
+                .to_string();
+            let preset = val
+                .get("preset")
+                .and_then(Value::as_str)
+                .map(GalleryMaskPreset::parse)
+                .unwrap_or(GalleryMaskPreset::Sensitive);
+            let can_click_reveal = val
+                .get("can_click_reveal")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let policy_rev = val.get("policy_rev").and_then(Value::as_u64).unwrap_or(0);
+            let (rule_id, reason, cta_label) = if can_click_reveal {
+                (
+                    encode_reveal_rule_id(kind, id, policy_rev),
+                    Some("Blurred by content policy. Click below to reveal this item.".into()),
+                    Some("Click to reveal".into()),
+                )
+            } else {
+                (
+                    val.get("matched_policy_ids")
+                        .and_then(Value::as_array)
+                        .and_then(|arr| arr.first())
+                        .and_then(Value::as_str)
+                        .unwrap_or("blurred")
+                        .to_string(),
+                    Some("Blurred by content safety policy. Manage switchers in Account.".into()),
+                    None,
+                )
+            };
+            GalleryMedia::Locked {
+                id,
+                kind,
+                width,
+                height,
+                mask: GalleryMask {
+                    rule_id,
+                    label,
+                    preset,
+                    reason,
+                    requires_login: false,
+                    requires_age: false,
+                    requires_terms: false,
+                    cta_label,
                 },
             }
         }
@@ -162,7 +241,6 @@ fn parse_media_value(val: &Value, fallback_id: i64, fallback_kind: GalleryMediaK
             }
         }
         _ => {
-            // Clear (explicit `"clear"` or legacy preview payload)
             let url = val
                 .get("url")
                 .or_else(|| val.get("media_url"))
@@ -335,18 +413,17 @@ struct PostDetailResp {
 
 #[component]
 pub fn FavoritesPage() -> impl IntoView {
+    let toasts = use_toast_store();
+
     let filter = RwSignal::new(FavFilter::All);
     let density = RwSignal::new(Density::Medium);
-    let safe_mode = RwSignal::new(false);
-    let panic_epoch = RwSignal::new(0u64);
-    let saved_switchers = RwSignal::new(Vec::<String>::new());
+    let invalidation_epoch = RwSignal::new(0u64);
 
     let cards = RwSignal::new(Vec::<GalleryCard>::new());
     let next_cursor = RwSignal::new(None::<i64>);
     let loading = RwSignal::new(false);
-    let error_msg = RwSignal::new(None::<String>);
 
-    // Undo toast after unliking an item
+    // Undo bar after unliking an item
     let undo_item = RwSignal::new(None::<(LikeTargetKind, i64)>);
 
     // Lightbox & Viewer state
@@ -364,7 +441,6 @@ pub fn FavoritesPage() -> impl IntoView {
 
     let load_page = Callback::new(move |(append, cursor): (bool, Option<i64>)| {
         loading.set(true);
-        error_msg.set(None);
         let cur_filter = filter.get_untracked();
         spawn_local(async move {
             let mut url = String::from("/user/api/likes?limit=48");
@@ -382,7 +458,7 @@ pub fn FavoritesPage() -> impl IntoView {
                     return;
                 }
                 Err(e) => {
-                    error_msg.set(Some(e.display()));
+                    toasts.error("Could not load favorites", Some(e.display()));
                     loading.set(false);
                     return;
                 }
@@ -420,34 +496,30 @@ pub fn FavoritesPage() -> impl IntoView {
                         cards.set(batch);
                     }
                 }
-                Err(e) => error_msg.set(Some(e.display())),
+                Err(e) => {
+                    toasts.error("Could not load media previews", Some(e.display()));
+                }
             }
             loading.set(false);
         });
     });
 
-    // Initial load: fetch `/user/api/me` for safe_mode & switchers, then load likes.
-    Effect::new(move |_| {
-        spawn_local(async move {
-            if let Ok(m) = api::get_json::<MeResp>("/user/api/me").await {
-                safe_mode.set(m.safe_mode);
-                saved_switchers.set(m.enabled_switchers);
-            }
-        });
-        load_page.run((false, None));
+    // Cross-tab BroadcastChannel / storage invalidation on logout, opt-out, account or policy change:
+    // immediately evicts DOM media sources, closes open modals/viewers, and reloads projected previews!
+    api::use_safety_invalidation_listener(move |reason| {
+        wipe_media_elements_in(None);
+        invalidation_epoch.update(|e| *e = e.wrapping_add(1));
+        active_album.set(None);
+        viewer_index.set(None);
+        if reason == "logout" {
+            api::navigate_hard("/user/login");
+        } else {
+            load_page.run((false, None));
+        }
     });
 
-    // Safe Mode toggle: persist via POST /user/api/preferences and immediately refetch projected previews!
-    let on_safe_toggle = Callback::new(move |next_safe: bool| {
-        let sw = saved_switchers.get_untracked();
-        spawn_local(async move {
-            let _ = api::post_json::<_, PreferencesResp>(
-                "/user/api/preferences",
-                &json!({ "enabled_switchers": sw, "safe_mode": next_safe }),
-            )
-            .await;
-            load_page.run((false, None));
-        });
+    Effect::new(move |_| {
+        load_page.run((false, None));
     });
 
     // Open card -> Post Lightbox or Image/Video Viewer
@@ -527,10 +599,12 @@ pub fn FavoritesPage() -> impl IntoView {
                         }));
                     }
                     Err(e) => {
+                        let msg = e.display();
+                        toasts.error("Could not load post media", Some(msg.clone()));
                         active_album.update(|a| {
                             if let Some(alb) = a {
                                 alb.loading = false;
-                                alb.error = Some(e.display());
+                                alb.error = Some(msg);
                             }
                         });
                     }
@@ -550,32 +624,122 @@ pub fn FavoritesPage() -> impl IntoView {
         }
     });
 
-    let on_like_toggle = Callback::new(move |(kind, target_id, next_liked): (LikeTargetKind, i64, bool)| {
-        spawn_local(async move {
-            let payload = json!({ "kind": kind.as_str(), "target_id": target_id });
-            let res = if next_liked {
-                api::post_json_empty("/user/api/like", &payload).await
-            } else {
-                api::delete_json_empty("/user/api/like", &payload).await
-            };
-            match res {
-                Ok(()) => {
-                    if !next_liked {
-                        let key = format!("{}:{target_id}", kind.as_str());
-                        cards.update(|list| list.retain(|c| c.key != key));
-                        undo_item.set(Some((kind, target_id)));
-                    } else {
-                        undo_item.set(None);
-                        load_page.run((false, None));
+    let on_like_toggle =
+        Callback::new(move |(kind, target_id, next_liked): (LikeTargetKind, i64, bool)| {
+            spawn_local(async move {
+                let payload = json!({ "kind": kind.as_str(), "target_id": target_id });
+                let res = if next_liked {
+                    api::post_json_empty("/user/api/like", &payload).await
+                } else {
+                    api::delete_json_empty("/user/api/like", &payload).await
+                };
+                match res {
+                    Ok(()) => {
+                        if !next_liked {
+                            let key = format!("{}:{target_id}", kind.as_str());
+                            cards.update(|list| list.retain(|c| c.key != key));
+                            undo_item.set(Some((kind, target_id)));
+                        } else {
+                            undo_item.set(None);
+                            toasts.success("Restored to favorites", None);
+                            load_page.run((false, None));
+                        }
+                    }
+                    Err(e) => {
+                        toasts.error("Could not update favorite", Some(e.display()));
                     }
                 }
-                Err(e) => error_msg.set(Some(e.display())),
-            }
+            });
         });
-    });
 
-    let on_unlock_click = Callback::new(move |_mask: GalleryMask| {
-        api::navigate_hard("/user/account");
+    // Supports both Policy v3 click-to-reveal (`POST /api/safety/reveal`) and account unlock links.
+    let on_unlock_click = Callback::new(move |mask: GalleryMask| {
+        if let Some((kind_str, asset_id, policy_rev)) = parse_reveal_rule_id(&mask.rule_id) {
+            spawn_local(async move {
+                match api::post_json::<_, RevealResponse>(
+                    "/api/safety/reveal",
+                    &json!({
+                        "kind": kind_str,
+                        "asset_id": asset_id,
+                        "policy_rev": policy_rev,
+                    }),
+                )
+                .await
+                {
+                    Ok(resp) => {
+                        let media_kind = if kind_str == "video" {
+                            GalleryMediaKind::Video
+                        } else {
+                            GalleryMediaKind::Image
+                        };
+                        let clear_url = resp.clear_url;
+                        cards.update(|list| {
+                            for card in list.iter_mut() {
+                                if card.media.id() == asset_id
+                                    && matches!(&card.media, GalleryMedia::Locked { kind, .. } if *kind == media_kind)
+                                {
+                                    let (w, h) = card.dimensions();
+                                    card.media = GalleryMedia::Clear {
+                                        id: asset_id,
+                                        kind: media_kind,
+                                        width: w,
+                                        height: h,
+                                        url: clear_url.clone(),
+                                        alt: card.title.clone(),
+                                        duration_secs: card.media.duration_secs(),
+                                    };
+                                }
+                            }
+                        });
+                        active_album.update(|alb_opt| {
+                            if let Some(alb) = alb_opt {
+                                if media_kind == GalleryMediaKind::Image {
+                                    for img in &mut alb.images {
+                                        if img.media.id() == asset_id {
+                                            let (w, h) = img.dimensions();
+                                            img.media = GalleryMedia::Clear {
+                                                id: asset_id,
+                                                kind: GalleryMediaKind::Image,
+                                                width: w,
+                                                height: h,
+                                                url: clear_url.clone(),
+                                                alt: img.title.clone(),
+                                                duration_secs: None,
+                                            };
+                                        }
+                                    }
+                                } else {
+                                    for vid in &mut alb.videos {
+                                        if vid.id() == asset_id {
+                                            let (w, h) = match vid {
+                                                GalleryMedia::Locked { width, height, .. } => {
+                                                    (*width, *height)
+                                                }
+                                                _ => (16, 9),
+                                            };
+                                            *vid = GalleryMedia::Clear {
+                                                id: asset_id,
+                                                kind: GalleryMediaKind::Video,
+                                                width: w,
+                                                height: h,
+                                                url: clear_url.clone(),
+                                                alt: String::new(),
+                                                duration_secs: vid.duration_secs(),
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        toasts.error("Could not reveal media", Some(e.display()));
+                    }
+                }
+            });
+        } else {
+            api::navigate_hard("/user/account");
+        }
     });
 
     let on_report_click = Callback::new(move |(kind, id): (ReportTargetKind, i64)| {
@@ -602,9 +766,16 @@ pub fn FavoritesPage() -> impl IntoView {
             .await
             {
                 Ok(()) => {
-                    report_ok.set(Some("Thank you — your report has been submitted for review.".into()));
+                    report_ok.set(Some(
+                        "Thank you — your report has been submitted for review.".into(),
+                    ));
+                    toasts.success("Report submitted", None);
                 }
-                Err(e) => report_err.set(Some(e.display())),
+                Err(e) => {
+                    let msg = e.display();
+                    report_err.set(Some(msg.clone()));
+                    toasts.error("Report submission failed", Some(msg));
+                }
             }
             report_busy.set(false);
         });
@@ -645,29 +816,15 @@ pub fn FavoritesPage() -> impl IntoView {
                 right=move || view! {
                     <div class="u-row">
                         <DensityPicker density=density />
-                        <SafeModeToggle
-                            safe_mode=safe_mode
-                            panic_epoch=panic_epoch
-                            on_toggle=on_safe_toggle
-                        />
                     </div>
                 }.into_any()
             />
 
             <div class="u-stack">
-                {move || error_msg.get().map(|msg| view! {
-                    <NoticeBanner
-                        content=NoticeContent::Text(msg)
-                        tone=NoticeTone::Danger
-                        dismissible=true
-                        on_dismiss=Callback::new(move |_| error_msg.set(None))
-                    />
-                })}
-
                 <MasonryGallery
                     cards=cards.into()
                     density=density.into()
-                    panic_epoch=panic_epoch.into()
+                    panic_epoch=invalidation_epoch.into()
                     empty_message="No favorites saved yet. Click the heart on any post or image in the gallery to save it here."
                     on_open=on_open_card
                     on_unlock_click=on_unlock_click
@@ -692,7 +849,7 @@ pub fn FavoritesPage() -> impl IntoView {
             <Lightbox
                 album=active_album.into()
                 density=density
-                panic_epoch=panic_epoch.into()
+                panic_epoch=invalidation_epoch.into()
                 on_close=Callback::new(move |()| active_album.set(None))
                 on_open_viewer=Callback::new(move |(idx, list)| {
                     viewer_items.set(list);
@@ -709,7 +866,7 @@ pub fn FavoritesPage() -> impl IntoView {
             <Viewer
                 items=viewer_items.into()
                 index=viewer_index
-                panic_epoch=panic_epoch.into()
+                panic_epoch=invalidation_epoch.into()
                 on_like_toggle=on_like_toggle
                 on_report=on_report_click
                 on_unlock_click=on_unlock_click

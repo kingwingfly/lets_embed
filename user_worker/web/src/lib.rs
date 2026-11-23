@@ -5,12 +5,14 @@ mod pages;
 mod wallet;
 
 use leptos::prelude::*;
+use lets_embed_ui::{ToastHost, provide_toast_store};
 use wasm_bindgen::{JsCast, prelude::wasm_bindgen};
 
 const USER_APP_CSS: &str = include_str!("styles.css");
 
 #[component]
 fn UserApp() -> impl IntoView {
+    let _toasts = provide_toast_store();
     let path = api::current_pathname();
     let route_view = match path.trim_end_matches('/') {
         "/user/login/approve" => view! { <pages::approve::ApprovePage /> }.into_any(),
@@ -22,6 +24,7 @@ fn UserApp() -> impl IntoView {
 
     view! {
         <style>{lets_embed_ui::UI_CSS}{USER_APP_CSS}</style>
+        <ToastHost />
         {route_view}
     }
 }

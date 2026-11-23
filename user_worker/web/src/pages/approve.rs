@@ -2,7 +2,9 @@
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use lets_embed_ui::{FloatingHeader, HeaderVariant, NoticeBanner, NoticeContent, NoticeTone};
+use lets_embed_ui::{
+    FloatingHeader, HeaderVariant, NoticeBanner, NoticeContent, NoticeTone, use_toast_store,
+};
 use serde_json::json;
 
 use crate::{
@@ -12,13 +14,13 @@ use crate::{
 
 #[component]
 pub fn ApprovePage() -> impl IntoView {
+    let toasts = use_toast_store();
     let session_id = StoredValue::new(api::current_search_param("s").unwrap_or_default());
 
     let bootstrap = RwSignal::new(None::<BootstrapResp>);
     let info = RwSignal::new(None::<HandoffInfoResp>);
     let busy = RwSignal::new(false);
-    let error_msg = RwSignal::new(None::<String>);
-    let success_msg = RwSignal::new(None::<String>);
+    let approved = RwSignal::new(false);
 
     Effect::new(move |_| {
         let sid = session_id.get_value();
@@ -27,13 +29,18 @@ pub fn ApprovePage() -> impl IntoView {
                 bootstrap.set(Some(b));
             }
             if sid.is_empty() {
-                error_msg.set(Some("Missing handoff session parameter (?s=...).".into()));
+                toasts.error(
+                    "Invalid handoff link",
+                    Some("Missing handoff session parameter (?s=...).".into()),
+                );
                 return;
             }
             let url = format!("/user/api/handoff/info?s={}", urlencoding::encode(&sid));
             match api::get_json::<HandoffInfoResp>(&url).await {
                 Ok(h) => info.set(Some(h)),
-                Err(e) => error_msg.set(Some(e.display())),
+                Err(e) => {
+                    toasts.error("Could not load handoff session", Some(e.display()));
+                }
             }
         });
     });
@@ -47,7 +54,6 @@ pub fn ApprovePage() -> impl IntoView {
         };
         let sid = session_id.get_value();
         busy.set(true);
-        error_msg.set(None);
         spawn_local(async move {
             let statement = format!(
                 "Approve sign-in for another browser on lets_embed (Code: {}, Session: {})",
@@ -76,15 +82,20 @@ pub fn ApprovePage() -> impl IntoView {
                     .await
                     {
                         Ok(()) => {
-                            success_msg.set(Some(
-                                "Sign-in approved! You can return to your other browser now."
-                                    .into(),
-                            ));
+                            approved.set(true);
+                            toasts.success(
+                                "Sign-in approved",
+                                Some("You can return to your other browser now.".into()),
+                            );
                         }
-                        Err(e) => error_msg.set(Some(e.display())),
+                        Err(e) => {
+                            toasts.error("Approval failed", Some(e.display()));
+                        }
                     }
                 }
-                Err(msg) => error_msg.set(Some(msg)),
+                Err(msg) => {
+                    toasts.error("Wallet signature failed", Some(msg));
+                }
             }
             busy.set(false);
         });
@@ -99,7 +110,6 @@ pub fn ApprovePage() -> impl IntoView {
         };
         let sid = session_id.get_value();
         busy.set(true);
-        error_msg.set(None);
         spawn_local(async move {
             let challenge = format!(
                 "Approve sign-in for another browser on lets_embed with Solana\nDomain: {}\nSession: {}\nCode: {}\nNonce: {}",
@@ -120,15 +130,20 @@ pub fn ApprovePage() -> impl IntoView {
                     .await
                     {
                         Ok(()) => {
-                            success_msg.set(Some(
-                                "Sign-in approved! You can return to your other browser now."
-                                    .into(),
-                            ));
+                            approved.set(true);
+                            toasts.success(
+                                "Sign-in approved",
+                                Some("You can return to your other browser now.".into()),
+                            );
                         }
-                        Err(e) => error_msg.set(Some(e.display())),
+                        Err(e) => {
+                            toasts.error("Approval failed", Some(e.display()));
+                        }
                     }
                 }
-                Err(msg) => error_msg.set(Some(msg)),
+                Err(msg) => {
+                    toasts.error("Wallet signature failed", Some(msg));
+                }
             }
             busy.set(false);
         });
@@ -146,16 +161,9 @@ pub fn ApprovePage() -> impl IntoView {
                 }.into_any()
             />
             <div class="u-stack">
-                {move || error_msg.get().map(|msg| view! {
+                {move || approved.get().then(|| view! {
                     <NoticeBanner
-                        content=NoticeContent::Text(msg)
-                        tone=NoticeTone::Danger
-                        dismissible=false
-                    />
-                })}
-                {move || success_msg.get().map(|msg| view! {
-                    <NoticeBanner
-                        content=NoticeContent::Text(msg)
+                        content=NoticeContent::Text("Sign-in approved! You can return to your other browser now.".into())
                         tone=NoticeTone::Success
                         dismissible=false
                     />
@@ -185,7 +193,7 @@ pub fn ApprovePage() -> impl IntoView {
                                     <button
                                         type="button"
                                         class="u-btn u-btn--full"
-                                        disabled=move || busy.get() || success_msg.get().is_some()
+                                        disabled=move || busy.get() || approved.get()
                                         on:click=approve_eth
                                     >
                                         "Approve with Ethereum Wallet"
@@ -193,7 +201,7 @@ pub fn ApprovePage() -> impl IntoView {
                                     <button
                                         type="button"
                                         class="u-btn u-btn--secondary u-btn--full"
-                                        disabled=move || busy.get() || success_msg.get().is_some()
+                                        disabled=move || busy.get() || approved.get()
                                         on:click=approve_sol
                                     >
                                         "Approve with Solana Wallet"

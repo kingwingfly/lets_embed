@@ -2,7 +2,7 @@
 //! All internal DO requests use the synthetic origin `https://do` — only the path is meaningful.
 
 use serde::{Deserialize, Serialize};
-use site_access::{AssuranceLevel, SessionContext};
+use site_access::{AssuranceLevel, PolicyRef, SessionContext};
 use worker::{Env, Method, Request, RequestInit, Response, Result};
 
 use crate::types::{BalanceResp, CreditReq, InitReq, StatusResp};
@@ -67,8 +67,22 @@ pub struct SessionInfoResp {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrefsUpdateReq {
-    pub enabled_switchers: Vec<String>,
-    pub safe_mode: bool,
+    pub enabled_switchers: Vec<PolicyRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_pref_version: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoPrefsConflictResp {
+    pub error: String,
+    pub pref_version: u64,
+    pub enabled_switchers: Vec<PolicyRef>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DoPrefsUpdateOutcome {
+    Updated(SessionContext),
+    Conflict(DoPrefsConflictResp),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,10 +238,15 @@ pub async fn do_prefs_update(
     env: &Env,
     do_key: &str,
     req: &PrefsUpdateReq,
-) -> Result<SessionContext> {
+) -> Result<DoPrefsUpdateOutcome> {
     let mut resp = call_do(env, do_key, Method::Post, "/prefs-update", Some(req)).await?;
-    expect_ok(&resp, "do prefs-update")?;
-    resp.json().await
+    match resp.status_code() {
+        200 => Ok(DoPrefsUpdateOutcome::Updated(resp.json().await?)),
+        409 => Ok(DoPrefsUpdateOutcome::Conflict(resp.json().await?)),
+        code => Err(worker::Error::RustError(format!(
+            "do prefs-update failed: {code}"
+        ))),
+    }
 }
 
 pub async fn do_terms_accept(env: &Env, do_key: &str, req: &TermsAcceptReq) -> Result<()> {

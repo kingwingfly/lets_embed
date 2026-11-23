@@ -1,11 +1,14 @@
 //! Typed HTTP client & DTOs for `user_worker` APIs and `/api/like_previews`.
 #![allow(dead_code)]
 
+use leptos::prelude::*;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use site_access::{AssuranceLevel, AuthProviderPublicConfig, PublicSitePolicy};
-use wasm_bindgen::JsCast;
+use site_access::{AssuranceLevel, AuthProviderPublicConfig, PolicyRef, PublicSitePolicy};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Headers, Request, RequestCredentials, RequestInit, RequestMode, Response};
+
+pub const SAFETY_INVALIDATE_STORAGE_KEY: &str = "lets-embed:safety-invalidate";
 
 #[derive(Clone, Debug)]
 pub struct ApiErr {
@@ -51,6 +54,7 @@ async fn send_request(
         body: String::new(),
     })?;
     let _ = headers.set("Accept", "application/json");
+    let _ = headers.set("X-Requested-With", "fetch");
     if let Some(body) = json_body {
         let _ = headers.set("Content-Type", "application/json");
         init.set_body(&wasm_bindgen::JsValue::from_str(&body));
@@ -236,6 +240,17 @@ pub struct PricingSummary {
     pub items: Vec<PricingItemView>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct SwitcherEligibility {
+    pub id: String,
+    pub grant_generation: u64,
+    pub opted_in: bool,
+    pub effective: bool,
+    pub country_excluded: bool,
+    #[serde(default)]
+    pub missing_requirements: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct MeResp {
     pub address: String,
@@ -254,13 +269,20 @@ pub struct MeResp {
     pub identities: Vec<IdentityView>,
     pub linked_eth_address: Option<String>,
     pub linked_solana_address: Option<String>,
-    pub enabled_switchers: Vec<String>,
-    pub effective_switchers: Vec<String>,
-    pub safe_mode: bool,
+    #[serde(default)]
+    pub enabled_switchers: Vec<PolicyRef>,
+    #[serde(default)]
+    pub effective_switchers: Vec<PolicyRef>,
+    #[serde(default)]
+    pub switcher_statuses: Vec<SwitcherEligibility>,
+    #[serde(default = "default_pref_version")]
+    pub pref_version: u64,
     pub terms_version_accepted: Option<u32>,
     pub terms_digest_accepted: Option<String>,
     pub terms_accepted_at: Option<u64>,
     pub terms_up_to_date: bool,
+    #[serde(default)]
+    pub accepted_current_terms: bool,
     pub assurance_level: AssuranceLevel,
     pub strict_age_ok: bool,
     pub session_auth_time: Option<u64>,
@@ -268,6 +290,10 @@ pub struct MeResp {
     pub available_providers: Vec<AuthProviderPublicConfig>,
     pub policy: PublicSitePolicy,
     pub pricing: PricingSummary,
+}
+
+fn default_pref_version() -> u64 {
+    1
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -362,9 +388,34 @@ pub struct AcceptTermsOkResp {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct PreferencesResp {
-    pub enabled_switchers: Vec<String>,
-    pub safe_mode: bool,
-    pub effective_switchers: Vec<String>,
+    #[serde(default)]
+    pub enabled_switchers: Vec<PolicyRef>,
+    #[serde(default)]
+    pub effective_switchers: Vec<PolicyRef>,
+    #[serde(default = "default_pref_version")]
+    pub pref_version: u64,
+    #[serde(default)]
+    pub switcher_statuses: Vec<SwitcherEligibility>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PreferencesConflictResp {
+    pub error: String,
+    pub pref_version: u64,
+    #[serde(default)]
+    pub enabled_switchers: Vec<PolicyRef>,
+    #[serde(default)]
+    pub effective_switchers: Vec<PolicyRef>,
+    #[serde(default)]
+    pub switcher_statuses: Vec<SwitcherEligibility>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RevealResponse {
+    pub clear_url: String,
+    pub expires_at: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -466,5 +517,117 @@ pub fn format_points(n: i64) -> String {
         "1 point".to_string()
     } else {
         format!("{n} points")
+    }
+}
+
+/// Format a UNIX epoch timestamp (seconds) as `YYYY-MM-DD` (UTC).
+pub fn format_epoch_date(epoch_secs: u64) -> String {
+    let ms = (epoch_secs as f64) * 1000.0;
+    let d = js_sys::Date::new(&JsValue::from_f64(ms));
+    let y = d.get_utc_full_year();
+    let m = d.get_utc_month() + 1;
+    let day = d.get_utc_date();
+    format!("{y:04}-{m:02}-{day:02}")
+}
+
+// ---------------------------------------------------------------------------
+// Cross-Tab Safety & Session Invalidation (`BroadcastChannel` + `localStorage`)
+// ---------------------------------------------------------------------------
+
+struct LocalCleanup(Option<Box<dyn FnOnce()>>);
+
+impl Drop for LocalCleanup {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
+/// Broadcast a cross-tab invalidation event (`logout`, `account_change`,
+/// `opt_out`, `prefs_change`, `policy_change`) via both
+/// `BroadcastChannel("lets_embed_safety")` and `localStorage` fallback.
+pub fn broadcast_safety_invalidation(reason: &str) {
+    let ts = js_sys::Date::now();
+    if let Ok(ch) =
+        web_sys::BroadcastChannel::new(lets_embed_ui::browser::SAFETY_CHANNEL_NAME)
+    {
+        let payload = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(
+            &payload,
+            &JsValue::from_str("type"),
+            &JsValue::from_str("invalidate"),
+        );
+        let _ = js_sys::Reflect::set(
+            &payload,
+            &JsValue::from_str("reason"),
+            &JsValue::from_str(reason),
+        );
+        let _ = js_sys::Reflect::set(
+            &payload,
+            &JsValue::from_str("ts"),
+            &JsValue::from_f64(ts),
+        );
+        let _ = ch.post_message(&payload);
+        ch.close();
+    }
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(SAFETY_INVALIDATE_STORAGE_KEY, &format!("{reason}:{ts:.0}"));
+    }
+}
+
+/// Subscribe to cross-tab safety invalidation events (`BroadcastChannel("lets_embed_safety")`
+/// + `storage` events on `SAFETY_INVALIDATE_STORAGE_KEY`). Cleans up automatically on unmount.
+pub fn use_safety_invalidation_listener(on_invalidate: impl Fn(String) + Clone + 'static) {
+    if let Ok(ch) =
+        web_sys::BroadcastChannel::new(lets_embed_ui::browser::SAFETY_CHANNEL_NAME)
+    {
+        let on_bc = on_invalidate.clone();
+        let cb = Closure::<dyn Fn(web_sys::MessageEvent)>::new(move |ev: web_sys::MessageEvent| {
+            let data = ev.data();
+            if !data.is_object() {
+                return;
+            }
+            let kind = js_sys::Reflect::get(&data, &JsValue::from_str("type"))
+                .ok()
+                .and_then(|v| v.as_string())
+                .unwrap_or_default();
+            if matches!(
+                kind.as_str(),
+                "invalidate" | "logout" | "account_change" | "opt_out" | "prefs_change" | "policy_change"
+            ) {
+                let reason = js_sys::Reflect::get(&data, &JsValue::from_str("reason"))
+                    .ok()
+                    .and_then(|v| v.as_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(kind);
+                on_bc(reason);
+            }
+        });
+        ch.set_onmessage(Some(cb.as_ref().unchecked_ref()));
+        let _ = StoredValue::new_local(LocalCleanup(Some(Box::new(move || {
+            ch.set_onmessage(None);
+            ch.close();
+            drop(cb);
+        }))));
+    }
+
+    if let Some(win) = web_sys::window() {
+        let on_st = on_invalidate;
+        let cb = Closure::<dyn Fn(web_sys::StorageEvent)>::new(move |ev: web_sys::StorageEvent| {
+            if ev.key().as_deref() == Some(SAFETY_INVALIDATE_STORAGE_KEY)
+                && let Some(raw) = ev.new_value()
+            {
+                let reason = raw.split(':').next().unwrap_or("invalidate").to_string();
+                on_st(reason);
+            }
+        });
+        let _ = win.add_event_listener_with_callback("storage", cb.as_ref().unchecked_ref());
+        let win_clean = win.clone();
+        let _ = StoredValue::new_local(LocalCleanup(Some(Box::new(move || {
+            let _ = win_clean
+                .remove_event_listener_with_callback("storage", cb.as_ref().unchecked_ref());
+            drop(cb);
+        }))));
     }
 }

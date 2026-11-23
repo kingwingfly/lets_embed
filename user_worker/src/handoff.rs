@@ -467,7 +467,7 @@ pub async fn start(State(st): State<AppState>, headers: HeaderMap) -> Response {
     };
     let now = session::now_secs();
     let req = DoHandoffStartReq {
-        ip_key: ip_rate_key(&headers, &st.jwt_secret),
+        ip_key: ip_rate_key(&headers, &st.session_v2_secret),
         session_id: session_id.clone(),
         poll_secret_hash: sha256_hex(&poll_secret),
         verify_code: verify_code.clone(),
@@ -505,7 +505,7 @@ pub async fn info(
     if !valid_id_token(&q.s) {
         return auth::api_error(StatusCode::BAD_REQUEST, "invalid session id");
     }
-    let ip_key = Some(ip_rate_key(&headers, &st.jwt_secret));
+    let ip_key = Some(ip_rate_key(&headers, &st.session_v2_secret));
     match fetch_pending_session(&st, &q.s, ip_key).await {
         Ok(info) => {
             let now = session::now_secs();
@@ -542,7 +542,7 @@ pub async fn approve_eth(
         return auth::api_error(StatusCode::BAD_REQUEST, "invalid session id");
     }
 
-    let ip_key = Some(ip_rate_key(&headers, &st.jwt_secret));
+    let ip_key = Some(ip_rate_key(&headers, &st.session_v2_secret));
     let info = match fetch_pending_session(&st, &req.session_id, ip_key).await {
         Ok(i) => i,
         Err(r) => return r,
@@ -669,7 +669,7 @@ pub async fn approve_sol(
         return auth::api_error(StatusCode::BAD_REQUEST, "invalid solana address");
     }
 
-    let ip_key = Some(ip_rate_key(&headers, &st.jwt_secret));
+    let ip_key = Some(ip_rate_key(&headers, &st.session_v2_secret));
     let info = match fetch_pending_session(&st, &req.session_id, ip_key).await {
         Ok(i) => i,
         Err(r) => return r,
@@ -755,7 +755,7 @@ pub async fn poll(
     if !valid_id_token(&req.session_id) || !valid_id_token(&req.poll_secret) {
         return auth::api_error(StatusCode::BAD_REQUEST, "invalid session parameters");
     }
-    let ip_key = ip_rate_key(&headers, &st.jwt_secret);
+    let ip_key = ip_rate_key(&headers, &st.session_v2_secret);
     let poll_secret_hash = sha256_hex(&req.poll_secret);
     let do_req = DoHandoffPollReq {
         ip_key: ip_key.clone(),
@@ -953,7 +953,7 @@ pub async fn transfer_claim(
     if let Err(r) = auth::require_same_origin(&st, &headers) {
         return r;
     }
-    let ip_key = ip_rate_key(&headers, &st.jwt_secret);
+    let ip_key = ip_rate_key(&headers, &st.session_v2_secret);
     let token_opt = req
         .token
         .as_deref()

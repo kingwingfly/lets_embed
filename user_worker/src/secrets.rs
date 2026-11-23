@@ -1,8 +1,12 @@
 //! Dedicated AES-256-GCM secret store for `provider_secrets` (fixes M3).
 //!
-//! Uses ONLY dedicated `SETTINGS_ENCRYPTION_KEY` (+ optional
-//! `SETTINGS_ENCRYPTION_KEY_PREV` for zero-downtime key rotation) — NEVER
-//! derived from `JWT_SECRET` or `SESSION_V2_SECRET`. Every decryption validates
+//! Resolves the 32-byte AES-256-GCM key via `site_access::resolve_provider_aes_key`:
+//! 1. Explicit override `PROVIDER_SECRETS_KEY` (or legacy `SETTINGS_ENCRYPTION_KEY`)
+//! 2. RFC 5869 HKDF-SHA256 derivation from `SITE_SECRET` (`KeyDomain::ProviderSecrets`)
+//! 3. Optional `PROVIDER_SECRETS_KEY_PREV` (or legacy `SETTINGS_ENCRYPTION_KEY_PREV`)
+//!    for zero-downtime key rotation.
+//!
+//! NEVER derived from `JWT_SECRET` or `SESSION_SECRET`. Every decryption validates
 //! exact AAD = `"{deployment_id}|{provider_id}|{field_name}"` and fails closed.
 
 use std::fmt;
@@ -11,14 +15,14 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
-use base64::{
-    Engine as _,
-    engine::general_purpose::{STANDARD as B64_STD, STANDARD_NO_PAD as B64_STD_NP, URL_SAFE, URL_SAFE_NO_PAD},
-};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use site_access::resolve_provider_aes_key;
 use worker::Env;
 
+pub const SITE_SECRET_ENV: &str = "SITE_SECRET";
+pub const PROVIDER_SECRETS_KEY_ENV: &str = "PROVIDER_SECRETS_KEY";
+pub const PROVIDER_SECRETS_KEY_PREV_ENV: &str = "PROVIDER_SECRETS_KEY_PREV";
 pub const ENCRYPTION_KEY_SECRET: &str = "SETTINGS_ENCRYPTION_KEY";
 pub const ENCRYPTION_KEY_PREV_SECRET: &str = "SETTINGS_ENCRYPTION_KEY_PREV";
 pub const NONCE_LEN: usize = 12;
@@ -61,7 +65,10 @@ pub enum SecretError {
 impl fmt::Display for SecretError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingEncryptionKey => write!(f, "SETTINGS_ENCRYPTION_KEY is not configured"),
+            Self::MissingEncryptionKey => write!(
+                f,
+                "missing provider encryption key (configure SITE_SECRET, PROVIDER_SECRETS_KEY, or SETTINGS_ENCRYPTION_KEY)"
+            ),
             Self::InvalidEncryptionKey(msg) => write!(f, "invalid encryption key: {msg}"),
             Self::InvalidNonceLength => write!(f, "invalid AES-GCM nonce length"),
             Self::EmptyCiphertext => write!(f, "empty ciphertext"),
@@ -90,6 +97,15 @@ impl fmt::Debug for EncryptionKey {
 }
 
 impl EncryptionKey {
+    /// Construct an encryption key from raw 32-byte key material using its deterministic kid.
+    pub fn from_bytes(key: [u8; 32]) -> Result<Self, SecretError> {
+        if key.iter().all(|&b| b == 0) {
+            return Err(SecretError::InvalidEncryptionKey("all-zero key rejected"));
+        }
+        let kid = derive_default_kid(&key);
+        Ok(Self { kid, key })
+    }
+
     /// Parse a dedicated 32-byte key from `"<kid>:<material>"` or plain `<material>`.
     /// `<material>` may be 64-char hex or standard/URL-safe base64 (padded or unpadded).
     pub fn parse(raw: &str) -> Result<Self, SecretError> {
@@ -98,57 +114,28 @@ impl EncryptionKey {
             return Err(SecretError::InvalidEncryptionKey("empty key"));
         }
 
-        let (explicit_kid, material) = match trimmed.split_once(':') {
-            Some((kid, rest))
+        let explicit_kid = match trimmed.split_once(':') {
+            Some((kid, _rest))
                 if !kid.is_empty()
                     && kid.len() <= 32
                     && kid
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')) =>
             {
-                (Some(kid.to_string()), rest.trim())
+                Some(kid.to_string())
             }
-            _ => (None, trimmed),
+            _ => None,
         };
 
-        let decoded = decode_32_byte_key(material)?;
-        if decoded.iter().all(|&b| b == 0) {
-            return Err(SecretError::InvalidEncryptionKey("all-zero key rejected"));
-        }
-
+        let decoded = resolve_provider_aes_key(Some(trimmed), None)
+            .map_err(SecretError::InvalidEncryptionKey)?;
         let kid = explicit_kid.unwrap_or_else(|| derive_default_kid(&decoded));
         Ok(Self { kid, key: decoded })
     }
-}
 
-fn decode_32_byte_key(material: &str) -> Result<[u8; 32], SecretError> {
-    if material.len() == 64 && material.bytes().all(|b| b.is_ascii_hexdigit()) {
-        let bytes = hex::decode(material)
-            .map_err(|_| SecretError::InvalidEncryptionKey("invalid hex key"))?;
-        return bytes
-            .try_into()
-            .map_err(|_| SecretError::InvalidEncryptionKey("expected 32 bytes"));
+    pub fn key_bytes(&self) -> &[u8; 32] {
+        &self.key
     }
-
-    for bytes in [
-        B64_STD.decode(material).ok(),
-        B64_STD_NP.decode(material).ok(),
-        URL_SAFE.decode(material).ok(),
-        URL_SAFE_NO_PAD.decode(material).ok(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if bytes.len() == 32 {
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&bytes);
-            return Ok(out);
-        }
-    }
-
-    Err(SecretError::InvalidEncryptionKey(
-        "key must decode to exactly 32 bytes (hex or base64)",
-    ))
 }
 
 fn derive_default_kid(key: &[u8; 32]) -> String {
@@ -162,6 +149,24 @@ pub struct KeyRing {
     pub prev: Option<EncryptionKey>,
 }
 
+fn first_non_empty<'a>(candidates: &[Option<&'a str>]) -> Option<&'a str> {
+    candidates
+        .iter()
+        .copied()
+        .flatten()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+}
+
+fn read_env_secret_or_var(env: &Env, name: &str) -> Option<String> {
+    env.secret(name)
+        .map(|s| s.to_string())
+        .or_else(|_| env.var(name).map(|v| v.to_string()))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 impl KeyRing {
     pub fn from_raw(current_raw: &str, prev_raw: Option<&str>) -> Result<Self, SecretError> {
         let current = EncryptionKey::parse(current_raw)?;
@@ -172,18 +177,49 @@ impl KeyRing {
         Ok(Self { current, prev })
     }
 
+    /// Resolve the active provider-secrets AES-256-GCM keyring via `site_access::kdf`:
+    /// - Current key precedence: `PROVIDER_SECRETS_KEY` > `SETTINGS_ENCRYPTION_KEY` > `SITE_SECRET` (HKDF `KeyDomain::ProviderSecrets`).
+    /// - Previous rotation key precedence: `PROVIDER_SECRETS_KEY_PREV` > `SETTINGS_ENCRYPTION_KEY_PREV`.
+    pub fn resolve(
+        provider_secrets_key: Option<&str>,
+        settings_encryption_key: Option<&str>,
+        site_secret: Option<&str>,
+        provider_secrets_key_prev: Option<&str>,
+        settings_encryption_key_prev: Option<&str>,
+    ) -> Result<Self, SecretError> {
+        let current = if let Some(explicit) =
+            first_non_empty(&[provider_secrets_key, settings_encryption_key])
+        {
+            EncryptionKey::parse(explicit)?
+        } else if let Some(master) = first_non_empty(&[site_secret]) {
+            let derived = resolve_provider_aes_key(None, Some(master))
+                .map_err(SecretError::InvalidEncryptionKey)?;
+            EncryptionKey::from_bytes(derived)?
+        } else {
+            return Err(SecretError::MissingEncryptionKey);
+        };
+
+        let prev = match first_non_empty(&[provider_secrets_key_prev, settings_encryption_key_prev])
+        {
+            Some(raw) => Some(EncryptionKey::parse(raw)?),
+            None => None,
+        };
+        Ok(Self { current, prev })
+    }
+
     pub fn from_env(env: &Env) -> Result<Self, SecretError> {
-        let current_raw = env
-            .secret(ENCRYPTION_KEY_SECRET)
-            .map(|s| s.to_string())
-            .or_else(|_| env.var(ENCRYPTION_KEY_SECRET).map(|v| v.to_string()))
-            .map_err(|_| SecretError::MissingEncryptionKey)?;
-        let prev_raw = env
-            .secret(ENCRYPTION_KEY_PREV_SECRET)
-            .map(|s| s.to_string())
-            .or_else(|_| env.var(ENCRYPTION_KEY_PREV_SECRET).map(|v| v.to_string()))
-            .ok();
-        Self::from_raw(&current_raw, prev_raw.as_deref())
+        let provider_key = read_env_secret_or_var(env, PROVIDER_SECRETS_KEY_ENV);
+        let legacy_key = read_env_secret_or_var(env, ENCRYPTION_KEY_SECRET);
+        let site_secret = read_env_secret_or_var(env, SITE_SECRET_ENV);
+        let provider_prev = read_env_secret_or_var(env, PROVIDER_SECRETS_KEY_PREV_ENV);
+        let legacy_prev = read_env_secret_or_var(env, ENCRYPTION_KEY_PREV_SECRET);
+        Self::resolve(
+            provider_key.as_deref(),
+            legacy_key.as_deref(),
+            site_secret.as_deref(),
+            provider_prev.as_deref(),
+            legacy_prev.as_deref(),
+        )
     }
 }
 
@@ -368,6 +404,12 @@ pub async fn load_provider_secret(
 
 #[cfg(test)]
 mod tests {
+    use base64::{
+        Engine as _,
+        engine::general_purpose::{STANDARD as B64_STD, URL_SAFE_NO_PAD},
+    };
+    use site_access::{KeyDomain, derive_domain_key_bytes};
+
     use super::*;
 
     const KEY_V1_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -478,5 +520,76 @@ mod tests {
         // Reject short key
         assert!(EncryptionKey::parse("abcd").is_err());
         assert!(EncryptionKey::parse("").is_err());
+    }
+
+    #[test]
+    fn keyring_resolves_from_site_secret_hkdf_and_honors_explicit_overrides() {
+        let master = "0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        // 1. SITE_SECRET-only derives KeyDomain::ProviderSecrets via HKDF-SHA256
+        let ring_hkdf = KeyRing::resolve(None, None, Some(master), None, None).expect("hkdf ring");
+        assert_eq!(
+            ring_hkdf.current.key_bytes(),
+            &derive_domain_key_bytes(master.as_bytes(), KeyDomain::ProviderSecrets)
+        );
+        let enc = encrypt_secret(&ring_hkdf, "prod", "google", "client_secret", "hkdf-secret")
+            .expect("encrypt with hkdf");
+        assert_eq!(
+            decrypt_secret(&ring_hkdf, "prod", "google", "client_secret", &enc)
+                .unwrap()
+                .expose(),
+            "hkdf-secret"
+        );
+
+        // 2. Explicit PROVIDER_SECRETS_KEY overrides both SETTINGS_ENCRYPTION_KEY and SITE_SECRET
+        let ring_explicit = KeyRing::resolve(
+            Some(&format!("p1:{KEY_V1_HEX}")),
+            Some(&format!("s1:{KEY_V2_HEX}")),
+            Some(master),
+            None,
+            Some(&format!("old:{KEY_V2_HEX}")),
+        )
+        .expect("explicit override");
+        assert_eq!(ring_explicit.current.kid, "p1");
+        assert_eq!(ring_explicit.prev.as_ref().unwrap().kid, "old");
+
+        // 3. Legacy SETTINGS_ENCRYPTION_KEY overrides SITE_SECRET when PROVIDER_SECRETS_KEY unset
+        let ring_legacy = KeyRing::resolve(
+            None,
+            Some(&format!("s1:{KEY_V2_HEX}")),
+            Some(master),
+            None,
+            None,
+        )
+        .expect("legacy override");
+        assert_eq!(ring_legacy.current.kid, "s1");
+
+        // 4. Rotation from legacy SETTINGS_ENCRYPTION_KEY -> SITE_SECRET via *_PREV succeeds
+        let enc_legacy = encrypt_secret(&ring_legacy, "prod", "github", "client_secret", "gh-tok")
+            .expect("encrypt legacy");
+        let ring_migrated = KeyRing::resolve(
+            None,
+            None,
+            Some(master),
+            None,
+            Some(&format!("s1:{KEY_V2_HEX}")),
+        )
+        .expect("migrated ring");
+        assert_eq!(
+            decrypt_secret(&ring_migrated, "prod", "github", "client_secret", &enc_legacy)
+                .unwrap()
+                .expose(),
+            "gh-tok"
+        );
+
+        // 5. Missing all keys fails closed
+        assert_eq!(
+            KeyRing::resolve(None, None, None, None, None).unwrap_err(),
+            SecretError::MissingEncryptionKey
+        );
+        assert_eq!(
+            KeyRing::resolve(Some("  "), Some(""), Some(" "), None, None).unwrap_err(),
+            SecretError::MissingEncryptionKey
+        );
     }
 }
