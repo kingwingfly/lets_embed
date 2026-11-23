@@ -216,6 +216,39 @@ pub struct PreferencesReq {
     pub safe_mode: Option<bool>,
 }
 
+/// Parse persisted `StoredContentPrefs` from D1 `users_v2.content_prefs_json`.
+pub fn parse_stored_content_prefs(raw: Option<&str>) -> Option<StoredContentPrefs> {
+    let json = raw?.trim();
+    if json.is_empty() {
+        return None;
+    }
+    serde_json::from_str::<StoredContentPrefs>(json).ok()
+}
+
+/// Resolve the user's saved `enabled_switchers` filtered against the live `policy`.
+///
+/// Reads persisted D1 `users_v2.content_prefs_json` so saved switchers survive
+/// Safe Mode (when `SessionContext.enabled_switchers` is fail-closed `[]`),
+/// falling back to `ctx_switchers` only when no persisted D1 row exists (or an
+/// uninitialized `{}` D1 row coexists with non-empty live DO switchers).
+pub fn resolve_saved_switchers(
+    policy: &PublicSitePolicy,
+    content_prefs_json: Option<&str>,
+    ctx_switchers: &[String],
+) -> Vec<String> {
+    let raw = match parse_stored_content_prefs(content_prefs_json) {
+        Some(prefs) => {
+            if prefs.enabled_switchers.is_empty() && !ctx_switchers.is_empty() {
+                ctx_switchers.to_vec()
+            } else {
+                prefs.enabled_switchers
+            }
+        }
+        None => ctx_switchers.to_vec(),
+    };
+    filter_valid_switchers(policy, &raw)
+}
+
 /// Pure partial-update resolver for `POST /user/api/preferences`:
 /// omitting `enabled_switchers` (e.g. Safe Mode panic toggle sending `{"safe_mode": true}`)
 /// preserves existing saved switchers; omitting `safe_mode` preserves existing `safe_mode`.
@@ -263,9 +296,22 @@ pub async fn update_preferences(
         }
     };
 
+    // Load persisted `users_v2.content_prefs_json` from D1 so toggling Safe Mode
+    // (`true -> false`) never uses the fail-closed empty `active.ctx.enabled_switchers`
+    // to wipe saved switchers. Fail closed on D1 read errors to avoid silent data loss.
+    let account = match identity::load_account_by_id(&st, &active.user_id).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let existing_switchers = resolve_saved_switchers(
+        &policy,
+        account.as_ref().map(|a| a.content_prefs_json.as_str()),
+        &active.ctx.enabled_switchers,
+    );
+
     let (filtered, next_safe) = resolve_preferences_update(
         &policy,
-        &active.ctx.enabled_switchers,
+        &existing_switchers,
         active.ctx.safe_mode,
         &req,
     );
@@ -278,17 +324,56 @@ pub async fn update_preferences(
     };
 
     // Persist in D1 `users_v2` AND update live `UserAccount` DO immediately!
-    if let Ok(db) = st.env.d1(crate::D1_BINDING)
-        && let Ok(stmt) = db
-            .prepare("UPDATE users_v2 SET content_prefs_json = ?1 WHERE id = ?2")
-            .bind(&[prefs_json.into(), active.user_id.as_str().into()])
-        && let Err(e) = stmt.run().await
+    let db = match st.env.d1(crate::D1_BINDING) {
+        Ok(db) => db,
+        Err(e) => {
+            worker::console_error!("preferences D1 binding failed: {e:?}");
+            return auth::internal_error();
+        }
+    };
+    let stmt = match db
+        .prepare("UPDATE users_v2 SET content_prefs_json = ?1 WHERE id = ?2")
+        .bind(&[prefs_json.into(), active.user_id.as_str().into()])
     {
+        Ok(s) => s,
+        Err(e) => {
+            worker::console_error!("preferences D1 bind failed: {e:?}");
+            return auth::internal_error();
+        }
+    };
+    if let Err(e) = stmt.run().await {
         worker::console_error!("preferences D1 write failed: {e:?}");
         return auth::internal_error();
     }
 
-    if let Err(e) = do_client::do_prefs_update(
+    // If this is a partial Safe Mode toggle for a legacy session with no `users_v2` row,
+    // omit `enabled_switchers` on DO `/prefs-update` so DO preserves `user_safety_state`.
+    let preserve_do_switchers = req.enabled_switchers.is_none() && account.is_none();
+    if preserve_do_switchers {
+        let partial_body = serde_json::json!({ "safe_mode": next_safe });
+        match do_client::call_do(
+            &st.env,
+            &active.do_key,
+            worker::Method::Post,
+            "/prefs-update",
+            Some(&partial_body),
+        )
+        .await
+        {
+            Ok(resp) if resp.status_code() == 200 => {}
+            Ok(resp) => {
+                worker::console_error!(
+                    "preferences partial DO update failed: HTTP {}",
+                    resp.status_code()
+                );
+                return auth::internal_error();
+            }
+            Err(e) => {
+                worker::console_error!("preferences partial DO update failed: {e:?}");
+                return auth::internal_error();
+            }
+        }
+    } else if let Err(e) = do_client::do_prefs_update(
         &st.env,
         &active.do_key,
         &PrefsUpdateReq {
@@ -306,10 +391,15 @@ pub async fn update_preferences(
     let updated_ctx = do_client::do_session_context(&st.env, &active.do_key, active.sid.as_deref())
         .await
         .unwrap_or(active.ctx);
+    let saved_switchers = if preserve_do_switchers && !next_safe {
+        filter_valid_switchers(&policy, &updated_ctx.enabled_switchers)
+    } else {
+        filtered
+    };
     let effective_switchers = updated_ctx.effective_switchers(&policy);
 
     Json(PreferencesResp {
-        enabled_switchers: filtered,
+        enabled_switchers: saved_switchers,
         safe_mode: next_safe,
         effective_switchers,
     })
@@ -1033,5 +1123,131 @@ mod tests {
         let (sw4, safe4) = resolve_preferences_update(&policy, &existing, true, &clear_sw);
         assert!(sw4.is_empty());
         assert!(!safe4);
+    }
+
+    #[test]
+    fn safe_mode_cycle_preserves_saved_switchers_across_d1_do_and_me() {
+        use crate::account_do::{
+            StoredSafetyState, StoredSessionSnapshot, apply_prefs_update, compute_session_context,
+        };
+
+        let mut policy = PublicSitePolicy {
+            safety_enabled: true,
+            age_policy: AgeVerificationPolicy::StrictProviderVerified18,
+            rules: vec![
+                site_access::SafetyRuleConfig {
+                    id: "r18".into(),
+                    name: "R-18".into(),
+                    mode: RuleMode::Switcher,
+                    query: "tag:explicit".into(),
+                    default_min_score: 0.5,
+                    preset: site_access::PlaceholderPreset::R18,
+                    requires_login: true,
+                    requires_age_18: true,
+                    enabled: true,
+                },
+                site_access::SafetyRuleConfig {
+                    id: "disabled_sw".into(),
+                    name: "Disabled".into(),
+                    mode: RuleMode::Switcher,
+                    query: "tag:old".into(),
+                    default_min_score: 0.5,
+                    preset: site_access::PlaceholderPreset::Custom,
+                    requires_login: false,
+                    requires_age_18: false,
+                    enabled: false,
+                },
+            ],
+            ..Default::default()
+        };
+        policy.legal.terms_version = 1;
+
+        let now = 1_750_000_000u64;
+        let session_row = StoredSessionSnapshot {
+            assurance_level: AssuranceLevel::Verified18,
+            strict_age_ok: true,
+            expires_at: now + 3600,
+            revoked_at: None,
+        };
+
+        // Initial persisted state: saved = ["r18"], safe_mode = false in both D1 and DO.
+        let mut d1_prefs_json = serde_json::to_string(&StoredContentPrefs {
+            enabled_switchers: vec!["r18".into(), "disabled_sw".into()],
+            safe_mode: false,
+        })
+        .unwrap();
+        let mut do_state = StoredSafetyState {
+            enabled_switchers: vec!["r18".into()],
+            safe_mode: false,
+            terms_version: Some(policy.legal.terms_version),
+            terms_digest: Some(policy.legal.terms_digest.clone()),
+            self_attested_18: false,
+            revoked_all_before: 0,
+        };
+
+        let ctx0 = compute_session_context(false, Some("sid1"), Some(&session_row), &do_state, now);
+        assert_eq!(ctx0.enabled_switchers, vec!["r18"]);
+        assert_eq!(ctx0.effective_switchers(&policy), vec!["r18"]);
+        assert_eq!(
+            auth::compute_me_switchers(&policy, Some(&d1_prefs_json), &ctx0),
+            (vec!["r18".to_string()], vec!["r18".to_string()])
+        );
+
+        // Step 1: POST /user/api/preferences {"safe_mode": true}
+        let req_on: PreferencesReq = serde_json::from_str(r#"{"safe_mode": true}"#).unwrap();
+        let existing1 =
+            resolve_saved_switchers(&policy, Some(&d1_prefs_json), &ctx0.enabled_switchers);
+        let (filtered1, next_safe1) =
+            resolve_preferences_update(&policy, &existing1, ctx0.safe_mode, &req_on);
+        assert_eq!(filtered1, vec!["r18"]);
+        assert!(next_safe1);
+
+        d1_prefs_json = serde_json::to_string(&StoredContentPrefs {
+            enabled_switchers: filtered1.clone(),
+            safe_mode: next_safe1,
+        })
+        .unwrap();
+        do_state = apply_prefs_update(&do_state, Some(filtered1), next_safe1);
+        assert_eq!(do_state.enabled_switchers, vec!["r18"]);
+        assert!(do_state.safe_mode);
+
+        // SessionContext MUST remain fail-closed (enabled_switchers = [], effective = []),
+        // while GET /user/api/me still returns saved enabled_switchers = ["r18"] and effective = []!
+        let ctx1 = compute_session_context(false, Some("sid1"), Some(&session_row), &do_state, now);
+        assert!(ctx1.safe_mode);
+        assert!(ctx1.enabled_switchers.is_empty());
+        assert!(ctx1.effective_switchers(&policy).is_empty());
+        assert_eq!(
+            auth::compute_me_switchers(&policy, Some(&d1_prefs_json), &ctx1),
+            (vec!["r18".to_string()], Vec::<String>::new())
+        );
+
+        // Step 2: POST /user/api/preferences {"safe_mode": false} (while ctx1.enabled_switchers is [])
+        let req_off: PreferencesReq = serde_json::from_str(r#"{"safe_mode": false}"#).unwrap();
+        let existing2 =
+            resolve_saved_switchers(&policy, Some(&d1_prefs_json), &ctx1.enabled_switchers);
+        let (filtered2, next_safe2) =
+            resolve_preferences_update(&policy, &existing2, ctx1.safe_mode, &req_off);
+        assert_eq!(filtered2, vec!["r18"]);
+        assert!(!next_safe2);
+
+        d1_prefs_json = serde_json::to_string(&StoredContentPrefs {
+            enabled_switchers: filtered2.clone(),
+            safe_mode: next_safe2,
+        })
+        .unwrap();
+        do_state = apply_prefs_update(&do_state, Some(filtered2), next_safe2);
+        assert_eq!(do_state.enabled_switchers, vec!["r18"]);
+        assert!(!do_state.safe_mode);
+
+        // SessionContext AND /user/api/me now restore saved=["r18"] and effective=["r18"]!
+        let ctx2 = compute_session_context(false, Some("sid1"), Some(&session_row), &do_state, now);
+        assert!(!ctx2.safe_mode);
+        assert_eq!(ctx2.enabled_switchers, vec!["r18"]);
+        assert_eq!(ctx2.effective_switchers(&policy), vec!["r18"]);
+        assert_eq!(
+            auth::compute_me_switchers(&policy, Some(&d1_prefs_json), &ctx2),
+            (vec!["r18".to_string()], vec!["r18".to_string()])
+        );
     }
 }

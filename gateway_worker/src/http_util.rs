@@ -398,6 +398,7 @@ pub(crate) fn browse_route(method: &Method, path: &str) -> bool {
             | "/api/search_advanced_image"
             | "/api/fetch_post_meta"
             | "/api/suggest_search"
+            | "/api/site_config"
     ) {
         return true;
     }

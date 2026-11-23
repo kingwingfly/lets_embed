@@ -2592,6 +2592,7 @@ mod tests {
             "/api/search_advanced",
             "/api/fetch_post_meta",
             "/api/suggest_search",
+            "/api/site_config",
             "/api/search_query",
             "/api/list_post_images",
             "/api/fetch_image_details",
@@ -2934,6 +2935,7 @@ mod tests {
         for pinned in [
             "/api/fetch_post_meta",
             "/api/suggest_search",
+            "/api/site_config",
             "/api/search_similar",
             "/api/search_by_image",
             "/api/search_by_desc",
@@ -2946,6 +2948,91 @@ mod tests {
             assert!(!browse_route(&Method::GET, pinned), "GET {pinned}");
         }
         assert!(browse_route(&Method::POST, "/api/search_query1234567890"));
+    }
+
+    #[test]
+    fn anonymous_post_site_config_allowed_under_open_guest_browsing() {
+        let policy = sample_safety_policy();
+        let mut backend = MockBackend::with_policy(policy.clone());
+        // login_required = false -> guest DO returns 200.
+        backend.account_statuses.insert("guest".to_string(), 200);
+        let cfg = test_cfg();
+
+        // Same-origin anonymous POST /api/site_config succeeds and proxies with anonymous assertion.
+        let mut ok_hdrs = HeaderMap::new();
+        ok_hdrs.insert("origin", "https://gallery.test".parse().unwrap());
+        let ok = dispatch(
+            &backend,
+            &cfg,
+            Method::POST,
+            "https://gallery.test/api/site_config",
+            ok_hdrs.clone(),
+            Bytes::new(),
+        );
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(
+            ok.headers().get("cache-control").unwrap(),
+            "private, no-store"
+        );
+        {
+            let calls = backend.account_calls.borrow();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].operation, "guest");
+            assert!(calls[0].payload["item"].is_null());
+        }
+        {
+            let up = backend.upstream_calls.borrow();
+            assert_eq!(up.len(), 1);
+            assert_eq!(up[0].url, "https://api.gallery.test/api/site_config");
+            let assertion_raw = header_value(&up[0].headers, GATEWAY_ASSERTION_HEADER).unwrap();
+            let verified = verify_gateway_assertion(
+                assertion_raw,
+                TEST_ASSERTION_SECRET,
+                GATEWAY_ASSERTION_AUDIENCE,
+                TEST_NOW,
+                5,
+            )
+            .unwrap();
+            assert_eq!(verified.sub, None);
+            assert!(verified.switchers.is_empty());
+            assert_eq!(verified.rev, policy.revision);
+        }
+
+        // Cross-origin anonymous POST /api/site_config is still rejected with 403 CSRF.
+        let mut cross_hdrs = HeaderMap::new();
+        cross_hdrs.insert("origin", "https://evil.test".parse().unwrap());
+        let cross = dispatch(
+            &backend,
+            &cfg,
+            Method::POST,
+            "https://gallery.test/api/site_config",
+            cross_hdrs,
+            Bytes::new(),
+        );
+        assert_eq!(cross.status(), StatusCode::FORBIDDEN);
+
+        // Anonymous GET /api/site_config stays gated (401).
+        let get_resp = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/api/site_config",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(get_resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Under login_required = true (guest DO returns 401), anonymous POST /api/site_config -> 401.
+        backend.account_statuses.insert("guest".to_string(), 401);
+        let gated = dispatch(
+            &backend,
+            &cfg,
+            Method::POST,
+            "https://gallery.test/api/site_config",
+            ok_hdrs,
+            Bytes::new(),
+        );
+        assert_eq!(gated.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]

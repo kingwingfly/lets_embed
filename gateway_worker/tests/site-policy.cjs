@@ -774,7 +774,8 @@ test('hardened gateway enforces geo-block, admin split, revocable v2 sessions, m
   });
   assert.equal(legacyOk.status, 200);
 
-  // Open guest browsing: anonymous /sitemap.xml becomes publicly cacheable, / stays private no-store.
+  // Open guest browsing: anonymous /sitemap.xml becomes publicly cacheable, / stays private no-store,
+  // and same-origin POST /api/site_config succeeds for client hydration.
   await configureAccount(userDoKey, { loginRequired: false });
   const openSitemap = await site('/sitemap.xml');
   assert.equal(openSitemap.status, 200);
@@ -782,6 +783,17 @@ test('hardened gateway enforces geo-block, admin split, revocable v2 sessions, m
   const openHome = await site('/');
   assert.equal(openHome.status, 200);
   assert.equal(openHome.headers.get('cache-control'), 'private, no-store');
+  const openSiteConfig = await site('/api/site_config', {
+    method: 'POST',
+    headers: { origin: appOrigin },
+  });
+  assert.equal(openSiteConfig.status, 200);
+  assert.equal(openSiteConfig.headers.get('cache-control'), 'private, no-store');
+  const crossSiteConfig = await site('/api/site_config', {
+    method: 'POST',
+    headers: { origin: 'https://evil.test' },
+  });
+  assert.equal(crossSiteConfig.status, 403);
 });
 
 test('embedded resources navigate only for a same-origin gallery allowance denial', async () => {

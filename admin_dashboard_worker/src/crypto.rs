@@ -69,21 +69,36 @@ impl fmt::Debug for SecretKey {
 }
 
 impl SecretKey {
-    /// Parses a 32-byte key encoded as 64 hex chars OR base64/base64url (padded or unpadded).
+    /// Parses a dedicated 32-byte key from `"<kid>:<material>"` or plain `<material>`.
+    /// `<material>` may be 64 hex chars OR base64/base64url (padded or unpadded).
     pub fn parse(raw: &str) -> Result<Self, CryptoError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Err(CryptoError::InvalidKeyFormat("key cannot be empty"));
         }
 
-        let decoded = if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
-            hex::decode(trimmed).map_err(|_| CryptoError::InvalidKeyFormat("invalid hex key"))?
+        let (explicit_kid, material) = match trimmed.split_once(':') {
+            Some((kid, rest))
+                if !kid.is_empty()
+                    && kid.len() <= 32
+                    && kid
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')) =>
+            {
+                (Some(kid.to_string()), rest.trim())
+            }
+            _ => (None, trimmed),
+        };
+
+        let mut decoded = if material.len() == 64 && material.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            hex::decode(material).map_err(|_| CryptoError::InvalidKeyFormat("invalid hex key"))?
         } else {
             STANDARD
-                .decode(trimmed)
-                .or_else(|_| STANDARD_NO_PAD.decode(trimmed))
-                .or_else(|_| URL_SAFE.decode(trimmed))
-                .or_else(|_| URL_SAFE_NO_PAD.decode(trimmed))
+                .decode(material)
+                .or_else(|_| STANDARD_NO_PAD.decode(material))
+                .or_else(|_| URL_SAFE.decode(material))
+                .or_else(|_| URL_SAFE_NO_PAD.decode(material))
                 .map_err(|_| {
                     CryptoError::InvalidKeyFormat(
                         "must be 64-char hex or base64/base64url encoding of 32 bytes",
@@ -92,6 +107,7 @@ impl SecretKey {
         };
 
         if decoded.len() != KEY_LEN {
+            decoded.zeroize();
             return Err(CryptoError::InvalidKeyFormat(
                 "decoded key must be exactly 32 bytes (256 bits)",
             ));
@@ -99,7 +115,17 @@ impl SecretKey {
 
         let mut bytes = [0u8; KEY_LEN];
         bytes.copy_from_slice(&decoded);
-        Ok(Self::from_bytes(bytes))
+        decoded.zeroize();
+
+        if bytes.iter().all(|&b| b == 0) {
+            return Err(CryptoError::InvalidKeyFormat("all-zero key rejected"));
+        }
+
+        let mut key = Self::from_bytes(bytes);
+        if let Some(kid) = explicit_kid {
+            key.kid = kid;
+        }
+        Ok(key)
     }
 
     pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
@@ -182,7 +208,7 @@ impl KeyRing {
         let previous = match previous_raw.map(str::trim).filter(|s| !s.is_empty()) {
             Some(prev) => {
                 let key = SecretKey::parse(prev)?;
-                if key.kid() == current.kid() {
+                if key.bytes == current.bytes {
                     None
                 } else {
                     Some(key)
@@ -314,5 +340,81 @@ impl KeyRing {
         let encrypted = self.encrypt(deployment_id, provider_id, field_name, &plaintext);
         plaintext.zeroize();
         encrypted
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_parser_supports_optional_kid_prefix_and_raw_encodings() {
+        let raw_bytes = [0x5au8; 32];
+        let hex_mat = hex::encode(raw_bytes);
+        let b64_mat = STANDARD.encode(raw_bytes);
+        let b64_url_mat = URL_SAFE_NO_PAD.encode(raw_bytes);
+
+        // Raw hex / base64 / base64url keep deterministic `k1:<16-hex>` kid.
+        let k_raw_hex = SecretKey::parse(&hex_mat).expect("raw hex");
+        let k_raw_b64 = SecretKey::parse(&b64_mat).expect("raw b64");
+        let k_raw_url = SecretKey::parse(&b64_url_mat).expect("raw b64url");
+        assert!(k_raw_hex.kid().starts_with("k1:"));
+        assert_eq!(k_raw_hex.kid(), k_raw_b64.kid());
+        assert_eq!(k_raw_hex.kid(), k_raw_url.kid());
+
+        // Optional `<kid>:<material>` prefix matches `user_worker/src/secrets.rs`.
+        let k_pref_hex = SecretKey::parse(&format!("v1:{hex_mat}")).expect("prefixed hex");
+        let k_pref_b64 = SecretKey::parse(&format!("rot-2026_01.a:{b64_url_mat}"))
+            .expect("prefixed base64url");
+        assert_eq!(k_pref_hex.kid(), "v1");
+        assert_eq!(k_pref_b64.kid(), "rot-2026_01.a");
+
+        // Ciphertext encrypted with prefixed key decrypts cleanly under raw key with same material.
+        let ring_pref = KeyRing::from_env_strings(&format!("v1:{hex_mat}"), None).unwrap();
+        let ring_raw = KeyRing::from_env_strings(&b64_mat, None).unwrap();
+        let enc = ring_pref
+            .encrypt("prod-1", "google", "client_secret", b"secret-value")
+            .unwrap();
+        assert_eq!(enc.kid, "v1");
+        let pt = ring_raw
+            .decrypt(
+                "prod-1",
+                "google",
+                "client_secret",
+                &enc.kid,
+                &enc.nonce,
+                &enc.ciphertext,
+            )
+            .unwrap();
+        assert_eq!(pt, b"secret-value");
+
+        // Key rotation with prefixed keys (`v2` current, `v1` previous).
+        let hex_v2 = hex::encode([0x7bu8; 32]);
+        let ring_rot =
+            KeyRing::from_env_strings(&format!("v2:{hex_v2}"), Some(&format!("v1:{hex_mat}")))
+                .unwrap();
+        assert!(ring_rot.has_previous());
+        assert_eq!(ring_rot.current.kid(), "v2");
+        assert_eq!(ring_rot.previous.as_ref().unwrap().kid(), "v1");
+        assert_eq!(
+            ring_rot
+                .decrypt(
+                    "prod-1",
+                    "google",
+                    "client_secret",
+                    &enc.kid,
+                    &enc.nonce,
+                    &enc.ciphertext
+                )
+                .unwrap(),
+            b"secret-value"
+        );
+
+        // Invalid prefixes and all-zero keys are rejected fail-closed.
+        assert!(SecretKey::parse(&format!(":{hex_mat}")).is_err());
+        assert!(SecretKey::parse(&format!("bad kid:{hex_mat}")).is_err());
+        assert!(SecretKey::parse(&format!("{}:{hex_mat}", "k".repeat(33))).is_err());
+        assert!(SecretKey::parse(&"00".repeat(32)).is_err());
+        assert!(SecretKey::parse(&format!("v1:{}", "00".repeat(32))).is_err());
     }
 }

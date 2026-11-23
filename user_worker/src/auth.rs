@@ -431,6 +431,27 @@ struct MeResp {
     pricing: PricingSummary,
 }
 
+/// Compute `(enabled_switchers, effective_switchers)` for `GET /user/api/me`.
+///
+/// - `enabled_switchers` reflects the user's saved switchers from D1
+///   `users_v2.content_prefs_json` (filtered against live `policy`), so UI pages
+///   loaded while Safe Mode is ON do not wipe saved preferences on subsequent saves.
+/// - `effective_switchers` stays strictly fail-closed via `ctx.effective_switchers(policy)`
+///   (`[]` during Safe Mode or when age/Terms gates are unsatisfied).
+pub(crate) fn compute_me_switchers(
+    policy: &PublicSitePolicy,
+    content_prefs_json: Option<&str>,
+    ctx: &site_access::SessionContext,
+) -> (Vec<String>, Vec<String>) {
+    let enabled_switchers = crate::safety_api::resolve_saved_switchers(
+        policy,
+        content_prefs_json,
+        &ctx.enabled_switchers,
+    );
+    let effective_switchers = ctx.effective_switchers(policy);
+    (enabled_switchers, effective_switchers)
+}
+
 #[worker::send]
 pub async fn me(State(st): State<AppState>, cookies: Cookies) -> Response {
     let active = match identity::require_active_session(&st, &cookies).await {
@@ -483,7 +504,11 @@ pub async fn me(State(st): State<AppState>, cookies: Cookies) -> Response {
     let can_link_identity_now =
         session_auth_time.is_some_and(|t| identity::is_recent_auth(t, now));
 
-    let effective_switchers = active.ctx.effective_switchers(&policy);
+    let (enabled_switchers, effective_switchers) = compute_me_switchers(
+        &policy,
+        account.as_ref().map(|a| a.content_prefs_json.as_str()),
+        &active.ctx,
+    );
     let terms_up_to_date = active.ctx.satisfies_terms(&policy.legal);
     let available_providers: Vec<AuthProviderPublicConfig> = policy
         .effective_login_providers()
@@ -561,7 +586,7 @@ pub async fn me(State(st): State<AppState>, cookies: Cookies) -> Response {
             identities,
             linked_eth_address: linked_eth.map(|a| display_address(&a)),
             linked_solana_address: linked_sol,
-            enabled_switchers: active.ctx.enabled_switchers,
+            enabled_switchers,
             effective_switchers,
             safe_mode: active.ctx.safe_mode,
             terms_version_accepted: active.ctx.terms_version_accepted,
@@ -640,5 +665,51 @@ mod tests {
         dup_sfs.append("sec-fetch-site", HeaderValue::from_static("same-origin"));
         dup_sfs.append("sec-fetch-site", HeaderValue::from_static("cross-site"));
         assert!(!same_origin(&dup_sfs, "siwe.example.com", None));
+    }
+
+    #[test]
+    fn me_switchers_return_saved_from_d1_while_keeping_effective_fail_closed_in_safe_mode() {
+        let mut policy = PublicSitePolicy {
+            safety_enabled: true,
+            age_policy: site_access::AgeVerificationPolicy::SelfAttestation,
+            rules: vec![site_access::SafetyRuleConfig {
+                id: "r18".into(),
+                name: "R-18".into(),
+                mode: site_access::RuleMode::Switcher,
+                query: "tag:explicit".into(),
+                default_min_score: 0.5,
+                preset: site_access::PlaceholderPreset::R18,
+                requires_login: true,
+                requires_age_18: true,
+                enabled: true,
+            }],
+            ..Default::default()
+        };
+        policy.legal.terms_version = 1;
+
+        let prefs_json = r#"{"enabled_switchers":["r18","removed_rule"],"safe_mode":true}"#;
+        let ctx_safe = site_access::SessionContext {
+            active: true,
+            banned: false,
+            sid_valid: true,
+            assurance_level: AssuranceLevel::SelfAttestation,
+            strict_age_ok: false,
+            terms_version_accepted: Some(1),
+            terms_digest_accepted: Some(policy.legal.terms_digest.clone()),
+            enabled_switchers: Vec::new(), // fail-closed in Safe Mode
+            safe_mode: true,
+        };
+        let (saved, effective) = compute_me_switchers(&policy, Some(prefs_json), &ctx_safe);
+        assert_eq!(saved, vec!["r18"]);
+        assert!(effective.is_empty());
+
+        let ctx_off = site_access::SessionContext {
+            enabled_switchers: vec!["r18".into()],
+            safe_mode: false,
+            ..ctx_safe
+        };
+        let (saved_off, effective_off) = compute_me_switchers(&policy, Some(prefs_json), &ctx_off);
+        assert_eq!(saved_off, vec!["r18"]);
+        assert_eq!(effective_off, vec!["r18"]);
     }
 }

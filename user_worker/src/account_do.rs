@@ -14,9 +14,9 @@ use crate::types::{
 use crate::{
     config,
     do_client::{
-        PrefsUpdateReq, PreviewBudgetReq, PreviewBudgetResp, SessionContextReq, SessionInfoResp,
-        SessionIssueReq, SessionIssueResp, SessionRevokeAllReq, SessionRevokeAllResp,
-        SessionRevokeReq, TermsAcceptReq,
+        PreviewBudgetReq, PreviewBudgetResp, SessionContextReq, SessionInfoResp, SessionIssueReq,
+        SessionIssueResp, SessionRevokeAllReq, SessionRevokeAllResp, SessionRevokeReq,
+        TermsAcceptReq,
     },
     identity::{assurance_from_str, assurance_to_str},
     settings::{self, Policy},
@@ -184,6 +184,34 @@ pub(crate) struct StoredSafetyState {
     pub terms_digest: Option<String>,
     pub self_attested_18: bool,
     pub revoked_all_before: u64,
+}
+
+/// Wire body accepted by `UserAccount` DO `POST /prefs-update`.
+///
+/// Backwards-compatible with `do_client::PrefsUpdateReq` (which always includes
+/// `enabled_switchers`), while also accepting partial updates omitting
+/// `enabled_switchers` (`None`) to preserve `user_safety_state.enabled_switchers_json`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct PrefsUpdateBody {
+    #[serde(default)]
+    pub enabled_switchers: Option<Vec<String>>,
+    pub safe_mode: bool,
+}
+
+/// Pure state-transition helper for `UserAccount` DO `/prefs-update` (host-testable).
+///
+/// Omitting `enabled_switchers` (`None`) preserves the previously persisted
+/// `enabled_switchers` in `user_safety_state` while updating `safe_mode`.
+pub(crate) fn apply_prefs_update(
+    current: &StoredSafetyState,
+    enabled_switchers: Option<Vec<String>>,
+    safe_mode: bool,
+) -> StoredSafetyState {
+    StoredSafetyState {
+        enabled_switchers: enabled_switchers.unwrap_or_else(|| current.enabled_switchers.clone()),
+        safe_mode,
+        ..current.clone()
+    }
 }
 
 pub(crate) fn compute_session_context(
@@ -1635,12 +1663,14 @@ impl UserAccount {
         )
     }
 
-    async fn prefs_update(&self, req: PrefsUpdateReq) -> Result<Response> {
+    async fn prefs_update(&self, req: PrefsUpdateBody) -> Result<Response> {
         let now = now_secs();
         let db = self.ensure_session_tables(now as i64)?;
-        let sw_json = serde_json::to_string(&req.enabled_switchers)
+        let current = self.read_safety_state(&db)?;
+        let next = apply_prefs_update(&current, req.enabled_switchers, req.safe_mode);
+        let sw_json = serde_json::to_string(&next.enabled_switchers)
             .map_err(|e| worker::Error::RustError(e.to_string()))?;
-        let safe_flag: i64 = if req.safe_mode { 1 } else { 0 };
+        let safe_flag: i64 = if next.safe_mode { 1 } else { 0 };
         db.exec(
             "INSERT INTO user_safety_state (id, enabled_switchers_json, safe_mode) VALUES (1, ?1, ?2) \
              ON CONFLICT(id) DO UPDATE SET enabled_switchers_json = excluded.enabled_switchers_json, \
@@ -2517,5 +2547,55 @@ mod tests {
         assert_eq!(decide_preview_budget(false, 0, 240), (true, 239));
         assert_eq!(decide_preview_budget(true, 240, 240), (true, 0));
         assert_eq!(decide_preview_budget(false, 240, 240), (false, 0));
+    }
+
+    #[test]
+    fn prefs_update_preserves_saved_switchers_across_safe_mode_toggle_while_session_ctx_stays_fail_closed()
+    {
+        let active_verified = StoredSessionSnapshot {
+            assurance_level: AssuranceLevel::Verified18,
+            strict_age_ok: true,
+            expires_at: NOW + 3600,
+            revoked_at: None,
+        };
+        let initial = StoredSafetyState {
+            enabled_switchers: vec!["r18".into()],
+            safe_mode: false,
+            terms_version: Some(1),
+            terms_digest: Some("abcd".into()),
+            self_attested_18: true,
+            revoked_all_before: 0,
+        };
+
+        // Partial Safe Mode ON (`{"safe_mode": true}`) preserves DO stored switchers while
+        // `compute_session_context` remains fail-closed (`enabled_switchers == []`).
+        let on_body: PrefsUpdateBody = serde_json::from_str(r#"{"safe_mode": true}"#).unwrap();
+        assert_eq!(on_body.enabled_switchers, None);
+        let state_on = apply_prefs_update(&initial, on_body.enabled_switchers, on_body.safe_mode);
+        assert_eq!(state_on.enabled_switchers, vec!["r18"]);
+        assert!(state_on.safe_mode);
+        let ctx_on =
+            compute_session_context(false, Some("sid1"), Some(&active_verified), &state_on, NOW);
+        assert!(ctx_on.safe_mode);
+        assert!(ctx_on.enabled_switchers.is_empty());
+
+        // Partial Safe Mode OFF (`{"safe_mode": false}`) restores saved switchers in SessionContext.
+        let off_body: PrefsUpdateBody = serde_json::from_str(r#"{"safe_mode": false}"#).unwrap();
+        assert_eq!(off_body.enabled_switchers, None);
+        let state_off =
+            apply_prefs_update(&state_on, off_body.enabled_switchers, off_body.safe_mode);
+        assert_eq!(state_off.enabled_switchers, vec!["r18"]);
+        assert!(!state_off.safe_mode);
+        let ctx_off =
+            compute_session_context(false, Some("sid1"), Some(&active_verified), &state_off, NOW);
+        assert!(!ctx_off.safe_mode);
+        assert_eq!(ctx_off.enabled_switchers, vec!["r18"]);
+
+        // Explicit empty list (`{"enabled_switchers": [], "safe_mode": false}`) clears DO switchers.
+        let clear_body: PrefsUpdateBody =
+            serde_json::from_str(r#"{"enabled_switchers": [], "safe_mode": false}"#).unwrap();
+        let state_cleared =
+            apply_prefs_update(&state_off, clear_body.enabled_switchers, clear_body.safe_mode);
+        assert!(state_cleared.enabled_switchers.is_empty());
     }
 }

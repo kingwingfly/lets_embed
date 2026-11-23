@@ -544,31 +544,187 @@ impl SessionContext {
     }
 
     /// Computes the set of Switcher rule IDs this session is currently allowed
-    /// to unlock under `policy`.
+    /// to unlock under `policy` (deduplicated in policy order).
+    ///
+    /// Rules enforced:
+    /// - If `!policy.safety_enabled`, `!self.is_authenticated()`, or `self.safe_mode`,
+    ///   returns `[]`.
+    /// - Only enabled `RuleMode::Switcher` rules requested in `self.enabled_switchers`
+    ///   are considered.
+    /// - When `policy.legal.terms_version > 0` and `(rule.requires_login ||
+    ///   rule.requires_age_18 || policy.age_gate_trigger != AgeGateTrigger::Off)`,
+    ///   both `terms_version_accepted` and `terms_digest_accepted` must match
+    ///   `policy.legal`.
+    /// - When `rule.requires_age_18`, `self.satisfies_age_policy(policy.age_policy)`
+    ///   must hold (`AgeVerificationPolicy::Off` imposes no age check).
     pub fn effective_switchers(&self, policy: &PublicSitePolicy) -> Vec<String> {
         if !policy.safety_enabled || !self.is_authenticated() || self.safe_mode {
             return Vec::new();
         }
-        let terms_ok = self.satisfies_terms(&policy.legal);
+        let terms_ok = policy.legal.terms_version == 0 || self.satisfies_terms(&policy.legal);
         let age_ok = self.satisfies_age_policy(policy.age_policy);
+        let global_terms_gate = policy.age_gate_trigger != AgeGateTrigger::Off;
+
+        let mut out = Vec::new();
+        for rule in &policy.rules {
+            if !rule.enabled || rule.mode != RuleMode::Switcher {
+                continue;
+            }
+            if !self.enabled_switchers.iter().any(|s| s == &rule.id) {
+                continue;
+            }
+            let requires_terms = policy.legal.terms_version > 0
+                && (rule.requires_login || rule.requires_age_18 || global_terms_gate);
+            if requires_terms && !terms_ok {
+                continue;
+            }
+            if rule.requires_age_18 && !age_ok {
+                continue;
+            }
+            if !out.iter().any(|existing| existing == &rule.id) {
+                out.push(rule.id.clone());
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_rule(
+        id: &str,
+        mode: RuleMode,
+        requires_login: bool,
+        requires_age_18: bool,
+        enabled: bool,
+    ) -> SafetyRuleConfig {
+        SafetyRuleConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            mode,
+            query: format!("tag:{id}"),
+            default_min_score: 0.5,
+            preset: PlaceholderPreset::Custom,
+            requires_login,
+            requires_age_18,
+            enabled,
+        }
+    }
+
+    fn base_policy() -> PublicSitePolicy {
+        let mut p = PublicSitePolicy {
+            safety_enabled: true,
+            age_policy: AgeVerificationPolicy::Off,
+            age_gate_trigger: AgeGateTrigger::Off,
+            rules: vec![
+                test_rule("login_only", RuleMode::Switcher, true, false, true),
+                test_rule("open_sw", RuleMode::Switcher, false, false, true),
+                test_rule("adult", RuleMode::Switcher, true, true, true),
+                test_rule("blur_only", RuleMode::SpoilerBlur, false, false, true),
+                test_rule("disabled_sw", RuleMode::Switcher, false, false, false),
+            ],
+            ..PublicSitePolicy::default()
+        };
+        p.legal.terms_version = 1;
+        p
+    }
+
+    fn authed_ctx(switchers: &[&str]) -> SessionContext {
+        SessionContext {
+            active: true,
+            banned: false,
+            sid_valid: true,
+            assurance_level: AssuranceLevel::None,
+            strict_age_ok: false,
+            terms_version_accepted: None,
+            terms_digest_accepted: None,
+            enabled_switchers: switchers.iter().map(|s| (*s).to_string()).collect(),
+            safe_mode: false,
+        }
+    }
+
+    #[test]
+    fn effective_switchers_enforces_terms_for_requires_login_without_age_18() {
+        let mut policy = base_policy();
+        let mut ctx = authed_ctx(&["login_only", "open_sw", "adult", "blur_only", "disabled_sw"]);
+
+        // With terms_version > 0 and age_gate_trigger == Off, login_only (requires_login=true,
+        // requires_age_18=false) and adult (requires_age_18=true) both require Terms acceptance,
+        // while open_sw (requires_login=false, requires_age_18=false) does not.
+        assert_eq!(ctx.effective_switchers(&policy), vec!["open_sw"]);
+
+        // Stale version or mismatched digest stays fail-closed.
+        ctx.terms_version_accepted = Some(1);
+        ctx.terms_digest_accepted = Some("0".repeat(64));
+        assert_eq!(ctx.effective_switchers(&policy), vec!["open_sw"]);
+
+        ctx.terms_version_accepted = Some(2);
+        ctx.terms_digest_accepted = Some(policy.legal.terms_digest.clone());
+        assert_eq!(ctx.effective_switchers(&policy), vec!["open_sw"]);
+
+        // Matching version + digest unlocks login_only and (under age_policy=Off) adult.
+        ctx.terms_version_accepted = Some(1);
+        ctx.terms_digest_accepted = Some(policy.legal.terms_digest.clone());
+        assert_eq!(
+            ctx.effective_switchers(&policy),
+            vec!["login_only", "open_sw", "adult"]
+        );
+
+        // When terms_version == 0, Terms gate is inactive.
+        policy.legal.terms_version = 0;
+        ctx.terms_version_accepted = None;
+        ctx.terms_digest_accepted = None;
+        assert_eq!(
+            ctx.effective_switchers(&policy),
+            vec!["login_only", "open_sw", "adult"]
+        );
+    }
+
+    #[test]
+    fn effective_switchers_enforces_terms_when_age_gate_trigger_is_active() {
+        for trigger in [AgeGateTrigger::JustInTime, AgeGateTrigger::SiteWideSplash] {
+            let mut policy = base_policy();
+            policy.age_gate_trigger = trigger;
+            let mut ctx = authed_ctx(&["open_sw", "login_only"]);
+
+            // Global terms gate blocks even open_sw (requires_login=false, requires_age_18=false)
+            // until current Terms are accepted.
+            assert!(
+                ctx.effective_switchers(&policy).is_empty(),
+                "trigger {trigger:?} must require Terms"
+            );
+
+            ctx.terms_version_accepted = Some(policy.legal.terms_version);
+            ctx.terms_digest_accepted = Some(policy.legal.terms_digest.clone());
+            assert_eq!(
+                ctx.effective_switchers(&policy),
+                vec!["login_only", "open_sw"]
+            );
+        }
+    }
+
+    #[test]
+    fn effective_switchers_enforces_age_policy_safe_mode_and_deduplication() {
+        let mut policy = base_policy();
+        policy.age_policy = AgeVerificationPolicy::StrictProviderVerified18;
+        // Duplicate rule IDs in policy/session must deduplicate cleanly.
         policy
             .rules
-            .iter()
-            .filter(|rule| rule.enabled && rule.mode == RuleMode::Switcher)
-            .filter(|rule| self.enabled_switchers.iter().any(|s| s == &rule.id))
-            .filter(|rule| {
-                if rule.requires_age_18 {
-                    let effective_age = match policy.age_policy {
-                        AgeVerificationPolicy::Off => true,
-                        _ => age_ok && terms_ok,
-                    };
-                    if !effective_age {
-                        return false;
-                    }
-                }
-                true
-            })
-            .map(|rule| rule.id.clone())
-            .collect()
+            .push(test_rule("open_sw", RuleMode::Switcher, false, false, true));
+
+        let mut ctx = authed_ctx(&["adult", "open_sw", "open_sw"]);
+        ctx.terms_version_accepted = Some(policy.legal.terms_version);
+        ctx.terms_digest_accepted = Some(policy.legal.terms_digest.clone());
+        ctx.assurance_level = AssuranceLevel::SelfAttestation;
+        assert_eq!(ctx.effective_switchers(&policy), vec!["open_sw"]);
+
+        ctx.assurance_level = AssuranceLevel::Verified18;
+        ctx.strict_age_ok = true;
+        assert_eq!(ctx.effective_switchers(&policy), vec!["open_sw", "adult"]);
+
+        ctx.safe_mode = true;
+        assert!(ctx.effective_switchers(&policy).is_empty());
     }
 }
