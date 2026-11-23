@@ -591,11 +591,12 @@ fn build_service_headers(
         let name = k.as_str();
         if is_hop_by_hop(name)
             || is_privileged_request_header(name)
+            || name.eq_ignore_ascii_case("x-forwarded-host")
+            || name.eq_ignore_ascii_case("x-forwarded-proto")
+            || name.eq_ignore_ascii_case("forwarded")
             || name.eq_ignore_ascii_case("cf-ipcountry")
+            || name.eq_ignore_ascii_case("cookie")
         {
-            continue;
-        }
-        if name.eq_ignore_ascii_case("cookie") {
             continue;
         }
         if let Ok(val) = v.to_str() {
@@ -610,22 +611,10 @@ fn build_service_headers(
             }
         }
         ServiceTarget::AdminDashboard => {
-            // Preserve admin SPA cookies (e.g., CSRF cookie) while stripping CF_Authorization.
-            let mut kept = Vec::new();
-            for raw in headers
-                .get_all("cookie")
-                .iter()
-                .filter_map(|v| v.to_str().ok())
-            {
-                for cookie in raw.split(';').map(str::trim).filter(|c| !c.is_empty()) {
-                    let name = cookie.split('=').next().unwrap_or("").trim();
-                    if name != "CF_Authorization" {
-                        kept.push(cookie);
-                    }
-                }
-            }
-            if !kept.is_empty() {
-                out.push(("cookie".to_string(), kept.join("; ")));
+            // Preserve admin SPA cookies (e.g., CSRF cookie) while stripping all
+            // sensitive origin/auth cookies (`STRIPPED_ORIGIN_COOKIES`).
+            if let Some(cookie) = sanitize_origin_cookie(headers) {
+                out.push(("cookie".to_string(), cookie));
             }
             if let Some(email) = admin_email {
                 out.push((ADMIN_HEADER.to_string(), email.to_string()));
@@ -762,7 +751,10 @@ async fn proxy_to_api(
     };
     match backend.fetch_upstream(req).await {
         Ok(resp) => {
-            if allow_public_cache {
+            if allow_public_cache
+                && resp.status().is_success()
+                && !resp.headers().contains_key("set-cookie")
+            {
                 resp
             } else {
                 private_no_store(resp)
@@ -856,6 +848,13 @@ async fn handle_media_route(
     let Some((kind, id)) = parse_media_route(uri.path()) else {
         return private_no_store((StatusCode::NOT_FOUND, "Not Found").into_response());
     };
+    // Fail closed BEFORE billing or upstream fetch when server-side preview blur
+    // is disabled, preventing `/media/preview/*` from serving untransformed clear bytes.
+    if kind == MediaCapKind::Preview && !snapshot.policy.cloudflare_images_blur {
+        return private_no_store(
+            (StatusCode::FORBIDDEN, "Server-side preview blur is disabled").into_response(),
+        );
+    }
     let Some(cap_token) = extract_media_cap_query(uri.query()) else {
         return private_no_store(
             (StatusCode::FORBIDDEN, "Missing or invalid media capability").into_response(),
@@ -1190,17 +1189,17 @@ async fn handle_gateway_request(
         Err(err) => return maybe_clear_session_cookie(err.into_response(), clear_cookie),
     };
 
-    // Same-origin CSRF check on metered POST searches runs for ALL callers,
-    // including `ADMIN_VIEW_COOKIE` (H13).
-    let metered_post = method == Method::POST && item.is_some();
-    if metered_post && !is_same_origin(&uri, &headers) {
+    // Same-origin CSRF check runs for ALL POST requests to `API_UPSTREAM`
+    // (both metered and unmetered), for ALL callers including `ADMIN_VIEW_COOKIE` (H13).
+    if method == Method::POST && !is_same_origin(&uri, &headers) {
         return maybe_clear_session_cookie(
             private_no_store(
-                (StatusCode::FORBIDDEN, "Cross-origin search request rejected").into_response(),
+                (StatusCode::FORBIDDEN, "Cross-origin POST request rejected").into_response(),
             ),
             clear_cookie,
         );
     }
+    let metered_post = method == Method::POST && item.is_some();
 
     // Build signed `X-Gateway-Assertion` for `lets-embed-web`.
     // Sitemaps are always projected strictly as the anonymous safe view.
@@ -1874,11 +1873,15 @@ mod tests {
         assert!(sc.starts_with("__Host-ue_admin_view="));
         assert!(sc.contains("HttpOnly"));
 
-        // `/user/account` forwards to USER_WORKER stripping ALL privileged headers and never setting ADMIN_HEADER.
+        // `/user/account` forwards to USER_WORKER stripping ALL privileged + forwarded headers
+        // and admin/Access cookies, and never setting ADMIN_HEADER.
         let mut spoofed = HeaderMap::new();
         spoofed.insert("x-gallery-admin-email", "evil@test".parse().unwrap());
         spoofed.insert("x-gateway-assertion", "ga1.fake.sig".parse().unwrap());
         spoofed.insert("cf-access-jwt-assertion", "fake-jwt".parse().unwrap());
+        spoofed.insert("x-forwarded-host", "evil.host".parse().unwrap());
+        spoofed.insert("x-forwarded-proto", "http".parse().unwrap());
+        spoofed.insert("forwarded", "host=evil.host".parse().unwrap());
         spoofed.insert(
             "cookie",
             format!("{}; {}=abc", make_admin_view_cookie(), SESSION_COOKIE)
@@ -1887,21 +1890,62 @@ mod tests {
         );
         let user_resp = dispatch(&backend, &cfg, Method::GET, "/user/account", spoofed, Bytes::new());
         assert_eq!(user_resp.status(), StatusCode::OK);
+        {
+            let calls = backend.service_calls.borrow();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].target, ServiceTarget::UserWorker);
+            assert_eq!(header_value(&calls[0].headers, ADMIN_HEADER), None);
+            assert_eq!(
+                header_value(&calls[0].headers, GATEWAY_ASSERTION_HEADER),
+                None
+            );
+            assert_eq!(
+                header_value(&calls[0].headers, "cf-access-jwt-assertion"),
+                None
+            );
+            assert_eq!(header_value(&calls[0].headers, "x-forwarded-host"), None);
+            assert_eq!(header_value(&calls[0].headers, "x-forwarded-proto"), None);
+            assert_eq!(header_value(&calls[0].headers, "forwarded"), None);
+            let fwd_cookie = header_value(&calls[0].headers, "cookie").unwrap();
+            assert!(fwd_cookie.contains("ue_session=abc"));
+            assert!(!fwd_cookie.contains(ADMIN_VIEW_COOKIE));
+        }
+
+        // `/admin/api/settings` forwards to ADMIN_DASHBOARD_WORKER stripping forwarded headers
+        // and all STRIPPED_ORIGIN_COOKIES while preserving admin SPA CSRF cookie.
+        let mut admin_spoof = HeaderMap::new();
+        admin_spoof.insert("x-forwarded-host", "evil.host".parse().unwrap());
+        admin_spoof.insert("x-forwarded-proto", "http".parse().unwrap());
+        admin_spoof.insert("forwarded", "for=1.2.3.4".parse().unwrap());
+        admin_spoof.insert(
+            "cookie",
+            format!(
+                "__Host-admin_csrf=tok1; {}=s1; {}; gw_token=g; __Host-auth_tx=t; CF_Authorization=c",
+                SESSION_COOKIE,
+                make_admin_view_cookie()
+            )
+            .parse()
+            .unwrap(),
+        );
+        let admin_api = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "/admin/api/settings",
+            admin_spoof,
+            Bytes::new(),
+        );
+        assert_eq!(admin_api.status(), StatusCode::OK);
         let calls = backend.service_calls.borrow();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].target, ServiceTarget::UserWorker);
-        assert_eq!(header_value(&calls[0].headers, ADMIN_HEADER), None);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].target, ServiceTarget::AdminDashboard);
+        assert_eq!(header_value(&calls[1].headers, "x-forwarded-host"), None);
+        assert_eq!(header_value(&calls[1].headers, "x-forwarded-proto"), None);
+        assert_eq!(header_value(&calls[1].headers, "forwarded"), None);
         assert_eq!(
-            header_value(&calls[0].headers, GATEWAY_ASSERTION_HEADER),
-            None
+            header_value(&calls[1].headers, "cookie"),
+            Some("__Host-admin_csrf=tok1")
         );
-        assert_eq!(
-            header_value(&calls[0].headers, "cf-access-jwt-assertion"),
-            None
-        );
-        let fwd_cookie = header_value(&calls[0].headers, "cookie").unwrap();
-        assert!(fwd_cookie.contains("ue_session=abc"));
-        assert!(!fwd_cookie.contains(ADMIN_VIEW_COOKIE));
     }
 
     // -----------------------------------------------------------------------
@@ -2496,6 +2540,110 @@ mod tests {
             home.headers().get("cache-control").unwrap(),
             "private, no-store"
         );
+
+        // Public-cacheable routes MUST force `private, no-store` on non-2xx responses
+        // or whenever upstream attaches `Set-Cookie`.
+        for status in [
+            StatusCode::FOUND,
+            StatusCode::NOT_FOUND,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            backend.upstream_status = status;
+            for p in ["/robots.txt", "/pkg/app.wasm", "/sitemap/1.xml"] {
+                let r = dispatch(&backend, &cfg, Method::GET, p, HeaderMap::new(), Bytes::new());
+                assert_eq!(r.status(), status);
+                assert_eq!(
+                    r.headers().get("cache-control").unwrap(),
+                    "private, no-store",
+                    "non-2xx {status} on {p} must not be publicly cached"
+                );
+            }
+        }
+        backend.upstream_status = StatusCode::OK;
+        backend.upstream_set_cookie = Some("sid=leak; Path=/");
+        for p in ["/robots.txt", "/pkg/app.wasm", "/sitemap/1.xml"] {
+            let r = dispatch(&backend, &cfg, Method::GET, p, HeaderMap::new(), Bytes::new());
+            assert_eq!(r.status(), StatusCode::OK);
+            assert_eq!(
+                r.headers().get("cache-control").unwrap(),
+                "private, no-store",
+                "Set-Cookie on {p} must force private, no-store"
+            );
+        }
+    }
+
+    #[test]
+    fn unmetered_post_routes_enforce_same_origin_csrf_for_all_callers() {
+        let policy = sample_safety_policy();
+        let mut backend = MockBackend::with_policy(policy);
+        let do_key = "usr:550e8400-e29b-41d4-a716-446655440000";
+        backend.session_contexts.insert(
+            do_key.to_string(),
+            SessionContext {
+                active: true,
+                banned: false,
+                sid_valid: true,
+                ..SessionContext::default()
+            },
+        );
+        let cfg = test_cfg();
+
+        for path in [
+            "/api/search_advanced",
+            "/api/fetch_post_meta",
+            "/api/suggest_search",
+            "/api/search_query",
+            "/api/list_post_images",
+            "/api/fetch_image_details",
+        ] {
+            let full_uri = format!("https://gallery.test{path}");
+            for caller_cookie in [
+                make_v2_cookie("user-42", do_key, "sid-1"),
+                make_admin_view_cookie(),
+            ] {
+                // Missing Origin / Sec-Fetch-Site -> 403
+                let mut missing = form_headers();
+                missing.insert("cookie", caller_cookie.parse().unwrap());
+                let r_missing = dispatch(
+                    &backend,
+                    &cfg,
+                    Method::POST,
+                    &full_uri,
+                    missing,
+                    Bytes::from_static(b"q=tag%3Amaid"),
+                );
+                assert_eq!(r_missing.status(), StatusCode::FORBIDDEN, "missing origin on {path}");
+
+                // Cross-origin -> 403
+                let mut cross = form_headers();
+                cross.insert("cookie", caller_cookie.parse().unwrap());
+                cross.insert("origin", "https://evil.test".parse().unwrap());
+                let r_cross = dispatch(
+                    &backend,
+                    &cfg,
+                    Method::POST,
+                    &full_uri,
+                    cross,
+                    Bytes::from_static(b"q=tag%3Amaid"),
+                );
+                assert_eq!(r_cross.status(), StatusCode::FORBIDDEN, "cross-origin on {path}");
+            }
+        }
+        assert!(backend.upstream_calls.borrow().is_empty());
+
+        // Same-origin succeeds cleanly.
+        let mut ok_hdrs = form_headers();
+        ok_hdrs.insert("origin", "https://gallery.test".parse().unwrap());
+        ok_hdrs.insert("cookie", make_admin_view_cookie().parse().unwrap());
+        let ok = dispatch(
+            &backend,
+            &cfg,
+            Method::POST,
+            "https://gallery.test/api/search_advanced",
+            ok_hdrs,
+            Bytes::from_static(b"q=tag%3Amaid"),
+        );
+        assert_eq!(ok.status(), StatusCode::OK);
     }
 
     #[test]
@@ -2716,13 +2864,10 @@ mod tests {
             assert!(!is_canonical_path(attack), "must reject {attack:?}");
         }
 
-        // Media cap path canonicalization & traversal defense
+        // Media cap path canonicalization & traversal defense (rejects `%` and `:` directly,
+        // matching hardened `site_access::is_safe_media_path`).
         assert_eq!(
             encode_canonical_cap_path("Demo album/a(1).webp").as_deref(),
-            Some("/Demo%20album/a%281%29.webp")
-        );
-        assert_eq!(
-            encode_canonical_cap_path("Demo%20album/a%281%29.webp").as_deref(),
             Some("/Demo%20album/a%281%29.webp")
         );
         for bad_cap in [
@@ -2731,9 +2876,12 @@ mod tests {
             "trailing/",
             "../secret.webp",
             "%2e%2e/secret.webp",
+            "Demo%20album/a.webp",
             "a/%2e/b.webp",
             "a%2fb.webp",
             "a%5cb.webp",
+            "a:b.webp",
+            "https://evil.test/x.webp",
             "a?b=1",
             "a#frag",
             "bad%2",
@@ -2925,7 +3073,8 @@ mod tests {
         );
         let cfg = test_cfg();
 
-        // When cloudflare_images_blur is false, preview does NOT request cf.image transform.
+        // When cloudflare_images_blur is false, /media/preview/* MUST fail closed (403)
+        // with ZERO billing calls and ZERO upstream clear-image fetches!
         let preview_cap = MediaCapability {
             v: MEDIA_CAP_VERSION,
             kind: MediaCapKind::Preview,
@@ -2946,9 +3095,13 @@ mod tests {
             HeaderMap::new(),
             Bytes::new(),
         );
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(backend.upstream_calls.borrow()[0].preview_blur, None);
-        assert!(backend.upstream_calls.borrow()[0].no_cache);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.headers().get("cache-control").unwrap(),
+            "private, no-store"
+        );
+        assert!(backend.account_calls.borrow().is_empty());
+        assert!(backend.upstream_calls.borrow().is_empty());
 
         // Admin browse pass combined with a user session in `safe_mode = true` MUST deny admin restricted media!
         let admin_cap = MediaCapability {

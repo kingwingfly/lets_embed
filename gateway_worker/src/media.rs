@@ -8,7 +8,6 @@ use site_access::{MEDIA_CAP_ANON_SUB, MediaCapKind, MediaCapability, PublicSiteP
 use crate::auth::{ADMIN_VIEW_SUB, LiveSession, admin_eligible_switchers};
 use crate::http_util::{
     Upstreams, is_canonical_path, is_rfc3986_unreserved, parse_upstream_origin, percent_decode,
-    percent_decode_segment_bytes,
 };
 
 /// Hardcoded, non-overridable Cloudflare Worker `cf.image` parameters used for
@@ -136,17 +135,17 @@ pub(crate) fn authorize_media_capability(
 /// Validates and canonicalizes a relative `cap.path` into a leading-slash
 /// RFC 3986 path safe to join onto `IMAGE_UPSTREAM` or `VIDEO_UPSTREAM`.
 ///
-/// Rejects leading/trailing `/`, empty segments, `.` / `..` (raw or percent-encoded),
-/// encoded `/` or `\`, control bytes, `?`, `#`, and malformed `%` escapes.
+/// Aligned with `site_access::is_safe_media_path`: rejects leading/trailing `/`,
+/// empty segments, `.` / `..`, `'%'`, `':'`, `'\\'`, `'?'`, `'#'`, and control chars,
+/// then percent-encodes raw non-unreserved bytes (spaces, parens, UTF-8) once.
 pub(crate) fn encode_canonical_cap_path(cap_path: &str) -> Option<String> {
     if cap_path.is_empty()
         || cap_path.starts_with('/')
         || cap_path.ends_with('/')
         || cap_path.contains("//")
-        || cap_path.contains('\\')
         || cap_path
             .chars()
-            .any(|c| c.is_control() || matches!(c, '?' | '#'))
+            .any(|c| c.is_control() || matches!(c, '%' | ':' | '\\' | '?' | '#'))
     {
         return None;
     }
@@ -156,18 +155,8 @@ pub(crate) fn encode_canonical_cap_path(cap_path: &str) -> Option<String> {
         if seg.is_empty() || seg == "." || seg == ".." {
             return None;
         }
-        let decoded = percent_decode_segment_bytes(seg)?;
-        if decoded.is_empty()
-            || decoded == b"."
-            || decoded == b".."
-            || decoded.contains(&b'/')
-            || decoded.contains(&b'\\')
-            || decoded.iter().any(|b| b.is_ascii_control())
-        {
-            return None;
-        }
         out.push('/');
-        for b in decoded {
+        for b in seg.bytes() {
             if is_rfc3986_unreserved(b) {
                 out.push(b as char);
             } else {
