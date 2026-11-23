@@ -65,7 +65,9 @@
       const url = new URL(src, location.href);
       if (
         url.origin !== location.origin ||
-        !/^\/(images|videos)\//.test(url.pathname) ||
+        !/^(\/(images|videos)\/|\/media\/(image|video|preview)\/)/.test(
+          url.pathname,
+        ) ||
         pending.has(url.href)
       )
         return;

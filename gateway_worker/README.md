@@ -11,12 +11,12 @@ The edge gateway enforces authoritative geo-blocking, Cloudflare Access admin ro
 5. **Raw `/images/*` and `/videos/*` blocked (`404`)**: Media bytes are only served via signed capability URLs at `/media/{image,video,preview}/{id}?cap=...`.
    - Verifies HMAC-SHA256 `cap` (`MEDIA_CAP_SECRET`), `(kind, id)`, expiry, and `cap.rev >= policy.min_enforce_rev` (`403` on failure).
    - Authorizes caller live against `USER_ACCOUNT` DO (`POST /session-context`), `safe_mode`, Terms acceptance, age policy (`SelfAttestation` / `StrictProviderVerified18`), and eligible active switchers **before** any billing or budget check (denied requests incur zero charge).
-   - `Preview` checks `POST /preview-budget` (`preview:{id}`) and never deducts clear-view balance; when `policy.cloudflare_images_blur` is enabled, attaches hardcoded Worker `cf.image` parameters (`blur: 80, width: 360, quality: 30, format: "webp"`).
+   - `Preview` checks `POST /preview-budget` (`preview:{id}`) and never deducts clear-view balance; requires `policy.cloudflare_images_blur = true` (fails closed `403` when disabled) and attaches hardcoded Worker `cf.image` parameters (`blur: 80, width: 360, quality: 30, format: "webp"`).
    - `Image`/`Video` settle against canonical `MediaBillingKey` (`media:image:{id}` / `media:video:{id}`, `HEAD` -> `can-charge`, `GET` -> `charge`).
    - Upstream media fetches use `redirect: "manual"` (rejecting any `3xx` with `502`), `cf.cacheTtl = 0`, and `Cache-Control: private, no-store`.
 6. **Gallery / web forwarding (`API_UPSTREAM`)**:
    - Strips all `site_access::is_privileged_request_header` headers and `STRIPPED_ORIGIN_COOKIES`, and attaches a freshly signed short-lived `X-Gateway-Assertion` (`GATEWAY_ASSERTION_SECRET`, 30s TTL, audience `"lets-embed-web"`).
-   - `__Host-ue_admin_view` only waives the login wall and metering; it still runs Step 0 geo checks, signs `X-Gateway-Assertion` (`is_admin_view: true`), enforces `/media/*` capabilities, and enforces same-origin CSRF on metered `POST` searches.
+   - `__Host-ue_admin_view` only waives the login wall and metering; it still runs Step 0 geo checks, signs `X-Gateway-Assertion` (`is_admin_view: true`), enforces `/media/*` capabilities, and enforces same-origin CSRF on all `POST` requests to `API_UPSTREAM`.
    - Keeps `/robots.txt`, `/terms`, `/privacy`, `/dmca`, `/content-policy`, `/pkg/*`, and `/favicon.ico` publicly accessible (after geo check); preserves public caching only on `/pkg/*`, `/robots.txt`, and anonymous `/sitemap.xml` / `/sitemap/*`.
 
 ## Bindings & Secrets (`wrangler.toml`)

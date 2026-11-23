@@ -400,7 +400,7 @@ test('hardened gateway enforces geo-block, admin split, revocable v2 sessions, m
 
   const mf = new Miniflare(
     convertV4MiniflareOptions({
-      cf: { country: 'US' },
+      cf: { country: 'US', httpProtocol: 'HTTP/1.1' },
       workers: [
         gatewayWorkerConfig('public-gateway', appHost, undefined, (request, target) => {
           upstreamCalls += 1;
@@ -485,20 +485,22 @@ test('hardened gateway enforces geo-block, admin split, revocable v2 sessions, m
 
   // 2. Step 0 Geo-Block: runtime cf.country enforced (spoofed CF-IPCountry ignored), /admin exempt.
   const geoBlocked = await site('/', {
-    cf: { country: 'KP' },
+    cf: { country: 'KP', httpProtocol: 'HTTP/1.1' },
     headers: { 'cf-ipcountry': 'US' },
   });
   assert.equal(geoBlocked.status, 451);
   assert.equal(geoBlocked.headers.get('cache-control'), 'private, no-store');
 
   const torBlocked = await site('/robots.txt', {
-    cf: { country: 'T1' },
+    cf: { country: 'T1', httpProtocol: 'HTTP/1.1' },
     headers: { 'cf-ipcountry': 'US' },
   });
   assert.equal(torBlocked.status, 451);
 
   // Admin route exempt from geo-block even when request.cf.country is blocked!
-  const adminFromBlocked = await visit(adminHost, '/admin', { cf: { country: 'KP' } });
+  const adminFromBlocked = await visit(adminHost, '/admin', {
+    cf: { country: 'KP', httpProtocol: 'HTTP/1.1' },
+  });
   assert.equal(adminFromBlocked.status, 200);
   const adminJson = await adminFromBlocked.json();
   assert.equal(adminJson.worker, 'admin-dashboard-worker');
@@ -509,7 +511,7 @@ test('hardened gateway enforces geo-block, admin split, revocable v2 sessions, m
 
   // Admin browse pass MUST NOT bypass geo-block on gallery routes!
   const adminViewBlocked = await site('/', {
-    cf: { country: 'KP' },
+    cf: { country: 'KP', httpProtocol: 'HTTP/1.1' },
     headers: { cookie: adminViewCookie },
   });
   assert.equal(adminViewBlocked.status, 451);
@@ -567,7 +569,7 @@ test('hardened gateway enforces geo-block, admin split, revocable v2 sessions, m
   assert.equal((await site('/sitemap.xml')).status, 303);
 
   // 6. ADMIN_VIEW_COOKIE hardening: waives login & billing, signs assertion with is_admin_view=true,
-  //    but STILL enforces same-origin CSRF on metered POST searches!
+  //    but STILL enforces same-origin CSRF on ALL POST requests (metered AND unmetered)!
   const appOrigin = 'https://' + appHost;
   const adminCsrfDenied = await site('/api/search_by_desc', {
     method: 'POST',
@@ -579,6 +581,17 @@ test('hardened gateway enforces geo-block, admin split, revocable v2 sessions, m
     body: 'q=csrf-probe',
   });
   assert.equal(adminCsrfDenied.status, 403);
+
+  const unmeteredCsrfDenied = await site('/api/search_advanced', {
+    method: 'POST',
+    headers: {
+      cookie: adminViewCookie,
+      origin: 'https://evil.test',
+      'content-type': 'application/x-www-form-urlencoded',
+    },
+    body: 'q=tag%3Amaid',
+  });
+  assert.equal(unmeteredCsrfDenied.status, 403);
 
   const adminSearchOk = await site('/api/search_by_desc', {
     method: 'POST',
@@ -706,12 +719,32 @@ test('hardened gateway enforces geo-block, admin split, revocable v2 sessions, m
   });
   assert.equal(previewResp.status, 200);
   assert.equal(previewResp.headers.get('cache-control'), 'private, no-store');
+  const previewCf = JSON.parse(previewResp.headers.get('x-test-cf'));
+  assert.equal(previewCf.cacheTtl, 0);
+  assert.equal(previewCf.cacheEverything, false);
+  assert.deepEqual(previewCf.image, {
+    blur: 80,
+    width: 360,
+    quality: 30,
+    format: 'webp',
+  });
   const previewCalls = await getAccountCalls(userDoKey);
   assert.deepEqual(
     previewCalls.map((c) => c.op),
     ['session-context', 'preview-budget']
   );
   assert.equal(previewCalls[1].body.key, 'preview:42');
+
+  // When cloudflare_images_blur is disabled, /media/preview/* fails closed (403, zero DO calls).
+  await setPolicy({ ...policy, cloudflare_images_blur: false });
+  await configureAccount(userDoKey, { resetCalls: true });
+  const previewOffResp = await site(`/media/preview/42?cap=${previewCap}`, {
+    headers: { cookie: signedSessionV2() },
+  });
+  assert.equal(previewOffResp.status, 403);
+  assert.equal(previewOffResp.headers.get('cache-control'), 'private, no-store');
+  assert.deepEqual(await getAccountCalls(userDoKey), []);
+  await setPolicy(policy);
 
   // Upstream 3xx redirect on media origin rejected with 502!
   nextUpstreamResponse = () =>
@@ -791,4 +824,14 @@ test('embedded resources navigate only for a same-origin gallery allowance denia
   await mediaError(failedVideo);
   assert.deepEqual(probes, Array(2).fill([failedVideo.target.currentSrc, 'HEAD']));
   assert.deepEqual(destinations, ['/user/upgrade', '/user/upgrade']);
+
+  // Standalone `/videos/...` still probes cleanly, while unrelated paths are ignored.
+  pageShow({ persisted: true });
+  const standaloneVideo = { target: { tagName: 'VIDEO', currentSrc: origin + '/videos/a.mp4' } };
+  const nonMediaVideo = { target: { tagName: 'VIDEO', currentSrc: origin + '/other/a.mp4' } };
+  await mediaError(nonMediaVideo);
+  assert.equal(probes.length, 2);
+  await mediaError(standaloneVideo);
+  assert.deepEqual(probes[2], [standaloneVideo.target.currentSrc, 'HEAD']);
+  assert.equal(destinations.length, 3);
 });
