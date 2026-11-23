@@ -162,6 +162,8 @@ pub struct SaveAccessReq {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SaveAccessResp {
     pub ok: bool,
+    #[serde(default)]
+    pub unchanged: bool,
     pub pending_activation: bool,
     pub activation_status: String,
     pub revision: u64,
@@ -332,6 +334,8 @@ pub struct SaveSafetyReq {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SaveSafetyResp {
     pub ok: bool,
+    #[serde(default)]
+    pub unchanged: bool,
     pub pending_activation: bool,
     pub activation_status: String,
     pub revision: u64,
@@ -360,6 +364,8 @@ pub struct ProviderView {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProvidersResp {
     pub ok: bool,
+    #[serde(default)]
+    pub unchanged: bool,
     pub pending_activation: bool,
     pub activation_status: String,
     pub revision: u64,
@@ -371,6 +377,8 @@ pub struct ProvidersResp {
     pub has_prev_key: bool,
     pub providers: Vec<ProviderView>,
 }
+
+pub type SaveProvidersResp = ProvidersResp;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderUpdateItem {

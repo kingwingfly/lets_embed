@@ -14,7 +14,7 @@ use axum::{
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
-use site_access::{builtin_safety_presets, compute_policy_digest};
+use site_access::compute_policy_digest;
 
 use crate::{
     AppState,
@@ -29,8 +29,8 @@ use crate::{
     security::AdminIdentity,
     settings::{
         ActivationOutcome, LEGACY_UNCLASSIFIED_NOTE, LoadedSettings, build_catalog_field_errors,
-        ensure_v3_ready_for_non_safety_mutation, ensure_v3_ready_for_safety_mutation,
-        prepare_safety_update,
+        compact_admin_safety_presets, ensure_v3_ready_for_non_safety_mutation,
+        ensure_v3_ready_for_safety_mutation, is_public_policy_unchanged, prepare_safety_update,
     },
 };
 
@@ -63,7 +63,7 @@ pub async fn get_safety(
         activation_status: loaded.activation_status.as_str().to_string(),
         safety_enabled: p.safety_enabled,
         policies: p.policies,
-        presets: builtin_safety_presets(),
+        presets: compact_admin_safety_presets(),
         unclassified_mode: p.unclassified_mode,
         fixed_blur_enabled: p.fixed_blur_enabled,
         age_policy: p.age_policy,
@@ -115,6 +115,28 @@ pub async fn save_safety(
         Ok(u) => u,
         Err(msg) => return bad_request(msg),
     };
+
+    if loaded.legacy_upgrade_notice.is_none()
+        && is_public_policy_unchanged(&loaded.doc.public, &prepared.next_policy)
+    {
+        let policy_digest = compute_policy_digest(&loaded.doc.public);
+        return Json(SaveSafetyResp {
+            ok: true,
+            unchanged: true,
+            pending_activation: loaded.activation_status.is_pending(),
+            activation_status: loaded.activation_status.as_str().to_string(),
+            revision: loaded.revision,
+            min_enforce_rev: loaded.doc.public.min_enforce_rev,
+            tightened: false,
+            terms_bumped: false,
+            auto_disabled_providers: Vec::new(),
+            policy_digest,
+            vocab_digest: loaded.doc.public.vocab_digest,
+            policies: loaded.doc.public.policies,
+            legal: loaded.doc.public.legal,
+        })
+        .into_response();
+    }
 
     // Optional origin catalog validation (`POST {APP_ORIGIN}/internal/validate-safety-catalog`)
     // for all `post_tag:` and `author:` references across `match_expr` and `except_expr`.
@@ -168,6 +190,7 @@ pub async fn save_safety(
             );
             Json(SaveSafetyResp {
                 ok: true,
+                unchanged: false,
                 pending_activation: false,
                 activation_status: ActivationStatus::Active.as_str().to_string(),
                 revision: ack.revision,

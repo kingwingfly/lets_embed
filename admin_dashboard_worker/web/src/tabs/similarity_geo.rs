@@ -2,15 +2,18 @@
 //! - Default DINOv3 & SigLIP2 cosine similarity cutoffs using keyboard-friendly
 //!   `lets_embed_ui::ScoreInput` (`0.00..=1.00`, `step=0.01`, zero native HTML5 step popups)
 //! - Authoritative ISO-3166 country blocklist + `XX` (unknown) & `T1` (Tor) `<ToggleSwitch>`
-//! - GCP top-right toasts via `use_toast_store()`
+//! - Root-level persistent draft (`AdminDraftStore`) + GCP top-right toasts via `use_toast_store()`
 
 use leptos::prelude::*;
 use lets_embed_ui::{ScoreInput, ToggleSwitch, use_toast_store};
 use site_access::{GeoPolicy, SimilarityDefaults};
 use wasm_bindgen_futures::spawn_local;
 
-use crate::api::{
-    ActivationResult, SafetyConfigResp, SaveSafetyReq, SaveSafetyResp, post_json_activatable,
+use crate::{
+    api::{
+        ActivationResult, SafetyConfigResp, SaveSafetyReq, SaveSafetyResp, post_json_activatable,
+    },
+    drafts::use_admin_drafts,
 };
 
 #[component]
@@ -19,26 +22,17 @@ pub fn SimilarityGeoTab(
     on_saved: Callback<()>,
 ) -> impl IntoView {
     let toasts = use_toast_store();
-
-    let dinov3_min = RwSignal::new(0.0f32);
-    let siglip2_min = RwSignal::new(0.0f32);
-    let countries_text = RwSignal::new(String::new());
-    let block_unknown = RwSignal::new(false);
-    let block_tor = RwSignal::new(false);
-    let revision = RwSignal::new(0u64);
+    let draft = use_admin_drafts().similarity_geo;
 
     let saving = RwSignal::new(false);
 
-    Effect::new(move |_| {
-        if let Some(cfg) = safety.get() {
-            revision.set(cfg.revision);
-            dinov3_min.set(cfg.similarity.dinov3_min);
-            siglip2_min.set(cfg.similarity.siglip2_min);
-            countries_text.set(cfg.geo.blocked_countries.join(", "));
-            block_unknown.set(cfg.geo.block_unknown);
-            block_tor.set(cfg.geo.block_tor);
+    let on_discard = move |_| {
+        if let Some(cfg) = safety.get_untracked() {
+            draft.hydrate(&cfg);
+            draft.dirty.set(false);
+            toasts.info("Discarded unsaved Similarity & Geo changes", None);
         }
-    });
+    };
 
     let on_save = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
@@ -49,7 +43,8 @@ pub fn SimilarityGeoTab(
             return;
         };
 
-        let blocked_countries: Vec<String> = countries_text
+        let blocked_countries: Vec<String> = draft
+            .countries_text
             .get_untracked()
             .split(|c: char| c == ',' || c.is_whitespace() || c == ';')
             .map(str::trim)
@@ -60,7 +55,7 @@ pub fn SimilarityGeoTab(
         saving.set(true);
 
         let req = SaveSafetyReq {
-            revision: revision.get_untracked(),
+            revision: current.revision,
             safety_enabled: current.safety_enabled,
             policies: current.policies,
             unclassified_mode: current.unclassified_mode,
@@ -68,13 +63,13 @@ pub fn SimilarityGeoTab(
             age_policy: current.age_policy,
             age_gate_trigger: current.age_gate_trigger,
             similarity: SimilarityDefaults {
-                dinov3_min: dinov3_min.get_untracked(),
-                siglip2_min: siglip2_min.get_untracked(),
+                dinov3_min: draft.dinov3_min.get_untracked(),
+                siglip2_min: draft.siglip2_min.get_untracked(),
             },
             geo: GeoPolicy {
                 blocked_countries,
-                block_unknown: block_unknown.get_untracked(),
-                block_tor: block_tor.get_untracked(),
+                block_unknown: draft.block_unknown.get_untracked(),
+                block_tor: draft.block_tor.get_untracked(),
             },
             legal: current.legal,
             confirm_policy_v3_migration: false,
@@ -83,18 +78,24 @@ pub fn SimilarityGeoTab(
         spawn_local(async move {
             match post_json_activatable::<_, SaveSafetyResp>("/admin/api/safety", &req).await {
                 Ok(ActivationResult::Active(resp)) => {
-                    revision.set(resp.revision);
-                    toasts.success(
-                        format!("Published Similarity & Geo policy rev #{}", resp.revision),
-                        Some(format!(
-                            "min_enforce_rev #{} · tightened={}",
-                            resp.min_enforce_rev, resp.tightened
-                        )),
-                    );
-                    on_saved.run(());
+                    draft.revision.set(resp.revision);
+                    draft.dirty.set(false);
+                    if resp.unchanged {
+                        toasts.info(format!("No changes to save (rev #{})", resp.revision), None);
+                    } else {
+                        toasts.success(
+                            format!("Published Similarity & Geo policy rev #{}", resp.revision),
+                            Some(format!(
+                                "min_enforce_rev #{} · tightened={}",
+                                resp.min_enforce_rev, resp.tightened
+                            )),
+                        );
+                        on_saved.run(());
+                    }
                 }
                 Ok(ActivationResult::PendingActivation(pending)) => {
-                    revision.set(pending.revision);
+                    draft.revision.set(pending.revision);
+                    draft.dirty.set(false);
                     toasts.warning(
                         format!(
                             "Saved rev #{} to D1 — awaiting SitePolicyDO activation",
@@ -140,19 +141,23 @@ pub fn SimilarityGeoTab(
                                 min="0"
                                 max="1"
                                 step="0.01"
-                                prop:value=move || format!("{:.2}", dinov3_min.get())
+                                prop:value=move || format!("{:.2}", draft.dinov3_min.get())
                                 on:input=move |ev| {
                                     if let Ok(v) = event_target_value(&ev).parse::<f32>()
                                         && v.is_finite()
                                     {
-                                        dinov3_min.set(v.clamp(0.0, 1.0));
+                                        draft.dinov3_min.set(v.clamp(0.0, 1.0));
+                                        draft.dirty.set(true);
                                     }
                                 }
                             />
                             <div class="adm-score-input-box">
                                 <ScoreInput
-                                    value=Signal::derive(move || dinov3_min.get())
-                                    on_change=Callback::new(move |v| dinov3_min.set(v))
+                                    value=Signal::derive(move || draft.dinov3_min.get())
+                                    on_change=Callback::new(move |v| {
+                                        draft.dinov3_min.set(v);
+                                        draft.dirty.set(true);
+                                    })
                                     min=0.00
                                     max=1.00
                                     step=0.01
@@ -177,19 +182,23 @@ pub fn SimilarityGeoTab(
                                 min="0"
                                 max="1"
                                 step="0.01"
-                                prop:value=move || format!("{:.2}", siglip2_min.get())
+                                prop:value=move || format!("{:.2}", draft.siglip2_min.get())
                                 on:input=move |ev| {
                                     if let Ok(v) = event_target_value(&ev).parse::<f32>()
                                         && v.is_finite()
                                     {
-                                        siglip2_min.set(v.clamp(0.0, 1.0));
+                                        draft.siglip2_min.set(v.clamp(0.0, 1.0));
+                                        draft.dirty.set(true);
                                     }
                                 }
                             />
                             <div class="adm-score-input-box">
                                 <ScoreInput
-                                    value=Signal::derive(move || siglip2_min.get())
-                                    on_change=Callback::new(move |v| siglip2_min.set(v))
+                                    value=Signal::derive(move || draft.siglip2_min.get())
+                                    on_change=Callback::new(move |v| {
+                                        draft.siglip2_min.set(v);
+                                        draft.dirty.set(true);
+                                    })
                                     min=0.00
                                     max=1.00
                                     step=0.01
@@ -216,21 +225,30 @@ pub fn SimilarityGeoTab(
                     <textarea
                         rows="3"
                         placeholder="US, GB, JP…"
-                        prop:value=move || countries_text.get()
-                        on:input=move |ev| countries_text.set(event_target_value(&ev))
+                        prop:value=move || draft.countries_text.get()
+                        on:input=move |ev| {
+                            draft.countries_text.set(event_target_value(&ev));
+                            draft.dirty.set(true);
+                        }
                     />
                 </label>
 
                 <div class="adm-toggle-grid">
                     <ToggleSwitch
-                        checked=Signal::derive(move || block_unknown.get())
-                        on_change=Callback::new(move |v| block_unknown.set(v))
+                        checked=Signal::derive(move || draft.block_unknown.get())
+                        on_change=Callback::new(move |v| {
+                            draft.block_unknown.set(v);
+                            draft.dirty.set(true);
+                        })
                         label="Block unknown / missing country (`XX`)"
                         description="Reject visitors whose IP has no resolved Cloudflare country code with HTTP 451."
                     />
                     <ToggleSwitch
-                        checked=Signal::derive(move || block_tor.get())
-                        on_change=Callback::new(move |v| block_tor.set(v))
+                        checked=Signal::derive(move || draft.block_tor.get())
+                        on_change=Callback::new(move |v| {
+                            draft.block_tor.set(v);
+                            draft.dirty.set(true);
+                        })
                         label="Block Tor exit nodes (`T1`)"
                         description="Reject traffic Cloudflare identifies as Tor exit network (`T1`) with HTTP 451."
                     />
@@ -239,9 +257,21 @@ pub fn SimilarityGeoTab(
 
             <div class="adm-save-bar">
                 <span class="adm-sub">"Editing geo-restrictions conservatively bumps min_enforce_rev and notifies SitePolicyDO."</span>
-                <button type="submit" class="adm-btn adm-btn--primary" disabled=move || saving.get()>
-                    {move || if saving.get() { "Publishing…" } else { "Save Similarity & Geo Policy" }}
-                </button>
+                <div class="adm-save-bar-actions">
+                    {move || draft.dirty.get().then(|| view! {
+                        <button
+                            type="button"
+                            class="adm-btn"
+                            disabled=move || saving.get()
+                            on:click=on_discard
+                        >
+                            "Discard changes"
+                        </button>
+                    })}
+                    <button type="submit" class="adm-btn adm-btn--primary" disabled=move || saving.get()>
+                        {move || if saving.get() { "Publishing…" } else { "Save Similarity & Geo Policy" }}
+                    </button>
+                </div>
             </div>
         </form>
     }

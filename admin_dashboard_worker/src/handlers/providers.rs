@@ -26,6 +26,7 @@ use crate::{
     AppState, D1_BINDING,
     api::{
         ActivationStatus, ProviderView, ProvidersResp, RotateSecretsResp, SaveProvidersReq,
+        SaveProvidersResp,
     },
     handlers::{
         bad_request, conflict, guard_mutation, guard_read, internal_error,
@@ -33,8 +34,9 @@ use crate::{
     },
     security::AdminIdentity,
     settings::{
-        ActivationOutcome, LoadedSettings, ensure_v3_ready_for_non_safety_mutation,
-        secret_field_for_provider, validate_provider_updates,
+        ActivationOutcome, LoadedSettings, are_providers_unchanged,
+        ensure_v3_ready_for_non_safety_mutation, secret_field_for_provider,
+        validate_provider_updates,
     },
 };
 
@@ -144,6 +146,7 @@ pub async fn get_providers(
 
     Json(ProvidersResp {
         ok: !loaded.activation_status.is_pending(),
+        unchanged: false,
         pending_activation: loaded.activation_status.is_pending(),
         activation_status: loaded.activation_status.as_str().to_string(),
         revision: loaded.revision,
@@ -245,6 +248,38 @@ pub async fn save_providers(
                 enc,
             });
         }
+    }
+
+    if are_providers_unchanged(
+        &loaded.doc.public.enabled_providers,
+        &public_configs,
+        !pending_ops.is_empty(),
+    ) {
+        let secret_meta = match load_secret_metadata(&st.env).await {
+            Ok(m) => m,
+            Err(e) => {
+                worker::console_error!("load provider_secrets metadata failed: {e:?}");
+                return internal_error();
+            }
+        };
+        let public = &loaded.doc.public;
+        let providers = build_provider_views(age_policy, &public.enabled_providers, &secret_meta);
+        let policy_digest = compute_policy_digest(public);
+        return Json(SaveProvidersResp {
+            ok: true,
+            unchanged: true,
+            pending_activation: loaded.activation_status.is_pending(),
+            activation_status: loaded.activation_status.as_str().to_string(),
+            revision: loaded.revision,
+            min_enforce_rev: public.min_enforce_rev,
+            digest: policy_digest.clone(),
+            policy_digest,
+            age_policy,
+            current_kid: st.keyring.current.kid().to_string(),
+            has_prev_key: st.keyring.has_previous(),
+            providers,
+        })
+        .into_response();
     }
 
     // Phase 1: Commit strictly non-secret provider config via D1 CAS (`pending_do_ack`).
@@ -361,8 +396,9 @@ pub async fn save_providers(
             };
             let providers = build_provider_views(age_policy, &public_configs, &secret_meta);
 
-            Json(ProvidersResp {
+            Json(SaveProvidersResp {
                 ok: true,
+                unchanged: false,
                 pending_activation: false,
                 activation_status: ActivationStatus::Active.as_str().to_string(),
                 revision: ack.revision,

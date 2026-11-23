@@ -226,6 +226,24 @@ body {
   color: #ffffff;
 }
 
+/* Unsaved draft indicator dot on nav tabs */
+.adm-dirty-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #f59e0b;
+  font-size: 18px;
+  font-weight: 900;
+  line-height: 1;
+  margin-left: -2px;
+  text-shadow: 0 0 6px rgba(245, 158, 11, 0.45);
+}
+
+.adm-tab.is-active .adm-dirty-dot {
+  color: #fde047;
+  text-shadow: 0 0 6px rgba(253, 224, 71, 0.6);
+}
+
 /* Cards & Grids — strictly left-aligned */
 .adm-stack {
   display: flex;
@@ -547,10 +565,65 @@ body {
   font-size: 12.5px;
 }
 
+.adm-btn--warn-outline {
+  border-color: #eab308;
+  background: #fefce8;
+  color: #854d0e;
+}
+
+.adm-btn--warn-outline:hover:not(:disabled) {
+  background: #fef9c3;
+  border-color: #ca8a04;
+}
+
+/* Semantic Safety Preset Buttons (Yellow / Purple / Red) */
+.adm-btn--preset-r18 {
+  background: #fef9c3;
+  border-color: #fde047;
+  color: #854d0e;
+}
+
+.adm-btn--preset-r18:hover:not(:disabled) {
+  background: #fef08a;
+  border-color: #eab308;
+  color: #713f12;
+}
+
+.adm-btn--preset-sensitive {
+  background: #f3e8ff;
+  border-color: #d8b4fe;
+  color: #581c87;
+}
+
+.adm-btn--preset-sensitive:hover:not(:disabled) {
+  background: #e9d5ff;
+  border-color: #9333ea;
+  color: #581c87;
+}
+
+.adm-btn--preset-blood {
+  background: #fee2e2;
+  border-color: #fca5a5;
+  color: #991b1b;
+}
+
+.adm-btn--preset-blood:hover:not(:disabled) {
+  background: #fecaca;
+  border-color: #dc2626;
+  color: #991b1b;
+}
+
 .adm-btn-group {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+}
+
+.adm-save-bar-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 /* Sticky Save Bar */
@@ -621,6 +694,26 @@ body {
   text-align: left;
 }
 
+.adm-inline-warn--action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+}
+
+.adm-inline-warn--action > span {
+  flex: 1 1 260px;
+}
+
+.adm-safety-off-notice {
+  background: #fef9c3;
+  border: 1.5px solid #eab308;
+  color: #854d0e;
+  padding: 11px 15px;
+  font-size: 13px;
+}
+
 .adm-inline-info {
   padding: 9px 12px;
   border-radius: 11px;
@@ -633,17 +726,200 @@ body {
   text-align: left;
 }
 
-/* Cloudflare Access-Style Policy v3 Builder Card */
+/* Cloudflare Access-Style Foldable Policy v3 Builder Card */
 .adm-policy-card {
   border: 1.5px solid #bddbf0;
-  border-radius: 18px;
+  border-left-width: 4px;
+  border-radius: 16px;
   background: #fbfdff;
-  padding: 18px;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  box-shadow: 0 4px 16px rgba(15, 76, 129, 0.06);
+  text-align: left;
+  transition: box-shadow 0.16s ease, border-color 0.16s ease;
+}
+
+.adm-policy-card--r18 {
+  border-left-color: #eab308;
+}
+
+.adm-policy-card--sensitive {
+  border-left-color: #9333ea;
+}
+
+.adm-policy-card--blood {
+  border-left-color: #dc2626;
+}
+
+.adm-policy-card--custom {
+  border-left-color: var(--adm-blue);
+}
+
+.adm-policy-card.is-disabled {
+  opacity: 0.78;
+}
+
+.adm-policy-summary-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 14px;
+  min-height: 36px;
+}
+
+.adm-policy-toggle-btn {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+  padding: 4px 6px 4px 2px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--adm-ink);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.14s ease;
+}
+
+.adm-policy-toggle-btn:hover {
+  background: rgba(4, 121, 173, 0.06);
+}
+
+.adm-policy-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  background: #e8f3fc;
+  color: var(--adm-blue);
+  font-size: 13px;
+  font-weight: 800;
+  flex: none;
+}
+
+.adm-policy-summary-name {
+  font-size: 14.5px;
+  font-weight: 700;
+  color: var(--adm-ink);
+  white-space: nowrap;
+}
+
+.adm-preset-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  flex: none;
+}
+
+.adm-preset-badge--r18 {
+  background: #fef9c3;
+  border: 1px solid #fde047;
+  color: #854d0e;
+}
+
+.adm-preset-badge--sensitive {
+  background: #f3e8ff;
+  border: 1px solid #d8b4fe;
+  color: #581c87;
+}
+
+.adm-preset-badge--blood {
+  background: #fee2e2;
+  border: 1px solid #fca5a5;
+  color: #991b1b;
+}
+
+.adm-preset-badge--custom {
+  background: #e6f4ff;
+  border: 1px solid #bae6fd;
+  color: #095287;
+}
+
+.adm-action-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 700;
+  white-space: nowrap;
+  flex: none;
+}
+
+.adm-action-pill--block {
+  background: #e2e8f0;
+  color: #1e293b;
+}
+
+.adm-action-pill--blur {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.adm-policy-selector-summary {
+  font-size: 12px;
+  color: var(--adm-muted);
+  background: #f1f7fc;
+  border: 1px solid #dcebf7;
+  padding: 2px 8px;
+  border-radius: 8px;
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  word-break: normal;
+}
+
+.adm-policy-bypass-summary {
+  font-size: 12px;
+  font-weight: 600;
+  color: #365976;
+  white-space: nowrap;
+}
+
+.adm-policy-body {
+  display: grid;
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transition: grid-template-rows 0.2s ease, opacity 0.18s ease;
+}
+
+.adm-policy-card.is-collapsed .adm-policy-body {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+
+.adm-policy-body-inner {
+  min-height: 0;
+  overflow: visible;
   display: flex;
   flex-direction: column;
   gap: 16px;
-  box-shadow: 0 4px 16px rgba(15, 76, 129, 0.06);
-  text-align: left;
+  margin-top: 12px;
+  padding-top: 14px;
+  border-top: 1px solid #dcebf7;
+}
+
+.adm-policy-card.is-collapsed .adm-policy-body-inner {
+  overflow: hidden;
+  visibility: hidden;
+  margin-top: 0;
+  padding-top: 0;
+  border-top-color: transparent;
 }
 
 .adm-policy-head {
@@ -660,7 +936,6 @@ body {
   display: grid;
   grid-template-columns: minmax(170px, 1.3fr) minmax(160px, 1fr) 96px minmax(170px, 1.1fr);
   gap: 10px;
-  flex: 1 1 560px;
   min-width: 0;
 }
 
@@ -1169,5 +1444,12 @@ body {
   }
   .adm-field--narrow {
     max-width: none;
+  }
+  .adm-policy-summary-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .adm-policy-selector-summary {
+    max-width: 100%;
   }
 }
