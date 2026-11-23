@@ -371,8 +371,8 @@ pub fn QueryRuleBuilder(
                                                     class="le-score-input"
                                                     aria-label="Minimum tag confidence score"
                                                     min="0.01"
-                                                    max="1"
-                                                    step="0.05"
+                                                    max="1.00"
+                                                    step="0.01"
                                                     placeholder="0.45"
                                                     value=move || score_sig.get().map(format_score).unwrap_or_default()
                                                     prop:value=move || score_sig.get().map(format_score).unwrap_or_default()
@@ -715,8 +715,8 @@ pub fn QueryRuleBuilder(
                                                                         class="le-score-input"
                                                                         aria-label="Minimum tag confidence score"
                                                                         min="0.01"
-                                                                        max="1"
-                                                                        step="0.05"
+                                                                        max="1.00"
+                                                                        step="0.01"
                                                                         placeholder="0.45"
                                                                         value=move || c_score.get().map(format_score).unwrap_or_default()
                                                                         prop:value=move || c_score.get().map(format_score).unwrap_or_default()

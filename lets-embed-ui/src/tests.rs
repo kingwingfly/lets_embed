@@ -1,35 +1,18 @@
-use leptos::prelude::*;
-
 use crate::components::{
-    ContentMaskCard, DensityPicker, FloatingHeader, Lightbox, LikeButton, MasonryGallery,
-    MinSimilaritySlider, NoticeBanner, QueryRuleBuilder, ReportDialog, SafeModeToggle, SkySelect,
-    SpoilerOverlay, Viewer, clamp_chars, compute_menu_placement_from_metrics, next_enabled_index,
+    QueryBuilderDraft, QueryBuilderMode, QueryBuilderNode, QueryCombinator, QueryFieldKind,
+    clamp_chars, compute_menu_placement_from_metrics, format_query_nodes, next_enabled_index,
+    parse_query_to_nodes,
 };
 use crate::layout::{format_duration, layout_masonry};
 use crate::models::{
-    Density, GalleryBlurMode, GalleryCard, GalleryCardKind, GalleryMask, GalleryMaskPreset,
-    GalleryMedia, GalleryMediaKind, LightboxAlbum, LikeTargetKind, LikeVariant,
-    MAX_REPORT_NOTE_CHARS, NoticeContent, NoticeTone, PresetTemplate, ReportReason,
-    ReportTargetKind, RuleBlock, RuleBlockKind, RuleClause, RuleConnector, RuleDraft, RuleField,
-    RuleGroupCombinator, SelectOption, SelectVariant, ViewerItem,
+    Density, GalleryBlurMode, GalleryMaskPreset, GalleryMedia, GalleryMediaKind,
+    MAX_REPORT_NOTE_CHARS, NoticeContent, PresetTemplate, RuleConnector, SelectOption,
+    SelectVariant, ViewerItem,
 };
 use crate::rule_syntax::{
     MAX_RULE_LEN, MAX_TERMS_PER_RULE, format_rule_blocks, format_score,
     parse_safety_rule_to_blocks,
 };
-
-fn sample_locked_mask(preset: GalleryMaskPreset) -> GalleryMask {
-    GalleryMask {
-        rule_id: format!("rule-{}", preset.as_str()),
-        label: preset.label().to_string(),
-        preset,
-        reason: Some("Restricted by site safety policy.".to_string()),
-        requires_login: true,
-        requires_age: preset == GalleryMaskPreset::R18,
-        requires_terms: true,
-        cta_label: None,
-    }
-}
 
 #[test]
 fn density_mobile_column_counts_are_distinct_3_2_1() {
@@ -268,14 +251,167 @@ fn ui_css_is_bundled_and_contains_mobile_density_breakpoints() {
     assert!(crate::UI_CSS.contains(".le-mask-card"));
     assert!(crate::UI_CSS.contains(".le-spoiler-img--css"));
     assert!(crate::UI_CSS.contains(".le-rule-group-paren"));
+    assert!(crate::UI_CSS.contains(".le-toast-host"));
+    assert!(crate::UI_CSS.contains("z-index: 9999;"));
+    assert!(crate::UI_CSS.contains(".le-qb-card"));
+    assert!(crate::UI_CSS.contains(".le-qb-group"));
+    assert!(crate::UI_CSS.contains(".le-qb-subcard"));
+    assert!(crate::UI_CSS.contains(".le-qb-group-paren"));
+    assert!(crate::UI_CSS.contains(".le-toggle-row"));
+    assert!(crate::UI_CSS.contains(".le-toggle-track"));
+    assert!(crate::UI_CSS.contains(".le-header"));
     assert!(crate::UI_CSS.contains(r#".gallery-ssr-grid[data-density="compact"]"#));
     assert!(crate::UI_CSS.contains(r#".gallery-ssr-grid[data-density="medium"]"#));
     assert!(crate::UI_CSS.contains(r#".gallery-ssr-grid[data-density="large"]"#));
 }
 
+#[test]
+fn query_builder_advanced_search_round_trips_per_condition_thresholds() {
+    let mut id = 1u64;
+    let mut alloc = || {
+        id += 1;
+        id
+    };
+
+    let raw = r#"tag:maid>=0.45 AND clip:"sunlit breeze">=0.25 AND dino:42>=0.7 AND upload:0>=0.65 AND (title:spring OR NOT author:alice)"#;
+    let nodes = parse_query_to_nodes(QueryBuilderMode::AdvancedSearch, raw, &mut alloc)
+        .expect("advanced search query parses");
+    assert_eq!(nodes.len(), 5);
+
+    match &nodes[0] {
+        QueryBuilderNode::Condition { condition, .. } => {
+            assert_eq!(condition.field, QueryFieldKind::Tag);
+            assert_eq!(condition.value, "maid");
+            assert_eq!(condition.threshold, Some(0.45));
+        }
+        other => panic!("expected condition, got {other:?}"),
+    }
+    match &nodes[1] {
+        QueryBuilderNode::Condition { condition, .. } => {
+            assert_eq!(condition.field, QueryFieldKind::ClipText);
+            assert_eq!(condition.value, "sunlit breeze");
+            assert_eq!(condition.threshold, Some(0.25));
+        }
+        other => panic!("expected clip condition, got {other:?}"),
+    }
+    match &nodes[2] {
+        QueryBuilderNode::Condition { condition, .. } => {
+            assert_eq!(condition.field, QueryFieldKind::SimilarId);
+            assert_eq!(condition.value, "42");
+            assert_eq!(condition.threshold, Some(0.7));
+        }
+        other => panic!("expected dino condition, got {other:?}"),
+    }
+    match &nodes[3] {
+        QueryBuilderNode::Condition { condition, .. } => {
+            assert_eq!(condition.field, QueryFieldKind::UploadImage);
+            assert_eq!(condition.value, "0");
+            assert_eq!(condition.threshold, Some(0.65));
+        }
+        other => panic!("expected upload condition, got {other:?}"),
+    }
+    match &nodes[4] {
+        QueryBuilderNode::Group(g) => {
+            assert_eq!(g.combinator, QueryCombinator::Or);
+            assert_eq!(g.conditions.len(), 2);
+            assert_eq!(g.conditions[0].field, QueryFieldKind::Title);
+            assert!(!g.conditions[0].negated);
+            assert_eq!(g.conditions[1].field, QueryFieldKind::Author);
+            assert!(g.conditions[1].negated);
+        }
+        other => panic!("expected group, got {other:?}"),
+    }
+
+    assert_eq!(format_query_nodes(&nodes), raw);
+}
+
+#[test]
+fn query_builder_safety_policy_mode_rejects_vectors_and_supports_or_not_groups() {
+    let mut id = 50u64;
+    let mut alloc = || {
+        id += 1;
+        id
+    };
+
+    // Allowed fields in SafetyPolicy mode must be strictly metadata-only
+    let fields = QueryFieldKind::fields_for_mode(QueryBuilderMode::SafetyPolicy);
+    assert_eq!(
+        fields,
+        &[
+            QueryFieldKind::Tag,
+            QueryFieldKind::PostTag,
+            QueryFieldKind::Author,
+            QueryFieldKind::Unclassified,
+        ]
+    );
+    assert!(fields.iter().all(|f| !f.is_vector()));
+
+    // Vector operators and non-safety fields are strictly rejected
+    for bad in [
+        "clip:sunset",
+        "clip:\"sunset\">=0.25",
+        "dino:42>=0.7",
+        "upload:0>=0.65",
+        "title:sketch",
+        "all:hello",
+        "post_tag:safe>=0.5",
+        "author:alice>=0.5",
+        "tag:blood>=0",
+        "tag:/blood.*/",
+    ] {
+        assert!(
+            parse_query_to_nodes(QueryBuilderMode::SafetyPolicy, bad, &mut alloc).is_err(),
+            "SafetyPolicy must reject {bad:?}"
+        );
+    }
+
+    // Round-trip OR NOT group and per-tag thresholds cleanly
+    let valid = "tag:explicit>=0.5 OR NOT (tag:safe OR post_tag:verified)";
+    let nodes = parse_query_to_nodes(QueryBuilderMode::SafetyPolicy, valid, &mut alloc)
+        .expect("valid safety policy parses");
+    assert_eq!(format_query_nodes(&nodes), valid);
+
+    let draft = QueryBuilderDraft::from_query(
+        QueryBuilderMode::SafetyPolicy,
+        "(tag:explicit>=0.45 OR tag:nude>=0.6) AND NOT post_tag:approved",
+    )
+    .expect("draft parses");
+    assert_eq!(
+        draft.format_query(),
+        "(tag:explicit>=0.45 OR tag:nude>=0.6) AND NOT post_tag:approved"
+    );
+}
+
 #[cfg(feature = "ssr")]
 mod ssr_render_tests {
     use super::*;
+    use leptos::prelude::*;
+
+    use crate::components::{
+        ContentMaskCard, DensityPicker, FloatingHeader, Lightbox, LikeButton, MAX_VISIBLE_TOASTS,
+        MasonryGallery, MinSimilaritySlider, NoticeBanner, QueryBuilder, QueryCondition,
+        QueryConnector, QueryGroup, QueryRuleBuilder, QueryThresholdDefaults, ReportDialog,
+        SafeModeToggle, SkySelect, SpoilerOverlay, ToastHost, ToastKind, ToggleSwitch, Viewer,
+        provide_toast_store, use_toast_store,
+    };
+    use crate::models::{
+        GalleryCard, GalleryCardKind, GalleryMask, LightboxAlbum, LikeTargetKind, LikeVariant,
+        NoticeTone, ReportReason, ReportTargetKind, RuleBlock, RuleBlockKind, RuleClause,
+        RuleDraft, RuleField, RuleGroupCombinator,
+    };
+
+    fn sample_locked_mask(preset: GalleryMaskPreset) -> GalleryMask {
+        GalleryMask {
+            rule_id: format!("rule-{}", preset.as_str()),
+            label: preset.label().to_string(),
+            preset,
+            reason: Some("Restricted by site safety policy.".to_string()),
+            requires_login: true,
+            requires_age: preset == GalleryMaskPreset::R18,
+            requires_terms: true,
+            cta_label: None,
+        }
+    }
 
     fn render_ssr<V: IntoView>(f: impl FnOnce() -> V) -> String {
         let owner = Owner::new();
@@ -658,5 +794,270 @@ mod ssr_render_tests {
         assert!(html.contains("Album 99"));
         assert!(!html.contains("NO_LEAK_VIEWER"));
         assert!(!html.contains("NO_LEAK_DL"));
+    }
+
+    #[test]
+    fn toast_host_ssr_renders_all_kinds_dismiss_button_and_caps_queue() {
+        let html = render_ssr(|| {
+            let store = provide_toast_store();
+            let same = use_toast_store();
+            let id_ok = same.success("Policy published", Some("rev #4 active".into()));
+            let _id_err = same.error("Sync failed", Some("503 upstream".into()));
+            let _id_warn = same.warning("CSS courtesy blur active", None);
+            let _id_info = same.info("Signed in", Some("user@example.com".into()));
+            let id_drop = store.push(ToastKind::Info, "Temporary", None);
+            store.dismiss(id_drop);
+            assert!(id_ok > 0);
+            assert_eq!(store.items().len(), 4);
+            view! { <ToastHost /> }
+        });
+
+        assert!(html.contains("le-toast-host"));
+        assert!(html.contains("le-toast--success"));
+        assert!(html.contains("le-toast--error"));
+        assert!(html.contains("le-toast--warning"));
+        assert!(html.contains("le-toast--info"));
+        assert!(html.contains("Policy published"));
+        assert!(html.contains("rev #4 active"));
+        assert!(html.contains("Sync failed"));
+        assert!(html.contains("503 upstream"));
+        assert!(html.contains("CSS courtesy blur active"));
+        assert!(html.contains("Signed in"));
+        assert!(!html.contains("Temporary"));
+        assert!(html.contains(r#"role="alert""#));
+        assert!(html.contains(r#"role="status""#));
+        assert!(html.contains("le-toast-close"));
+
+        // Verify queue cap keeps the latest MAX_VISIBLE_TOASTS entries
+        let owner = Owner::new();
+        owner.with(|| {
+            let store = provide_toast_store();
+            for i in 0..(MAX_VISIBLE_TOASTS + 3) {
+                store.info(format!("Toast #{i}"), None);
+            }
+            let items = store.items();
+            assert_eq!(items.len(), MAX_VISIBLE_TOASTS);
+            assert_eq!(items.first().unwrap().title, "Toast #3");
+        });
+    }
+
+    #[test]
+    fn query_builder_ssr_advanced_search_renders_per_condition_thresholds_and_step_001() {
+        let html = render_ssr(|| {
+            let draft = RwSignal::new(QueryBuilderDraft {
+                mode: QueryBuilderMode::AdvancedSearch,
+                nodes: vec![
+                    QueryBuilderNode::Condition {
+                        connector: QueryConnector::And,
+                        condition: QueryCondition {
+                            id: 10,
+                            field: QueryFieldKind::Tag,
+                            value: "maid".into(),
+                            negated: false,
+                            threshold: Some(0.45),
+                        },
+                    },
+                    QueryBuilderNode::Condition {
+                        connector: QueryConnector::And,
+                        condition: QueryCondition {
+                            id: 11,
+                            field: QueryFieldKind::ClipText,
+                            value: "sunlit garden".into(),
+                            negated: false,
+                            threshold: Some(0.25),
+                        },
+                    },
+                    QueryBuilderNode::Condition {
+                        connector: QueryConnector::And,
+                        condition: QueryCondition {
+                            id: 12,
+                            field: QueryFieldKind::SimilarId,
+                            value: "42".into(),
+                            negated: false,
+                            threshold: Some(0.7),
+                        },
+                    },
+                    QueryBuilderNode::Condition {
+                        connector: QueryConnector::And,
+                        condition: QueryCondition {
+                            id: 13,
+                            field: QueryFieldKind::UploadImage,
+                            value: "0".into(),
+                            negated: false,
+                            threshold: Some(0.65),
+                        },
+                    },
+                    QueryBuilderNode::Group(QueryGroup {
+                        id: 14,
+                        combinator: QueryCombinator::Or,
+                        connector: QueryConnector::And,
+                        negated: false,
+                        conditions: vec![
+                            QueryCondition {
+                                id: 15,
+                                field: QueryFieldKind::Title,
+                                value: "spring".into(),
+                                negated: false,
+                                threshold: None,
+                            },
+                            QueryCondition {
+                                id: 16,
+                                field: QueryFieldKind::Author,
+                                value: "alice".into(),
+                                negated: true,
+                                threshold: None,
+                            },
+                        ],
+                    }),
+                ],
+                query: r#"tag:maid>=0.45 AND clip:"sunlit garden">=0.25 AND dino:42>=0.7 AND upload:0>=0.65 AND (title:spring OR NOT author:alice)"#.into(),
+                active_preset: None,
+            });
+            let defaults = Signal::derive(|| QueryThresholdDefaults {
+                tag_min_score: Some(0.45),
+                clip_min_sim: Some(0.22),
+                dino_min_sim: Some(0.60),
+            });
+            view! {
+                <QueryBuilder
+                    draft=draft
+                    mode=QueryBuilderMode::AdvancedSearch
+                    threshold_defaults=defaults
+                />
+            }
+        });
+
+        assert!(html.contains(r#"data-mode="advanced""#));
+        assert!(html.contains("le-qb-card"));
+        assert!(html.contains("le-qb-card-header"));
+        assert!(html.contains("le-qb-group"));
+        assert!(html.contains("le-qb-subcard"));
+        assert!(html.contains("le-qb-group-paren"));
+        assert!(html.contains("( ... )"));
+        assert!(html.contains("Min score"));
+        assert!(html.contains("Min sim"));
+        assert!(html.contains(r#"min="0.01""#));
+        assert!(html.contains(r#"max="1.00""#));
+        assert!(html.contains(r#"step="0.01""#));
+        assert!(
+            !html.contains(r#"step="0.05""#),
+            "Must never emit step=0.05 with min=0.01"
+        );
+        // 4 threshold inputs (Tag, ClipText, SimilarId, UploadImage)
+        assert_eq!(html.matches("le-qb-threshold-input").count(), 4);
+        // Distinct remove buttons for 4 cards + 1 group + 2 subcards = 7
+        assert_eq!(html.matches("le-qb-remove-btn").count(), 7);
+        // Zero CLIP/DINO weighted summation controls
+        assert!(!html.contains("clip_weight"));
+        assert!(!html.contains("dino_weight"));
+        assert!(!html.contains("CLIP weight"));
+        // Presets hidden by default in AdvancedSearch mode
+        assert!(!html.contains("le-qb-presets"));
+    }
+
+    #[test]
+    fn query_builder_ssr_safety_policy_renders_presets_step_001_and_zero_vector_fields() {
+        let html = render_ssr(|| {
+            let draft = RwSignal::new(QueryBuilderDraft {
+                mode: QueryBuilderMode::SafetyPolicy,
+                nodes: vec![
+                    QueryBuilderNode::Group(QueryGroup {
+                        id: 1,
+                        combinator: QueryCombinator::Or,
+                        connector: QueryConnector::And,
+                        negated: false,
+                        conditions: vec![
+                            QueryCondition {
+                                id: 2,
+                                field: QueryFieldKind::Tag,
+                                value: "explicit".into(),
+                                negated: false,
+                                threshold: Some(0.5),
+                            },
+                            QueryCondition {
+                                id: 3,
+                                field: QueryFieldKind::PostTag,
+                                value: "r18".into(),
+                                negated: false,
+                                threshold: None,
+                            },
+                        ],
+                    }),
+                    QueryBuilderNode::Condition {
+                        connector: QueryConnector::And,
+                        condition: QueryCondition {
+                            id: 4,
+                            field: QueryFieldKind::Unclassified,
+                            value: String::new(),
+                            negated: false,
+                            threshold: None,
+                        },
+                    },
+                ],
+                query: "(tag:explicit>=0.5 OR post_tag:r18) AND unclassified".into(),
+                active_preset: Some("r18".into()),
+            });
+            view! {
+                <QueryBuilder draft=draft mode=QueryBuilderMode::SafetyPolicy />
+            }
+        });
+
+        assert!(html.contains(r#"data-mode="safety""#));
+        assert!(html.contains("R-18 / Explicit"));
+        assert!(html.contains("Suggestive / Ecchi"));
+        assert!(html.contains("Blood / Violence"));
+        assert!(html.contains("Custom"));
+        assert!(html.contains("WD Tag"));
+        assert!(html.contains("Post Tag"));
+        assert!(html.contains("Unclassified"));
+        assert!(html.contains("Min score"));
+        assert!(html.contains(r#"min="0.01""#));
+        assert!(html.contains(r#"max="1.00""#));
+        assert!(html.contains(r#"step="0.01""#));
+        assert!(!html.contains(r#"step="0.05""#));
+        // Zero vector fields or vector operators in SafetyPolicy mode
+        assert!(!html.contains("CLIP Text"));
+        assert!(!html.contains("Similar ID"));
+        assert!(!html.contains("Upload Image"));
+        assert!(!html.contains("clip:"));
+        assert!(!html.contains("dino:"));
+        assert!(!html.contains("upload:"));
+    }
+
+    #[test]
+    fn toggle_switch_ssr_renders_accessible_left_aligned_switch() {
+        let html = render_ssr(|| {
+            let enabled = RwSignal::new(true);
+            let blur = RwSignal::new(false);
+            view! {
+                <div>
+                    <ToggleSwitch
+                        checked=enabled
+                        on_change=Callback::new(move |next| enabled.set(next))
+                        label="Enable server-side content safety filtering"
+                        description="Evaluates policies before HTML, hydration, API, or media delivery."
+                    />
+                    <ToggleSwitch
+                        checked=blur
+                        on_change=Callback::new(move |next| blur.set(next))
+                        label="Cloudflare Images blur"
+                        compact=true
+                        disabled=true
+                    />
+                </div>
+            }
+        });
+
+        assert!(html.contains(r#"role="switch""#));
+        assert!(html.contains(r#"aria-checked="true""#));
+        assert!(html.contains(r#"aria-checked="false""#));
+        assert!(html.contains("le-toggle-copy"));
+        assert!(html.contains("le-toggle-track"));
+        assert!(html.contains("le-toggle-thumb"));
+        assert!(html.contains("le-toggle-row--compact"));
+        assert!(html.contains("is-checked"));
+        assert!(html.contains("is-disabled"));
+        assert!(html.contains("Enable server-side content safety filtering"));
+        assert!(html.contains("Evaluates policies before HTML, hydration, API, or media delivery."));
     }
 }
