@@ -383,6 +383,37 @@ pub fn use_document_scroll_capture(handler: impl Fn(ev::Event) + 'static) {
     }
 }
 
+/// Register a capture-phase `scroll` listener on `window` that catches both viewport
+/// scrolling and ancestor scroll-container scrolling, cleaned up automatically on unmount.
+pub fn use_window_scroll_capture(handler: impl Fn(ev::Event) + 'static) {
+    #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+    {
+        use wasm_bindgen::{JsCast, closure::Closure};
+
+        if let Some(win) = web_sys::window() {
+            let cb = Closure::<dyn Fn(ev::Event)>::new(handler);
+            let _ = win.add_event_listener_with_callback_and_bool(
+                "scroll",
+                cb.as_ref().unchecked_ref(),
+                true,
+            );
+            let win_clean = win.clone();
+            on_local_cleanup(move || {
+                let _ = win_clean.remove_event_listener_with_callback_and_bool(
+                    "scroll",
+                    cb.as_ref().unchecked_ref(),
+                    true,
+                );
+                drop(cb);
+            });
+        }
+    }
+    #[cfg(not(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr"))))]
+    {
+        let _ = handler;
+    }
+}
+
 /// Reference-counted `<body>` scroll lock using `.modal-open` class.
 pub fn lock_body_scroll() {
     #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]

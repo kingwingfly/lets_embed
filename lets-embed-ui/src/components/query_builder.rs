@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use leptos::prelude::*;
+use leptos::{ev, html, prelude::*};
 use serde::{Deserialize, Serialize};
 
 use crate::components::{OptionalScoreInput, SkySelect};
@@ -106,6 +107,20 @@ pub fn format_threshold(v: f32) -> String {
     format!("{}.{:02}", hundredths / 100, hundredths % 100)
 }
 
+/// Split `raw` on commas/newlines, trim each candidate, and append unique non-empty
+/// values into `existing` while preserving order. Returns `true` if any chip was added.
+pub(crate) fn merge_chip_values(existing: &mut Vec<String>, raw: &str) -> bool {
+    let mut added = false;
+    for part in raw.split([',', '\n', '\r']) {
+        let trimmed = part.trim();
+        if !trimmed.is_empty() && !existing.iter().any(|v| v == trimmed) {
+            existing.push(trimmed.to_string());
+            added = true;
+        }
+    }
+    added
+}
+
 /// Operating mode for the unified visual [`QueryBuilder`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -115,6 +130,70 @@ pub enum QueryBuilderMode {
     AdvancedSearch,
     /// Admin Content Policy Selector — strictly metadata-only (`tag:`, `post_tag:`, `author:`, `unclassified`).
     SafetyPolicy,
+}
+
+/// Comparison operator for a condition card in [`QueryBuilder`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryConditionOp {
+    #[default]
+    Is,
+    IsNot,
+    In,
+    NotIn,
+}
+
+impl QueryConditionOp {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Is => "is",
+            Self::IsNot => "is_not",
+            Self::In => "in",
+            Self::NotIn => "not_in",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Is => "is",
+            Self::IsNot => "is not",
+            Self::In => "in",
+            Self::NotIn => "not in",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "is_not" | "is not" | "not" => Self::IsNot,
+            "in" => Self::In,
+            "not_in" | "not in" => Self::NotIn,
+            _ => Self::Is,
+        }
+    }
+
+    pub const fn is_negated(self) -> bool {
+        matches!(self, Self::IsNot | Self::NotIn)
+    }
+
+    pub const fn is_list(self) -> bool {
+        matches!(self, Self::In | Self::NotIn)
+    }
+
+    pub fn select_options(supports_list: bool) -> Vec<SelectOption> {
+        if supports_list {
+            vec![
+                SelectOption::new("is", "is"),
+                SelectOption::new("is_not", "is not"),
+                SelectOption::new("in", "in"),
+                SelectOption::new("not_in", "not in"),
+            ]
+        } else {
+            vec![
+                SelectOption::new("is", "is"),
+                SelectOption::new("is_not", "is not"),
+            ]
+        }
+    }
 }
 
 /// Predicate field kinds supported across [`QueryBuilderMode::AdvancedSearch`] and
@@ -187,6 +266,13 @@ impl QueryFieldKind {
         matches!(self, Self::ClipText | Self::SimilarId | Self::UploadImage)
     }
 
+    /// Discrete metadata fields supporting multi-value `IN (...)` / `NOT IN (...)` lists.
+    /// Matches `search_types::query` (`tag`, `author`) and `search_types::safety`
+    /// (`tag`, `post_tag`, `author`). Vector fields (`clip`, `dino`, `upload`) stay single-value.
+    pub const fn supports_in(self) -> bool {
+        matches!(self, Self::Tag | Self::PostTag | Self::Author)
+    }
+
     /// Fields that carry an inline per-condition `>=` score/similarity threshold.
     pub const fn supports_threshold(self) -> bool {
         matches!(
@@ -251,6 +337,15 @@ impl QueryFieldKind {
             Self::SimilarId => "Image ID (e.g. 2286979)",
             Self::UploadImage => "Upload slot index (e.g. 0)",
             Self::Unclassified => "Matches pending / unclassified media",
+        }
+    }
+
+    pub const fn chip_placeholder(self) -> &'static str {
+        match self {
+            Self::Tag => "Type tag & press Enter or , \u{2026}",
+            Self::PostTag => "Type post tag & press Enter or , \u{2026}",
+            Self::Author => "Type author & press Enter or , \u{2026}",
+            _ => "Type value & press Enter or , \u{2026}",
         }
     }
 
@@ -355,7 +450,51 @@ pub struct QueryCondition {
     pub threshold: Option<f32>,
 }
 
+impl QueryCondition {
+    /// Effective single-value operator (`Is` or `IsNot`).
+    pub const fn operator(&self) -> QueryConditionOp {
+        if self.negated {
+            QueryConditionOp::IsNot
+        } else {
+            QueryConditionOp::Is
+        }
+    }
+}
+
+/// Multi-value `IN (...)` / `NOT IN (...)` condition for discrete list-capable fields
+/// (`Tag`, `PostTag`, `Author`) with optional shared `>=` score threshold on `Tag`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct QueryListCondition {
+    pub id: u64,
+    #[serde(default)]
+    pub field: QueryFieldKind,
+    #[serde(default)]
+    pub values: Vec<String>,
+    #[serde(default)]
+    pub negated: bool,
+    #[serde(default)]
+    pub threshold: Option<f32>,
+}
+
+impl QueryListCondition {
+    /// Effective list operator (`In` or `NotIn`).
+    pub const fn operator(&self) -> QueryConditionOp {
+        if self.negated {
+            QueryConditionOp::NotIn
+        } else {
+            QueryConditionOp::In
+        }
+    }
+
+    pub fn set_operator(&mut self, op: QueryConditionOp) {
+        self.negated = op.is_negated();
+    }
+}
+
 /// Parenthesized `( ... )` boolean group containing 1..N [`QueryCondition`] rows.
+///
+/// Inner conditions using `IN` / `NOT IN` store their multi-chip value list in
+/// `list_values` keyed by `QueryCondition::id`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QueryGroup {
     pub id: u64,
@@ -367,6 +506,22 @@ pub struct QueryGroup {
     pub negated: bool,
     #[serde(default)]
     pub conditions: Vec<QueryCondition>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub list_values: BTreeMap<u64, Vec<String>>,
+}
+
+impl QueryGroup {
+    pub fn condition_operator(&self, cond: &QueryCondition) -> QueryConditionOp {
+        if self.list_values.contains_key(&cond.id) {
+            if cond.negated {
+                QueryConditionOp::NotIn
+            } else {
+                QueryConditionOp::In
+            }
+        } else {
+            cond.operator()
+        }
+    }
 }
 
 /// Ordered top-level item inside a [`QueryBuilderDraft`].
@@ -377,6 +532,11 @@ pub enum QueryBuilderNode {
         connector: QueryConnector,
         condition: QueryCondition,
     },
+    ListCondition {
+        #[serde(default)]
+        connector: QueryConnector,
+        condition: QueryListCondition,
+    },
     Group(QueryGroup),
 }
 
@@ -384,6 +544,7 @@ impl QueryBuilderNode {
     pub const fn id(&self) -> u64 {
         match self {
             Self::Condition { condition, .. } => condition.id,
+            Self::ListCondition { condition, .. } => condition.id,
             Self::Group(group) => group.id,
         }
     }
@@ -391,6 +552,7 @@ impl QueryBuilderNode {
     pub const fn connector(&self) -> QueryConnector {
         match self {
             Self::Condition { connector, .. } => *connector,
+            Self::ListCondition { connector, .. } => *connector,
             Self::Group(group) => group.connector,
         }
     }
@@ -398,6 +560,7 @@ impl QueryBuilderNode {
     pub fn set_connector(&mut self, next: QueryConnector) {
         match self {
             Self::Condition { connector, .. } => *connector = next,
+            Self::ListCondition { connector, .. } => *connector = next,
             Self::Group(group) => group.connector = next,
         }
     }
@@ -405,6 +568,7 @@ impl QueryBuilderNode {
     pub fn is_vector(&self) -> bool {
         match self {
             Self::Condition { condition, .. } => condition.field.is_vector(),
+            Self::ListCondition { condition, .. } => condition.field.is_vector(),
             Self::Group(group) => group.conditions.iter().any(|c| c.field.is_vector()),
         }
     }
@@ -544,6 +708,25 @@ fn quote_query_value_if_needed(raw: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+fn quote_query_list_item_if_needed(raw: &str) -> String {
+    let needs_quote = raw.is_empty()
+        || raw.starts_with('/')
+        || raw.starts_with('-')
+        || raw.eq_ignore_ascii_case("AND")
+        || raw.eq_ignore_ascii_case("OR")
+        || raw.eq_ignore_ascii_case("NOT")
+        || raw.eq_ignore_ascii_case("IN")
+        || raw.chars().any(|c| {
+            c.is_whitespace()
+                || matches!(c, '(' | ')' | '"' | '\\' | '>' | '<' | '~' | '=' | ':' | ',')
+        });
+    if !needs_quote {
+        return raw.to_string();
+    }
+    let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 /// Format a single [`QueryCondition`] into canonical query syntax (including `>=0.45`
 /// hundredths-precision threshold when set on `Tag`, `ClipText`, `SimilarId`, or `UploadImage`).
 pub fn format_query_condition(cond: &QueryCondition) -> Option<String> {
@@ -572,6 +755,39 @@ pub fn format_query_condition(cond: &QueryCondition) -> Option<String> {
     })
 }
 
+/// Format a [`QueryListCondition`] into canonical `IN` / `NOT IN` query syntax, e.g.:
+/// - `tag IN (explicit, nude, nipples) >= 0.45`
+/// - `tag NOT IN (safe, general) >= 0.45`
+/// - `author IN ("alice smith", bob)`
+pub fn format_query_list_condition(cond: &QueryListCondition) -> Option<String> {
+    if !cond.field.supports_in() {
+        return None;
+    }
+    let items: Vec<String> = cond
+        .values
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(quote_query_list_item_if_needed)
+        .collect();
+    if items.is_empty() {
+        return None;
+    }
+    let prefix = cond.field.as_prefix();
+    let op = if cond.negated { "NOT IN" } else { "IN" };
+    let joined = items.join(", ");
+    if cond.field.supports_threshold()
+        && let Some(score) = cond.threshold.and_then(quantize_threshold)
+    {
+        Some(format!(
+            "{prefix} {op} ({joined}) >= {}",
+            format_threshold(score)
+        ))
+    } else {
+        Some(format!("{prefix} {op} ({joined})"))
+    }
+}
+
 /// Format visual [`QueryBuilderNode`] entries into canonical query syntax.
 pub fn format_query_nodes(nodes: &[QueryBuilderNode]) -> String {
     let mut or_branches: Vec<Vec<String>> = Vec::new();
@@ -583,18 +799,34 @@ pub fn format_query_nodes(nodes: &[QueryBuilderNode]) -> String {
                 connector,
                 condition,
             } => (*connector, format_query_condition(condition)),
+            QueryBuilderNode::ListCondition {
+                connector,
+                condition,
+            } => (*connector, format_query_list_condition(condition)),
             QueryBuilderNode::Group(group) => {
                 let parts: Vec<String> = group
                     .conditions
                     .iter()
-                    .filter_map(format_query_condition)
+                    .filter_map(|c| {
+                        if let Some(vals) = group.list_values.get(&c.id) {
+                            format_query_list_condition(&QueryListCondition {
+                                id: c.id,
+                                field: c.field,
+                                values: vals.clone(),
+                                negated: c.negated,
+                                threshold: c.threshold,
+                            })
+                        } else {
+                            format_query_condition(c)
+                        }
+                    })
                     .collect();
                 let expr = match parts.len() {
                     0 => None,
                     1 => {
                         let only = parts.into_iter().next().unwrap();
                         if group.negated {
-                            if only.starts_with("NOT ") {
+                            if only.starts_with("NOT ") || only.contains(" NOT IN ") {
                                 Some(format!("NOT ({only})"))
                             } else {
                                 Some(format!("NOT {only}"))
@@ -661,6 +893,19 @@ struct QbAtom {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct QbListItem {
+    text: String,
+    quoted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QbInList {
+    prefix: String,
+    negated_in: bool,
+    items: Vec<QbListItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum QbToken {
     LParen,
     RParen,
@@ -670,10 +915,158 @@ enum QbToken {
     Minus,
     Gte,
     Atom(QbAtom),
+    InList(QbInList),
 }
 
 fn is_gte_at(chars: &[char], i: usize) -> bool {
     chars.get(i) == Some(&'>') && chars.get(i + 1) == Some(&'=')
+}
+
+fn skip_ws_qb(chars: &[char], i: &mut usize) {
+    while *i < chars.len() && chars[*i].is_whitespace() {
+        *i += 1;
+    }
+}
+
+fn peek_word_qb(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let mut i = start;
+    let mut word = String::new();
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace()
+            || matches!(c, '(' | ')' | ':' | '"' | ',')
+            || is_gte_at(chars, i)
+        {
+            break;
+        }
+        word.push(c);
+        i += 1;
+    }
+    (!word.is_empty()).then_some((word, i))
+}
+
+fn is_known_in_candidate_in_advanced(prefix: &str) -> bool {
+    QueryFieldKind::parse_for_mode(prefix, QueryBuilderMode::AdvancedSearch).is_some()
+        || prefix.eq_ignore_ascii_case("post_tag")
+        || prefix.eq_ignore_ascii_case("unclassified")
+}
+
+/// If the characters after a bare field word `prefix` match `[NOT] IN ( ... )`
+/// (case-insensitive), consume the entire list expression up to and including `)`
+/// and return `Ok(Some(QbInList))`. Otherwise leave `i` unchanged and return `Ok(None)`.
+///
+/// In `AdvancedSearch` mode, non-field words (e.g. `alice in (wonderland)`) are left as
+/// bare words so free-text queries containing the word `in` continue to work naturally.
+fn try_consume_in_list_qb(
+    chars: &[char],
+    i: &mut usize,
+    prefix: &str,
+    mode: QueryBuilderMode,
+) -> Result<Option<QbInList>, String> {
+    if mode == QueryBuilderMode::AdvancedSearch && !is_known_in_candidate_in_advanced(prefix) {
+        return Ok(None);
+    }
+    let mut look = *i;
+    skip_ws_qb(chars, &mut look);
+    let Some((first_word, after_first)) = peek_word_qb(chars, look) else {
+        return Ok(None);
+    };
+    let (negated_in, after_in) = if first_word.eq_ignore_ascii_case("IN") {
+        (false, after_first)
+    } else if first_word.eq_ignore_ascii_case("NOT") {
+        let mut next_pos = after_first;
+        skip_ws_qb(chars, &mut next_pos);
+        let Some((second_word, after_second)) = peek_word_qb(chars, next_pos) else {
+            return Ok(None);
+        };
+        if !second_word.eq_ignore_ascii_case("IN") {
+            return Ok(None);
+        }
+        (true, after_second)
+    } else {
+        return Ok(None);
+    };
+
+    let mut paren_pos = after_in;
+    skip_ws_qb(chars, &mut paren_pos);
+    if chars.get(paren_pos) != Some(&'(') {
+        return Ok(None);
+    }
+
+    *i = paren_pos + 1; // consume '('
+    let mut items = Vec::new();
+    let mut closed = false;
+    let mut saw_comma = false;
+
+    while *i < chars.len() {
+        skip_ws_qb(chars, i);
+        if *i >= chars.len() {
+            break;
+        }
+        let c = chars[*i];
+        if c == ')' {
+            *i += 1;
+            closed = true;
+            break;
+        }
+        if c == '(' {
+            return Err("Nested `(` is not allowed inside `IN (...)` list".to_string());
+        }
+        if c == ',' {
+            if items.is_empty() || saw_comma {
+                return Err("Unexpected `,` inside `IN (...)` list".to_string());
+            }
+            saw_comma = true;
+            *i += 1;
+            continue;
+        }
+        if c == '"' {
+            let text = read_quoted_qb(chars, i)?;
+            if *i < chars.len() && !chars[*i].is_whitespace() && !matches!(chars[*i], ',' | ')') {
+                return Err(
+                    "Unexpected trailing characters after quoted item in `IN (...)`".to_string(),
+                );
+            }
+            items.push(QbListItem { text, quoted: true });
+            saw_comma = false;
+        } else {
+            let mut text = String::new();
+            while *i < chars.len() {
+                let uc = chars[*i];
+                if uc.is_whitespace() || matches!(uc, ',' | '(' | ')') {
+                    break;
+                }
+                if uc == '"' {
+                    return Err(
+                        "Unexpected quote inside unquoted item in `IN (...)` list".to_string(),
+                    );
+                }
+                text.push(uc);
+                *i += 1;
+            }
+            items.push(QbListItem {
+                text,
+                quoted: false,
+            });
+            saw_comma = false;
+        }
+    }
+
+    if !closed {
+        return Err("Unclosed `(` in `IN (...)` list".to_string());
+    }
+    if saw_comma {
+        return Err("Trailing `,` before `)` in `IN (...)` list".to_string());
+    }
+    if items.is_empty() {
+        return Err("Empty value list in `IN ()` is not allowed".to_string());
+    }
+
+    Ok(Some(QbInList {
+        prefix: prefix.to_string(),
+        negated_in,
+        items,
+    }))
 }
 
 fn tokenize_qb(input: &str, mode: QueryBuilderMode) -> Result<Vec<QbToken>, String> {
@@ -824,7 +1217,13 @@ fn tokenize_qb(input: &str, mode: QueryBuilderMode) -> Result<Vec<QbToken>, Stri
                 "AND" => tokens.push(QbToken::And),
                 "OR" => tokens.push(QbToken::Or),
                 "NOT" => tokens.push(QbToken::Not),
-                _ => tokens.push(QbToken::Atom(QbAtom { prefix, rest: None })),
+                _ => {
+                    if let Some(in_list) = try_consume_in_list_qb(&chars, &mut i, &prefix, mode)? {
+                        tokens.push(QbToken::InList(in_list));
+                    } else {
+                        tokens.push(QbToken::Atom(QbAtom { prefix, rest: None }));
+                    }
+                }
             }
         }
     }
@@ -936,6 +1335,72 @@ fn consume_optional_threshold(
     Ok(Some(threshold))
 }
 
+fn parse_qb_in_list(
+    in_list: &QbInList,
+    mode: QueryBuilderMode,
+    in_group: bool,
+    outer_negated: bool,
+    next_id: &mut impl FnMut() -> u64,
+) -> Result<QueryListCondition, String> {
+    if outer_negated && in_list.negated_in {
+        return Err("Double negation (`NOT ... NOT IN`) is not allowed".to_string());
+    }
+    let field = QueryFieldKind::parse_for_mode(&in_list.prefix, mode).ok_or_else(|| match mode {
+        QueryBuilderMode::SafetyPolicy => format!(
+            "Disallowed predicate `{}` in `IN (...)` safety policy (allowed: tag, post_tag, author)",
+            in_list.prefix
+        ),
+        QueryBuilderMode::AdvancedSearch => format!(
+            "Unsupported field `{}` for `IN (...)` (allowed: tag, author)",
+            in_list.prefix
+        ),
+    })?;
+
+    if !field.supports_in() {
+        return Err(format!(
+            "`{}` does not support `IN (...)` / `NOT IN (...)` (only discrete metadata fields do)",
+            field.as_prefix()
+        ));
+    }
+    if in_group && field.is_vector() {
+        return Err("Vector clauses cannot be placed inside parenthesized groups".to_string());
+    }
+
+    let field_name = field.as_prefix();
+    let mut values = Vec::with_capacity(in_list.items.len());
+    for item in &in_list.items {
+        let trimmed = item.text.trim();
+        if trimmed.is_empty() {
+            return Err(format!(
+                "Empty value inside `{field_name} IN (...)` is not allowed"
+            ));
+        }
+        if !item.quoted {
+            if trimmed.contains(">=") {
+                return Err(format!(
+                    "Place `>=` threshold outside `)` (e.g. `{field_name} IN (a, b) >= 0.45`)"
+                ));
+            }
+            if mode == QueryBuilderMode::SafetyPolicy {
+                reject_safety_disallowed_syntax(trimmed, field_name)?;
+            }
+        }
+        values.push(trimmed.to_string());
+    }
+
+    if values.is_empty() {
+        return Err(format!("Empty value list in `{field_name} IN ()` is not allowed"));
+    }
+
+    Ok(QueryListCondition {
+        id: next_id(),
+        field,
+        values,
+        negated: outer_negated || in_list.negated_in,
+        threshold: None,
+    })
+}
+
 fn parse_qb_atom(
     atom: &QbAtom,
     mode: QueryBuilderMode,
@@ -955,7 +1420,7 @@ fn parse_qb_atom(
                 });
             }
             return Err(format!(
-                "Unsupported term `{}` — use tag:, post_tag:, author:, or unclassified",
+                "Unsupported term `{}` — use tag:, post_tag:, author:, unclassified, or tag IN (...)",
                 atom.prefix
             ));
         }
@@ -1029,8 +1494,9 @@ fn parse_qb_atom(
 /// for the given [`QueryBuilderMode`].
 ///
 /// Supports:
-/// - Optional whitespace around `>=` outside quotes (`tag:maid>=0.45`, `tag:maid>= 0.45`,
-///   `tag:maid >=0.45`, `tag:maid >= 0.45`, `clip:"sunlit sky" >= 0.25`)
+/// - Multi-value `IN (...)` / `NOT IN (...)` / `NOT field IN (...)` lists on discrete metadata
+///   fields (`tag`, `author` in `AdvancedSearch`; `tag`, `post_tag`, `author` in `SafetyPolicy`)
+/// - Optional whitespace around `>=` outside quotes or `)` (`tag:maid>=0.45`, `tag IN (a, b) >= 0.45`)
 /// - Hundredths-precision thresholds `0.01..=1.00` on `tag:`, `clip:`, `dino:`, `upload:`
 /// - Unary `-` (`-tag:monochrome`, `-(tag:a OR tag:b)`) as equivalent to `NOT`
 pub fn parse_query_to_nodes(
@@ -1069,7 +1535,11 @@ pub fn parse_query_to_nodes(
                 QbToken::Gte => {
                     return Err("Unexpected `>=` threshold operator".to_string());
                 }
-                QbToken::Not | QbToken::Minus | QbToken::Atom(_) | QbToken::LParen => {
+                QbToken::Not
+                | QbToken::Minus
+                | QbToken::Atom(_)
+                | QbToken::InList(_)
+                | QbToken::LParen => {
                     if mode == QueryBuilderMode::SafetyPolicy {
                         return Err(
                             "Missing explicit `AND` or `OR` operator between predicates"
@@ -1103,6 +1573,7 @@ pub fn parse_query_to_nodes(
             QbToken::LParen => {
                 pos += 1;
                 let mut conditions = Vec::new();
+                let mut list_values: BTreeMap<u64, Vec<String>> = BTreeMap::new();
                 let mut combinator: Option<QueryCombinator> = None;
                 let mut inner_expect_operand = true;
                 let mut inner_neg = false;
@@ -1144,7 +1615,11 @@ pub fn parse_query_to_nodes(
                                 return Err("Unexpected `>=` threshold operator inside group"
                                     .to_string());
                             }
-                            QbToken::Not | QbToken::Minus | QbToken::Atom(_) | QbToken::LParen => {
+                            QbToken::Not
+                            | QbToken::Minus
+                            | QbToken::Atom(_)
+                            | QbToken::InList(_)
+                            | QbToken::LParen => {
                                 if mode == QueryBuilderMode::SafetyPolicy {
                                     return Err(
                                         "Missing explicit `AND` or `OR` inside `(...)` group"
@@ -1203,12 +1678,36 @@ pub fn parse_query_to_nodes(
                                     "Query exceeds maximum of {MAX_TERMS_PER_RULE} terms"
                                 ));
                             }
-                            let mut cond =
-                                parse_qb_atom(atom, mode, true, inner_neg, next_id)?;
+                            let mut cond = parse_qb_atom(atom, mode, true, inner_neg, next_id)?;
                             pos += 1;
                             cond.threshold =
                                 consume_optional_threshold(&tokens, &mut pos, cond.field)?;
                             conditions.push(cond);
+                            inner_neg = false;
+                            inner_expect_operand = false;
+                        }
+                        QbToken::InList(in_list) => {
+                            term_count += in_list.items.len();
+                            if term_count > MAX_TERMS_PER_RULE {
+                                return Err(format!(
+                                    "Query exceeds maximum of {MAX_TERMS_PER_RULE} terms"
+                                ));
+                            }
+                            let mut list_cond =
+                                parse_qb_in_list(in_list, mode, true, inner_neg, next_id)?;
+                            pos += 1;
+                            list_cond.threshold =
+                                consume_optional_threshold(&tokens, &mut pos, list_cond.field)?;
+                            let cid = list_cond.id;
+                            let first_val = list_cond.values.first().cloned().unwrap_or_default();
+                            list_values.insert(cid, list_cond.values);
+                            conditions.push(QueryCondition {
+                                id: cid,
+                                field: list_cond.field,
+                                value: first_val,
+                                negated: list_cond.negated,
+                                threshold: list_cond.threshold,
+                            });
                             inner_neg = false;
                             inner_expect_operand = false;
                         }
@@ -1232,6 +1731,7 @@ pub fn parse_query_to_nodes(
                     connector: pending_conn,
                     negated: pending_neg,
                     conditions,
+                    list_values,
                 }));
                 pending_conn = QueryConnector::And;
                 pending_neg = false;
@@ -1250,6 +1750,25 @@ pub fn parse_query_to_nodes(
                 nodes.push(QueryBuilderNode::Condition {
                     connector: pending_conn,
                     condition: cond,
+                });
+                pending_conn = QueryConnector::And;
+                pending_neg = false;
+                expect_operand = false;
+            }
+            QbToken::InList(in_list) => {
+                term_count += in_list.items.len();
+                if term_count > MAX_TERMS_PER_RULE {
+                    return Err(format!(
+                        "Query exceeds maximum of {MAX_TERMS_PER_RULE} terms"
+                    ));
+                }
+                let mut list_cond = parse_qb_in_list(in_list, mode, false, pending_neg, next_id)?;
+                pos += 1;
+                list_cond.threshold =
+                    consume_optional_threshold(&tokens, &mut pos, list_cond.field)?;
+                nodes.push(QueryBuilderNode::ListCondition {
+                    connector: pending_conn,
+                    condition: list_cond,
                 });
                 pending_conn = QueryConnector::And;
                 pending_neg = false;
@@ -1309,6 +1828,297 @@ fn ThresholdPillInput(
     }
 }
 
+/// Compact condition operator selector:
+/// - List-capable fields (`Tag`, `PostTag`, `Author`): `<SkySelect>` with `is | is not | in | not in`.
+/// - Non-list fields (`TitleAndAuthor`, `Title`, `ClipText`, `SimilarId`, `UploadImage`, `Unclassified`):
+///   compact `is | is not` segmented toggle.
+#[component]
+fn OperatorControl(
+    field: Signal<QueryFieldKind>,
+    operator: Signal<QueryConditionOp>,
+    variant: SelectVariant,
+    on_change: Callback<QueryConditionOp>,
+) -> impl IntoView {
+    let list_op_options = Signal::derive(|| QueryConditionOp::select_options(true));
+
+    view! {
+        {move || {
+            let f = field.get();
+            if f.supports_in() {
+                let op_val = Signal::derive(move || operator.get().as_str().to_string());
+                view! {
+                    <span class=move || if operator.get().is_negated() {
+                        "le-qb-op-wrap is-negated"
+                    } else {
+                        "le-qb-op-wrap"
+                    }>
+                        <SkySelect
+                            aria_label="Condition operator"
+                            variant=variant
+                            trigger_class="le-qb-op-select"
+                            value=op_val
+                            options=list_op_options
+                            on_change=Callback::new(move |raw: String| {
+                                on_change.run(QueryConditionOp::parse(&raw));
+                            })
+                        />
+                    </span>
+                }
+                .into_any()
+            } else {
+                view! {
+                    <div class="le-qb-op-toggle" role="group" aria-label="Condition operator">
+                        <button
+                            type="button"
+                            class=move || if !operator.get().is_negated() {
+                                "le-qb-op-toggle-btn is-active"
+                            } else {
+                                "le-qb-op-toggle-btn"
+                            }
+                            aria-pressed=move || (!operator.get().is_negated()).to_string()
+                            on:click=move |_| on_change.run(QueryConditionOp::Is)
+                        >
+                            "is"
+                        </button>
+                        <button
+                            type="button"
+                            class=move || if operator.get().is_negated() {
+                                "le-qb-op-toggle-btn is-active is-negated"
+                            } else {
+                                "le-qb-op-toggle-btn"
+                            }
+                            aria-pressed=move || operator.get().is_negated().to_string()
+                            on:click=move |_| on_change.run(QueryConditionOp::IsNot)
+                        >
+                            "is not"
+                        </button>
+                    </div>
+                }
+                .into_any()
+            }
+        }}
+    }
+}
+
+/// Multi-chip pill editor rendered when a condition uses `in` or `not in`.
+///
+/// Supports:
+/// - `Enter` or `,` to commit trimmed deduplicated chip(s) (preventing form submission)
+/// - Pasting comma/newline-separated tags splits and adds all items immediately
+/// - `Backspace` on an empty input removes the last chip
+/// - Clicking `×` removes a specific chip
+/// - Commits any pending text on `blur` so users never lose the last typed tag
+#[component]
+fn ChipListInput(
+    field: QueryFieldKind,
+    negated: Signal<bool>,
+    values: Signal<Vec<String>>,
+    on_commit_raw: Callback<String>,
+    on_remove_chip: Callback<String>,
+    on_remove_last: Callback<()>,
+) -> impl IntoView {
+    let pending = RwSignal::new(String::new());
+    let input_ref = NodeRef::<html::Input>::new();
+
+    let focus_input = move |_| {
+        #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+        if let Some(el) = input_ref.get_untracked() {
+            let _ = el.focus();
+        }
+    };
+
+    let commit_pending = move || {
+        let cur = pending.get_untracked();
+        if !cur.trim().is_empty() {
+            on_commit_raw.run(cur);
+        }
+        pending.set(String::new());
+    };
+
+    let placeholder_text = field.chip_placeholder();
+
+    view! {
+        <div
+            class=move || if negated.get() {
+                "le-qb-chips-box is-negated"
+            } else {
+                "le-qb-chips-box"
+            }
+            on:click=focus_input
+        >
+            <For
+                each=move || values.get()
+                key=|chip| chip.clone()
+                let(chip)
+            >
+                {
+                    let chip_for_remove = chip.clone();
+                    let remove_aria = format!("Remove {chip}");
+                    view! {
+                        <span class="le-qb-chip">
+                            <span class="le-qb-chip-text">{chip}</span>
+                            <button
+                                type="button"
+                                class="le-qb-chip-remove"
+                                aria-label=remove_aria
+                                on:click=move |ev: ev::MouseEvent| {
+                                    ev.stop_propagation();
+                                    on_remove_chip.run(chip_for_remove.clone());
+                                }
+                            >
+                                "\u{00D7}"
+                            </button>
+                        </span>
+                    }
+                }
+            </For>
+
+            <input
+                node_ref=input_ref
+                type="text"
+                class="le-qb-chips-input"
+                aria-label="Add list value"
+                placeholder=move || if values.with(Vec::is_empty) {
+                    placeholder_text
+                } else {
+                    "Add more\u{2026}"
+                }
+                value=move || pending.get()
+                prop:value=move || pending.get()
+                on:input=move |ev| {
+                    let next = event_target_value(&ev);
+                    if next.contains(',') || next.contains('\n') || next.contains('\r') {
+                        on_commit_raw.run(next);
+                        pending.set(String::new());
+                    } else {
+                        pending.set(next);
+                    }
+                }
+                on:keydown=move |ev: ev::KeyboardEvent| {
+                    if ev.is_composing() || ev.key_code() == 229 {
+                        return;
+                    }
+                    match ev.key().as_str() {
+                        "Enter" | "," => {
+                            ev.prevent_default();
+                            commit_pending();
+                        }
+                        "Backspace" if pending.get_untracked().is_empty() => {
+                            on_remove_last.run(());
+                        }
+                        _ => {}
+                    }
+                }
+                on:blur=move |_| {
+                    commit_pending();
+                }
+            />
+        </div>
+    }
+}
+
+/// Apply an operator change (`Is` / `IsNot` / `In` / `NotIn`) to a top-level condition
+/// node (converting seamlessly between `Condition` and `ListCondition` while preserving
+/// `id`, `connector`, `field`, `threshold`, and migrating values).
+fn apply_top_operator_change(node: &mut QueryBuilderNode, next_op: QueryConditionOp) {
+    let target_is_list = next_op.is_list();
+    let target_neg = next_op.is_negated();
+    match node {
+        QueryBuilderNode::Condition {
+            connector,
+            condition,
+        } => {
+            if target_is_list && condition.field.supports_in() {
+                let mut vals = Vec::new();
+                merge_chip_values(&mut vals, &condition.value);
+                let list_cond = QueryListCondition {
+                    id: condition.id,
+                    field: condition.field,
+                    values: vals,
+                    negated: target_neg,
+                    threshold: condition.threshold,
+                };
+                *node = QueryBuilderNode::ListCondition {
+                    connector: *connector,
+                    condition: list_cond,
+                };
+            } else {
+                condition.negated = target_neg;
+            }
+        }
+        QueryBuilderNode::ListCondition {
+            connector,
+            condition,
+        } => {
+            if target_is_list && condition.field.supports_in() {
+                condition.negated = target_neg;
+            } else {
+                let single = QueryCondition {
+                    id: condition.id,
+                    field: condition.field,
+                    value: condition.values.first().cloned().unwrap_or_default(),
+                    negated: target_neg,
+                    threshold: condition.threshold,
+                };
+                *node = QueryBuilderNode::Condition {
+                    connector: *connector,
+                    condition: single,
+                };
+            }
+        }
+        QueryBuilderNode::Group(_) => {}
+    }
+}
+
+/// Apply a field change to a top-level condition node, automatically collapsing `ListCondition`
+/// to `Condition` if the new field does not support `IN` / `NOT IN`.
+fn apply_top_field_change(node: &mut QueryBuilderNode, next_field: QueryFieldKind) {
+    match node {
+        QueryBuilderNode::Condition { condition, .. } => {
+            condition.field = next_field;
+            if !next_field.supports_threshold() {
+                condition.threshold = None;
+            }
+            if next_field == QueryFieldKind::Unclassified {
+                condition.value.clear();
+            }
+        }
+        QueryBuilderNode::ListCondition {
+            connector,
+            condition,
+        } => {
+            if next_field.supports_in() {
+                condition.field = next_field;
+                if !next_field.supports_threshold() {
+                    condition.threshold = None;
+                }
+            } else {
+                let value = if next_field == QueryFieldKind::Unclassified {
+                    String::new()
+                } else {
+                    condition.values.first().cloned().unwrap_or_default()
+                };
+                let threshold = if next_field.supports_threshold() {
+                    condition.threshold
+                } else {
+                    None
+                };
+                *node = QueryBuilderNode::Condition {
+                    connector: *connector,
+                    condition: QueryCondition {
+                        id: condition.id,
+                        field: next_field,
+                        value,
+                        negated: condition.negated,
+                        threshold,
+                    },
+                };
+            }
+        }
+        QueryBuilderNode::Group(_) => {}
+    }
+}
+
 /// Unified visual boolean query builder shared by BOTH Gallery Advanced Search
 /// (`QueryBuilderMode::AdvancedSearch`) and Admin Content Policy Selector
 /// (`QueryBuilderMode::SafetyPolicy`).
@@ -1316,6 +2126,9 @@ fn ThresholdPillInput(
 /// Key guarantees:
 /// - Self-contained bordered condition cards (`le-qb-card`) with top-right `×` close
 ///   buttons unambiguously bound to each card.
+/// - Compact `is | is not | in | not in` operator selector for discrete list-capable
+///   fields (`Tag`, `PostTag`, `Author`) with an inline multi-chip pill editor, and
+///   `is | is not` segmented toggle for single-value/vector fields.
 /// - Distinct nested group cards (`le-qb-group`) with a crisp single-row header
 ///   (`[AND/OR] [NOT] ( ... ) [ANY | ALL]` + `[+ Row]` + `[×]`) and distinct
 ///   inner mini-cards (`le-qb-subcard`) with their own top-right `×` buttons.
@@ -1442,6 +2255,7 @@ pub fn QueryBuilder(
                         threshold: None,
                     },
                 ],
+                list_values: BTreeMap::new(),
             }));
         });
         sync_from_nodes();
@@ -1466,19 +2280,19 @@ pub fn QueryBuilder(
 
     let raw_label = match effective_mode {
         QueryBuilderMode::SafetyPolicy => {
-            "Policy Selector Expression (metadata-only: tag:, post_tag:, author:, unclassified)"
+            "Policy Selector Expression (metadata-only: tag:, post_tag:, author:, IN (...), unclassified)"
         }
         QueryBuilderMode::AdvancedSearch => {
-            "Query Expression (tag:, title:, author:, clip:, dino:, upload:, with optional >=threshold)"
+            "Query Expression (tag:, title:, author:, IN (...), clip:, dino:, upload:, with optional >=threshold)"
         }
     };
 
     let raw_placeholder = match effective_mode {
         QueryBuilderMode::SafetyPolicy => {
-            "e.g. (tag:explicit>=0.45 OR tag:nude) AND NOT post_tag:safe"
+            "e.g. tag IN (explicit, nude, nipples) >= 0.45 AND NOT post_tag:safe"
         }
         QueryBuilderMode::AdvancedSearch => {
-            "e.g. (tag:maid>=0.45 OR tag:apron) AND clip:\"sunlit garden\">=0.25"
+            "e.g. tag IN (maid, apron) >= 0.45 AND clip:\"sunlit garden\">=0.25"
         }
     };
 
@@ -1585,20 +2399,6 @@ pub fn QueryBuilder(
                         });
 
                         if !is_group {
-                            let neg_sig = Memo::new(move |_| {
-                                draft.with(|d| {
-                                    d.nodes
-                                        .iter()
-                                        .find(|n| n.id() == node_id)
-                                        .and_then(|n| match n {
-                                            QueryBuilderNode::Condition { condition, .. } => {
-                                                Some(condition.negated)
-                                            }
-                                            _ => None,
-                                        })
-                                        .unwrap_or(false)
-                                })
-                            });
                             let field_sig = Memo::new(move |_| {
                                 draft.with(|d| {
                                     d.nodes
@@ -1608,9 +2408,29 @@ pub fn QueryBuilder(
                                             QueryBuilderNode::Condition { condition, .. } => {
                                                 Some(condition.field)
                                             }
-                                            _ => None,
+                                            QueryBuilderNode::ListCondition { condition, .. } => {
+                                                Some(condition.field)
+                                            }
+                                            QueryBuilderNode::Group(_) => None,
                                         })
                                         .unwrap_or(QueryFieldKind::Tag)
+                                })
+                            });
+                            let op_sig = Memo::new(move |_| {
+                                draft.with(|d| {
+                                    d.nodes
+                                        .iter()
+                                        .find(|n| n.id() == node_id)
+                                        .and_then(|n| match n {
+                                            QueryBuilderNode::Condition { condition, .. } => {
+                                                Some(condition.operator())
+                                            }
+                                            QueryBuilderNode::ListCondition { condition, .. } => {
+                                                Some(condition.operator())
+                                            }
+                                            QueryBuilderNode::Group(_) => None,
+                                        })
+                                        .unwrap_or(QueryConditionOp::Is)
                                 })
                             });
                             let val_sig = Memo::new(move |_| {
@@ -1627,6 +2447,20 @@ pub fn QueryBuilder(
                                         .unwrap_or_default()
                                 })
                             });
+                            let values_sig = Memo::new(move |_| {
+                                draft.with(|d| {
+                                    d.nodes
+                                        .iter()
+                                        .find(|n| n.id() == node_id)
+                                        .and_then(|n| match n {
+                                            QueryBuilderNode::ListCondition { condition, .. } => {
+                                                Some(condition.values.clone())
+                                            }
+                                            _ => None,
+                                        })
+                                        .unwrap_or_default()
+                                })
+                            });
                             let threshold_sig = Signal::derive(move || {
                                 draft.with(|d| {
                                     d.nodes
@@ -1636,20 +2470,75 @@ pub fn QueryBuilder(
                                             QueryBuilderNode::Condition { condition, .. } => {
                                                 condition.threshold
                                             }
-                                            _ => None,
+                                            QueryBuilderNode::ListCondition { condition, .. } => {
+                                                condition.threshold
+                                            }
+                                            QueryBuilderNode::Group(_) => None,
                                         })
                                 })
                             });
 
                             let on_threshold_change = Callback::new(move |next: Option<f32>| {
                                 draft.update(|d| {
-                                    if let Some(QueryBuilderNode::Condition { condition, .. }) =
-                                        d.nodes.iter_mut().find(|n| n.id() == node_id)
-                                    {
-                                        condition.threshold = next.and_then(quantize_threshold);
+                                    match d.nodes.iter_mut().find(|n| n.id() == node_id) {
+                                        Some(QueryBuilderNode::Condition { condition, .. }) => {
+                                            condition.threshold = next.and_then(quantize_threshold);
+                                        }
+                                        Some(QueryBuilderNode::ListCondition { condition, .. }) => {
+                                            condition.threshold = next.and_then(quantize_threshold);
+                                        }
+                                        _ => {}
                                     }
                                 });
                                 sync_from_nodes();
+                            });
+
+                            let on_op_change = Callback::new(move |next_op: QueryConditionOp| {
+                                draft.update(|d| {
+                                    if let Some(node) = d.nodes.iter_mut().find(|n| n.id() == node_id) {
+                                        apply_top_operator_change(node, next_op);
+                                    }
+                                });
+                                sync_from_nodes();
+                            });
+
+                            let on_commit_raw = Callback::new(move |raw: String| {
+                                let mut changed = false;
+                                draft.update(|d| {
+                                    if let Some(QueryBuilderNode::ListCondition { condition, .. }) =
+                                        d.nodes.iter_mut().find(|n| n.id() == node_id)
+                                    {
+                                        changed = merge_chip_values(&mut condition.values, &raw);
+                                    }
+                                });
+                                if changed {
+                                    sync_from_nodes();
+                                }
+                            });
+
+                            let on_remove_chip = Callback::new(move |chip: String| {
+                                draft.update(|d| {
+                                    if let Some(QueryBuilderNode::ListCondition { condition, .. }) =
+                                        d.nodes.iter_mut().find(|n| n.id() == node_id)
+                                    {
+                                        condition.values.retain(|v| v != &chip);
+                                    }
+                                });
+                                sync_from_nodes();
+                            });
+
+                            let on_remove_last = Callback::new(move |()| {
+                                let mut removed = false;
+                                draft.update(|d| {
+                                    if let Some(QueryBuilderNode::ListCondition { condition, .. }) =
+                                        d.nodes.iter_mut().find(|n| n.id() == node_id)
+                                    {
+                                        removed = condition.values.pop().is_some();
+                                    }
+                                });
+                                if removed {
+                                    sync_from_nodes();
+                                }
                             });
 
                             view! {
@@ -1677,29 +2566,6 @@ pub fn QueryBuilder(
                                                 }
                                             }}
 
-                                            <button
-                                                type="button"
-                                                class=move || if neg_sig.get() {
-                                                    "le-qb-not-btn is-active"
-                                                } else {
-                                                    "le-qb-not-btn"
-                                                }
-                                                aria-pressed=move || neg_sig.get().to_string()
-                                                title="Negate condition (NOT)"
-                                                on:click=move |_| {
-                                                    draft.update(|d| {
-                                                        if let Some(QueryBuilderNode::Condition { condition, .. }) =
-                                                            d.nodes.iter_mut().find(|n| n.id() == node_id)
-                                                        {
-                                                            condition.negated = !condition.negated;
-                                                        }
-                                                    });
-                                                    sync_from_nodes();
-                                                }
-                                            >
-                                                "NOT"
-                                            </button>
-
                                             <SkySelect
                                                 aria_label="Condition field"
                                                 variant=SelectVariant::SkyBox
@@ -1711,21 +2577,22 @@ pub fn QueryBuilder(
                                                         QueryFieldKind::parse_for_mode(&val, effective_mode)
                                                     {
                                                         draft.update(|d| {
-                                                            if let Some(QueryBuilderNode::Condition { condition, .. }) =
+                                                            if let Some(node) =
                                                                 d.nodes.iter_mut().find(|n| n.id() == node_id)
                                                             {
-                                                                condition.field = next_field;
-                                                                if !next_field.supports_threshold() {
-                                                                    condition.threshold = None;
-                                                                }
-                                                                if next_field == QueryFieldKind::Unclassified {
-                                                                    condition.value.clear();
-                                                                }
+                                                                apply_top_field_change(node, next_field);
                                                             }
                                                         });
                                                         sync_from_nodes();
                                                     }
                                                 })
+                                            />
+
+                                            <OperatorControl
+                                                field=Signal::derive(move || field_sig.get())
+                                                operator=Signal::derive(move || op_sig.get())
+                                                variant=SelectVariant::SkyBox
+                                                on_change=on_op_change
                                             />
                                         </div>
 
@@ -1743,6 +2610,20 @@ pub fn QueryBuilder(
                                     <div class="le-qb-card-body">
                                         {move || {
                                             let f = field_sig.get();
+                                            let op = op_sig.get();
+                                            if f.supports_in() && op.is_list() {
+                                                return view! {
+                                                    <ChipListInput
+                                                        field=f
+                                                        negated=Signal::derive(move || op_sig.get().is_negated())
+                                                        values=Signal::derive(move || values_sig.get())
+                                                        on_commit_raw=on_commit_raw
+                                                        on_remove_chip=on_remove_chip
+                                                        on_remove_last=on_remove_last
+                                                    />
+                                                }
+                                                .into_any();
+                                            }
                                             match f {
                                                 QueryFieldKind::Unclassified => view! {
                                                     <span class="le-qb-unclassified-badge">
@@ -2009,22 +2890,6 @@ pub fn QueryBuilder(
                                                         .with(|ids| ids.iter().position(|x| *x == cid))
                                                         .unwrap_or(0)
                                                 });
-                                                let c_neg = Memo::new(move |_| {
-                                                    draft.with(|d| {
-                                                        d.nodes
-                                                            .iter()
-                                                            .find(|n| n.id() == node_id)
-                                                            .and_then(|n| match n {
-                                                                QueryBuilderNode::Group(g) => g
-                                                                    .conditions
-                                                                    .iter()
-                                                                    .find(|c| c.id == cid)
-                                                                    .map(|c| c.negated),
-                                                                _ => None,
-                                                            })
-                                                            .unwrap_or(false)
-                                                    })
-                                                });
                                                 let c_field = Memo::new(move |_| {
                                                     draft.with(|d| {
                                                         d.nodes
@@ -2041,6 +2906,22 @@ pub fn QueryBuilder(
                                                             .unwrap_or(QueryFieldKind::Tag)
                                                     })
                                                 });
+                                                let c_op = Memo::new(move |_| {
+                                                    draft.with(|d| {
+                                                        d.nodes
+                                                            .iter()
+                                                            .find(|n| n.id() == node_id)
+                                                            .and_then(|n| match n {
+                                                                QueryBuilderNode::Group(g) => g
+                                                                    .conditions
+                                                                    .iter()
+                                                                    .find(|c| c.id == cid)
+                                                                    .map(|c| g.condition_operator(c)),
+                                                                _ => None,
+                                                            })
+                                                            .unwrap_or(QueryConditionOp::Is)
+                                                    })
+                                                });
                                                 let c_val = Memo::new(move |_| {
                                                     draft.with(|d| {
                                                         d.nodes
@@ -2052,6 +2933,20 @@ pub fn QueryBuilder(
                                                                     .iter()
                                                                     .find(|c| c.id == cid)
                                                                     .map(|c| c.value.clone()),
+                                                                _ => None,
+                                                            })
+                                                            .unwrap_or_default()
+                                                    })
+                                                });
+                                                let c_values = Memo::new(move |_| {
+                                                    draft.with(|d| {
+                                                        d.nodes
+                                                            .iter()
+                                                            .find(|n| n.id() == node_id)
+                                                            .and_then(|n| match n {
+                                                                QueryBuilderNode::Group(g) => {
+                                                                    g.list_values.get(&cid).cloned()
+                                                                }
                                                                 _ => None,
                                                             })
                                                             .unwrap_or_default()
@@ -2086,6 +2981,69 @@ pub fn QueryBuilder(
                                                     sync_from_nodes();
                                                 });
 
+                                                let on_inner_op_change = Callback::new(move |next_op: QueryConditionOp| {
+                                                    draft.update(|d| {
+                                                        if let Some(QueryBuilderNode::Group(g)) =
+                                                            d.nodes.iter_mut().find(|n| n.id() == node_id)
+                                                            && let Some(c) =
+                                                                g.conditions.iter_mut().find(|c| c.id == cid)
+                                                        {
+                                                            c.negated = next_op.is_negated();
+                                                            if next_op.is_list() && c.field.supports_in() {
+                                                                let entry = g.list_values.entry(cid).or_default();
+                                                                if entry.is_empty() && !c.value.trim().is_empty() {
+                                                                    merge_chip_values(entry, &c.value);
+                                                                }
+                                                            } else if let Some(vals) = g.list_values.remove(&cid) {
+                                                                c.value = vals.into_iter().next().unwrap_or_default();
+                                                            }
+                                                        }
+                                                    });
+                                                    sync_from_nodes();
+                                                });
+
+                                                let on_inner_commit_raw = Callback::new(move |raw: String| {
+                                                    let mut changed = false;
+                                                    draft.update(|d| {
+                                                        if let Some(QueryBuilderNode::Group(g)) =
+                                                            d.nodes.iter_mut().find(|n| n.id() == node_id)
+                                                        {
+                                                            let entry = g.list_values.entry(cid).or_default();
+                                                            changed = merge_chip_values(entry, &raw);
+                                                        }
+                                                    });
+                                                    if changed {
+                                                        sync_from_nodes();
+                                                    }
+                                                });
+
+                                                let on_inner_remove_chip = Callback::new(move |chip: String| {
+                                                    draft.update(|d| {
+                                                        if let Some(QueryBuilderNode::Group(g)) =
+                                                            d.nodes.iter_mut().find(|n| n.id() == node_id)
+                                                            && let Some(vals) = g.list_values.get_mut(&cid)
+                                                        {
+                                                            vals.retain(|v| v != &chip);
+                                                        }
+                                                    });
+                                                    sync_from_nodes();
+                                                });
+
+                                                let on_inner_remove_last = Callback::new(move |()| {
+                                                    let mut removed = false;
+                                                    draft.update(|d| {
+                                                        if let Some(QueryBuilderNode::Group(g)) =
+                                                            d.nodes.iter_mut().find(|n| n.id() == node_id)
+                                                            && let Some(vals) = g.list_values.get_mut(&cid)
+                                                        {
+                                                            removed = vals.pop().is_some();
+                                                        }
+                                                    });
+                                                    if removed {
+                                                        sync_from_nodes();
+                                                    }
+                                                });
+
                                                 let remove_inner = move |_| {
                                                     draft.update(|d| {
                                                         let mut drop_group = false;
@@ -2093,6 +3051,7 @@ pub fn QueryBuilder(
                                                             d.nodes.iter_mut().find(|n| n.id() == node_id)
                                                         {
                                                             g.conditions.retain(|c| c.id != cid);
+                                                            g.list_values.remove(&cid);
                                                             drop_group = g.conditions.is_empty();
                                                         }
                                                         if drop_group {
@@ -2117,31 +3076,6 @@ pub fn QueryBuilder(
                                                                     </span>
                                                                 })}
 
-                                                                <button
-                                                                    type="button"
-                                                                    class=move || if c_neg.get() {
-                                                                        "le-qb-not-btn is-active"
-                                                                    } else {
-                                                                        "le-qb-not-btn"
-                                                                    }
-                                                                    aria-pressed=move || c_neg.get().to_string()
-                                                                    title="Negate this condition (NOT)"
-                                                                    on:click=move |_| {
-                                                                        draft.update(|d| {
-                                                                            if let Some(QueryBuilderNode::Group(g)) =
-                                                                                d.nodes.iter_mut().find(|n| n.id() == node_id)
-                                                                                && let Some(c) =
-                                                                                    g.conditions.iter_mut().find(|c| c.id == cid)
-                                                                            {
-                                                                                c.negated = !c.negated;
-                                                                            }
-                                                                        });
-                                                                        sync_from_nodes();
-                                                                    }
-                                                                >
-                                                                    "NOT"
-                                                                </button>
-
                                                                 <SkySelect
                                                                     aria_label="Inner condition field"
                                                                     variant=SelectVariant::IndigoBox
@@ -2163,6 +3097,11 @@ pub fn QueryBuilder(
                                                                                     if !f.supports_threshold() {
                                                                                         c.threshold = None;
                                                                                     }
+                                                                                    if !f.supports_in()
+                                                                                        && let Some(vals) = g.list_values.remove(&cid)
+                                                                                    {
+                                                                                        c.value = vals.into_iter().next().unwrap_or_default();
+                                                                                    }
                                                                                     if f == QueryFieldKind::Unclassified {
                                                                                         c.value.clear();
                                                                                     }
@@ -2171,6 +3110,13 @@ pub fn QueryBuilder(
                                                                             sync_from_nodes();
                                                                         }
                                                                     })
+                                                                />
+
+                                                                <OperatorControl
+                                                                    field=Signal::derive(move || c_field.get())
+                                                                    operator=Signal::derive(move || c_op.get())
+                                                                    variant=SelectVariant::IndigoBox
+                                                                    on_change=on_inner_op_change
                                                                 />
                                                             </div>
 
@@ -2188,7 +3134,20 @@ pub fn QueryBuilder(
                                                         <div class="le-qb-card-body">
                                                             {move || {
                                                                 let f = c_field.get();
-                                                                if f == QueryFieldKind::Unclassified {
+                                                                let op = c_op.get();
+                                                                if f.supports_in() && op.is_list() {
+                                                                    view! {
+                                                                        <ChipListInput
+                                                                            field=f
+                                                                            negated=Signal::derive(move || c_op.get().is_negated())
+                                                                            values=Signal::derive(move || c_values.get())
+                                                                            on_commit_raw=on_inner_commit_raw
+                                                                            on_remove_chip=on_inner_remove_chip
+                                                                            on_remove_last=on_inner_remove_last
+                                                                        />
+                                                                    }
+                                                                    .into_any()
+                                                                } else if f == QueryFieldKind::Unclassified {
                                                                     view! {
                                                                         <span class="le-qb-unclassified-badge">
                                                                             "unclassified"

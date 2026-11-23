@@ -184,24 +184,29 @@ impl GalleryMask {
     }
 
     /// Label rendered inside the unlock call-to-action button.
+    ///
+    /// - When `cta_label` is `Some(explicit)`: returns `explicit.trim().to_string()` (so
+    ///   `Some("")` cleanly suppresses the CTA button for permanently blocked items).
+    /// - When `cta_label` is `None`: resolves deterministically from missing requirements.
     pub fn resolved_cta(&self) -> String {
-        if let Some(cta) = self
-            .cta_label
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            return cta.to_string();
+        if let Some(cta) = self.cta_label.as_deref() {
+            return cta.trim().to_string();
         }
         if self.requires_login {
             "Sign in to unlock".to_string()
         } else if self.requires_age {
-            "Verify 18+ to unlock".to_string()
+            "Confirm 18+ to unlock".to_string()
         } else if self.requires_terms {
-            "Review Terms".to_string()
+            "Accept Terms to unlock".to_string()
         } else {
-            "Unlock settings".to_string()
+            "Enable in Account Settings".to_string()
         }
+    }
+
+    /// Resolved CTA label, or `None` when explicitly suppressed (e.g. `cta_label: Some("")`).
+    pub fn resolved_cta_opt(&self) -> Option<String> {
+        let cta = self.resolved_cta();
+        (!cta.is_empty()).then_some(cta)
     }
 }
 
@@ -988,6 +993,9 @@ pub struct PresetTemplate {
 
 impl PresetTemplate {
     /// Built-in WD-Tagger safety presets verified against canonical tag vocabulary.
+    ///
+    /// Uses compact single-row `tag IN (...) >= 0.45` syntax so each preset produces
+    /// one clean multi-chip `WD Tag in [...]` condition card instead of stacked OR rows.
     pub fn builtins() -> Vec<Self> {
         vec![
             Self {
@@ -997,7 +1005,7 @@ impl PresetTemplate {
                 default_mode: RuleMode::Switcher,
                 preset: GalleryMaskPreset::R18,
                 requires_age: true,
-                query: "tag:explicit OR tag:nude OR tag:nipples OR tag:pussy OR tag:penis OR tag:sex OR tag:uncensored OR tag:censored OR tag:topless OR tag:bottomless".to_string(),
+                query: "tag IN (explicit, nude, nipples, pussy, penis, sex, uncensored, censored, topless, bottomless) >= 0.45".to_string(),
             },
             Self {
                 id: "sensitive".to_string(),
@@ -1006,7 +1014,7 @@ impl PresetTemplate {
                 default_mode: RuleMode::SpoilerBlur,
                 preset: GalleryMaskPreset::Sensitive,
                 requires_age: false,
-                query: "tag:questionable OR tag:sensitive OR tag:lingerie OR tag:bikini OR tag:underwear OR tag:panties OR tag:cleavage OR tag:bdsm".to_string(),
+                query: "tag IN (questionable, sensitive, lingerie, bikini, underwear, panties, cleavage, bdsm) >= 0.45".to_string(),
             },
             Self {
                 id: "blood".to_string(),
@@ -1015,7 +1023,7 @@ impl PresetTemplate {
                 default_mode: RuleMode::Switcher,
                 preset: GalleryMaskPreset::Blood,
                 requires_age: false,
-                query: "tag:blood".to_string(),
+                query: "tag IN (blood) >= 0.45".to_string(),
             },
             Self {
                 id: "custom".to_string(),
