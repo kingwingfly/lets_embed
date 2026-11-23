@@ -14,6 +14,8 @@ static NEXT_SELECT_ID: AtomicUsize = AtomicUsize::new(1);
 pub struct SelectOption {
     pub value: String,
     pub label: String,
+    /// Optional concise label shown inside the trigger on narrow mobile viewports (`<sm`).
+    pub short_label: Option<String>,
     pub disabled: bool,
 }
 
@@ -22,8 +24,14 @@ impl SelectOption {
         Self {
             value: value.into(),
             label: label.into(),
+            short_label: None,
             disabled: false,
         }
+    }
+
+    pub fn short_label(mut self, short: impl Into<String>) -> Self {
+        self.short_label = Some(short.into());
+        self
     }
 
     pub fn disabled(mut self, disabled: bool) -> Self {
@@ -326,22 +334,22 @@ pub fn SkySelect(
         );
     }
 
-    let selected_label = move || {
+    let selected_labels = move || {
         let cur = value.get();
         options.with(|opts| {
             opts.iter()
                 .find(|o| o.value == cur)
                 .or_else(|| opts.first())
-                .map(|o| o.label.clone())
+                .map(|o| (o.label.clone(), o.short_label.clone()))
                 .unwrap_or_default()
         })
     };
 
     let trigger_base = match variant {
         SelectVariant::SearchPill => {
-            "self-stretch inline-flex items-center justify-between gap-1.5 rounded-l-full bg-sky-50/90 \
+            "self-stretch inline-flex items-center justify-between gap-1 sm:gap-1.5 rounded-l-full bg-sky-50/90 \
              hover:bg-sky-100/80 text-sky-800 text-xs sm:text-sm font-medium \
-             pl-3 sm:pl-3.5 pr-2.5 sm:pr-3 py-2 border-r border-sky-200/80 \
+             pl-2.5 sm:pl-3.5 pr-2 sm:pr-3 py-1.5 sm:py-2 border-r border-sky-200/80 \
              outline-none cursor-pointer transition-colors whitespace-nowrap"
         }
         SelectVariant::SkyBox => {
@@ -509,7 +517,20 @@ pub fn SkySelect(
                 on:click=toggle
                 on:keydown=on_keydown
             >
-                <span class="truncate">{selected_label}</span>
+                {move || {
+                    let (full, short) = selected_labels();
+                    match short {
+                        Some(s) => view! {
+                            <span class="truncate sm:hidden">{s}</span>
+                            <span class="truncate hidden sm:inline">{full}</span>
+                        }
+                        .into_any(),
+                        None => view! {
+                            <span class="truncate">{full}</span>
+                        }
+                        .into_any(),
+                    }
+                }}
                 <svg
                     class=move || {
                         let rot = if open.get() { "rotate-180" } else { "" };

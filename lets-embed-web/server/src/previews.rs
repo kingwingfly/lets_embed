@@ -18,7 +18,7 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
 };
-use search_types::{BlurDeliveryMode, MaskMetadata, ProjectedImage, ProjectedVideo};
+use search_types::{MaskMetadata, PlaceholderPreset, ProjectedImage, ProjectedVideo};
 use serde::{Deserialize, Serialize};
 
 /// Cap on how many unique items a single request may ask about per kind.
@@ -307,14 +307,16 @@ pub struct Preview {
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview_url: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blurred: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub can_click_reveal: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reveal_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub blur_mode: Option<BlurDeliveryMode>,
+    pub policy_rev: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub preset: Option<String>,
+    pub preset: Option<PlaceholderPreset>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub locked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -351,8 +353,9 @@ pub(crate) fn preview_from_projected_image(
             name: name.clone(),
             url: Some(url.clone()),
             preview_url: None,
-            reveal_url: None,
-            blur_mode: None,
+            blurred: false,
+            can_click_reveal: false,
+            policy_rev: None,
             label: None,
             preset: None,
             locked: false,
@@ -363,15 +366,15 @@ pub(crate) fn preview_from_projected_image(
             image_count,
             video_count,
         },
-        ProjectedImage::Spoiler {
+        ProjectedImage::Blurred {
             id,
             preview_url,
-            reveal_url,
-            width,
-            height,
+            can_click_reveal,
+            policy_rev,
             label,
             preset,
-            blur_mode,
+            width,
+            height,
             ..
         } => Preview {
             kind,
@@ -379,11 +382,12 @@ pub(crate) fn preview_from_projected_image(
             image_id: Some(*id),
             name: None,
             url: None,
-            preview_url: Some(preview_url.clone()),
-            reveal_url: Some(reveal_url.clone()),
-            blur_mode: Some(*blur_mode),
+            preview_url: preview_url.clone(),
+            blurred: true,
+            can_click_reveal: *can_click_reveal,
+            policy_rev: Some(*policy_rev),
             label: Some(label.clone()),
-            preset: Some(preset.clone()),
+            preset: Some(*preset),
             locked: false,
             mask: None,
             width: *width,
@@ -392,8 +396,9 @@ pub(crate) fn preview_from_projected_image(
             image_count,
             video_count,
         },
-        ProjectedImage::Locked {
+        ProjectedImage::Placeholder {
             id,
+            policy_rev,
             width,
             height,
             mask,
@@ -404,8 +409,9 @@ pub(crate) fn preview_from_projected_image(
             name: None,
             url: None,
             preview_url: None,
-            reveal_url: None,
-            blur_mode: None,
+            blurred: false,
+            can_click_reveal: false,
+            policy_rev: Some(*policy_rev),
             label: None,
             preset: None,
             locked: true,
@@ -427,7 +433,8 @@ pub(crate) fn preview_from_projected_video_post(
     video_count: Option<usize>,
 ) -> Preview {
     match vid {
-        Some(ProjectedVideo::Locked {
+        Some(ProjectedVideo::Placeholder {
+            policy_rev,
             width,
             height,
             mask,
@@ -439,12 +446,42 @@ pub(crate) fn preview_from_projected_video_post(
             name: None,
             url: None,
             preview_url: None,
-            reveal_url: None,
-            blur_mode: None,
+            blurred: false,
+            can_click_reveal: false,
+            policy_rev: Some(*policy_rev),
             label: None,
             preset: None,
             locked: true,
             mask: Some(mask.clone()),
+            width: *width,
+            height: *height,
+            title,
+            image_count,
+            video_count,
+        },
+        Some(ProjectedVideo::Blurred {
+            preview_url,
+            can_click_reveal,
+            policy_rev,
+            label,
+            preset,
+            width,
+            height,
+            ..
+        }) => Preview {
+            kind: "post",
+            target_id: post_id,
+            image_id: None,
+            name: None,
+            url: None,
+            preview_url: preview_url.clone(),
+            blurred: true,
+            can_click_reveal: *can_click_reveal,
+            policy_rev: Some(*policy_rev),
+            label: Some(label.clone()),
+            preset: Some(*preset),
+            locked: false,
+            mask: None,
             width: *width,
             height: *height,
             title,
@@ -458,8 +495,9 @@ pub(crate) fn preview_from_projected_video_post(
             name: None,
             url: None,
             preview_url: None,
-            reveal_url: None,
-            blur_mode: None,
+            blurred: false,
+            can_click_reveal: false,
+            policy_rev: None,
             label: None,
             preset: None,
             locked: false,
@@ -477,8 +515,9 @@ pub(crate) fn preview_from_projected_video_post(
             name: None,
             url: None,
             preview_url: None,
-            reveal_url: None,
-            blur_mode: None,
+            blurred: false,
+            can_click_reveal: false,
+            policy_rev: None,
             label: None,
             preset: None,
             locked: false,
@@ -620,9 +659,10 @@ mod tests {
 
     fn sample_mask() -> MaskMetadata {
         MaskMetadata {
-            rule_id: "r18".into(),
+            policy_id: "r18".into(),
+            matched_policy_ids: vec!["r18".into()],
             label: "Adult 18+".into(),
-            preset: "r18".into(),
+            preset: PlaceholderPreset::R18,
             requires_login: true,
             requires_age: true,
             requires_terms: true,
@@ -630,9 +670,10 @@ mod tests {
     }
 
     #[test]
-    fn locked_preview_emits_zero_name_zero_url_zero_cap_while_preserving_counts() {
-        let locked = ProjectedImage::Locked {
+    fn placeholder_and_blurred_previews_never_emit_clear_urls_or_reveal_urls() {
+        let placeholder = ProjectedImage::Placeholder {
             id: 77,
+            policy_rev: 4,
             width: 1200,
             height: 1600,
             mask: sample_mask(),
@@ -640,7 +681,7 @@ mod tests {
         let p = preview_from_projected_image(
             "post",
             12,
-            &locked,
+            &placeholder,
             Some("My Album".into()),
             Some(9),
             Some(2),
@@ -650,36 +691,73 @@ mod tests {
         assert!(p.name.is_none());
         assert!(p.url.is_none());
         assert!(p.preview_url.is_none());
-        assert!(p.reveal_url.is_none());
         assert!(!json.contains("\"name\""));
         assert!(!json.contains("\"url\""));
+        assert!(!json.contains("reveal_url"));
         assert!(!json.contains("cap="));
         assert!(json.contains("\"title\":\"My Album\""));
         assert!(json.contains("\"image_count\":9"));
         assert!(json.contains("\"video_count\":2"));
+
+        let blurred = ProjectedImage::Blurred {
+            id: 78,
+            preview_url: Some("/media/preview/78?cap=mc3.prev".into()),
+            can_click_reveal: true,
+            policy_rev: 4,
+            matched_policy_ids: vec!["sensitive".into()],
+            label: "Suggestive".into(),
+            preset: PlaceholderPreset::Sensitive,
+            width: 800,
+            height: 1000,
+        };
+        let bp = preview_from_projected_image("image", 78, &blurred, None, None, None);
+        let bp_json = serde_json::to_string(&bp).unwrap();
+        assert!(bp.blurred);
+        assert!(bp.can_click_reveal);
+        assert_eq!(bp.policy_rev, Some(4));
+        assert!(bp.url.is_none());
+        assert!(!bp_json.contains("\"url\""));
+        assert!(!bp_json.contains("reveal_url"));
     }
 
     #[test]
-    fn post_like_previews_and_post_images_match_favorites_wire_contract_and_hide_locked_urls() {
-        let locked_img = ProjectedImage::Locked {
+    fn post_like_previews_and_post_images_match_policy_v3_wire_contract() {
+        let placeholder_img = ProjectedImage::Placeholder {
             id: 501,
+            policy_rev: 7,
             width: 1000,
             height: 1500,
             mask: sample_mask(),
         };
+        let blurred_img = ProjectedImage::Blurred {
+            id: 503,
+            preview_url: Some("/media/preview/503?cap=mc3.prev".into()),
+            can_click_reveal: true,
+            policy_rev: 7,
+            matched_policy_ids: vec!["sensitive".into()],
+            label: "Suggestive".into(),
+            preset: PlaceholderPreset::Sensitive,
+            width: 800,
+            height: 600,
+        };
         let clear_img = ProjectedImage::Clear {
             id: 502,
-            url: "/media/image/502?cap=tok1".into(),
+            url: "/media/image/502?cap=mc3.tok1".into(),
             name: None,
             width: 800,
             height: 600,
         };
-        let locked_vid = ProjectedVideo::Locked {
+        let blurred_vid = ProjectedVideo::Blurred {
             id: 901,
+            preview_url: None,
+            can_click_reveal: true,
+            policy_rev: 7,
+            matched_policy_ids: vec!["sensitive".into()],
+            label: "Suggestive".into(),
+            preset: PlaceholderPreset::Sensitive,
             width: 1920,
             height: 1080,
             duration: 30,
-            mask: sample_mask(),
         };
 
         let post_item = build_post_preview_item(
@@ -687,62 +765,71 @@ mod tests {
             "Locked Album".into(),
             5,
             1,
-            Some(&locked_img),
+            Some(&placeholder_img),
             None,
         );
         let vid_only_post = build_post_preview_item(
             13,
-            "Video Only".into(),
+            "Blurred Video".into(),
             0,
             1,
             None,
-            Some(&locked_vid),
+            Some(&blurred_vid),
         );
 
         let resp = LikePreviewsPostResp {
             posts: vec![post_item, vid_only_post],
-            images: vec![clear_img.clone(), locked_img.clone()],
-            videos: vec![locked_vid.clone()],
+            images: vec![clear_img.clone(), blurred_img.clone(), placeholder_img.clone()],
+            videos: vec![blurred_vid.clone()],
         };
         let val = serde_json::to_value(&resp).unwrap();
 
-        // Post 12 cover has tagged `"state":"locked"` and zero url/name/cap.
+        // Post 12 cover has tagged `"state":"placeholder"` and zero url/name/cap.
         let p0 = &val["posts"][0];
         assert_eq!(p0["post_id"], 12);
         assert_eq!(p0["title"], "Locked Album");
         assert_eq!(p0["image_count"], 5);
         assert_eq!(p0["video_count"], 1);
-        assert_eq!(p0["cover"]["state"], "locked");
+        assert_eq!(p0["cover"]["state"], "placeholder");
         assert!(p0["cover"].get("url").is_none());
         assert!(p0["cover"].get("name").is_none());
 
-        // Video-only Post 13 cover carries `"kind":"video"` and `"state":"locked"`.
+        // Video-only Post 13 cover preserves `"kind":"video"` and `"state":"blurred"` (NEVER Clear!).
         let p1 = &val["posts"][1];
         assert_eq!(p1["cover"]["kind"], "video");
-        assert_eq!(p1["cover"]["state"], "locked");
+        assert_eq!(p1["cover"]["state"], "blurred");
+        assert_eq!(p1["cover"]["can_click_reveal"], true);
         assert!(p1["cover"].get("url").is_none());
+        assert!(p1["cover"].get("reveal_url").is_none());
 
-        // Standalone images & videos use tagged `state`.
+        // Standalone images & videos use tagged `state` with ZERO pre-minted `reveal_url`.
         assert_eq!(val["images"][0]["state"], "clear");
-        assert_eq!(val["images"][0]["url"], "/media/image/502?cap=tok1");
-        assert_eq!(val["images"][1]["state"], "locked");
+        assert_eq!(val["images"][0]["url"], "/media/image/502?cap=mc3.tok1");
+        assert_eq!(val["images"][1]["state"], "blurred");
+        assert_eq!(val["images"][1]["can_click_reveal"], true);
         assert!(val["images"][1].get("url").is_none());
-        assert_eq!(val["videos"][0]["state"], "locked");
+        assert!(val["images"][1].get("reveal_url").is_none());
+        assert_eq!(val["images"][2]["state"], "placeholder");
+        assert!(val["images"][2].get("url").is_none());
+        assert_eq!(val["videos"][0]["state"], "blurred");
         assert!(val["videos"][0].get("url").is_none());
+        assert!(val["videos"][0].get("reveal_url").is_none());
 
         // GET /api/post_images response matches `{title, authors, images, videos}`.
         let album = PostImagesResp {
             title: "Album Title".into(),
             authors: vec!["Artist A".into()],
-            images: vec![clear_img, locked_img],
-            videos: vec![locked_vid],
+            images: vec![clear_img, blurred_img, placeholder_img],
+            videos: vec![blurred_vid],
         };
         let album_val = serde_json::to_value(&album).unwrap();
         assert_eq!(album_val["title"], "Album Title");
         assert_eq!(album_val["authors"][0], "Artist A");
-        assert_eq!(album_val["images"][1]["state"], "locked");
-        assert!(album_val["images"][1].get("url").is_none());
-        assert_eq!(album_val["videos"][0]["state"], "locked");
+        assert_eq!(album_val["images"][1]["state"], "blurred");
+        assert!(album_val["images"][1].get("reveal_url").is_none());
+        assert_eq!(album_val["images"][2]["state"], "placeholder");
+        assert!(album_val["images"][2].get("url").is_none());
+        assert_eq!(album_val["videos"][0]["state"], "blurred");
         assert!(album_val["videos"][0].get("url").is_none());
     }
 }

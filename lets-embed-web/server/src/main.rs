@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod cli;
+mod internal;
 mod legal_routes;
 mod middleware;
 mod previews;
@@ -19,13 +20,13 @@ use axum::{
     Router,
     http::{StatusCode, header},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
 use clap::Parser;
 use leptos::prelude::*;
 use leptos_axum::{AxumRouteListing, LeptosRoutes, generate_route_list};
 use middleware::{MetadataRateLimiter, MiddlewareState};
-use site_access::PublicSitePolicy;
+use site_access::decode_active_policy_v3;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::{
     EnvFilter, Registry, layer::SubscriberExt as _, util::SubscriberInitExt as _,
@@ -44,18 +45,37 @@ async fn healthz() -> impl IntoResponse {
 fn build_core_router(app_state: &AppState, serve_media_prefix: Option<PathBuf>) -> Router<AppState> {
     let mut router = Router::new().route("/healthz", get(healthz));
 
-    // HARD INVARIANT (C2): raw ServeDir on `/images` and `/videos` is mounted ONLY
-    // in Standalone Mode. Managed Mode unconditionally refuses raw media file mounts
-    // even if `--prefix` was passed on the command line.
+    // HARD INVARIANT:
+    // - Managed Mode unconditionally refuses raw media mounts on `/images` and `/videos`.
+    // - Standalone Mode mounts standard `ServeDir` ONLY when `safety_enabled == false`.
+    //   When a local Policy v3 file enables safety (`safety_enabled == true`), `/images/*`
+    //   and `/videos/*` route through the DB-authorizing Standalone Media Guard!
     if app_state.mode == DeploymentMode::Standalone
         && let Some(prefix) = serve_media_prefix
     {
-        router = router
-            .nest_service("/images", ServeDir::new(&prefix))
-            .nest_service("/videos", ServeDir::new(&prefix));
+        if app_state
+            .policy_store
+            .current_standalone()
+            .policy
+            .safety_enabled
+        {
+            router = router
+                .route("/images/{*path}", get(internal::standalone_guarded_image))
+                .route("/videos/{*path}", get(internal::standalone_guarded_video));
+        } else {
+            router = router
+                .nest_service("/images", ServeDir::new(&prefix))
+                .nest_service("/videos", ServeDir::new(&prefix));
+        }
     }
 
     router
+        .route("/internal/facts-rev/{kind}/{id}", get(internal::facts_rev))
+        .route(
+            "/internal/validate-safety-catalog",
+            post(internal::validate_safety_catalog),
+        )
+        .route("/api/safety/reveal", post(internal::safety_reveal))
         .route("/robots.txt", get(seo::robots_txt))
         .route("/sitemap.xml", get(seo::sitemap_root))
         .route("/sitemap/{page}", get(seo::sitemap_page))
@@ -138,16 +158,19 @@ async fn main() -> anyhow::Result<()> {
                 let raw = std::fs::read_to_string(path).with_context(|| {
                     format!("failed reading --policy-file {}", path.display())
                 })?;
-                let parsed: PublicSitePolicy = serde_json::from_str(&raw).with_context(|| {
-                    format!("failed parsing PublicSitePolicy JSON in {}", path.display())
+                let parsed = decode_active_policy_v3(&raw).map_err(|err| {
+                    anyhow::anyhow!(
+                        "failed decoding Policy v3 JSON in {}: {err}",
+                        path.display()
+                    )
                 })?;
                 tracing::info!(
                     path = %path.display(),
                     rev = parsed.revision,
                     safety_enabled = parsed.safety_enabled,
-                    "loaded standalone safety policy"
+                    "loaded standalone Policy v3 safety policy"
                 );
-                engine.compile_policy(parsed).await?
+                engine.compile_policy(parsed)?
             } else {
                 CompiledPolicy::disabled()
             };
@@ -172,6 +195,7 @@ async fn main() -> anyhow::Result<()> {
         policy_store,
         gateway_assertion_secret: runtime.gateway_assertion_secret.map(Arc::new),
         media_cap_secret: runtime.media_cap_secret.map(Arc::new),
+        internal_api_secret: runtime.internal_api_secret.map(Arc::new),
     };
 
     let routes = generate_route_list(App);
@@ -199,8 +223,9 @@ mod tests {
     };
     use middleware::MetadataRateLimitConfig;
     use site_access::{
-        GATEWAY_ASSERTION_AUDIENCE, GATEWAY_ASSERTION_HEADER, GATEWAY_ASSERTION_VERSION,
-        GatewayAssertion, compute_policy_digest, sign_gateway_assertion,
+        ActorBinding, GATEWAY_ASSERTION_AUDIENCE, GATEWAY_ASSERTION_HEADER,
+        GATEWAY_ASSERTION_VERSION, GatewayAssertion, PublicSitePolicy, compute_policy_digest,
+        sign_gateway_assertion,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
     use tower::ServiceExt as _;
@@ -275,17 +300,23 @@ mod tests {
         sub: Option<&str>,
         exp: u64,
     ) -> String {
+        let actor = match sub {
+            Some(s) => ActorBinding::User {
+                sub: s.to_string(),
+                sid: "sid-test".to_string(),
+            },
+            None => ActorBinding::Anon,
+        };
         let a = GatewayAssertion {
             v: GATEWAY_ASSERTION_VERSION,
             aud: GATEWAY_ASSERTION_AUDIENCE.to_string(),
+            actor,
             rev: policy.revision,
             min_enforce_rev: policy.min_enforce_rev,
-            policy_digest: compute_policy_digest(policy),
-            sub: sub.map(ToOwned::to_owned),
-            sid: sub.map(|_| "sid-test".to_string()),
-            switchers: vec![],
-            safe_mode: false,
-            is_admin_view: false,
+            digest: compute_policy_digest(policy),
+            direct_grants: vec![],
+            click_eligible: vec![],
+            is_billing_waived: false,
             exp,
         };
         sign_gateway_assertion(&a, secret).unwrap()
@@ -310,6 +341,7 @@ mod tests {
             policy_store: Arc::new(PolicyStore::standalone(CompiledPolicy::disabled())),
             gateway_assertion_secret: None,
             media_cap_secret: None,
+            internal_api_secret: None,
         };
 
         let app = test_router(state.clone(), Some(tmp.clone()));
@@ -403,10 +435,12 @@ mod tests {
         };
         policy.legal.rta_meta_enabled = true;
         policy.legal.terms_md = "# Terms\n\n<script>alert('xss')</script>\n\n<img src=x onerror=alert(1)>\n\n[bad](javascript:alert(2))\n\nSafe **text**.".to_string();
+        policy.refresh_policy_digest();
 
         let policy_url = spawn_policy_server(&policy).await;
         let assert_secret = b"managed-assertion-secret-0123456789";
         let cap_secret = b"managed-media-cap-secret-0123456789";
+        let internal_secret = b"managed-internal-api-secret-012345";
 
         let store = PolicyStore::managed(PolicySyncConfig {
             policy_url,
@@ -426,6 +460,7 @@ mod tests {
             policy_store: Arc::new(store),
             gateway_assertion_secret: Some(Arc::new(assert_secret.to_vec())),
             media_cap_secret: Some(Arc::new(cap_secret.to_vec())),
+            internal_api_secret: Some(Arc::new(internal_secret.to_vec())),
         };
 
         // Even if someone passes `Some(tmp)` to `build_core_router`, Managed Mode MUST refuse `/images` mount!
@@ -677,12 +712,13 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_rate_limiter_enforces_per_subject_and_global_429_limits() {
-        let policy = PublicSitePolicy {
+        let mut policy = PublicSitePolicy {
             revision: 2,
             min_enforce_rev: 2,
             safety_enabled: false,
             ..PublicSitePolicy::default()
         };
+        policy.refresh_policy_digest();
         let policy_url = spawn_policy_server(&policy).await;
         let assert_secret = b"rate-limit-assertion-secret-012345";
         let cap_secret = b"rate-limit-cap-secret-0123456789";
@@ -705,6 +741,7 @@ mod tests {
             policy_store: Arc::new(store),
             gateway_assertion_secret: Some(Arc::new(assert_secret.to_vec())),
             media_cap_secret: Some(Arc::new(cap_secret.to_vec())),
+            internal_api_secret: None,
         };
 
         let app = test_router_with_limits(
@@ -746,5 +783,215 @@ mod tests {
         let rc = app.oneshot(make_req(&tok_c)).await.unwrap();
         assert_eq!(rc.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(rc.headers().get(header::CACHE_CONTROL).unwrap(), "private, no-store");
+    }
+
+    #[tokio::test]
+    async fn internal_endpoints_and_reveal_and_standalone_media_guard_enforce_policy_v3_invariants() {
+        let mut policy = PublicSitePolicy {
+            revision: 7,
+            min_enforce_rev: 5,
+            safety_enabled: true,
+            fixed_blur_enabled: true,
+            ..PublicSitePolicy::default()
+        };
+        policy.refresh_policy_digest();
+        let policy_url = spawn_policy_server(&policy).await;
+        let assert_secret = b"v3-assertion-secret-0123456789abcdef";
+        let cap_secret = b"v3-media-cap-secret-0123456789abcdef";
+        let internal_secret = b"v3-internal-secret-0123456789abcdef";
+
+        let store = PolicyStore::managed(PolicySyncConfig {
+            policy_url,
+            cf_access_client_id: None,
+            cf_access_client_secret: None,
+            max_staleness: Duration::from_secs(60),
+        })
+        .unwrap();
+
+        let state = AppState {
+            leptos_options: test_leptos_opts(),
+            engine: test_engine(),
+            prefix: Arc::new(None),
+            public_url: Arc::new(Some("https://gallery.example.com".to_string())),
+            mode: DeploymentMode::Managed,
+            trust_proxy: false,
+            policy_store: Arc::new(store),
+            gateway_assertion_secret: Some(Arc::new(assert_secret.to_vec())),
+            media_cap_secret: Some(Arc::new(cap_secret.to_vec())),
+            internal_api_secret: Some(Arc::new(internal_secret.to_vec())),
+        };
+        let app = test_router(state, None);
+
+        // 1. `/internal/facts-rev` rejects unauthenticated calls with 403.
+        let unauth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/facts-rev/image/42")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::FORBIDDEN);
+
+        // 2. `/internal/facts-rev` accepts `X-Internal-Api-Secret` (sent by gateway_worker/admin)
+        // as well as `Authorization: Bearer <internal_api_secret>` and validates kind.
+        let bad_kind = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/facts-rev/audio/42")
+                    .header(
+                        "x-internal-api-secret",
+                        std::str::from_utf8(internal_secret).unwrap(),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_kind.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            bad_kind.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+
+        // 3. `/internal/validate-safety-catalog` accepts valid v3 assertion without DB for empty arrays!
+        let valid_anon = signed_assertion(assert_secret, &policy, None, now_secs() + 20);
+        let empty_catalog = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/validate-safety-catalog")
+                    .header(GATEWAY_ASSERTION_HEADER, &valid_anon)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"post_tags":[],"authors":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(empty_catalog.status(), StatusCode::OK);
+        let cat_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(empty_catalog.into_body(), 4096).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cat_json,
+            serde_json::json!({ "unknown_post_tags": [], "unknown_authors": [] })
+        );
+
+        // 4. `POST /api/safety/reveal`: rejects missing CSRF header (403).
+        let valid_user = signed_assertion(assert_secret, &policy, Some("usr:12345678"), now_secs() + 20);
+        let no_csrf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/safety/reveal")
+                    .header(GATEWAY_ASSERTION_HEADER, &valid_user)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("origin", "https://gallery.example.com")
+                    .body(Body::from(
+                        r#"{"kind":"image","asset_id":42,"policy_rev":7}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_csrf.status(), StatusCode::FORBIDDEN);
+
+        // 5. `POST /api/safety/reveal`: rejects stale policy_rev with 409 Conflict.
+        let stale_rev = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/safety/reveal")
+                    .header(GATEWAY_ASSERTION_HEADER, &valid_user)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("origin", "https://gallery.example.com")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-requested-with", "fetch")
+                    .body(Body::from(
+                        r#"{"kind":"image","asset_id":42,"policy_rev":6}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale_rev.status(), StatusCode::CONFLICT);
+
+        // 6. `POST /api/safety/reveal`: rejects Anon actor with 403 Forbidden.
+        let anon_reveal = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/safety/reveal")
+                    .header(GATEWAY_ASSERTION_HEADER, &valid_anon)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("origin", "https://gallery.example.com")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("x-requested-with", "fetch")
+                    .body(Body::from(
+                        r#"{"kind":"image","asset_id":42,"policy_rev":7}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anon_reveal.status(), StatusCode::FORBIDDEN);
+
+        // 7. Standalone Media Guard: when `safety_enabled == true`, raw files on disk are NOT
+        // served by `ServeDir` — requests pass through the DB-authorizing guard (which fails closed
+        // with 404/503 instead of leaking raw bytes from disk!).
+        let tmp = std::env::temp_dir().join(format!(
+            "lets-embed-standalone-guard-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        std::fs::write(tmp.join("restricted.webp"), b"secret-standalone-bytes").unwrap();
+        let guarded_compiled = CompiledPolicy::compile(policy).unwrap();
+        let standalone_guarded_state = AppState {
+            leptos_options: test_leptos_opts(),
+            engine: test_engine(),
+            prefix: Arc::new(Some(tmp.clone())),
+            public_url: Arc::new(None),
+            mode: DeploymentMode::Standalone,
+            trust_proxy: false,
+            policy_store: Arc::new(PolicyStore::standalone(guarded_compiled)),
+            gateway_assertion_secret: None,
+            media_cap_secret: None,
+            internal_api_secret: None,
+        };
+        let guarded_app = test_router(standalone_guarded_state, Some(tmp.clone()));
+        let guarded_resp = guarded_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/images/restricted.webp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            guarded_resp.status(),
+            StatusCode::OK,
+            "guarded standalone media MUST NOT serve raw bytes without DB authorization"
+        );
+        // Non-.webp path rejected immediately with 404.
+        let non_webp = guarded_app
+            .oneshot(
+                Request::builder()
+                    .uri("/images/restricted.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(non_webp.status(), StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

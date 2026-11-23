@@ -31,8 +31,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use site_access::{
-    GATEWAY_ASSERTION_AUDIENCE, GATEWAY_ASSERTION_DEFAULT_MAX_SKEW, GATEWAY_ASSERTION_HEADER,
-    GATEWAY_ASSERTION_TTL, is_privileged_request_header, verify_gateway_assertion,
+    ActorBinding, GATEWAY_ASSERTION_AUDIENCE, GATEWAY_ASSERTION_DEFAULT_MAX_SKEW,
+    GATEWAY_ASSERTION_HEADER, GATEWAY_ASSERTION_TTL, is_privileged_request_header,
+    verify_gateway_assertion,
 };
 
 /// Maximum distinct subject buckets kept in memory by [`MetadataRateLimiter`].
@@ -226,7 +227,53 @@ pub(crate) fn is_rate_limited_metadata_route(path: &str) -> bool {
             | "/api/post_images"
             | "/api/list_post_images"
             | "/api/list_post_videos"
+            | "/api/safety/reveal"
     )
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn has_valid_internal_secret(headers: &HeaderMap, expected: &[u8]) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    if let Some(auth) = extract_single_header(headers, "authorization")
+        && let Some(token) = auth
+            .strip_prefix("Bearer ")
+            .or_else(|| auth.strip_prefix("bearer "))
+        && constant_time_eq(token.trim().as_bytes(), expected)
+    {
+        return true;
+    }
+    if let Some(tok) = extract_single_header(headers, "x-internal-api-secret")
+        && constant_time_eq(tok.as_bytes(), expected)
+    {
+        return true;
+    }
+    if let Some(tok) = extract_single_header(headers, "x-internal-secret")
+        && constant_time_eq(tok.as_bytes(), expected)
+    {
+        return true;
+    }
+    false
+}
+
+fn rate_limit_subject(actor: &ActorBinding) -> &str {
+    match actor {
+        ActorBinding::User { sub, .. } => sub.as_str(),
+        ActorBinding::LiveAdmin { email } => email.as_str(),
+        ActorBinding::GuestSession { gid } => gid.as_str(),
+        ActorBinding::Anon => "anon",
+    }
 }
 
 fn no_store_error(status: StatusCode, body: &'static str) -> Response {
@@ -255,6 +302,9 @@ pub async fn safety_and_auth_middleware(
     let path = req.uri().path().to_string();
 
     if state.mode == DeploymentMode::Standalone {
+        if path.starts_with("/internal/") {
+            return no_store_error(StatusCode::FORBIDDEN, "Internal endpoint unavailable");
+        }
         // Standalone Mode unconditionally ignores privileged gateway/CF headers.
         strip_privileged_headers(req.headers_mut());
         if is_rate_limited_metadata_route(&path)
@@ -270,9 +320,53 @@ pub async fn safety_and_auth_middleware(
         return next.run(req).await;
     }
 
-    // Managed Mode: ONLY `/healthz` is exempted from X-Gateway-Assertion verification.
+    // Managed Mode: ONLY `/healthz` is exempted from authentication.
     if path == "/healthz" {
         strip_privileged_headers(req.headers_mut());
+        let mut resp = next.run(req).await;
+        resp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        return resp;
+    }
+
+    let now = unix_now_secs();
+
+    // Managed Mode `/internal/*` endpoints authenticate via EITHER a valid v3
+    // `X-Gateway-Assertion` (without requiring `PolicyStore` sync) OR the
+    // `INTERNAL_API_SECRET` bearer / `X-Internal-Secret` token.
+    if path.starts_with("/internal/") {
+        let assertion_ok = state
+            .gateway_assertion_secret
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(|secret| {
+                let raw = extract_single_header(req.headers(), GATEWAY_ASSERTION_HEADER)?;
+                verify_gateway_assertion(
+                    raw,
+                    secret,
+                    GATEWAY_ASSERTION_AUDIENCE,
+                    now,
+                    GATEWAY_ASSERTION_DEFAULT_MAX_SKEW,
+                )
+                .ok()
+            })
+            .is_some();
+        let internal_token_ok = state
+            .internal_api_secret
+            .as_deref()
+            .is_some_and(|secret| has_valid_internal_secret(req.headers(), secret));
+
+        if !assertion_ok && !internal_token_ok {
+            return no_store_error(StatusCode::FORBIDDEN, "Invalid internal credentials");
+        }
+
+        strip_privileged_headers(req.headers_mut());
+        req.headers_mut().remove(header::AUTHORIZATION);
+        req.headers_mut().remove("x-internal-api-secret");
+        req.headers_mut().remove("x-internal-secret");
+
         let mut resp = next.run(req).await;
         resp.headers_mut().insert(
             header::CACHE_CONTROL,
@@ -303,7 +397,6 @@ pub async fn safety_and_auth_middleware(
         return no_store_error(StatusCode::FORBIDDEN, "Missing gateway assertion");
     };
 
-    let now = unix_now_secs();
     let assertion = match verify_gateway_assertion(
         raw_token,
         assertion_secret,
@@ -318,25 +411,25 @@ pub async fn safety_and_auth_middleware(
         }
     };
 
-    // Defense-in-depth checks on expiry upper bound and safe_mode invariant.
+    // Defense-in-depth check on expiry upper bound.
     let max_exp = now.saturating_add(GATEWAY_ASSERTION_TTL + GATEWAY_ASSERTION_DEFAULT_MAX_SKEW);
-    if assertion.exp > max_exp || (assertion.safe_mode && !assertion.switchers.is_empty()) {
-        tracing::warn!(%path, "rejected gateway assertion violating invariants");
+    if assertion.exp > max_exp {
+        tracing::warn!(%path, "rejected gateway assertion exceeding max TTL");
         return no_store_error(StatusCode::FORBIDDEN, "Invalid gateway assertion");
     }
 
     // Strip all privileged headers before forwarding to handlers.
     strip_privileged_headers(req.headers_mut());
 
-    // Enforce per-subject + global rate limits on unmetered metadata routes (M2).
+    // Enforce per-subject + global rate limits on unmetered metadata & reveal routes.
     if is_rate_limited_metadata_route(&path) {
-        let subject = assertion.sub.as_deref().unwrap_or("anon");
+        let subject = rate_limit_subject(&assertion.actor);
         if let Err(retry_after) = mw.rate_limiter.check_and_record(subject) {
             return rate_limited_response(retry_after);
         }
     }
 
-    // Pin ONE immutable digest-verified compiled policy snapshot for this request.
+    // Pin ONE immutable exact-aligned Policy v3 snapshot for this request.
     let policy = match state
         .policy_store
         .resolve_for_assertion(&assertion, &state.engine)
@@ -349,7 +442,7 @@ pub async fn safety_and_auth_middleware(
         }
     };
 
-    let is_anonymous = assertion.sub.is_none();
+    let is_anonymous = assertion.actor.is_anon();
     let ctx = RequestSafetyContext {
         mode: DeploymentMode::Managed,
         policy,

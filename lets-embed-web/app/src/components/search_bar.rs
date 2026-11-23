@@ -5,6 +5,7 @@ use crate::types::{
     DEFAULT_SEARCH_LIMIT, GalleryDensityState, Mode, SafetyUiState, parse_url_limit,
     parse_url_min_similarity,
 };
+#[cfg(feature = "hydrate")]
 use js_sys::futures::JsFuture;
 use leptos::{prelude::*, task::spawn_local};
 use leptos_router::{
@@ -15,10 +16,12 @@ use leptos_router::{
 #[cfg(feature = "hydrate")]
 use leptos_use_element_size::{UseElementSizeReturn, use_element_size};
 use leptos_use_signal_debounce_throttle::signal_debounced;
-use lets_embed_ui::{DensityPicker, NoticeBanner, NoticeContent, NoticeTone, SafeModeToggle};
+use lets_embed_ui::{DensityPicker, NoticeBanner, NoticeContent, NoticeTone};
 use search_types::query::{AdvancedSort, QueryExpr, ResultKind, SearchField, parse_and_compile};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "hydrate")]
 use wasm_bindgen::{JsCast as _, JsValue};
+#[cfg(feature = "hydrate")]
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, ImageBitmap};
 
 pub(crate) const DEFAULT_LIMIT: usize = DEFAULT_SEARCH_LIMIT as usize;
@@ -43,7 +46,6 @@ pub struct UrlSearchState {
     pub q: String,
     pub adv: String,
     pub sort: AdvancedSort,
-    pub clip_weight: i32,
     pub min_similarity: Option<f32>,
     pub img_nonce: String,
     pub limit: usize,
@@ -56,67 +58,12 @@ impl Default for UrlSearchState {
             q: String::new(),
             adv: String::new(),
             sort: AdvancedSort::Relevance,
-            clip_weight: 50,
             min_similarity: None,
             img_nonce: String::new(),
             limit: DEFAULT_LIMIT,
         }
     }
 }
-
-#[cfg(feature = "hydrate")]
-async fn persist_safe_mode(enabled: bool) -> bool {
-    use web_sys::{Headers, RequestInit, Response};
-
-    let Some(win) = web_sys::window() else {
-        return false;
-    };
-    let opts = RequestInit::new();
-    opts.set_method("POST");
-    if let Ok(headers) = Headers::new() {
-        let _ = headers.set("Content-Type", "application/json");
-        let _ = headers.set(site_access::USER_CSRF_HEADER, "1");
-        opts.set_headers(&headers);
-    }
-    // Omit `enabled_switchers` so `user_worker` preserves the user's saved switchers
-    // while toggling only `safe_mode`.
-    let body = serde_json::json!({ "safe_mode": enabled }).to_string();
-    opts.set_body(&JsValue::from_str(&body));
-    match JsFuture::from(win.fetch_with_str_and_init("/user/api/preferences", &opts)).await {
-        Ok(val) => val
-            .dyn_into::<Response>()
-            .map(|r| r.ok())
-            .unwrap_or(false),
-        Err(_) => false,
-    }
-}
-
-#[cfg(not(feature = "hydrate"))]
-async fn persist_safe_mode(_enabled: bool) -> bool {
-    false
-}
-
-#[cfg(feature = "hydrate")]
-fn broadcast_safe_mode_synced(enabled: bool) {
-    if let Ok(ch) = web_sys::BroadcastChannel::new(lets_embed_ui::browser::SAFETY_CHANNEL_NAME) {
-        let payload = js_sys::Object::new();
-        let _ = js_sys::Reflect::set(
-            &payload,
-            &JsValue::from_str("type"),
-            &JsValue::from_str("safe_mode_synced"),
-        );
-        let _ = js_sys::Reflect::set(
-            &payload,
-            &JsValue::from_str("enabled"),
-            &JsValue::from_bool(enabled),
-        );
-        let _ = ch.post_message(&payload);
-        ch.close();
-    }
-}
-
-#[cfg(not(feature = "hydrate"))]
-fn broadcast_safe_mode_synced(_enabled: bool) {}
 
 /// Summary descriptor rendered in the Active Advanced Query Summary Strip.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,7 +115,6 @@ fn parse_url_state(
     q_raw: Option<String>,
     adv_raw: Option<String>,
     sort_raw: Option<String>,
-    cw_raw: Option<String>,
     min_sim_raw: Option<String>,
     img_raw: Option<String>,
     limit_raw: Option<String>,
@@ -180,10 +126,6 @@ fn parse_url_state(
         .as_deref()
         .map(AdvancedSort::parse)
         .unwrap_or(AdvancedSort::Relevance);
-    let clip_weight = cw_raw
-        .and_then(|s| s.parse::<i32>().ok())
-        .unwrap_or(50)
-        .clamp(5, 95);
     let min_similarity = parse_url_min_similarity(min_sim_raw.as_deref());
     let img_nonce = img_raw.unwrap_or_default();
     let limit = parse_url_limit(limit_raw.as_deref()) as usize;
@@ -192,7 +134,6 @@ fn parse_url_state(
         q,
         adv,
         sort,
-        clip_weight,
         min_similarity,
         img_nonce,
         limit,
@@ -208,13 +149,17 @@ fn active_query_summary(state: &UrlSearchState) -> Option<ActiveQuerySummary> {
             }
             match parse_and_compile(trimmed) {
                 Ok((_, plan)) => {
-                    let meta_badge = if plan.has_clip() && plan.has_dino() {
-                        Some(format!("CLIP {}%", state.clip_weight))
-                    } else if !plan.has_vectors()
+                    let meta_badge = if !plan.has_vectors()
                         && !plan.positive_tags.is_empty()
                         && state.sort == AdvancedSort::Newest
                     {
                         Some("Newest".to_string())
+                    } else if plan.has_clip() && plan.has_dino() {
+                        Some("CLIP + Visual".to_string())
+                    } else if plan.has_clip() {
+                        Some("CLIP".to_string())
+                    } else if plan.has_dino() {
+                        Some("Visual".to_string())
                     } else {
                         None
                     };
@@ -239,6 +184,7 @@ fn active_query_summary(state: &UrlSearchState) -> Option<ActiveQuerySummary> {
             let query_text = QueryExpr::Term {
                 field: SearchField::Tag,
                 value: trimmed.to_string(),
+                threshold: None,
             }
             .format_query();
             Some(ActiveQuerySummary {
@@ -255,6 +201,7 @@ fn active_query_summary(state: &UrlSearchState) -> Option<ActiveQuerySummary> {
             let query_text = QueryExpr::Term {
                 field: SearchField::Clip,
                 value: trimmed.to_string(),
+                threshold: None,
             }
             .format_query();
             Some(ActiveQuerySummary {
@@ -271,6 +218,7 @@ fn active_query_summary(state: &UrlSearchState) -> Option<ActiveQuerySummary> {
             let query_text = QueryExpr::Term {
                 field: SearchField::Dino,
                 value: trimmed.to_string(),
+                threshold: None,
             }
             .format_query();
             Some(ActiveQuerySummary {
@@ -295,6 +243,7 @@ fn active_query_summary(state: &UrlSearchState) -> Option<ActiveQuerySummary> {
 }
 
 /// Resize an uploaded image file to <=256px WebP and return `(url_safe_b64, preview_data_url)`.
+#[cfg(feature = "hydrate")]
 pub(crate) async fn encode_image_file(file: web_sys::File) -> Option<(String, String)> {
     const MAX_EDGE: f64 = 256.0;
 
@@ -439,7 +388,6 @@ pub fn SearchBar() -> impl IntoView {
                 m.get("q"),
                 m.get("adv"),
                 m.get("sort"),
-                m.get("cw"),
                 m.get("min_sim"),
                 m.get("img"),
                 m.get("limit"),
@@ -633,14 +581,10 @@ pub fn SearchBar() -> impl IntoView {
 
     let density = use_context::<GalleryDensityState>().unwrap_or_default().0;
     let safety = expect_context::<SafetyUiState>();
-    // Monotonic generation counter to serialize rapid local Safe Mode toggles and
-    // ignore superseded `/user/api/preferences` responses.
-    let safe_persist_gen: StoredValue<u64> = StoredValue::new(0);
-    #[cfg(feature = "hydrate")]
-    let remote_reload_gen: StoredValue<u64> = StoredValue::new(0);
 
-    // Subscribe to cross-tab Safe Mode broadcasts directly so remote tabs immediately
-    // wipe media and refresh without firing redundant `POST /user/api/preferences` calls.
+    // Retain cross-tab `BroadcastChannel("lets_embed_safety")` & `storage` invalidation
+    // listeners for logout, account switch, opt-out, and policy change events so revealed
+    // blurred cards, modals, and stale thumbnails are immediately wiped and reloaded.
     #[cfg(feature = "hydrate")]
     {
         use wasm_bindgen::closure::Closure;
@@ -653,73 +597,21 @@ pub fn SearchBar() -> impl IntoView {
             }
         }
 
+        let trigger_invalidation = move || {
+            let _ = safety
+                .invalidation_epoch
+                .try_update(|e| *e = e.wrapping_add(1));
+            lets_embed_ui::browser::wipe_media_elements_in(None);
+            let _ = safety.reload_epoch.try_update(|e| *e = e.wrapping_add(1));
+        };
+
         if let Ok(ch) = web_sys::BroadcastChannel::new(lets_embed_ui::browser::SAFETY_CHANNEL_NAME)
         {
             let cb =
                 Closure::<dyn Fn(web_sys::MessageEvent)>::new(move |ev: web_sys::MessageEvent| {
                     let data = ev.data();
-                    let (msg_type, enabled) = if let Some(b) = data.as_bool() {
-                        (Some("safe_mode".to_string()), Some(b))
-                    } else if data.is_object() {
-                        let t = js_sys::Reflect::get(&data, &JsValue::from_str("type"))
-                            .ok()
-                            .and_then(|v| v.as_string());
-                        let b = js_sys::Reflect::get(&data, &JsValue::from_str("enabled"))
-                            .ok()
-                            .and_then(|v| v.as_bool());
-                        (t, b)
-                    } else {
-                        (None, None)
-                    };
-                    let Some(enabled) = enabled else {
-                        return;
-                    };
-                    match msg_type.as_deref() {
-                        Some("safe_mode") => {
-                            let _ = safety.safe_mode.try_set(enabled);
-                            if enabled {
-                                let _ = safety
-                                    .panic_epoch
-                                    .try_update(|e| *e = e.wrapping_add(1));
-                                lets_embed_ui::browser::wipe_media_elements_in(None);
-                            }
-                            if safety.is_managed.try_get_untracked().unwrap_or(false) {
-                                // Wait briefly for the originating tab's `safe_mode_synced` signal
-                                // after its POST completes; fall back to reload if the broadcast
-                                // came from another SPA (e.g. `/user/favorites`).
-                                let rgen = remote_reload_gen
-                                    .try_get_value()
-                                    .unwrap_or(0)
-                                    .wrapping_add(1);
-                                let _ = remote_reload_gen.try_set_value(rgen);
-                                set_timeout(
-                                    move || {
-                                        if remote_reload_gen.try_get_value() == Some(rgen) {
-                                            let _ = safety
-                                                .reload_epoch
-                                                .try_update(|e| *e = e.wrapping_add(1));
-                                        }
-                                    },
-                                    std::time::Duration::from_millis(250),
-                                );
-                            } else {
-                                let _ = safety
-                                    .reload_epoch
-                                    .try_update(|e| *e = e.wrapping_add(1));
-                            }
-                        }
-                        Some("safe_mode_synced") => {
-                            let rgen = remote_reload_gen
-                                .try_get_value()
-                                .unwrap_or(0)
-                                .wrapping_add(1);
-                            let _ = remote_reload_gen.try_set_value(rgen);
-                            let _ = safety.safe_mode.try_set(enabled);
-                            let _ = safety
-                                .reload_epoch
-                                .try_update(|e| *e = e.wrapping_add(1));
-                        }
-                        _ => {}
+                    if !data.is_null() && !data.is_undefined() {
+                        trigger_invalidation();
                     }
                 });
             ch.set_onmessage(Some(cb.as_ref().unchecked_ref()));
@@ -729,30 +621,25 @@ pub fn SearchBar() -> impl IntoView {
                 drop(cb);
             }))));
         }
+
+        if let Some(win) = web_sys::window() {
+            let cb = Closure::<dyn Fn(web_sys::StorageEvent)>::new(move |ev: web_sys::StorageEvent| {
+                if ev.key().as_deref().is_some_and(|k| {
+                    k.starts_with("lets-embed:safety") || k.starts_with("lets-embed:auth")
+                }) {
+                    trigger_invalidation();
+                }
+            });
+            let _ = win.add_event_listener_with_callback("storage", cb.as_ref().unchecked_ref());
+            let win_clean = win.clone();
+            let _ = StoredValue::new_local(LocalChannelCleanup(Some(Box::new(move || {
+                let _ = win_clean
+                    .remove_event_listener_with_callback("storage", cb.as_ref().unchecked_ref());
+                drop(cb);
+            }))));
+        }
     }
 
-    let on_safe_mode_toggle = Callback::new(move |next: bool| {
-        if next {
-            lets_embed_ui::browser::wipe_media_elements_in(None);
-        }
-        // Immediately notify sibling tabs so they wipe media and update UI synchronously.
-        lets_embed_ui::browser::broadcast_safe_mode(next);
-        let persist_gen = safe_persist_gen.get_value().wrapping_add(1);
-        safe_persist_gen.set_value(persist_gen);
-
-        if safety.is_managed.get_untracked() {
-            spawn_local(async move {
-                let _ok = persist_safe_mode(next).await;
-                if safe_persist_gen.try_get_value() != Some(persist_gen) {
-                    return;
-                }
-                let _ = safety.reload_epoch.try_update(|e| *e = e.wrapping_add(1));
-                broadcast_safe_mode_synced(next);
-            });
-        } else {
-            safety.reload_epoch.update(|e| *e = e.wrapping_add(1));
-        }
-    });
     let is_home = move || pathname.with(|p| p == "/");
     let header_card_ref = NodeRef::<leptos::html::Div>::new();
 
@@ -794,9 +681,9 @@ pub fn SearchBar() -> impl IntoView {
 
     let bar_row_cls = move || {
         if is_home() {
-            "flex flex-wrap xl:flex-nowrap w-full items-center gap-x-1.5 sm:gap-x-2 gap-y-2 py-2 sm:py-2.5 px-2 sm:px-3.5"
+            "flex flex-wrap xl:flex-nowrap w-full items-center gap-x-1.5 sm:gap-x-2 gap-y-1.5 sm:gap-y-2 py-2 sm:py-2.5 px-2.5 sm:px-3.5"
         } else {
-            "flex flex-wrap lg:flex-nowrap w-full items-center gap-x-1.5 sm:gap-x-2 gap-y-2 py-2 sm:py-2.5 px-2 sm:px-3.5"
+            "flex flex-wrap lg:flex-nowrap w-full items-center gap-x-1.5 sm:gap-x-2 gap-y-1.5 sm:gap-y-2 py-2 sm:py-2.5 px-2.5 sm:px-3.5"
         }
     };
     let account_slot_cls = move || {
@@ -815,9 +702,9 @@ pub fn SearchBar() -> impl IntoView {
     };
     let actions_slot_cls = move || {
         if is_home() {
-            "order-5 md:order-6 xl:order-3 ml-auto xl:ml-0 flex items-center gap-1.5 sm:gap-2 shrink-0"
+            "md:order-6 xl:order-3 ml-auto xl:ml-0 flex items-center gap-1 sm:gap-2 shrink-0"
         } else {
-            "order-5 md:order-6 lg:order-3 ml-auto lg:ml-0 flex items-center gap-1.5 sm:gap-2 shrink-0"
+            "md:order-6 lg:order-3 ml-auto lg:ml-0 flex items-center gap-1 sm:gap-2 shrink-0"
         }
     };
 
@@ -861,7 +748,7 @@ pub fn SearchBar() -> impl IntoView {
                                 value=Signal::derive(move || field_mode.get().as_str().to_string())
                                 options=Signal::derive(move || {
                                     vec![
-                                        SelectOption::new("all", "Title & Author"),
+                                        SelectOption::new("all", "Title & Author").short_label("All"),
                                         SelectOption::new("title", "Title"),
                                         SelectOption::new("author", "Author"),
                                     ]
@@ -1078,128 +965,124 @@ pub fn SearchBar() -> impl IntoView {
                     // Clean 2-row separator on tablet breakpoints (`md..xl` on home, `md..lg` on details)
                     <div class=row_break_cls aria-hidden="true" />
 
-                    // Gallery density selector integrated into the floating header on the home page
-                    {move || is_home().then(|| view! {
-                        <div class="order-4 md:order-5 xl:order-4 shrink-0">
-                            <DensityPicker density=density persist=true />
-                        </div>
-                    })}
+                    // Balanced toolbar row on mobile (<md): Density left, View Mode (Random) + Advanced right.
+                    // Unwraps via `md:contents` on tablet/desktop to participate directly in the flex order.
+                    <div class="order-4 w-full flex items-center justify-between gap-1.5 min-w-0 md:contents">
+                        {move || is_home().then(|| view! {
+                            <div class="md:order-5 xl:order-4 shrink-0">
+                                <DensityPicker density=density persist=true />
+                            </div>
+                        })}
 
-                    // Compact action buttons: Safe Mode, Random (+ inline Posts|Images when active) & Advanced
-                    <div class=actions_slot_cls>
-                        <SafeModeToggle
-                            safe_mode=safety.safe_mode
-                            panic_epoch=safety.panic_epoch
-                            sync_tabs=false
-                            compact=true
-                            on_toggle=on_safe_mode_toggle
-                        />
-                        {move || if is_random_mode() {
-                            let cur_target = random_target();
-                            let reroll = go_random_main.clone();
-                            let roll_posts = go_random_posts.clone();
-                            let roll_images = go_random_images.clone();
-                            let posts_cls = if cur_target == "posts" {
-                                "px-2.5 py-1 rounded-full text-xs font-semibold bg-sky-500 text-white shadow-xs transition-all cursor-pointer"
+                        // Compact action buttons: Random (+ inline Posts|Images when active) & Advanced
+                        <div class=actions_slot_cls>
+                            {move || if is_random_mode() {
+                                let cur_target = random_target();
+                                let reroll = go_random_main.clone();
+                                let roll_posts = go_random_posts.clone();
+                                let roll_images = go_random_images.clone();
+                                let posts_cls = if cur_target == "posts" {
+                                    "px-2 sm:px-2.5 py-1 rounded-full text-[11px] sm:text-xs font-semibold bg-sky-500 text-white shadow-xs transition-all cursor-pointer"
+                                } else {
+                                    "px-2 sm:px-2.5 py-1 rounded-full text-[11px] sm:text-xs font-medium text-sky-700 hover:bg-sky-200/70 transition-all cursor-pointer"
+                                };
+                                let images_cls = if cur_target == "images" {
+                                    "px-2 sm:px-2.5 py-1 rounded-full text-[11px] sm:text-xs font-semibold bg-sky-500 text-white shadow-xs transition-all cursor-pointer"
+                                } else {
+                                    "px-2 sm:px-2.5 py-1 rounded-full text-[11px] sm:text-xs font-medium text-sky-700 hover:bg-sky-200/70 transition-all cursor-pointer"
+                                };
+                                view! {
+                                    <div class="inline-flex items-center gap-0.5 p-0.5 rounded-full bg-sky-100/90 ring-1 ring-sky-200/90">
+                                        <button
+                                            type="button"
+                                            title="Re-roll random shuffle"
+                                            class="inline-flex items-center gap-1 px-1.5 sm:px-2.5 py-1 rounded-full text-xs font-semibold
+                                                   text-sky-700 hover:bg-white/80 transition-colors cursor-pointer whitespace-nowrap"
+                                            on:click=move |_| reroll(cur_target)
+                                        >
+                                            <span aria-hidden="true">"\u{1F3B2}"</span>
+                                            <span class="hidden sm:inline">"Random"</span>
+                                        </button>
+                                        <button
+                                            type="button"
+                                            aria-pressed=(cur_target == "posts").to_string()
+                                            class=posts_cls
+                                            on:click=move |_| roll_posts("posts")
+                                        >
+                                            "Posts"
+                                        </button>
+                                        <button
+                                            type="button"
+                                            aria-pressed=(cur_target == "images").to_string()
+                                            class=images_cls
+                                            on:click=move |_| roll_images("images")
+                                        >
+                                            "Images"
+                                        </button>
+                                    </div>
+                                }.into_any()
                             } else {
-                                "px-2.5 py-1 rounded-full text-xs font-medium text-sky-700 hover:bg-sky-200/70 transition-all cursor-pointer"
-                            };
-                            let images_cls = if cur_target == "images" {
-                                "px-2.5 py-1 rounded-full text-xs font-semibold bg-sky-500 text-white shadow-xs transition-all cursor-pointer"
-                            } else {
-                                "px-2.5 py-1 rounded-full text-xs font-medium text-sky-700 hover:bg-sky-200/70 transition-all cursor-pointer"
-                            };
-                            view! {
-                                <div class="inline-flex items-center gap-0.5 p-0.5 rounded-full bg-sky-100/90 ring-1 ring-sky-200/90">
+                                let roll = go_random_main.clone();
+                                view! {
                                     <button
                                         type="button"
-                                        title="Re-roll random shuffle"
-                                        class="inline-flex items-center gap-1 px-2 sm:px-2.5 py-1 rounded-full text-xs font-semibold
-                                               text-sky-700 hover:bg-white/80 transition-colors cursor-pointer whitespace-nowrap"
-                                        on:click=move |_| reroll(cur_target)
+                                        title="Roll random posts"
+                                        class="inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1.5 sm:py-2 rounded-full text-xs sm:text-sm
+                                               font-medium text-sky-700 bg-sky-50 hover:bg-sky-100 ring-1 ring-sky-200/90
+                                               active:scale-95 transition-all cursor-pointer whitespace-nowrap"
+                                        on:click=move |_| roll("posts")
                                     >
                                         <span aria-hidden="true">"\u{1F3B2}"</span>
                                         <span class="hidden sm:inline">"Random"</span>
                                     </button>
-                                    <button
-                                        type="button"
-                                        aria-pressed=(cur_target == "posts").to_string()
-                                        class=posts_cls
-                                        on:click=move |_| roll_posts("posts")
-                                    >
-                                        "Posts"
-                                    </button>
-                                    <button
-                                        type="button"
-                                        aria-pressed=(cur_target == "images").to_string()
-                                        class=images_cls
-                                        on:click=move |_| roll_images("images")
-                                    >
-                                        "Images"
-                                    </button>
-                                </div>
-                            }.into_any()
-                        } else {
-                            let roll = go_random_main.clone();
-                            view! {
-                                <button
-                                    type="button"
-                                    title="Roll random posts"
-                                    class="inline-flex items-center gap-1.5 px-2 sm:px-3 py-1.5 sm:py-2 rounded-full text-xs sm:text-sm
-                                           font-medium text-sky-700 bg-sky-50 hover:bg-sky-100 ring-1 ring-sky-200/90
-                                           active:scale-95 transition-all cursor-pointer whitespace-nowrap"
-                                    on:click=move |_| roll("posts")
-                                >
-                                    <span aria-hidden="true">"\u{1F3B2}"</span>
-                                    <span class="hidden sm:inline">"Random"</span>
-                                </button>
-                            }.into_any()
-                        }}
+                                }.into_any()
+                            }}
 
-                        <button
-                            type="button"
-                            aria-expanded=move || adv_open.get().to_string()
-                            aria-controls="advanced-search-panel"
-                            title="Open Web-of-Science Advanced Query Builder (Tag, Author, Title, CLIP, Visual)"
-                            class=move || {
-                                if adv_open.get() || has_active_advanced() {
-                                    "relative inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1.5 sm:py-2 rounded-full text-xs sm:text-sm \
-                                     font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 ring-1 ring-indigo-300 \
-                                     shadow-xs shadow-indigo-200/50 active:scale-95 transition-all cursor-pointer whitespace-nowrap"
-                                } else {
-                                    "relative inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1.5 sm:py-2 rounded-full text-xs sm:text-sm \
-                                     font-medium text-slate-700 bg-white hover:bg-sky-50 hover:text-sky-700 ring-1 ring-sky-200 \
-                                     active:scale-95 transition-all cursor-pointer whitespace-nowrap"
+                            <button
+                                type="button"
+                                aria-expanded=move || adv_open.get().to_string()
+                                aria-controls="advanced-search-panel"
+                                title="Open Advanced Query Builder (Tag, Author, Title, CLIP, Visual)"
+                                class=move || {
+                                    if adv_open.get() || has_active_advanced() {
+                                        "relative inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1.5 sm:py-2 rounded-full text-[11.5px] sm:text-sm \
+                                         font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 ring-1 ring-indigo-300 \
+                                         shadow-xs shadow-indigo-200/50 active:scale-95 transition-all cursor-pointer whitespace-nowrap"
+                                    } else {
+                                        "relative inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1.5 sm:py-2 rounded-full text-[11.5px] sm:text-sm \
+                                         font-medium text-slate-700 bg-white hover:bg-sky-50 hover:text-sky-700 ring-1 ring-sky-200 \
+                                         active:scale-95 transition-all cursor-pointer whitespace-nowrap"
+                                    }
                                 }
-                            }
-                            on:click=move |_| {
-                                input_focused.set(false);
-                                cancel_suggestions();
-                                adv_open.update(|v| *v = !*v);
-                            }
-                        >
-                            <svg
-                                class="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0"
-                                fill="none"
-                                viewBox="0 0 24 24"
-                                stroke="currentColor"
-                                stroke-width="2"
-                                aria-hidden="true"
+                                on:click=move |_| {
+                                    input_focused.set(false);
+                                    cancel_suggestions();
+                                    adv_open.update(|v| *v = !*v);
+                                }
                             >
-                                <path
-                                    stroke-linecap="round"
-                                    stroke-linejoin="round"
-                                    d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"
-                                />
-                            </svg>
-                            <span>"Advanced"</span>
-                            {move || has_active_advanced().then(|| view! {
-                                <span
-                                    class="w-2 h-2 rounded-full bg-indigo-500 ring-2 ring-white shrink-0"
-                                    aria-label="Advanced query active"
-                                />
-                            })}
-                        </button>
+                                <svg
+                                    class="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0"
+                                    fill="none"
+                                    viewBox="0 0 24 24"
+                                    stroke="currentColor"
+                                    stroke-width="2"
+                                    aria-hidden="true"
+                                >
+                                    <path
+                                        stroke-linecap="round"
+                                        stroke-linejoin="round"
+                                        d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"
+                                    />
+                                </svg>
+                                <span>"Advanced"</span>
+                                {move || has_active_advanced().then(|| view! {
+                                    <span
+                                        class="w-2 h-2 rounded-full bg-indigo-500 ring-2 ring-white shrink-0"
+                                        aria-label="Advanced query active"
+                                    />
+                                })}
+                            </button>
+                        </div>
                     </div>
                 </div>
 
@@ -1450,11 +1333,10 @@ mod tests {
 
     #[test]
     fn url_state_defaults_to_all_and_limit_50() {
-        let st = parse_url_state(None, None, None, None, None, None, None, None);
+        let st = parse_url_state(None, None, None, None, None, None, None);
         assert_eq!(st.mode, Mode::All);
         assert_eq!(st.q, "");
         assert_eq!(st.limit, 50);
-        assert_eq!(st.clip_weight, 50);
         assert_eq!(st.min_similarity, None);
         assert_eq!(st.sort, AdvancedSort::Relevance);
 
@@ -1463,7 +1345,6 @@ mod tests {
             None,
             Some("tag:maid".into()),
             Some("newest".into()),
-            Some("120".into()),
             Some("0.42".into()),
             Some("999".into()),
             Some("25".into()),
@@ -1471,17 +1352,15 @@ mod tests {
         assert_eq!(adv.mode, Mode::Advanced);
         assert_eq!(adv.adv, "tag:maid");
         assert_eq!(adv.sort, AdvancedSort::Newest);
-        assert_eq!(adv.clip_weight, 95);
         assert_eq!(adv.min_similarity, Some(0.42));
         assert_eq!(adv.img_nonce, "999");
         assert_eq!(adv.limit, 25);
 
-        let zero_lim = parse_url_state(None, None, None, None, None, None, None, Some("0".into()));
+        let zero_lim = parse_url_state(None, None, None, None, None, None, Some("0".into()));
         assert_eq!(zero_lim.limit, 50);
-        let neg_lim = parse_url_state(None, None, None, None, None, None, None, Some("-5".into()));
+        let neg_lim = parse_url_state(None, None, None, None, None, None, Some("-5".into()));
         assert_eq!(neg_lim.limit, 50);
-        let huge_lim =
-            parse_url_state(None, None, None, None, None, None, None, Some("999".into()));
+        let huge_lim = parse_url_state(None, None, None, None, None, None, Some("999".into()));
         assert_eq!(huge_lim.limit, 100);
     }
 

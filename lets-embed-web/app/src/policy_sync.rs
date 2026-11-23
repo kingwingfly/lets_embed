@@ -1,8 +1,7 @@
-//! Immutable digest-verified policy sync & `ArcSwap` compilation for Managed Mode
+//! Immutable digest-verified Policy v3 sync & `ArcSwap` compilation for Managed Mode
 //! (and zero-network static holder for Standalone Mode).
 
 use std::{
-    future::Future,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -10,7 +9,9 @@ use std::{
 use anyhow::{Context as _, anyhow, bail};
 use arc_swap::ArcSwap;
 use search_engine::{CompiledPolicy, Engine};
-use site_access::{GatewayAssertion, PublicSitePolicy, compute_policy_digest};
+use site_access::{
+    GatewayAssertion, PublicSitePolicy, compute_policy_digest, decode_active_policy_v3,
+};
 
 /// Maximum acceptable policy payload size returned by `POLICY_URL` (2 MiB).
 const MAX_POLICY_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -61,8 +62,9 @@ impl PolicyStore {
         }
     }
 
-    /// Managed Mode store: starts uninitialized and MUST fetch, digest-verify, and compile
-    /// from `POLICY_URL` before serving any protected request (fails closed on error).
+    /// Managed Mode store: starts uninitialized and MUST fetch, strictly decode (schema v3),
+    /// digest-verify, and compile from `POLICY_URL` before serving any protected request
+    /// (fails closed on error).
     pub fn managed(config: PolicySyncConfig) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -86,11 +88,13 @@ impl PolicyStore {
     }
 
     /// Pin ONE immutable `Arc<CompiledPolicy>` snapshot for an incoming Managed Mode
-    /// request verified with `assertion`, performing a bounded single-flight refresh
-    /// whenever uninitialized, stale, or below `assertion.min_enforce_rev` / `assertion.rev`.
+    /// request verified with `assertion`, enforcing exact `(rev, digest)` alignment
+    /// and performing a bounded single-flight refresh whenever uninitialized, stale,
+    /// or mismatched.
     ///
-    /// Fails closed (returns `Err`) on any fetch, digest mismatch, out-of-order downgrade,
-    /// or Postgres rule compilation failure — NEVER falls back to `CompiledPolicy::disabled()`.
+    /// Fails closed (returns `Err`) on any fetch, schema v3 validation, digest mismatch,
+    /// revision mismatch, out-of-order downgrade, or compilation failure — NEVER falls
+    /// back to `CompiledPolicy::disabled()`.
     pub async fn resolve_for_assertion(
         &self,
         assertion: &GatewayAssertion,
@@ -101,21 +105,22 @@ impl PolicyStore {
     }
 
     /// Generic variant accepting a custom compiler closure (used for unit testing
-    /// digest checks, single-flight swaps, and fail-closed compilation errors).
-    pub async fn resolve_for_assertion_with<F, Fut>(
+    /// digest checks, exact revision alignment, single-flight swaps, and fail-closed errors).
+    pub async fn resolve_for_assertion_with<F>(
         &self,
         assertion: &GatewayAssertion,
         compiler: F,
     ) -> anyhow::Result<Arc<CompiledPolicy>>
     where
-        F: FnOnce(PublicSitePolicy) -> Fut,
-        Fut: Future<Output = anyhow::Result<CompiledPolicy>>,
+        F: FnOnce(PublicSitePolicy) -> anyhow::Result<CompiledPolicy>,
     {
         let Some(sync) = self.sync.as_ref() else {
             return Ok(self.snapshot.load().compiled.clone());
         };
 
-        if let Some(pinned) = snapshot_satisfies(&self.snapshot.load(), assertion, sync.config.max_staleness) {
+        if let Some(pinned) =
+            snapshot_satisfies(&self.snapshot.load(), assertion, sync.config.max_staleness)
+        {
             return Ok(pinned);
         }
 
@@ -138,7 +143,7 @@ impl PolicyStore {
             );
         }
 
-        // Enforce monotonic min_enforce_rev and exact digest match against the signed gateway assertion.
+        // Enforce monotonic min_enforce_rev AND exact `(rev, digest)` match against the signed gateway assertion.
         if fetched.revision < assertion.min_enforce_rev {
             bail!(
                 "fetched policy revision {} is below assertion min_enforce_rev {}",
@@ -153,19 +158,16 @@ impl PolicyStore {
                 assertion.rev
             );
         }
-        if computed_digest != assertion.policy_digest {
+        if computed_digest != assertion.digest {
             bail!(
                 "fetched policy digest {} does not match assertion digest {}",
                 computed_digest,
-                assertion.policy_digest
+                assertion.digest
             );
         }
 
-        let compiled = Arc::new(
-            compiler(fetched)
-                .await
-                .context("failed compiling safety policy rules")?,
-        );
+        let compiled =
+            Arc::new(compiler(fetched).context("failed compiling Policy v3 safety rules")?);
         self.snapshot.store(Arc::new(PolicySnapshot {
             initialized: true,
             compiled: compiled.clone(),
@@ -175,6 +177,8 @@ impl PolicyStore {
     }
 }
 
+/// Exact Policy v3 snapshot alignment: NEVER accept a newer or older revision when
+/// `assertion.rev` or `assertion.digest` differs from the pinned snapshot.
 fn snapshot_satisfies(
     snap: &PolicySnapshot,
     assertion: &GatewayAssertion,
@@ -193,12 +197,7 @@ fn snapshot_satisfies(
     if rev < assertion.min_enforce_rev {
         return None;
     }
-    // Never downgrade if we already hold a strictly newer fresh verified revision.
-    if rev > assertion.rev {
-        return Some(snap.compiled.clone());
-    }
-    // Same revision must match digest exactly.
-    if rev == assertion.rev && snap.compiled.digest == assertion.policy_digest {
+    if rev == assertion.rev && snap.compiled.digest == assertion.digest {
         return Some(snap.compiled.clone());
     }
     None
@@ -262,22 +261,27 @@ async fn fetch_policy_from_url(sync: &PolicySyncClient) -> anyhow::Result<Public
     let value: serde_json::Value =
         serde_json::from_slice(&bytes).context("invalid JSON from policy endpoint")?;
 
-    let (policy, envelope_digest): (PublicSitePolicy, Option<String>) =
+    let (policy_json, envelope_digest): (String, Option<String>) =
         if let Some(inner) = value.get("policy") {
-            let pol: PublicSitePolicy = serde_json::from_value(inner.clone())
-                .context("invalid 'policy' object in policy envelope")?;
+            let raw = serde_json::to_string(inner)
+                .context("failed serializing 'policy' object from envelope")?;
             let dig = value
                 .get("digest")
+                .or_else(|| value.get("policy_digest"))
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(ToOwned::to_owned);
-            (pol, dig)
+            (raw, dig)
         } else {
-            let pol: PublicSitePolicy = serde_json::from_value(value)
-                .context("invalid PublicSitePolicy JSON")?;
-            (pol, None)
+            let raw = String::from_utf8(bytes).context("policy body is not valid UTF-8")?;
+            (raw, None)
         };
+
+    // Strictly enforce Policy v3 schema decoding (rejects missing/non-3 schema_version,
+    // legacy "rules" field, internal digest mismatch, or invalid expressions/policies).
+    let policy = decode_active_policy_v3(&policy_json)
+        .map_err(|e| anyhow!("invalid Policy v3 document from POLICY_URL: {e}"))?;
 
     let computed = compute_policy_digest(&policy);
     if let Some(expected) = envelope_digest
@@ -302,20 +306,30 @@ async fn fetch_policy_from_url(sync: &PolicySyncClient) -> anyhow::Result<Public
 mod tests {
     use super::*;
     use axum::{Router, routing::get};
-    use site_access::{GATEWAY_ASSERTION_AUDIENCE, GATEWAY_ASSERTION_VERSION};
+    use site_access::{ActorBinding, GATEWAY_ASSERTION_AUDIENCE, GATEWAY_ASSERTION_VERSION};
+
+    fn make_v3_policy(revision: u64, min_enforce_rev: u64, safety_enabled: bool) -> PublicSitePolicy {
+        let mut p = PublicSitePolicy {
+            revision,
+            min_enforce_rev,
+            safety_enabled,
+            ..PublicSitePolicy::default()
+        };
+        p.refresh_policy_digest();
+        p
+    }
 
     fn make_assertion(policy: &PublicSitePolicy) -> GatewayAssertion {
         GatewayAssertion {
             v: GATEWAY_ASSERTION_VERSION,
             aud: GATEWAY_ASSERTION_AUDIENCE.to_string(),
+            actor: ActorBinding::Anon,
             rev: policy.revision,
             min_enforce_rev: policy.min_enforce_rev,
-            policy_digest: compute_policy_digest(policy),
-            sub: None,
-            sid: None,
-            switchers: vec![],
-            safe_mode: false,
-            is_admin_view: false,
+            digest: compute_policy_digest(policy),
+            direct_grants: vec![],
+            click_eligible: vec![],
+            is_billing_waived: false,
             exp: 2_000_000_000,
         }
     }
@@ -338,12 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn managed_policy_sync_verifies_digest_and_fails_closed_on_mismatch_or_compile_error() {
-        let p1 = PublicSitePolicy {
-            revision: 3,
-            min_enforce_rev: 2,
-            safety_enabled: false,
-            ..PublicSitePolicy::default()
-        };
+        let p1 = make_v3_policy(3, 2, false);
         let envelope = serde_json::json!({
             "policy": p1,
             "digest": compute_policy_digest(&p1),
@@ -361,17 +370,10 @@ mod tests {
 
         // 1. Mismatched assertion digest MUST fail closed (and leave store uninitialized).
         let mut bad_assertion = make_assertion(&p1);
-        bad_assertion.policy_digest = "a".repeat(64);
+        bad_assertion.digest = "a".repeat(64);
         assert!(
             store
-                .resolve_for_assertion_with(&bad_assertion, |pol| async move {
-                    CompiledPolicy::compile_with_resolver(
-                        pol,
-                        &Default::default(),
-                        &Default::default(),
-                        &Default::default(),
-                    )
-                })
+                .resolve_for_assertion_with(&bad_assertion, CompiledPolicy::compile)
                 .await
                 .is_err()
         );
@@ -381,8 +383,8 @@ mod tests {
         let good_assertion = make_assertion(&p1);
         assert!(
             store
-                .resolve_for_assertion_with(&good_assertion, |_| async move {
-                    Err(anyhow!("simulated db compile error"))
+                .resolve_for_assertion_with(&good_assertion, |_| {
+                    Err(anyhow!("simulated compile error"))
                 })
                 .await
                 .is_err()
@@ -391,70 +393,94 @@ mod tests {
 
         // 3. Valid fetch + digest + compile swaps atomically.
         let compiled = store
-            .resolve_for_assertion_with(&good_assertion, |pol| async move {
-                CompiledPolicy::compile_with_resolver(
-                    pol,
-                    &Default::default(),
-                    &Default::default(),
-                    &Default::default(),
-                )
-            })
+            .resolve_for_assertion_with(&good_assertion, CompiledPolicy::compile)
             .await
             .expect("valid sync");
         assert_eq!(compiled.policy.revision, 3);
         assert!(store.snapshot.load().initialized);
 
-        // 4. Subsequent request with higher min_enforce_rev against stale mock fails closed!
+        // 4. Subsequent request with different revision against stale mock fails closed!
         let mut tightened = good_assertion.clone();
         tightened.rev = 4;
         tightened.min_enforce_rev = 4;
         assert!(
             store
-                .resolve_for_assertion_with(&tightened, |pol| async move {
-                    CompiledPolicy::compile_with_resolver(
-                        pol,
-                        &Default::default(),
-                        &Default::default(),
-                        &Default::default(),
-                    )
-                })
+                .resolve_for_assertion_with(&tightened, CompiledPolicy::compile)
                 .await
                 .is_err()
         );
     }
 
-    #[test]
-    fn snapshot_satisfies_enforces_staleness_even_when_rev_exceeds_assertion() {
-        let p5 = PublicSitePolicy {
-            revision: 5,
-            min_enforce_rev: 4,
-            ..PublicSitePolicy::default()
-        };
-        let compiled = Arc::new(
-            CompiledPolicy::compile_with_resolver(
-                p5.clone(),
-                &Default::default(),
-                &Default::default(),
-                &Default::default(),
-            )
-            .unwrap(),
+    #[tokio::test]
+    async fn managed_policy_sync_rejects_pre_v3_schema_and_legacy_rules_field() {
+        let legacy_json = serde_json::json!({
+            "schema_version": 2,
+            "revision": 1,
+            "min_enforce_rev": 1,
+            "safety_enabled": false,
+            "rules": []
+        })
+        .to_string();
+        let url = spawn_policy_mock(legacy_json).await;
+
+        let store = PolicyStore::managed(PolicySyncConfig {
+            policy_url: url,
+            cf_access_client_id: None,
+            cf_access_client_secret: None,
+            max_staleness: Duration::from_secs(60),
+        })
+        .unwrap();
+
+        let p = make_v3_policy(1, 1, false);
+        let assertion = make_assertion(&p);
+        let err = store
+            .resolve_for_assertion_with(&assertion, CompiledPolicy::compile)
+            .await
+            .expect_err("schema_version 2 must be rejected strictly");
+        assert!(
+            err.to_string().contains("Policy v3"),
+            "unexpected err: {err}"
         );
+    }
+
+    #[test]
+    fn snapshot_satisfies_requires_exact_revision_and_digest_and_freshness() {
+        let p5 = make_v3_policy(5, 4, false);
+        let compiled = Arc::new(CompiledPolicy::compile(p5.clone()).unwrap());
+
+        let exact_assertion = make_assertion(&p5);
         let mut older_assertion = make_assertion(&p5);
         older_assertion.rev = 4;
+        let mut wrong_digest_assertion = make_assertion(&p5);
+        wrong_digest_assertion.digest = "b".repeat(64);
 
         let fresh_snap = PolicySnapshot {
             initialized: true,
             compiled: compiled.clone(),
             fetched_at: Some(Instant::now()),
         };
-        assert!(snapshot_satisfies(&fresh_snap, &older_assertion, Duration::from_secs(60)).is_some());
+        // Exact match succeeds when fresh.
+        assert!(
+            snapshot_satisfies(&fresh_snap, &exact_assertion, Duration::from_secs(60)).is_some()
+        );
+        // Policy v3 NEVER accepts revision skew (rev 5 snapshot MUST NOT satisfy rev 4 assertion).
+        assert!(
+            snapshot_satisfies(&fresh_snap, &older_assertion, Duration::from_secs(60)).is_none()
+        );
+        // Digest mismatch rejected even when revision matches.
+        assert!(
+            snapshot_satisfies(&fresh_snap, &wrong_digest_assertion, Duration::from_secs(60))
+                .is_none()
+        );
 
         let stale_snap = PolicySnapshot {
             initialized: true,
             compiled,
             fetched_at: Instant::now().checked_sub(Duration::from_secs(120)),
         };
-        assert!(snapshot_satisfies(&stale_snap, &older_assertion, Duration::from_secs(60)).is_none());
+        assert!(
+            snapshot_satisfies(&stale_snap, &exact_assertion, Duration::from_secs(60)).is_none()
+        );
     }
 
     #[tokio::test]
@@ -492,14 +518,7 @@ mod tests {
         let p = PublicSitePolicy::default();
         let assertion = make_assertion(&p);
         let err = store
-            .resolve_for_assertion_with(&assertion, |pol| async move {
-                CompiledPolicy::compile_with_resolver(
-                    pol,
-                    &Default::default(),
-                    &Default::default(),
-                    &Default::default(),
-                )
-            })
+            .resolve_for_assertion_with(&assertion, CompiledPolicy::compile)
             .await
             .expect_err("oversized chunked body must fail closed");
         assert!(err.to_string().contains("exceeds maximum size"), "err: {err}");
