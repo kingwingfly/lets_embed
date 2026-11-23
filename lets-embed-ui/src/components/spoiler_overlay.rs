@@ -25,6 +25,7 @@ pub fn SpoilerOverlay(
     #[prop(default = GalleryBlurMode::ServerTransform)] blur_mode: GalleryBlurMode,
     #[prop(optional)] panic_epoch: Option<Signal<u64>>,
     #[prop(optional)] on_reveal: Option<Callback<i64>>,
+    #[prop(optional)] on_hide: Option<Callback<i64>>,
     #[prop(optional)] on_open: Option<Callback<()>>,
 ) -> impl IntoView {
     let revealed = RwSignal::new(false);
@@ -41,6 +42,9 @@ pub fn SpoilerOverlay(
                         wipe_media_elements_in(Some(el.as_ref()));
                     }
                     revealed.set(false);
+                    if let Some(cb) = on_hide {
+                        cb.run(id);
+                    }
                 }
             }
         });
@@ -194,6 +198,9 @@ pub fn SpoilerOverlay(
                                         wipe_media_elements_in(Some(el.as_ref()));
                                     }
                                     revealed.set(false);
+                                    if let Some(cb) = on_hide {
+                                        cb.run(id);
+                                    }
                                 }
                             >
                                 "Hide"

@@ -714,6 +714,10 @@ pub enum NoticeContent {
     /// Callers MUST ONLY pass HTML that has been sanitized server-side through
     /// a strict allowlist (such as `ammonia`). Never construct this variant
     /// from untrusted user input or unsanitized Markdown.
+    ///
+    /// Marked `#[serde(skip_deserializing)]` so untrusted JSON can never
+    /// deserialize directly into `inner_html`.
+    #[serde(skip_deserializing)]
     PreSanitizedHtml(String),
 }
 
