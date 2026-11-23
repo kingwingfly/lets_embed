@@ -6,6 +6,7 @@ members = [
     "dinov3",
     "embed",
     "search_engine",
+    "lets-embed-ui",
     "lets-embed-web/app",
     "lets-embed-web/frontend",
     "lets-embed-web/server",
