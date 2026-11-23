@@ -3,8 +3,9 @@
 //!
 //! Grammar (strictly metadata-only, zero vector/fuzzy/regex operators):
 //! - `tag:<exact_name>[>= <score>]` (score in `0.01..=1.00` hundredths on new writes)
-//! - `post_tag:<exact_name>`
-//! - `author:<exact_name>`
+//! - `tag [NOT] IN (<name>, ...)[>= <score>]` (desugars to OR / NOT OR of `tag:<name>`)
+//! - `post_tag:<exact_name>` / `post_tag [NOT] IN (<name>, ...)`
+//! - `author:<exact_name>` / `author [NOT] IN (<name>, ...)`
 //! - `unclassified`
 //! - Boolean operators `AND`, `OR`, `NOT`, unary `-`, and parentheses `(...)`
 
@@ -478,6 +479,7 @@ enum TokenKind {
     Minus,
     Unclassified,
     Predicate(SafetyPredicate),
+    InList(SafetyExpr),
 }
 
 #[derive(Debug, Clone)]
@@ -575,6 +577,243 @@ fn read_unquoted_segment(chars: &[(usize, char)], i: &mut usize) -> String {
         *i += 1;
     }
     out
+}
+
+fn read_keyword_word(chars: &[(usize, char)], i: &mut usize) -> String {
+    let mut out = String::new();
+    while *i < chars.len() {
+        let (_, c) = chars[*i];
+        if c.is_whitespace() || matches!(c, '(' | ')' | '"' | ',' | ':') {
+            break;
+        }
+        out.push(c);
+        *i += 1;
+    }
+    out
+}
+
+fn read_unquoted_list_item(chars: &[(usize, char)], i: &mut usize) -> String {
+    let mut out = String::new();
+    while *i < chars.len() {
+        let (_, c) = chars[*i];
+        if c.is_whitespace() || matches!(c, ',' | '(' | ')' | '"') {
+            break;
+        }
+        out.push(c);
+        *i += 1;
+    }
+    out
+}
+
+fn parse_safety_in_list(
+    chars: &[(usize, char)],
+    i: &mut usize,
+    field: SafetyField,
+    negated: bool,
+    start: usize,
+    strict_hundredths: bool,
+) -> Result<SafetyExpr, SafetyRuleError> {
+    skip_ws(chars, i);
+    if *i >= chars.len() || chars[*i].1 != '(' {
+        return Err(SafetyRuleError::new(
+            format!(
+                "Expected '(' after '{} {}IN'",
+                field.as_str(),
+                if negated { "NOT " } else { "" }
+            ),
+            Some(start),
+        ));
+    }
+    let lparen_pos = chars[*i].0;
+    *i += 1; // consume '('
+
+    let mut names = Vec::new();
+    let mut expect_item_after_comma = false;
+    let mut closed = false;
+
+    while *i < chars.len() {
+        skip_ws(chars, i);
+        if *i >= chars.len() {
+            break;
+        }
+        let (item_pos, ch) = chars[*i];
+        if ch == ')' {
+            if expect_item_after_comma {
+                return Err(SafetyRuleError::new(
+                    "Expected a value after ',' in IN (...) list",
+                    Some(item_pos),
+                ));
+            }
+            *i += 1;
+            closed = true;
+            break;
+        }
+        if ch == ',' {
+            if names.is_empty() || expect_item_after_comma {
+                return Err(SafetyRuleError::new(
+                    "Unexpected ',' in IN (...) list",
+                    Some(item_pos),
+                ));
+            }
+            expect_item_after_comma = true;
+            *i += 1;
+            continue;
+        }
+        if ch == '(' {
+            return Err(SafetyRuleError::new(
+                "Unexpected '(' inside IN (...) list; quote names containing parentheses",
+                Some(item_pos),
+            ));
+        }
+
+        let name = if ch == '"' {
+            let quoted = parse_quoted(chars, i)?;
+            if *i < chars.len()
+                && !chars[*i].1.is_whitespace()
+                && !matches!(chars[*i].1, ',' | ')')
+            {
+                return Err(SafetyRuleError::new(
+                    format!(
+                        "Unexpected trailing characters after quoted value in '{} IN (...)'",
+                        field.as_str()
+                    ),
+                    Some(chars[*i].0),
+                ));
+            }
+            quoted
+        } else {
+            let raw = read_unquoted_list_item(chars, i);
+            if *i < chars.len() && chars[*i].1 == '"' {
+                return Err(SafetyRuleError::new(
+                    format!(
+                        "Unexpected '\"' inside unquoted value in '{} IN (...)'",
+                        field.as_str()
+                    ),
+                    Some(chars[*i].0),
+                ));
+            }
+            if *i < chars.len() && chars[*i].1 == '(' {
+                return Err(SafetyRuleError::new(
+                    "Unexpected '(' inside IN (...) list; quote names containing parentheses",
+                    Some(chars[*i].0),
+                ));
+            }
+            if is_regex_literal(&raw) {
+                return Err(SafetyRuleError::new(
+                    "Regular expressions are not allowed in safety rules",
+                    Some(item_pos),
+                ));
+            }
+            if raw.contains("~=") || raw.contains("=~") {
+                return Err(SafetyRuleError::new(
+                    "Regex/fuzzy comparison operators are not allowed in safety rules",
+                    Some(item_pos),
+                ));
+            }
+            if raw.contains(">=") {
+                return Err(SafetyRuleError::new(
+                    "Score threshold '>=' must appear after ')', not inside IN (...) list",
+                    Some(item_pos),
+                ));
+            }
+            if field == SafetyField::Tag
+                && let Some(op_idx) = raw.find(['>', '<', '='])
+            {
+                let after = &raw[op_idx..];
+                let num_part = after.trim_start_matches(['>', '<', '=']);
+                if !num_part.is_empty() && num_part.parse::<f32>().is_ok() {
+                    return Err(SafetyRuleError::new(
+                        "Only '>=' score thresholds are allowed after ')' on tag IN (...) predicates",
+                        Some(item_pos),
+                    ));
+                }
+            }
+            raw
+        };
+
+        let trimmed = name.trim();
+        if trimmed.is_empty() || trimmed != name {
+            return Err(SafetyRuleError::new(
+                format!(
+                    "Exact name in '{} IN (...)' cannot be empty or padded with whitespace",
+                    field.as_str()
+                ),
+                Some(item_pos),
+            ));
+        }
+        if name.chars().any(char::is_control) {
+            return Err(SafetyRuleError::new(
+                format!(
+                    "Exact name in '{} IN (...)' cannot contain control characters",
+                    field.as_str()
+                ),
+                Some(item_pos),
+            ));
+        }
+
+        names.push(name);
+        expect_item_after_comma = false;
+    }
+
+    if !closed {
+        return Err(SafetyRuleError::new(
+            "Unclosed '(' in IN (...) list",
+            Some(lparen_pos),
+        ));
+    }
+    if names.is_empty() {
+        return Err(SafetyRuleError::new(
+            format!(
+                "Empty list in '{} {}IN ()' is not allowed",
+                field.as_str(),
+                if negated { "NOT " } else { "" }
+            ),
+            Some(lparen_pos),
+        ));
+    }
+
+    let trailing_score = try_read_trailing_gte(chars, i)?;
+    let min_score = match field {
+        SafetyField::Tag => match trailing_score {
+            Some((raw_score, score_pos)) => Some(parse_threshold_value(
+                &raw_score,
+                score_pos,
+                strict_hundredths,
+            )?),
+            None => None,
+        },
+        SafetyField::PostTag | SafetyField::Author => {
+            if trailing_score.is_some() {
+                return Err(SafetyRuleError::new(
+                    "Score thresholds ('>=') are only allowed on tag: / tag IN (...) predicates",
+                    Some(start),
+                ));
+            }
+            None
+        }
+    };
+
+    let mut preds: Vec<SafetyExpr> = names
+        .into_iter()
+        .map(|name| {
+            let pred = match field {
+                SafetyField::Tag => SafetyPredicate::WdTag { name, min_score },
+                SafetyField::PostTag => SafetyPredicate::PostTag(name),
+                SafetyField::Author => SafetyPredicate::Author(name),
+            };
+            SafetyExpr::Predicate(pred)
+        })
+        .collect();
+
+    let mut expr = if preds.len() == 1 {
+        preds.pop().unwrap()
+    } else {
+        SafetyExpr::Or(preds)
+    };
+    if negated {
+        expr = SafetyExpr::Not(Box::new(expr));
+    }
+    Ok(expr)
 }
 
 /// Checks for an optional `>= <score>` following a predicate value, allowing
@@ -893,6 +1132,71 @@ fn tokenize(input: &str, strict_hundredths: bool) -> Result<Vec<Token>, SafetyRu
                             Some(start),
                         ));
                     }
+                    let lower = prefix.to_ascii_lowercase();
+                    if let Some(field) = match lower.as_str() {
+                        "tag" => Some(SafetyField::Tag),
+                        "post_tag" => Some(SafetyField::PostTag),
+                        "author" => Some(SafetyField::Author),
+                        _ => None,
+                    } {
+                        skip_ws(&chars, &mut i);
+                        let kw1 = read_keyword_word(&chars, &mut i);
+                        if kw1.eq_ignore_ascii_case("IN") {
+                            let expr = parse_safety_in_list(
+                                &chars,
+                                &mut i,
+                                field,
+                                false,
+                                start,
+                                strict_hundredths,
+                            )?;
+                            tokens.push(Token {
+                                kind: TokenKind::InList(expr),
+                                pos: start,
+                            });
+                            continue;
+                        }
+                        if kw1.eq_ignore_ascii_case("NOT") {
+                            skip_ws(&chars, &mut i);
+                            let kw2 = read_keyword_word(&chars, &mut i);
+                            if kw2.eq_ignore_ascii_case("IN") {
+                                let expr = parse_safety_in_list(
+                                    &chars,
+                                    &mut i,
+                                    field,
+                                    true,
+                                    start,
+                                    strict_hundredths,
+                                )?;
+                                tokens.push(Token {
+                                    kind: TokenKind::InList(expr),
+                                    pos: start,
+                                });
+                                continue;
+                            }
+                            return Err(SafetyRuleError::new(
+                                format!("Expected 'IN (...)' after '{} NOT'", field.as_str()),
+                                Some(start),
+                            ));
+                        }
+                        return Err(SafetyRuleError::new(
+                            format!(
+                                "Bare term '{prefix}' is not allowed in safety rules; use tag:, tag IN (...), post_tag:, author:, or unclassified"
+                            ),
+                            Some(start),
+                        ));
+                    }
+                    if matches!(
+                        lower.as_str(),
+                        "clip" | "desc" | "dino" | "similar" | "id" | "upload" | "img"
+                    ) {
+                        return Err(SafetyRuleError::new(
+                            format!(
+                                "Vector operator '{prefix}' is not allowed in metadata-only safety rules"
+                            ),
+                            Some(start),
+                        ));
+                    }
                     let kind = match prefix.to_ascii_uppercase().as_str() {
                         "AND" => TokenKind::And,
                         "OR" => TokenKind::Or,
@@ -901,7 +1205,7 @@ fn tokenize(input: &str, strict_hundredths: bool) -> Result<Vec<Token>, SafetyRu
                         _ => {
                             return Err(SafetyRuleError::new(
                                 format!(
-                                    "Bare term '{prefix}' is not allowed in safety rules; use tag:, post_tag:, author:, or unclassified"
+                                    "Bare term '{prefix}' is not allowed in safety rules; use tag:, tag IN (...), post_tag:, author:, or unclassified"
                                 ),
                                 Some(start),
                             ));
@@ -1012,6 +1316,7 @@ impl Parser {
                 }
             }
             TokenKind::Predicate(pred) => Ok(SafetyExpr::Predicate(pred)),
+            TokenKind::InList(expr) => Ok(expr),
             TokenKind::Unclassified => Ok(SafetyExpr::Predicate(SafetyPredicate::Unclassified)),
             TokenKind::RParen => Err(SafetyRuleError::new("Unexpected ')'", Some(tok.pos))),
             TokenKind::And => Err(SafetyRuleError::new("Unexpected 'AND'", Some(tok.pos))),
@@ -1402,5 +1707,227 @@ mod tests {
             .join(" OR ");
         let seven_rules: Vec<&str> = (0..7).map(|_| twenty_terms.as_str()).collect();
         assert!(validate_policy_rules(seven_rules).is_err());
+    }
+
+    #[test]
+    fn parses_in_and_not_in_across_all_safety_fields_and_whitespace_combos() {
+        let expected_tag_in = SafetyExpr::Or(vec![
+            SafetyExpr::Predicate(SafetyPredicate::WdTag {
+                name: "explicit".into(),
+                min_score: Some(0.45),
+            }),
+            SafetyExpr::Predicate(SafetyPredicate::WdTag {
+                name: "nude".into(),
+                min_score: Some(0.45),
+            }),
+            SafetyExpr::Predicate(SafetyPredicate::WdTag {
+                name: "long_hair".into(),
+                min_score: Some(0.45),
+            }),
+        ]);
+
+        for raw in [
+            r#"tag IN (explicit, nude, "long_hair") >= 0.45"#,
+            r#"tag IN (explicit, nude, "long_hair")>=0.45"#,
+            r#"tag IN (explicit, nude, "long_hair")>= 0.45"#,
+            r#"tag IN (explicit, nude, "long_hair") >=0.45"#,
+            r#"TAG in(explicit nude "long_hair") >= 0.45"#,
+            r#"Tag In (explicit,nude "long_hair") >= 0.45"#,
+        ] {
+            let expr = parse_safety_rule(raw).unwrap_or_else(|e| panic!("failed {raw}: {e}"));
+            assert_eq!(expr, expected_tag_in, "mismatch for {raw}");
+            assert_eq!(expr.term_count(), 3);
+            assert_eq!(expr.max_depth(), 2);
+            validate_wd_tags_in_expr(&expr).expect("all canonical WD tags");
+            // Roundtrip via canonical format_rule
+            assert_eq!(parse_safety_rule(&expr.format_rule()).unwrap(), expr);
+        }
+
+        // `tag NOT IN (...) >= T`, `NOT tag IN (...) >= T`, `-tag IN (...) >= T` desugar identically
+        let expected_tag_not_in = SafetyExpr::Not(Box::new(SafetyExpr::Or(vec![
+            SafetyExpr::Predicate(SafetyPredicate::WdTag {
+                name: "sensitive".into(),
+                min_score: Some(0.45),
+            }),
+            SafetyExpr::Predicate(SafetyPredicate::WdTag {
+                name: "general".into(),
+                min_score: Some(0.45),
+            }),
+        ])));
+        for raw in [
+            "tag NOT IN (sensitive, general) >= 0.45",
+            "tag not in(sensitive general)>=0.45",
+            "NOT tag IN (sensitive, general) >= 0.45",
+            "-tag IN (sensitive, general) >= 0.45",
+        ] {
+            let expr = parse_safety_rule(raw).unwrap_or_else(|e| panic!("failed {raw}: {e}"));
+            assert_eq!(expr, expected_tag_not_in, "mismatch for {raw}");
+            assert_eq!(expr.term_count(), 2);
+            assert_eq!(expr.max_depth(), 3);
+            validate_wd_tags_in_expr(&expr).expect("canonical tags in NOT IN");
+        }
+
+        // Kleene 3-valued logic equivalence: `tag NOT IN (a, b)` == `NOT (tag:a OR tag:b)`
+        use TriBool::{False as F, True as T, Unknown as U};
+        let not_in = parse_safety_rule("tag NOT IN (explicit, nude) >= 0.45").unwrap();
+        assert_eq!(
+            not_in.eval_tribool(&|p| match p {
+                SafetyPredicate::WdTag { name, .. } if name == "explicit" => F,
+                SafetyPredicate::WdTag { name, .. } if name == "nude" => U,
+                _ => F,
+            }),
+            U
+        );
+        assert_eq!(
+            not_in.eval_tribool(&|p| match p {
+                SafetyPredicate::WdTag { name, .. } if name == "explicit" => T,
+                SafetyPredicate::WdTag { name, .. } if name == "nude" => U,
+                _ => F,
+            }),
+            F
+        );
+        assert_eq!(
+            not_in.eval_tribool(&|_| F),
+            T
+        );
+
+        // `post_tag IN / NOT IN` and `author IN / NOT IN` + quoted values with spaces/escaped quotes/parens
+        let combined = parse_safety_rule(
+            r#"tag IN ("eimi_(blue_archive)", explicit) >= 0.50 AND post_tag IN (cosplay, "maid outfit") AND author NOT IN ("alice \"A\"", bob)"#,
+        )
+        .expect("combined IN/NOT IN rule");
+        assert_eq!(
+            combined.referenced_wd_tags(),
+            vec!["eimi_(blue_archive)".to_string(), "explicit".to_string()]
+        );
+        let (post_tags, authors) = collect_catalog_refs(&combined);
+        assert_eq!(
+            post_tags,
+            vec!["cosplay".to_string(), "maid outfit".to_string()]
+        );
+        assert_eq!(authors, vec![r#"alice "A""#.to_string(), "bob".to_string()]);
+        assert_eq!(combined.term_count(), 6);
+        validate_wd_tags_in_expr(&combined).expect("quoted canonical WD tag valid");
+
+        // Single-element IN / NOT IN collapses cleanly
+        assert_eq!(
+            parse_safety_rule("post_tag IN (cosplay)").unwrap(),
+            SafetyExpr::Predicate(SafetyPredicate::PostTag("cosplay".into()))
+        );
+        assert_eq!(
+            parse_safety_rule("author NOT IN (bob)").unwrap(),
+            SafetyExpr::Not(Box::new(SafetyExpr::Predicate(SafetyPredicate::Author(
+                "bob".into()
+            ))))
+        );
+
+        // Legacy precision helper also supports `tag IN (...) >= 0.001`
+        assert!(parse_safety_rule("tag IN (blood, explicit) >= 0.001").is_err());
+        assert!(parse_safety_rule_legacy_precision("tag IN (blood, explicit) >= 0.001").is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_in_not_in_wd_typos_and_enforces_safety_term_budgets() {
+        // Invalid syntax, empty lists, bad commas, thresholds on post_tag/author, vector fields
+        for bad in [
+            "tag IN ()",
+            "tag IN (   )",
+            "tag NOT IN ()",
+            "post_tag IN ()",
+            "author NOT IN ()",
+            "tag IN (,)",
+            "tag IN (, explicit)",
+            "tag IN (explicit,)",
+            "tag IN (explicit,,nude)",
+            "tag IN explicit",
+            "tag NOT explicit",
+            "tag NOT IN explicit",
+            "tag IN (explicit, nude",
+            r#"tag IN ("")"#,
+            r#"tag IN (" explicit ")"#,
+            "tag IN (\"blood\0\")",
+            "tag IN (explicit >= 0.45)",
+            "tag IN (explicit>=0.45)",
+            "tag IN (explicit>0.45)",
+            "tag IN (/blood.*/)",
+            "tag IN (blood~=0.5)",
+            r#"tag IN ("explicit"nude)"#,
+            r#"tag IN (explicit"nude")"#,
+            "tag IN (eimi_(blue_archive))",
+            "tag IN (explicit, nude) >= 0.456",
+            "tag IN (explicit, nude) >= 0",
+            "tag IN (explicit, nude) >= 1.01",
+            "tag IN (explicit, nude) >= -0.5",
+            "tag IN (explicit, nude) >=",
+            "tag IN (explicit, nude) >= 0.45 >= 0.50",
+            "(tag IN (explicit, nude)) >= 0.45",
+            "post_tag IN (cosplay, maid) >= 0.45",
+            "post_tag NOT IN (cosplay, maid) >= 0.45",
+            "author IN (alice, bob) >= 0.45",
+            "author NOT IN (alice, bob) >= 0.45",
+            "dino IN (12, 34)",
+            r#"clip IN ("blood", "gore")"#,
+            "upload IN (0, 1)",
+            "title IN (nsfw, r18)",
+            "unclassified IN (a, b)",
+        ] {
+            assert!(
+                parse_safety_rule(bad).is_err(),
+                "must reject invalid safety IN/NOT IN rule: {bad:?}"
+            );
+        }
+
+        // WD vocab typo inside `tag NOT IN (...)` MUST be rejected
+        let err = validate_policy_expr_pair("tag NOT IN (general, explict_typo) >= 0.45", None)
+            .unwrap_err();
+        assert!(err.message.contains("explict_typo"));
+
+        // WD vocab typo inside `except_expr` `tag IN (...)` MUST be rejected
+        let err = validate_policy_expr_pair(
+            "tag IN (explicit, nude) >= 0.45",
+            Some("tag IN (general, not_a_wd_tag)"),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("except_expr") && err.message.contains("not_a_wd_tag"));
+
+        // 32-term per-policy budget counts ALL elements inside `IN (...)`
+        let exact_32 = format!(
+            "tag IN ({}) >= 0.45",
+            (0..MAX_TERMS_PER_POLICY)
+                .map(|i| format!("t{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let parsed_32 = parse_safety_rule(&exact_32).expect("32 terms inside IN passes");
+        assert_eq!(parsed_32.term_count(), MAX_TERMS_PER_POLICY);
+        assert_eq!(parsed_32.max_depth(), 2);
+
+        let over_32 = format!(
+            "tag IN ({}) >= 0.45",
+            (0..=MAX_TERMS_PER_POLICY)
+                .map(|i| format!("t{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(parse_safety_rule(&over_32).is_err());
+
+        // Combined match_expr + except_expr > 32 via IN / NOT IN rejected
+        let twenty_in = format!(
+            "tag IN ({})",
+            (0..20).map(|_| "blood").collect::<Vec<_>>().join(", ")
+        );
+        let thirteen_not_in = format!(
+            "tag NOT IN ({})",
+            (0..13).map(|_| "general").collect::<Vec<_>>().join(", ")
+        );
+        assert!(validate_policy_expr_pair(&twenty_in, Some(&thirteen_not_in)).is_err());
+
+        // 128-total-term PolicySet budget counts ALL elements inside `IN (...)`
+        let twenty_six_in = format!(
+            "tag IN ({})",
+            (0..26).map(|i| format!("t{i}")).collect::<Vec<_>>().join(", ")
+        );
+        let five_rules: Vec<&str> = (0..5).map(|_| twenty_six_in.as_str()).collect();
+        assert!(validate_policy_rules(five_rules).is_err()); // 5 * 26 = 130 > 128
     }
 }

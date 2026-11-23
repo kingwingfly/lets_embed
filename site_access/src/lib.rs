@@ -20,8 +20,8 @@ pub use kdf::{
     validate_master_secret,
 };
 pub use legal::{
-    DEFAULT_CONTENT_POLICY_MD, DEFAULT_DMCA_MD, DEFAULT_PRIVACY_MD, DEFAULT_TERMS_MD,
-    LegalDocConfig, compute_terms_digest,
+    DEFAULT_CONTENT_POLICY_MD, DEFAULT_DMCA_MD, DEFAULT_NOTICE_BANNER_MD, DEFAULT_PRIVACY_MD,
+    DEFAULT_TERMS_MD, LegalDocConfig, compute_terms_digest,
 };
 pub use policy::{
     AgeGateTrigger, AgeVerificationMode, AgeVerificationPolicy, AssuranceLevel, AuthProviderId,
@@ -317,6 +317,8 @@ mod tests {
             direct_grants: vec![PolicyRef::new("r18", 2)],
             click_eligible: vec![PolicyRef::new("sensitive", 1)],
             is_billing_waived: false,
+            caller_age_verified: true,
+            caller_terms_accepted: true,
             exp: 1030,
         };
 
@@ -349,6 +351,39 @@ mod tests {
             ..assertion.clone()
         };
         assert!(sign_gateway_assertion(&ok_anon, secret).is_ok());
+
+        // Legacy v3 payload omitting caller_age_verified / caller_terms_accepted defaults both to false
+        let legacy_ga3_json = serde_json::json!({
+            "v": GATEWAY_ASSERTION_VERSION,
+            "aud": GATEWAY_ASSERTION_AUDIENCE,
+            "actor": { "kind": "user", "sub": "user-legacy", "sid": "sid-legacy" },
+            "rev": 7,
+            "min_enforce_rev": 5,
+            "digest": SAMPLE_DIGEST,
+            "direct_grants": [],
+            "click_eligible": [],
+            "is_billing_waived": false,
+            "exp": 1030
+        });
+        let legacy_payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&legacy_ga3_json).unwrap());
+        let mut mac_v3 = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+        mac_v3.update(b"gateway-assertion/v3\0");
+        mac_v3.update(b"ga3.");
+        mac_v3.update(legacy_payload.as_bytes());
+        let legacy_ga3_hdr = format!(
+            "ga3.{legacy_payload}.{}",
+            URL_SAFE_NO_PAD.encode(mac_v3.finalize().into_bytes())
+        );
+        let decoded_legacy = verify_gateway_assertion(
+            &legacy_ga3_hdr,
+            secret,
+            GATEWAY_ASSERTION_AUDIENCE,
+            1020,
+            5,
+        )
+        .expect("v3 assertion without caller flags must decode with defaults");
+        assert!(!decoded_legacy.caller_age_verified);
+        assert!(!decoded_legacy.caller_terms_accepted);
 
         // Reject legacy v1 (`ga1.`) assertion!
         let fake_v1_payload = URL_SAFE_NO_PAD.encode(b"{}");
@@ -893,5 +928,40 @@ mod tests {
             MediaBillingKey::preview_budget_key(42),
             img_key.canonical_key()
         );
+    }
+
+    #[test]
+    fn legal_defaults_export_notice_banner_and_omit_safe_mode_copy() {
+        assert_eq!(
+            DEFAULT_NOTICE_BANNER_MD,
+            "This gallery hosts community-tagged artwork. Review our [Content Policy](/content-policy) or adjust your content preferences in [Account Settings](/user/account)."
+        );
+
+        let privacy_lower = DEFAULT_PRIVACY_MD.to_ascii_lowercase();
+        assert!(!privacy_lower.contains("safe mode"));
+        assert!(!privacy_lower.contains("safe-mode"));
+
+        let mut legal = LegalDocConfig::default();
+        assert!(legal.notice_banner_md.is_empty());
+        assert!(!legal.notice_banner_enabled);
+        assert_eq!(legal.effective_notice_banner_md(), None);
+
+        legal.notice_banner_enabled = true;
+        assert_eq!(
+            legal.effective_notice_banner_md(),
+            Some(DEFAULT_NOTICE_BANNER_MD)
+        );
+
+        legal.notice_banner_md = "   ".to_string();
+        assert_eq!(
+            legal.effective_notice_banner_md(),
+            Some(DEFAULT_NOTICE_BANNER_MD)
+        );
+
+        legal.notice_banner_md = "  Custom notice  ".to_string();
+        assert_eq!(legal.effective_notice_banner_md(), Some("Custom notice"));
+
+        legal.notice_banner_enabled = false;
+        assert_eq!(legal.effective_notice_banner_md(), None);
     }
 }

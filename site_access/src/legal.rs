@@ -35,13 +35,13 @@ This Privacy Policy explains what information the Service processes and how it i
 
 ## 1. Information We Collect
 - **Account & Identity Records**: When you sign in, we store your internal account identifier, linked authentication provider identifiers (subject/issuer), optional display name or contact email, and any recorded age-assurance level or Terms acceptance timestamp.
-- **Session & Security State**: Active session identifiers, safety switcher preferences, safe-mode status, and anti-abuse rate-limiting counters are stored to enforce revocable sessions and service integrity.
+- **Session & Security State**: Active session identifiers, safety switcher preferences, and anti-abuse rate-limiting counters are stored to enforce revocable sessions and service integrity.
 - **Billing & Payment Records**: If crypto top-ups or plans are enabled, we record wallet addresses, transaction hashes, token amounts, and credited balances.
 - **Content Reports**: Reports submitted by visitors record the target item, reason category, optional note, and a salted reporter key for deduplication and spam prevention.
 
 ## 2. Cookies & Local State
 - Strictly necessary `HttpOnly`, `Secure` cookies are used for session authentication and short-lived login transactions.
-- Optional UI preferences (such as layout density or Safe Mode broadcast synchronization across browser tabs) may be stored in browser storage.
+- Optional UI preferences (such as layout density) may be stored in browser storage.
 
 ## 3. Data Sharing & Retention
 - We do not sell personal data. Third-party identity or age-assurance providers process authentication requests under their respective privacy policies.
@@ -50,6 +50,8 @@ This Privacy Policy explains what information the Service processes and how it i
 ## 4. Your Choices
 - You may sign out at any time to immediately revoke your active session, manage linked identities on your account page, or contact the site operator to request account deletion.
 "#;
+
+pub const DEFAULT_NOTICE_BANNER_MD: &str = "This gallery hosts community-tagged artwork. Review our [Content Policy](/content-policy) or adjust your content preferences in [Account Settings](/user/account).";
 
 pub const DEFAULT_DMCA_MD: &str = r#"# DMCA & Copyright Policy
 
@@ -142,5 +144,19 @@ impl LegalDocConfig {
     /// Recomputes `terms_digest` from `terms_md`.
     pub fn refresh_terms_digest(&mut self) {
         self.terms_digest = compute_terms_digest(&self.terms_md);
+    }
+
+    /// Returns the effective notice banner Markdown when enabled, falling back
+    /// to [`DEFAULT_NOTICE_BANNER_MD`] if `notice_banner_md` is blank.
+    pub fn effective_notice_banner_md(&self) -> Option<&str> {
+        if !self.notice_banner_enabled {
+            return None;
+        }
+        let trimmed = self.notice_banner_md.trim();
+        if trimmed.is_empty() {
+            Some(DEFAULT_NOTICE_BANNER_MD)
+        } else {
+            Some(trimmed)
+        }
     }
 }

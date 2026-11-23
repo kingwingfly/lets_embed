@@ -887,6 +887,11 @@ enum TokenKind {
     Word(String),
     Quoted(String),
     Field(SearchField),
+    InList {
+        field: SearchField,
+        negated: bool,
+        values: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -897,6 +902,222 @@ struct Token {
 
 fn is_gte_at(chars: &[(usize, char)], i: usize) -> bool {
     i + 1 < chars.len() && chars[i].1 == '>' && chars[i + 1].1 == '='
+}
+
+fn skip_ws(chars: &[(usize, char)], i: &mut usize) {
+    while *i < chars.len() && chars[*i].1.is_whitespace() {
+        *i += 1;
+    }
+}
+
+fn parse_quoted_string(chars: &[(usize, char)], i: &mut usize) -> Result<String, QueryError> {
+    let start = chars[*i].0;
+    *i += 1;
+    let mut val = String::new();
+    let mut closed = false;
+    while *i < chars.len() {
+        let (_, c) = chars[*i];
+        if c == '\\' {
+            if *i + 1 >= chars.len() {
+                return Err(QueryError::new(
+                    "Unterminated escape sequence in quoted string",
+                    Some(chars[*i].0),
+                ));
+            }
+            val.push(chars[*i + 1].1);
+            *i += 2;
+        } else if c == '"' {
+            closed = true;
+            *i += 1;
+            break;
+        } else {
+            val.push(c);
+            *i += 1;
+        }
+    }
+    if !closed {
+        return Err(QueryError::new("Unterminated quoted string", Some(start)));
+    }
+    Ok(val)
+}
+
+fn read_alpha_keyword(chars: &[(usize, char)], i: &mut usize) -> String {
+    let mut out = String::new();
+    while *i < chars.len() {
+        let (_, c) = chars[*i];
+        if c.is_whitespace() || matches!(c, '(' | ')' | '"' | ',' | ':') {
+            break;
+        }
+        out.push(c);
+        *i += 1;
+    }
+    out
+}
+
+/// Look ahead after a bare field word for `[NOT] IN (` (case-insensitive).
+/// Returns `Some((negated, lparen_index))` if matched, without mutating caller state.
+fn peek_in_operator(chars: &[(usize, char)], i: usize) -> Option<(bool, usize)> {
+    let mut j = i;
+    skip_ws(chars, &mut j);
+    if j >= chars.len() {
+        return None;
+    }
+    let w1 = read_alpha_keyword(chars, &mut j);
+    if w1.eq_ignore_ascii_case("IN") {
+        skip_ws(chars, &mut j);
+        if j < chars.len() && chars[j].1 == '(' {
+            return Some((false, j));
+        }
+        return None;
+    }
+    if w1.eq_ignore_ascii_case("NOT") {
+        skip_ws(chars, &mut j);
+        if j >= chars.len() {
+            return None;
+        }
+        let w2 = read_alpha_keyword(chars, &mut j);
+        if w2.eq_ignore_ascii_case("IN") {
+            skip_ws(chars, &mut j);
+            if j < chars.len() && chars[j].1 == '(' {
+                return Some((true, j));
+            }
+        }
+    }
+    None
+}
+
+fn parse_in_list_items(
+    chars: &[(usize, char)],
+    i: &mut usize,
+    field: SearchField,
+    negated: bool,
+) -> Result<Vec<String>, QueryError> {
+    let lparen_pos = chars[*i].0;
+    *i += 1; // consume '('
+
+    let mut values = Vec::new();
+    let mut expect_item_after_comma = false;
+    let mut closed = false;
+
+    while *i < chars.len() {
+        skip_ws(chars, i);
+        if *i >= chars.len() {
+            break;
+        }
+        let (item_pos, ch) = chars[*i];
+        if ch == ')' {
+            if expect_item_after_comma {
+                return Err(QueryError::new(
+                    "Expected a value after ',' in IN (...) list",
+                    Some(item_pos),
+                ));
+            }
+            *i += 1;
+            closed = true;
+            break;
+        }
+        if ch == ',' {
+            if values.is_empty() || expect_item_after_comma {
+                return Err(QueryError::new(
+                    "Unexpected ',' in IN (...) list",
+                    Some(item_pos),
+                ));
+            }
+            expect_item_after_comma = true;
+            *i += 1;
+            continue;
+        }
+        if ch == '(' {
+            return Err(QueryError::new(
+                "Unexpected '(' inside IN (...) list; quote values containing parentheses",
+                Some(item_pos),
+            ));
+        }
+        if is_gte_at(chars, *i) {
+            return Err(QueryError::new(
+                "Threshold '>=' must appear after ')', not inside IN (...) list",
+                Some(item_pos),
+            ));
+        }
+
+        let raw = if ch == '"' {
+            let quoted = parse_quoted_string(chars, i)?;
+            if *i < chars.len()
+                && !chars[*i].1.is_whitespace()
+                && !matches!(chars[*i].1, ',' | ')')
+            {
+                return Err(QueryError::new(
+                    format!(
+                        "Unexpected trailing characters after quoted value in '{} IN (...)'",
+                        field.as_prefix()
+                    ),
+                    Some(chars[*i].0),
+                ));
+            }
+            quoted
+        } else {
+            let mut word = String::new();
+            while *i < chars.len() {
+                if is_gte_at(chars, *i) {
+                    return Err(QueryError::new(
+                        "Threshold '>=' must appear after ')', not inside IN (...) list",
+                        Some(chars[*i].0),
+                    ));
+                }
+                let (_, c) = chars[*i];
+                if c.is_whitespace() || matches!(c, ',' | '(' | ')' | '"') {
+                    break;
+                }
+                word.push(c);
+                *i += 1;
+            }
+            if *i < chars.len() && chars[*i].1 == '"' {
+                return Err(QueryError::new(
+                    format!(
+                        "Unexpected '\"' inside unquoted value in '{} IN (...)'",
+                        field.as_prefix()
+                    ),
+                    Some(chars[*i].0),
+                ));
+            }
+            if *i < chars.len() && chars[*i].1 == '(' {
+                return Err(QueryError::new(
+                    "Unexpected '(' inside IN (...) list; quote values containing parentheses",
+                    Some(chars[*i].0),
+                ));
+            }
+            word
+        };
+
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(QueryError::new(
+                format!("Value in '{} IN (...)' cannot be empty", field.as_prefix()),
+                Some(item_pos),
+            ));
+        }
+        values.push(trimmed);
+        expect_item_after_comma = false;
+    }
+
+    if !closed {
+        return Err(QueryError::new(
+            "Unclosed '(' in IN (...) list",
+            Some(lparen_pos),
+        ));
+    }
+    if values.is_empty() {
+        return Err(QueryError::new(
+            format!(
+                "Empty list in '{} {}IN ()' is not allowed",
+                field.as_prefix(),
+                if negated { "NOT " } else { "" }
+            ),
+            Some(lparen_pos),
+        ));
+    }
+
+    Ok(values)
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, QueryError> {
@@ -979,32 +1200,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, QueryError> {
             }
             '"' => {
                 let start = char_pos;
-                i += 1;
-                let mut val = String::new();
-                let mut closed = false;
-                while i < chars.len() {
-                    let (_, c) = chars[i];
-                    if c == '\\' {
-                        if i + 1 >= chars.len() {
-                            return Err(QueryError::new(
-                                "Unterminated escape sequence in quoted string",
-                                Some(chars[i].0),
-                            ));
-                        }
-                        val.push(chars[i + 1].1);
-                        i += 2;
-                    } else if c == '"' {
-                        closed = true;
-                        i += 1;
-                        break;
-                    } else {
-                        val.push(c);
-                        i += 1;
-                    }
-                }
-                if !closed {
-                    return Err(QueryError::new("Unterminated quoted string", Some(start)));
-                }
+                let val = parse_quoted_string(&chars, &mut i)?;
                 tokens.push(Token {
                     kind: TokenKind::Quoted(val),
                     pos: start,
@@ -1043,16 +1239,64 @@ fn tokenize(input: &str) -> Result<Vec<Token>, QueryError> {
                         kind: TokenKind::Field(field),
                         pos: start,
                     });
+                } else if after_value_expecting {
+                    tokens.push(Token {
+                        kind: TokenKind::Word(word),
+                        pos: start,
+                    });
                 } else {
-                    let kind = if after_value_expecting {
-                        TokenKind::Word(word)
-                    } else {
-                        match word.to_ascii_uppercase().as_str() {
-                            "AND" => TokenKind::And,
-                            "OR" => TokenKind::Or,
-                            "NOT" => TokenKind::Not,
-                            _ => TokenKind::Word(word),
+                    let lower = word.to_ascii_lowercase();
+                    if let Some((negated, lparen_idx)) = peek_in_operator(&chars, i) {
+                        match lower.as_str() {
+                            "tag" => {
+                                i = lparen_idx;
+                                let values =
+                                    parse_in_list_items(&chars, &mut i, SearchField::Tag, negated)?;
+                                tokens.push(Token {
+                                    kind: TokenKind::InList {
+                                        field: SearchField::Tag,
+                                        negated,
+                                        values,
+                                    },
+                                    pos: start,
+                                });
+                                continue;
+                            }
+                            "author" => {
+                                i = lparen_idx;
+                                let values = parse_in_list_items(
+                                    &chars,
+                                    &mut i,
+                                    SearchField::Author,
+                                    negated,
+                                )?;
+                                tokens.push(Token {
+                                    kind: TokenKind::InList {
+                                        field: SearchField::Author,
+                                        negated,
+                                        values,
+                                    },
+                                    pos: start,
+                                });
+                                continue;
+                            }
+                            "post_tag" | "title" | "all" | "clip" | "dino" | "upload" => {
+                                return Err(QueryError::new(
+                                    format!(
+                                        "Operator 'IN (...)' is not supported on '{lower}' (supported fields: tag, author)"
+                                    ),
+                                    Some(start),
+                                ));
+                            }
+                            _ => {}
                         }
+                    }
+
+                    let kind = match word.to_ascii_uppercase().as_str() {
+                        "AND" => TokenKind::And,
+                        "OR" => TokenKind::Or,
+                        "NOT" => TokenKind::Not,
+                        _ => TokenKind::Word(word),
                     };
                     tokens.push(Token { kind, pos: start });
                 }
@@ -1117,6 +1361,7 @@ impl Parser {
                     | TokenKind::Minus
                     | TokenKind::LParen
                     | TokenKind::Field(_)
+                    | TokenKind::InList { .. }
                     | TokenKind::Word(_)
                     | TokenKind::Quoted(_),
                 ) => {
@@ -1255,6 +1500,30 @@ impl Parser {
                     value: trimmed,
                     threshold,
                 })
+            }
+            TokenKind::InList {
+                field,
+                negated,
+                values,
+            } => {
+                let threshold = self.parse_optional_threshold(field)?;
+                let mut terms: Vec<QueryExpr> = values
+                    .into_iter()
+                    .map(|value| QueryExpr::Term {
+                        field,
+                        value,
+                        threshold,
+                    })
+                    .collect();
+                let mut expr = if terms.len() == 1 {
+                    terms.pop().unwrap()
+                } else {
+                    QueryExpr::Or(terms)
+                };
+                if negated {
+                    expr = QueryExpr::Not(Box::new(expr));
+                }
+                Ok(expr)
             }
             TokenKind::Word(w) | TokenKind::Quoted(w) => {
                 let trimmed = w.trim().to_string();
@@ -1614,5 +1883,205 @@ mod tests {
         );
         let reparsed = parse_query(&expr.format_query()).unwrap();
         assert_eq!(expr, reparsed);
+    }
+
+    #[test]
+    fn parses_in_and_not_in_multi_value_lists_with_thresholds_and_quotes() {
+        // Comma-separated with threshold (all 4 whitespace combos) and case-insensitive operators
+        let expected_tag_in = QueryExpr::Or(vec![
+            QueryExpr::Term {
+                field: SearchField::Tag,
+                value: "maid".into(),
+                threshold: Some(0.45),
+            },
+            QueryExpr::Term {
+                field: SearchField::Tag,
+                value: "apron".into(),
+                threshold: Some(0.45),
+            },
+            QueryExpr::Term {
+                field: SearchField::Tag,
+                value: "long hair".into(),
+                threshold: Some(0.45),
+            },
+        ]);
+        for raw in [
+            r#"tag IN (maid, apron, "long hair") >= 0.45"#,
+            r#"tag IN (maid, apron, "long hair")>=0.45"#,
+            r#"tag IN (maid, apron, "long hair")>= 0.45"#,
+            r#"tag IN (maid, apron, "long hair") >=0.45"#,
+            r#"TAG in(maid apron "long hair") >= 0.45"#,
+            r#"Tag In (maid,apron "long hair") >= 0.45"#,
+        ] {
+            let parsed = parse_query(raw).unwrap_or_else(|e| panic!("failed {raw}: {e}"));
+            assert_eq!(parsed, expected_tag_in, "mismatch for {raw}");
+            let (_, plan) = parse_and_compile(raw).expect("valid plan");
+            assert_eq!(plan.result_kind, ResultKind::Images);
+            assert_eq!(plan.tier, VectorTier::None);
+            assert_eq!(plan.positive_tags, vec!["maid", "apron", "long hair"]);
+            // Roundtrip formatting
+            assert_eq!(parse_query(&parsed.format_query()).unwrap(), parsed);
+        }
+
+        // `tag NOT IN (...) >= T`, `NOT tag IN (...) >= T`, and `-tag IN (...) >= T` desugar identically
+        let expected_tag_not_in = QueryExpr::Not(Box::new(QueryExpr::Or(vec![
+            QueryExpr::Term {
+                field: SearchField::Tag,
+                value: "safe".into(),
+                threshold: Some(0.45),
+            },
+            QueryExpr::Term {
+                field: SearchField::Tag,
+                value: "general".into(),
+                threshold: Some(0.45),
+            },
+        ])));
+        for raw in [
+            "tag NOT IN (safe, general) >= 0.45",
+            "tag not in(safe general)>=0.45",
+            "NOT tag IN (safe, general) >= 0.45",
+            "-tag IN (safe, general) >= 0.45",
+        ] {
+            let parsed = parse_query(raw).unwrap_or_else(|e| panic!("failed {raw}: {e}"));
+            assert_eq!(parsed, expected_tag_not_in, "mismatch for {raw}");
+            let (_, plan) = parse_and_compile(raw).expect("valid plan");
+            assert_eq!(plan.result_kind, ResultKind::Images);
+            assert!(plan.positive_tags.is_empty());
+        }
+
+        // Single-element IN / NOT IN collapses cleanly without redundant single-item Or
+        assert_eq!(
+            parse_query("tag IN (maid) >= 0.50").unwrap(),
+            QueryExpr::Term {
+                field: SearchField::Tag,
+                value: "maid".into(),
+                threshold: Some(0.50),
+            }
+        );
+        assert_eq!(
+            parse_query("tag NOT IN (maid)").unwrap(),
+            QueryExpr::Not(Box::new(QueryExpr::Term {
+                field: SearchField::Tag,
+                value: "maid".into(),
+                threshold: None,
+            }))
+        );
+
+        // Escaped quotes, commas inside quotes, parentheses inside quotes, Unicode authors
+        let escaped = parse_query(r#"author NOT IN ("alice \"A\"", "渡久山", bob)"#).unwrap();
+        assert_eq!(
+            escaped,
+            QueryExpr::Not(Box::new(QueryExpr::Or(vec![
+                QueryExpr::Term {
+                    field: SearchField::Author,
+                    value: r#"alice "A""#.into(),
+                    threshold: None,
+                },
+                QueryExpr::Term {
+                    field: SearchField::Author,
+                    value: "渡久山".into(),
+                    threshold: None,
+                },
+                QueryExpr::Term {
+                    field: SearchField::Author,
+                    value: "bob".into(),
+                    threshold: None,
+                },
+            ])))
+        );
+        let (_, author_plan) = parse_and_compile(r#"author IN ("渡久山", bob)"#).unwrap();
+        assert_eq!(author_plan.result_kind, ResultKind::Posts);
+
+        // Implicit AND adjacency and combination with vector clauses
+        let (_, combined_plan) = parse_and_compile(
+            r#"tag IN (maid, apron) >= 0.45 author NOT IN (alice, bob) AND clip:"sunny cafe" >= 0.25"#,
+        )
+        .expect("combined IN + vector plan");
+        assert_eq!(combined_plan.result_kind, ResultKind::Images);
+        assert_eq!(combined_plan.tier, VectorTier::Clip);
+        assert_eq!(combined_plan.positive_tags, vec!["maid", "apron"]);
+
+        // Bare word queries containing "tag" / "author" / "in" remain backwards compatible
+        assert_eq!(
+            parse_query("tag NOT alice").unwrap(),
+            QueryExpr::And(vec![
+                QueryExpr::Term {
+                    field: SearchField::All,
+                    value: "tag".into(),
+                    threshold: None,
+                },
+                QueryExpr::Not(Box::new(QueryExpr::Term {
+                    field: SearchField::All,
+                    value: "alice".into(),
+                    threshold: None,
+                })),
+            ])
+        );
+        assert!(parse_query("alice in (wonderland)").is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_in_not_in_lists_thresholds_and_unsupported_fields() {
+        for bad in [
+            "tag IN ()",
+            "tag IN (   )",
+            "tag NOT IN ()",
+            "author IN ()",
+            "tag IN (,)",
+            "tag IN (, maid)",
+            "tag IN (maid,)",
+            "tag IN (maid,,apron)",
+            r#"tag IN ("")"#,
+            r#"tag IN ("   ", maid)"#,
+            "tag IN (maid, apron",
+            "tag IN (maid >= 0.45)",
+            "tag IN (maid>=0.45)",
+            r#"tag IN ("maid"apron)"#,
+            r#"tag IN (maid"apron")"#,
+            "tag IN (eimi_(blue_archive))",
+            "tag IN (maid, apron) >= 0.456",
+            "tag IN (maid, apron) >= 0",
+            "tag IN (maid, apron) >= 1.01",
+            "tag IN (maid, apron) >= -0.5",
+            "tag IN (maid, apron) >=",
+            "tag IN (maid, apron) >= 0.45 >= 0.50",
+            "(tag IN (maid, apron)) >= 0.45",
+            // Thresholds rejected on author IN / NOT IN
+            "author IN (alice, bob) >= 0.45",
+            "author NOT IN (alice, bob) >= 0.45",
+            // Unsupported fields for IN / NOT IN in search_types::query
+            "dino IN (12, 34, 56)",
+            "dino IN (12, 34) >= 0.70",
+            "dino NOT IN (12, 34)",
+            "post_tag IN (cosplay, maid)",
+            r#"clip IN ("sunset", "beach")"#,
+            "upload IN (0, 1)",
+            "title IN (cafe, tea)",
+            "all IN (cafe, tea)",
+        ] {
+            assert!(
+                parse_and_compile(bad).is_err(),
+                "must reject invalid IN/NOT IN query: {bad:?}"
+            );
+        }
+
+        // MAX_TERMS (24) budget counts every element inside IN (...)
+        let too_many = format!(
+            "tag IN ({})",
+            (0..=MAX_TERMS)
+                .map(|i| format!("t{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(parse_and_compile(&too_many).is_err());
+
+        let exact_max = format!(
+            "tag IN ({})",
+            (0..MAX_TERMS)
+                .map(|i| format!("t{i}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert!(parse_and_compile(&exact_max).is_ok());
     }
 }

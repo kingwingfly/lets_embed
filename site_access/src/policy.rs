@@ -1665,4 +1665,44 @@ mod tests {
         compute_next_grant_generations(&base, &mut reordered);
         assert_eq!(reordered.policies[0].grant_generation, 1);
     }
+
+    #[test]
+    fn validate_policy_set_supports_in_not_in_rules_and_extracts_all_refs() {
+        let mut p = PublicSitePolicy {
+            revision: 1,
+            min_enforce_rev: 1,
+            safety_enabled: true,
+            policies: vec![ContentPolicy {
+                id: "r18".into(),
+                grant_generation: 1,
+                enabled: true,
+                priority: 10,
+                name: "R-18".into(),
+                preset: PlaceholderPreset::R18,
+                match_expr: "tag IN (explicit, nude, nipples) >= 0.45".into(),
+                except_expr: Some(
+                    r#"post_tag IN (medical, educational) OR author NOT IN ("alice", bob)"#.into(),
+                ),
+                default_tag_min: 0.45,
+                action: PolicyAction::Block,
+                bypass: PolicyBypass::default(),
+            }],
+            ..PublicSitePolicy::default()
+        };
+        p.refresh_policy_digest();
+
+        let info = validate_policy_set(&p).expect("IN/NOT IN policy set valid");
+        assert_eq!(info.total_terms, 7);
+        assert_eq!(
+            info.referenced_wd_tags,
+            vec!["explicit", "nipples", "nude"]
+        );
+        assert_eq!(info.referenced_post_tags, vec!["educational", "medical"]);
+        assert_eq!(info.referenced_authors, vec!["alice", "bob"]);
+
+        // Typo inside `tag NOT IN (...)` rejected by validate_policy_set
+        let mut bad = p.clone();
+        bad.policies[0].match_expr = "tag NOT IN (general, bad_wd_typo) >= 0.45".into();
+        assert!(validate_policy_set(&bad).is_err());
+    }
 }

@@ -159,8 +159,9 @@ pub fn derive_domain_secret(master_secret: &str, domain: KeyDomain) -> String {
 /// Resolves the active secret for `domain`:
 /// 1. If `explicit_override` is present and non-empty (trimmed), returns it
 ///    directly for backwards-compatible per-purpose rotation.
-/// 2. Else if `master_secret` (`SITE_SECRET`) is present and non-empty
-///    (trimmed), derives an isolated 64-char hex key via [`derive_domain_secret`].
+/// 2. Else if `master_secret` (`SITE_SECRET`, the canonical primary secret) is
+///    present and non-empty (trimmed), derives an isolated 64-char hex key via
+///    [`derive_domain_secret`].
 /// 3. Else fails closed with `Err`.
 pub fn resolve_domain_secret(
     explicit_override: Option<&str>,
@@ -173,7 +174,7 @@ pub fn resolve_domain_secret(
     if let Some(master) = master_secret.map(str::trim).filter(|s| !s.is_empty()) {
         return Ok(derive_domain_secret(master, domain));
     }
-    Err("missing secret: configure explicit override or SITE_SECRET")
+    Err("missing secret: configure SITE_SECRET or an explicit override")
 }
 
 fn decode_hex_32(raw: &str) -> Result<[u8; 32], &'static str> {
@@ -200,11 +201,12 @@ fn hex_nibble(b: u8) -> Result<u8, &'static str> {
 }
 
 /// Resolves the 32-byte AES-256-GCM key for encrypted `provider_secrets`:
-/// 1. If `explicit_base64` (`SETTINGS_ENCRYPTION_KEY` / `PROVIDER_SECRETS_KEY`)
-///    is present and non-empty, decodes `<optional_kid:><base64|base64url|64-hex>`
-///    into 32 non-zero bytes.
-/// 2. Else if `master_secret` (`SITE_SECRET`) is present and non-empty, derives
-///    `[u8; 32]` directly with [`KeyDomain::ProviderSecrets`].
+/// 1. If an explicit per-purpose override (`explicit_base64`) is present and
+///    non-empty, decodes `<optional_kid:><base64|base64url|64-hex>` into 32
+///    non-zero bytes.
+/// 2. Else if `master_secret` (`SITE_SECRET`, the canonical primary secret) is
+///    present and non-empty, derives `[u8; 32]` directly with
+///    [`KeyDomain::ProviderSecrets`].
 /// 3. Else fails closed with `Err`.
 pub fn resolve_provider_aes_key(
     explicit_base64: Option<&str>,
@@ -254,7 +256,7 @@ pub fn resolve_provider_aes_key(
         ));
     }
 
-    Err("missing provider AES key: configure explicit key or SITE_SECRET")
+    Err("missing provider AES key: configure SITE_SECRET or an explicit key override")
 }
 
 #[cfg(test)]

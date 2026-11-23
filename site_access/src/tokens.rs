@@ -596,6 +596,10 @@ pub struct GatewayAssertion {
     pub click_eligible: Vec<PolicyRef>,
     #[serde(default)]
     pub is_billing_waived: bool,
+    #[serde(default)]
+    pub caller_age_verified: bool,
+    #[serde(default)]
+    pub caller_terms_accepted: bool,
     pub exp: u64,
 }
 
