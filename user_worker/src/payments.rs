@@ -5,7 +5,7 @@
 use axum::{
     Json,
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -18,7 +18,7 @@ use crate::config::{self, Chain, MIN_CONFIRMATIONS};
 use crate::rates;
 use crate::solana::{self, SolOutcome};
 use crate::types::{ApiError, CreditReq, PaymentRow, SubscribeReq, TopupReq, TopupResp};
-use crate::{do_client, session};
+use crate::{auth, do_client, identity, session};
 
 mod checkout;
 pub use checkout::prepare;
@@ -198,7 +198,8 @@ async fn d1_exec(env: &Env, sql: &str, binds: &[JsValue]) -> worker::Result<()> 
 }
 
 struct Deposit<'a> {
-    address: &'a str,
+    user_id: &'a str,
+    do_key: &'a str,
     hash: &'a str,
     token: &'a config::TokenSpec,
 }
@@ -222,7 +223,8 @@ impl Deposit<'_> {
         if row.status == "rejected" {
             return Ok(None);
         }
-        let same_payment = row.address == self.address
+        let same_owner = row.address == self.user_id || row.address == self.do_key;
+        let same_payment = same_owner
             && row.token == self.token.symbol
             && row.chain == self.token.chain.as_str();
         if row.status == "credited" && same_payment {
@@ -238,7 +240,7 @@ impl Deposit<'_> {
                 if !do_client::payment_applied(&st.env, &row.address, self.hash).await? {
                     return Ok(None);
                 }
-                if row.address == self.address {
+                if same_owner {
                     return Ok(Some(api_err(
                         StatusCode::CONFLICT,
                         "This payment was already credited. If it still shows as pending, contact support to reconcile the original receipt.",
@@ -250,7 +252,7 @@ impl Deposit<'_> {
                     .parse::<i64>()
                     .map_err(|e| worker::Error::RustError(e.to_string()))?;
                 return Ok(Some(
-                    finalize_credit(st, self.address, self.hash, points).await,
+                    finalize_credit(st, &row.address, self.do_key, self.hash, points).await,
                 ));
             }
         }
@@ -265,7 +267,7 @@ impl Deposit<'_> {
         let raw_amount = amount.map_or_else(|| "0".to_string(), |a| a.to_string());
         if let Err(e) = d1_exec(env,
             "INSERT INTO payments(tx_hash,address,chain,token,amount,created_at,status) VALUES(?,?,?,?,?,unixepoch(),'rejected') ON CONFLICT(tx_hash) DO NOTHING",
-            &[self.hash.into(), self.address.into(), self.token.chain.as_str().into(), self.token.symbol.into(), raw_amount.into()],
+            &[self.hash.into(), self.user_id.into(), self.token.chain.as_str().into(), self.token.symbol.into(), raw_amount.into()],
         ).await {
             worker::console_error!("recording rejected payment failed: {e:?}");
         }
@@ -285,7 +287,7 @@ impl Deposit<'_> {
              (payments.status='pending' AND payments.points=0)",
             &[
                 self.hash.into(),
-                self.address.into(),
+                self.user_id.into(),
                 self.token.chain.as_str().into(),
                 self.token.symbol.into(),
                 amount.to_string().into(),
@@ -328,15 +330,16 @@ fn too_early() -> Response {
 }
 
 /// Forward a subscription change to the user's DO, relay its status + JSON
-/// body, and on 200 mirror the display-only `users.plan` column in D1.
+/// body, and on 200 mirror the display-only `users_v2.plan` (and legacy `users.plan`) column in D1.
 async fn plan_passthrough(
     st: &AppState,
-    addr: &str,
+    user_id: &str,
+    do_key: &str,
     path: &str,
     body: Option<&SubscribeReq>,
     plan: Option<&str>,
 ) -> Response {
-    let mut resp = match do_client::call_do(&st.env, addr, Method::Post, path, body).await {
+    let mut resp = match do_client::call_do(&st.env, do_key, Method::Post, path, body).await {
         Ok(r) => r,
         Err(e) => {
             worker::console_error!("do {path} failed: {e:?}");
@@ -349,18 +352,33 @@ async fn plan_passthrough(
     let code = resp.status_code();
     let text = resp.text().await.unwrap_or_default();
     if code == 200 {
-        let (sql, binds): (&str, Vec<JsValue>) = match plan {
+        let (v2_sql, v2_binds): (&str, Vec<JsValue>) = match plan {
             Some(p) => (
-                "UPDATE users SET plan = ? WHERE address = ?",
-                vec![p.into(), addr.into()],
+                "UPDATE users_v2 SET plan = ?1 WHERE id = ?2",
+                vec![p.into(), user_id.into()],
             ),
             None => (
-                "UPDATE users SET plan = NULL WHERE address = ?",
-                vec![addr.into()],
+                "UPDATE users_v2 SET plan = NULL WHERE id = ?1",
+                vec![user_id.into()],
             ),
         };
-        if let Err(e) = d1_exec(&st.env, sql, &binds).await {
-            worker::console_error!("users.plan mirror failed: {e:?}");
+        if let Err(e) = d1_exec(&st.env, v2_sql, &v2_binds).await {
+            worker::console_error!("users_v2.plan mirror failed: {e:?}");
+        }
+        if session::is_valid_principal(do_key) {
+            let (sql, binds): (&str, Vec<JsValue>) = match plan {
+                Some(p) => (
+                    "UPDATE users SET plan = ?1 WHERE address = ?2",
+                    vec![p.into(), do_key.into()],
+                ),
+                None => (
+                    "UPDATE users SET plan = NULL WHERE address = ?1",
+                    vec![do_key.into()],
+                ),
+            };
+            if let Err(e) = d1_exec(&st.env, sql, &binds).await {
+                worker::console_error!("users.plan mirror failed: {e:?}");
+            }
         }
     }
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -374,16 +392,21 @@ async fn plan_passthrough(
 #[worker::send]
 pub async fn topup(
     State(st): State<AppState>,
+    headers: HeaderMap,
     cookies: Cookies,
     Json(req): Json<TopupReq>,
 ) -> Response {
-    let Some(addr) = session::session_address(&cookies, &st.jwt_secret) else {
-        return api_err(StatusCode::UNAUTHORIZED, "login required");
+    if let Err(r) = auth::require_same_origin(&st, &headers) {
+        return r;
+    }
+    let active = match identity::require_active_session(&st, &cookies).await {
+        Ok(a) => a,
+        Err(r) => return r,
     };
     if req
         .account
         .as_ref()
-        .is_some_and(|expected| *expected != addr)
+        .is_some_and(|expected| *expected != active.user_id && *expected != active.do_key)
     {
         return api_err(
             StatusCode::UNAUTHORIZED,
@@ -417,7 +440,8 @@ pub async fn topup(
         }
     };
     let deposit = Deposit {
-        address: &addr,
+        user_id: &active.user_id,
+        do_key: &active.do_key,
         hash: &hash,
         token: spec,
     };
@@ -492,11 +516,20 @@ async fn resolve_price(st: &AppState, spec: &config::TokenSpec) -> Result<Option
     }
 }
 
-async fn solana_sender(st: &AppState, addr: &str) -> Result<String, Response> {
-    if session::is_sol_principal(addr) {
-        return Ok(addr.to_string());
-    }
-    crate::solana_link::linked_address(&st.env, addr)
+pub(super) async fn eth_sender(st: &AppState, user_id: &str) -> Result<String, Response> {
+    identity::linked_eth_wallet(st, user_id)
+        .await
+        .map_err(payment_db_error)?
+        .ok_or_else(|| {
+            api_err(
+                StatusCode::BAD_REQUEST,
+                "Link an Ethereum wallet before topping up with ETH or ERC-20 tokens.",
+            )
+        })
+}
+
+pub(super) async fn solana_sender(st: &AppState, user_id: &str) -> Result<String, Response> {
+    identity::linked_solana_wallet(st, user_id)
         .await
         .map_err(payment_db_error)?
         .ok_or_else(|| {
@@ -510,8 +543,8 @@ async fn solana_sender(st: &AppState, addr: &str) -> Result<String, Response> {
 /// Solana top-up (native SOL + SPL USDT/USDC). Verification lives in
 /// `crate::solana`. This handler owns the payment row and account credit.
 async fn topup_solana(st: &AppState, deposit: &Deposit<'_>) -> Response {
-    let (addr, sig, spec) = (deposit.address, deposit.hash, deposit.token);
-    let linked = match solana_sender(st, addr).await {
+    let (user_id, sig, spec) = (deposit.user_id, deposit.hash, deposit.token);
+    let linked = match solana_sender(st, user_id).await {
         Ok(address) => address,
         Err(response) => return response,
     };
@@ -623,13 +656,11 @@ async fn deposit_terms_candidates(
 
 /// Native ETH and ERC-20 share the same sender, receipt, confirmation and block-time checks.
 async fn topup_ethereum(st: &AppState, deposit: &Deposit<'_>) -> Response {
-    let (addr, tx_hash, spec) = (deposit.address, deposit.hash, deposit.token);
-    if !session::is_eth_address(addr) {
-        return api_err(
-            StatusCode::BAD_REQUEST,
-            "Choose Solana for this gallery account.",
-        );
-    }
+    let (user_id, tx_hash, spec) = (deposit.user_id, deposit.hash, deposit.token);
+    let sender_addr = match eth_sender(st, user_id).await {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
     if let Err(response) = verify_ethereum_network(st).await {
         return response;
     }
@@ -654,10 +685,10 @@ async fn topup_ethereum(st: &AppState, deposit: &Deposit<'_>) -> Response {
             return rpc_unavailable("eth_getTransactionByHash decode", e);
         }
     };
-    if tx.from.to_lowercase() != addr {
+    if tx.from.to_lowercase() != sender_addr {
         return api_err(
             StatusCode::FORBIDDEN,
-            "tx sender does not match logged-in address",
+            "tx sender is not your linked Ethereum wallet",
         );
     }
 
@@ -745,7 +776,7 @@ async fn topup_ethereum(st: &AppState, deposit: &Deposit<'_>) -> Response {
         match spec.contract {
             Some(contract) => {
                 let recipient = policy.eth_deposit.strip_prefix("0x").unwrap_or("");
-                let sender = addr.strip_prefix("0x").unwrap_or(addr);
+                let sender = sender_addr.strip_prefix("0x").unwrap_or(&sender_addr);
                 match_transfer_log(&receipt.logs, contract, recipient, sender)
                     .ok_or("no matching token transfer")
             }
@@ -784,13 +815,19 @@ async fn topup_ethereum(st: &AppState, deposit: &Deposit<'_>) -> Response {
 
 /// Credit points via the DO ("tx:{hash}" idempotency key), then finalize the
 /// payment row. Shared by every chain/token path.
-async fn finalize_credit(st: &AppState, addr: &str, tx_hash: &str, points: i64) -> Response {
+async fn finalize_credit(
+    st: &AppState,
+    user_id: &str,
+    do_key: &str,
+    tx_hash: &str,
+    points: i64,
+) -> Response {
     let credit = CreditReq {
         points,
         key: format!("tx:{tx_hash}"),
         reason: "topup".into(),
     };
-    let bal = match do_client::do_credit(&st.env, addr, &credit).await {
+    let bal = match do_client::do_credit(&st.env, do_key, &credit).await {
         Ok(b) => b,
         Err(e) => {
             worker::console_error!("do_credit failed for {tx_hash}: {e:?}");
@@ -804,7 +841,7 @@ async fn finalize_credit(st: &AppState, addr: &str, tx_hash: &str, points: i64) 
     if let Err(e) = d1_exec(
         &st.env,
         "UPDATE payments SET status='credited' WHERE tx_hash=? AND address=? AND status='pending'",
-        &[tx_hash.into(), addr.into()],
+        &[tx_hash.into(), user_id.into()],
     )
     .await
     {
@@ -820,16 +857,17 @@ async fn finalize_credit(st: &AppState, addr: &str, tx_hash: &str, points: i64) 
 
 #[worker::send]
 pub async fn list_payments(State(st): State<AppState>, cookies: Cookies) -> Response {
-    let Some(addr) = session::session_address(&cookies, &st.jwt_secret) else {
-        return api_err(StatusCode::UNAUTHORIZED, "login required");
+    let active = match identity::require_active_session(&st, &cookies).await {
+        Ok(a) => a,
+        Err(r) => return r,
     };
 
     let stmt = st.env.d1(crate::D1_BINDING).and_then(|db| {
         db.prepare(
             "SELECT tx_hash, chain, token, amount, CAST(points AS TEXT) AS points, status, created_at \
-             FROM payments WHERE address = ? ORDER BY created_at DESC LIMIT 50",
+             FROM payments WHERE address = ?1 OR address = ?2 ORDER BY created_at DESC LIMIT 50",
         )
-        .bind(&[addr.as_str().into()])
+        .bind(&[active.user_id.as_str().into(), active.do_key.as_str().into()])
     });
     let rows = match stmt {
         Ok(s) => s.all().await.and_then(|r| r.results::<PaymentRow>()),
@@ -847,23 +885,44 @@ pub async fn list_payments(State(st): State<AppState>, cookies: Cookies) -> Resp
 #[worker::send]
 pub async fn subscribe(
     State(st): State<AppState>,
+    headers: HeaderMap,
     cookies: Cookies,
     Json(req): Json<SubscribeReq>,
 ) -> Response {
-    let Some(addr) = session::session_address(&cookies, &st.jwt_secret) else {
-        return api_err(StatusCode::UNAUTHORIZED, "login required");
+    if let Err(r) = auth::require_same_origin(&st, &headers) {
+        return r;
+    }
+    let active = match identity::require_active_session(&st, &cookies).await {
+        Ok(a) => a,
+        Err(r) => return r,
     };
-    plan_passthrough(&st, &addr, "/subscribe", Some(&req), Some(&req.plan)).await
+    plan_passthrough(
+        &st,
+        &active.user_id,
+        &active.do_key,
+        "/subscribe",
+        Some(&req),
+        Some(&req.plan),
+    )
+    .await
 }
 
 #[worker::send]
-pub async fn unsubscribe(State(st): State<AppState>, cookies: Cookies) -> Response {
-    let Some(addr) = session::session_address(&cookies, &st.jwt_secret) else {
-        return api_err(StatusCode::UNAUTHORIZED, "login required");
+pub async fn unsubscribe(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    cookies: Cookies,
+) -> Response {
+    if let Err(r) = auth::require_same_origin(&st, &headers) {
+        return r;
+    }
+    let active = match identity::require_active_session(&st, &cookies).await {
+        Ok(a) => a,
+        Err(r) => return r,
     };
     // No body / no plan: the DO refunds the prorated remainder and lapses to
-    // PAYG; the passthrough mirrors `users.plan = NULL` in D1 on success.
-    plan_passthrough(&st, &addr, "/unsubscribe", None, None).await
+    // PAYG; the passthrough mirrors `users_v2.plan = NULL` in D1 on success.
+    plan_passthrough(&st, &active.user_id, &active.do_key, "/unsubscribe", None, None).await
 }
 
 // ---------------------------------------------------------------------------
