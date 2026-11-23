@@ -1,6 +1,11 @@
 use std::{
-    collections::HashMap, io::Cursor, iter::repeat, path::PathBuf, sync::LazyLock,
-    thread::available_parallelism, time::Duration,
+    collections::{HashMap, HashSet},
+    io::Cursor,
+    iter::repeat,
+    path::PathBuf,
+    sync::{Arc, LazyLock},
+    thread::available_parallelism,
+    time::Duration,
 };
 
 use anyhow::bail;
@@ -105,6 +110,17 @@ pub struct EmbedCli {
     /// whether to quit if `SELECT ... FOR UPDATE SKIP LOCKED` got no record
     #[arg(long, alias = "nq")]
     no_quit_while_empty: bool,
+
+    /// extra canonical WD-Tagger tag names to always persist regardless of `top_k` and
+    /// `general_threshold` (in addition to category-9 rating tags and built-in safety presets)
+    #[arg(long, value_delimiter = ',')]
+    safety_tags: Vec<String>,
+
+    /// backfill mode: re-run WD-Tagger only on already-`completed` images that are missing any
+    /// category-9 rating tag (`general`, `sensitive`, `questionable`, `explicit`), upserting
+    /// rating and safety tags without modifying embeddings or image status
+    #[arg(long)]
+    retag_safety: bool,
 }
 
 #[derive(Debug)]
@@ -177,8 +193,36 @@ impl EmbedCli {
         let tags = wd_tagger::tags(self.selected_tags)?;
         let tags = tags.leak::<'static>();
 
+        let mut safety_tag_set = wd_tagger::default_safety_tag_set();
+        for tag in self.safety_tags {
+            let trimmed = tag.trim();
+            if !trimmed.is_empty() {
+                safety_tag_set.insert(trimmed.to_string());
+            }
+        }
+        let always_keep_tags = Arc::new(safety_tag_set);
+
         let ort_env = ort::init().with_name("embed").build()?;
         let wd_tagger_session = wd_tagger::model_with_env(&ort_env, self.wd_tagger_model)?;
+
+        if self.retag_safety {
+            return run_retag_safety(
+                pool,
+                op,
+                wd_tagger_session,
+                tags,
+                always_keep_tags,
+                RetagParams {
+                    top_k: self.top_k,
+                    general_threshold: self.general_threshold,
+                    character_threshold: self.character_threshold,
+                    batch_size: self.batch_size.max(1),
+                },
+                cancel,
+            )
+            .await;
+        }
+
         let clip_vision_session = siglip2::model_with_env(&ort_env, self.clip_vision_model)?;
         let dinov3_session = dinov3::model_with_env(&ort_env, self.dinov3_model)?;
 
@@ -218,6 +262,7 @@ impl EmbedCli {
             infer(
                 wd_tagger_session,
                 tags,
+                always_keep_tags,
                 self.top_k,
                 self.general_threshold,
                 self.character_threshold,
@@ -476,6 +521,7 @@ async fn convert_image(
 fn infer(
     mut wd_tagger_session: Session,
     tags: &'static [Tag],
+    always_keep_tags: Arc<HashSet<String>>,
     top_k: usize,
     general_threshold: f32,
     character_threshold: f32,
@@ -531,13 +577,14 @@ fn infer(
         let res = if some_ids.is_empty() {
             none_ids.into_iter().zip(repeat(None)).collect::<Vec<_>>()
         } else {
-            match wd_tagger::infer_tag(
+            match wd_tagger::infer_tag_with_safety(
                 &mut wd_tagger_session,
                 wd_images,
                 tags,
                 top_k,
                 general_threshold,
                 character_threshold,
+                Some(&always_keep_tags),
             )
             .and_then(|tags| {
                 Ok((
@@ -788,4 +835,175 @@ async fn record(
         }
     }
     failure.map_or(Ok(()), Err)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RetagParams {
+    top_k: usize,
+    general_threshold: f32,
+    character_threshold: f32,
+    batch_size: usize,
+}
+
+/// Backfills WD-Tagger category-9 rating tags and safety-vocabulary tags for
+/// already-`completed` images that are missing any of the four rating tags
+/// (`general`, `sensitive`, `questionable`, `explicit`).
+///
+/// Uses runtime `sqlx::query` so `.sqlx` offline query metadata for the main
+/// ingestion pipeline remains unchanged.
+#[tracing::instrument(skip_all, err)]
+async fn run_retag_safety(
+    pool: PgPool,
+    op: Operator,
+    mut wd_tagger_session: Session,
+    tags: &'static [Tag],
+    always_keep_tags: Arc<HashSet<String>>,
+    params: RetagParams,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let rating_names: Vec<String> = wd_tagger::RATING_TAG_NAMES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let mut last_id: i64 = 0;
+    let mut processed: u64 = 0;
+
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            r#"
+            SELECT i.id, i.name
+            FROM images i
+            WHERE i.status = 'completed'::process_status
+              AND i.id > $1
+              AND (
+                  SELECT COUNT(*)
+                  FROM wd_tag_images wti
+                  JOIN wd_tags wt ON wt.id = wti.wd_tag_id
+                  WHERE wti.image_id = i.id
+                    AND wt.name = ANY($2)
+              ) < $3
+            ORDER BY i.id ASC
+            LIMIT $4
+            "#,
+        )
+        .bind(last_id)
+        .bind(&rating_names)
+        .bind(rating_names.len() as i64)
+        .bind(params.batch_size as i64)
+        .fetch_all(&pool)
+        .await?;
+
+        if rows.is_empty() {
+            tracing::info!(processed, "retag-safety backfill complete");
+            break;
+        }
+
+        last_id = rows.last().map(|(id, _)| *id).unwrap_or(last_id);
+
+        let mut batch_ids = Vec::with_capacity(rows.len());
+        let mut batch_inputs = Vec::with_capacity(rows.len());
+
+        for (id, name) in rows {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let buf = match op.read(&format!("{name}.webp")).await {
+                Ok(buf) => buf.to_bytes(),
+                Err(e) => {
+                    tracing::warn!(id, err = %e, "retag-safety: failed to read image");
+                    continue;
+                }
+            };
+            match tokio::task::spawn_blocking(move || wd_tagger::convert_image(Cursor::new(buf)))
+                .await?
+            {
+                Ok(hwc) => {
+                    batch_ids.push(id);
+                    batch_inputs.push(hwc);
+                }
+                Err(e) => {
+                    tracing::warn!(id, err = %e, "retag-safety: failed to decode image");
+                }
+            }
+        }
+
+        if batch_ids.is_empty() {
+            continue;
+        }
+
+        let keep = Arc::clone(&always_keep_tags);
+        let (session_back, inferred) = tokio::task::spawn_blocking(move || {
+            let res = wd_tagger::infer_tag_with_safety(
+                &mut wd_tagger_session,
+                batch_inputs,
+                tags,
+                params.top_k,
+                params.general_threshold,
+                params.character_threshold,
+                Some(&keep),
+            );
+            (wd_tagger_session, res)
+        })
+        .await?;
+        wd_tagger_session = session_back;
+        let inferred = inferred?;
+
+        let mut wd_ids: Vec<i64> = Vec::new();
+        let mut tag_names: Vec<&str> = Vec::new();
+        let mut scores: Vec<f32> = Vec::new();
+
+        for (id, img_tags) in batch_ids.iter().copied().zip(inferred) {
+            for (tag, score) in img_tags {
+                wd_ids.push(id);
+                tag_names.push(tag.name.as_str());
+                scores.push(score);
+            }
+        }
+
+        if !tag_names.is_empty() {
+            let mut conn = pool.acquire().await?;
+            sqlx::query(
+                r#"
+                INSERT INTO wd_tags (name)
+                SELECT DISTINCT name FROM unnest($1::TEXT[]) AS _(name)
+                WHERE trim(name) != ''
+                ORDER BY name
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(&tag_names)
+            .execute(&mut *conn)
+            .await?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO wd_tag_images (wd_tag_id, image_id, score)
+                SELECT wt.id, i.id, i.score
+                FROM unnest($1::BIGINT[], $2::TEXT[], $3::REAL[]) AS i(id, name, score)
+                JOIN wd_tags wt USING (name)
+                ON CONFLICT (wd_tag_id, image_id) DO UPDATE
+                SET score = EXCLUDED.score
+                "#,
+            )
+            .bind(&wd_ids)
+            .bind(&tag_names)
+            .bind(&scores)
+            .execute(&mut *conn)
+            .await?;
+        }
+
+        processed += batch_ids.len() as u64;
+        tracing::info!(
+            processed,
+            last_id,
+            batch = batch_ids.len(),
+            "retag-safety batch updated"
+        );
+    }
+
+    Ok(())
 }

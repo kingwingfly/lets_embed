@@ -1,4 +1,11 @@
+pub mod projection;
 pub mod query;
+pub mod safety;
+
+pub use projection::{
+    BlurDeliveryMode, MaskMetadata, ProjectedImage, ProjectedVideo, SimilarityThresholdError,
+    clamp_min_similarity, validate_min_similarity,
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

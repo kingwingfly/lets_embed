@@ -13,6 +13,9 @@ use pingora::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 const ADDR: &str = "0.0.0.0:8080";
+const IMMUTABLE_PUBLIC_CACHE: &str = "public, max-age=31536000, immutable";
+const REVALIDATED_PKG_CACHE: &str =
+    "public, max-age=0, s-maxage=300, stale-while-revalidate=60, must-revalidate";
 
 struct Ingress {
     upstream: HttpPeer,
@@ -64,48 +67,111 @@ impl ProxyHttp for Ingress {
     where
         Self::CTX: Send + Sync,
     {
+        let existing_cache_controls: Vec<&str> = upstream_response
+            .headers
+            .get_all(http::header::CACHE_CONTROL)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+
         let content_type = upstream_response
             .headers
             .get(http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| {
-                v.split(';')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_ascii_lowercase()
-            });
-
-        let Some(content_type) = content_type else {
-            return Ok(());
-        };
+            .and_then(|v| v.to_str().ok());
 
         let path = session.req_header().uri.path();
-        let is_hashed = is_content_hashed(path);
 
-        let cache_control = match content_type.as_str() {
-            _ if is_hashed => Some("public, max-age=31536000, immutable"),
-
-            t if t.starts_with("image/") || t.starts_with("font/") => {
-                Some("public, max-age=31536000, immutable")
-            }
-
-            "text/html" => {
-                Some("no-cache, must-revalidate, s-maxage=30, stale-while-revalidate=60")
-            }
-
-            "application/javascript" | "text/javascript" | "text/css" | "application/wasm" => {
-                Some("public, max-age=0, s-maxage=300, stale-while-revalidate=60, must-revalidate")
-            }
-
-            _ => None,
-        };
-
-        if let Some(value) = cache_control {
+        if let Some(value) = decide_cache_control(path, content_type, &existing_cache_controls) {
             upstream_response.insert_header(http::header::CACHE_CONTROL, value)?;
         }
 
         Ok(())
+    }
+}
+
+/// Returns `true` if any existing `Cache-Control` directive marks the response
+/// as `private`, `no-store`, or `no-cache`.
+fn has_protective_cache_control(existing: &[&str]) -> bool {
+    existing.iter().any(|header| {
+        header.split(',').any(|raw| {
+            let directive = raw
+                .split('=')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            matches!(directive.as_str(), "private" | "no-store" | "no-cache")
+        })
+    })
+}
+
+fn is_sensitive_path(path: &str) -> bool {
+    path == "/api"
+        || path.starts_with("/api/")
+        || path == "/media"
+        || path.starts_with("/media/")
+        || path == "/user"
+        || path.starts_with("/user/")
+        || path == "/admin"
+        || path.starts_with("/admin/")
+        || path == "/images"
+        || path.starts_with("/images/")
+        || path == "/videos"
+        || path.starts_with("/videos/")
+}
+
+fn is_pkg_asset_path(path: &str) -> bool {
+    path.starts_with("/pkg/")
+        && !path.contains('\\')
+        && !path.split('/').any(|seg| seg == "." || seg == "..")
+}
+
+/// Decides whether Pingora should inject a `Cache-Control` header, or return
+/// `None` to leave the upstream response's caching semantics untouched.
+///
+/// Security invariants (H2):
+/// 1. Any upstream `Cache-Control` carrying `private`, `no-store`, or `no-cache`
+///    is ALWAYS preserved untouched.
+/// 2. `text/html`, `/api/*`, `/media/*`, `/user/*`, `/admin*`, `/images/*`, and
+///    `/videos/*` NEVER receive `public` or `s-maxage`.
+/// 3. `public, max-age=31536000, immutable` is applied ONLY to content-hashed
+///    non-HTML assets under `/pkg/*` (never blindly to all `image/*`).
+fn decide_cache_control(
+    path: &str,
+    content_type: Option<&str>,
+    existing_cache_controls: &[&str],
+) -> Option<&'static str> {
+    if has_protective_cache_control(existing_cache_controls) {
+        return None;
+    }
+
+    if is_sensitive_path(path) {
+        return None;
+    }
+
+    let normalized_ct = content_type?.split(';').next()?.trim().to_ascii_lowercase();
+    if normalized_ct.is_empty() || normalized_ct == "text/html" {
+        return None;
+    }
+
+    if !is_pkg_asset_path(path) {
+        return None;
+    }
+
+    if is_content_hashed(path) {
+        return Some(IMMUTABLE_PUBLIC_CACHE);
+    }
+
+    if existing_cache_controls.is_empty() {
+        match normalized_ct.as_str() {
+            "application/javascript" | "text/javascript" | "text/css" | "application/wasm" => {
+                Some(REVALIDATED_PKG_CACHE)
+            }
+            t if t.starts_with("font/") => Some(REVALIDATED_PKG_CACHE),
+            _ => None,
+        }
+    } else {
+        None
     }
 }
 
@@ -158,4 +224,135 @@ fn main() -> ExitCode {
 
     tracing::info!("listening on {ADDR}");
     my_server.run_forever();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_private_no_store_and_no_cache_responses_untouched() {
+        // Private/no-store HTML is never overwritten
+        assert_eq!(
+            decide_cache_control("/", Some("text/html; charset=utf-8"), &["private, no-store"]),
+            None
+        );
+        // Even a hashed /pkg/* path with protective upstream headers is never overwritten
+        assert_eq!(
+            decide_cache_control(
+                "/pkg/app.deadbeef01.js",
+                Some("application/javascript"),
+                &["private, no-store"]
+            ),
+            None
+        );
+        assert_eq!(
+            decide_cache_control(
+                "/pkg/app.deadbeef01.js",
+                Some("application/javascript"),
+                &["no-cache, must-revalidate"]
+            ),
+            None
+        );
+        assert_eq!(
+            decide_cache_control(
+                "/pkg/app.deadbeef01.js",
+                Some("application/javascript"),
+                &["max-age=60", "Private=\"Set-Cookie\""]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn never_injects_public_or_s_maxage_on_html_api_media_or_non_hashed_images() {
+        // Unlabelled HTML
+        assert_eq!(decide_cache_control("/", Some("text/html"), &[]), None);
+        assert_eq!(
+            decide_cache_control("/details/42", Some("text/html; charset=utf-8"), &[]),
+            None
+        );
+        // Hashed-looking HTML even under /pkg/
+        assert_eq!(
+            decide_cache_control("/pkg/index.deadbeef01.html", Some("text/html"), &[]),
+            None
+        );
+
+        // API & media paths
+        assert_eq!(
+            decide_cache_control("/api/fetch_posts", Some("application/json"), &[]),
+            None
+        );
+        assert_eq!(
+            decide_cache_control("/media/image/42", Some("image/webp"), &[]),
+            None
+        );
+        assert_eq!(
+            decide_cache_control("/media/preview/42", Some("image/webp"), &[]),
+            None
+        );
+
+        // Non-hashed images & images outside /pkg/ (even if filename looks hashed)
+        assert_eq!(
+            decide_cache_control("/images/album/pic.webp", Some("image/webp"), &[]),
+            None
+        );
+        assert_eq!(
+            decide_cache_control("/images/pic.12345678.webp", Some("image/webp"), &[]),
+            None
+        );
+        assert_eq!(
+            decide_cache_control("/avatar.png", Some("image/png"), &[]),
+            None
+        );
+        assert_eq!(
+            decide_cache_control("/pkg/logo.png", Some("image/png"), &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn applies_immutable_public_cache_only_to_content_hashed_pkg_assets() {
+        assert_eq!(
+            decide_cache_control(
+                "/pkg/lets-embed-web.a1b2c3d4.js",
+                Some("application/javascript; charset=utf-8"),
+                &[]
+            ),
+            Some(IMMUTABLE_PUBLIC_CACHE)
+        );
+        assert_eq!(
+            decide_cache_control(
+                "/pkg/lets-embed-web.a1b2c3d4.wasm",
+                Some("application/wasm"),
+                &[]
+            ),
+            Some(IMMUTABLE_PUBLIC_CACHE)
+        );
+        assert_eq!(
+            decide_cache_control(
+                "/pkg/lets-embed-web.a1b2c3d4.css",
+                Some("text/css"),
+                &[]
+            ),
+            Some(IMMUTABLE_PUBLIC_CACHE)
+        );
+        assert_eq!(
+            decide_cache_control(
+                "/pkg/placeholder.a1b2c3d4.svg",
+                Some("image/svg+xml"),
+                &[]
+            ),
+            Some(IMMUTABLE_PUBLIC_CACHE)
+        );
+        // Traversal out of /pkg/ must be rejected
+        assert_eq!(
+            decide_cache_control(
+                "/pkg/../images/pic.a1b2c3d4.webp",
+                Some("image/webp"),
+                &[]
+            ),
+            None
+        );
+    }
 }
