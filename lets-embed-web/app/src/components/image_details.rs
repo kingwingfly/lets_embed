@@ -1,8 +1,8 @@
 use crate::{
     components::{BlurredMediaCard, Lightbox, LikeButton, LikeVariant, Results, Viewer},
     types::{
-        ImageQuery, ImageQueryPayload, PostItem, ProjectedImageDetails, SafetyUiState, mask_to_ui,
-        navigate_external, unlock_href_for_mask,
+        ImageQuery, ImageQueryPayload, PostItem, ProjectedImageDetails, SafetyUiState,
+        handle_mask_unlock, mask_to_ui,
     },
     util::{format_duration, layout_image_masonry, public_origin, set_document_title},
 };
@@ -209,8 +209,9 @@ fn PostAlbumMasonry(
         images_store.with_value(|imgs| layout_image_masonry(imgs, count))
     });
 
+    let safety = use_context::<SafetyUiState>();
     let on_unlock = Callback::new(move |mask: GalleryMask| {
-        navigate_external(unlock_href_for_mask(&mask));
+        handle_mask_unlock(&mask, safety);
     });
 
     view! {
@@ -534,7 +535,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
     };
 
     let on_unlock = Callback::new(move |mask: GalleryMask| {
-        navigate_external(unlock_href_for_mask(&mask));
+        handle_mask_unlock(&mask, safety);
     });
 
     let render_author_pill = |name: String| {

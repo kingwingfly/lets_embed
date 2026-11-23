@@ -33,6 +33,15 @@ pub const RESTRICTED_MEDIA_CAP_TTL_SECS: u64 = 300;
 /// by same-origin CSRF-protected `POST /api/safety/reveal`).
 pub const CLICK_REVEAL_MEDIA_CAP_TTL_SECS: u64 = 900;
 
+/// Reserved marker appended to [`MaskMetadata::matched_policy_ids`] when a
+/// placeholder restriction has no user self-service unlock path (e.g. neither
+/// `include_switcher` nor `include_click` is enabled, `require_age_18` is
+/// configured while `age_policy == Off`, or the asset is pending classification).
+///
+/// Uses a `:` prefix which is disallowed in valid Policy v3 IDs so it can never
+/// collide with an administrator-defined policy slug.
+pub const MASK_NO_UNLOCK_MARKER: &str = "system:no_unlock";
+
 /// Explicit error returned when a similarity search seed (`search_similar` or
 /// `dino:<id>` / `-dino:<id>`) is not Clear for the caller or lacks trusted facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +70,8 @@ pub struct CallerContext {
     pub direct_grants: HashSet<PolicyRef>,
     pub click_eligible: HashSet<PolicyRef>,
     pub is_billing_waived: bool,
+    pub age_verified: bool,
+    pub terms_accepted: bool,
 }
 
 impl Default for CallerContext {
@@ -70,6 +81,8 @@ impl Default for CallerContext {
             direct_grants: HashSet::new(),
             click_eligible: HashSet::new(),
             is_billing_waived: false,
+            age_verified: false,
+            terms_accepted: false,
         }
     }
 }
@@ -85,7 +98,13 @@ impl CallerContext {
             direct_grants: assertion.direct_grants.iter().cloned().collect(),
             click_eligible: assertion.click_eligible.iter().cloned().collect(),
             is_billing_waived: assertion.is_billing_waived,
+            age_verified: assertion.caller_age_verified,
+            terms_accepted: assertion.caller_terms_accepted,
         }
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        matches!(self.actor, ActorBinding::User { .. })
     }
 
     pub fn has_direct_grant(&self, policy_ref: &PolicyRef) -> bool {
@@ -677,7 +696,7 @@ impl CompiledPolicy {
         // 1. Any unsatisfied Block ALWAYS yields Placeholder.
         if !unsatisfied_blocks.is_empty() {
             return MediaOutcome::Placeholder {
-                mask: aggregate_placeholder_mask(&unsatisfied_blocks, &self.policy),
+                mask: aggregate_placeholder_mask(&unsatisfied_blocks, &self.policy, caller),
                 facts_rev,
             };
         }
@@ -719,7 +738,7 @@ impl CompiledPolicy {
         if !unsatisfied_blurs.is_empty() {
             if !self.policy.fixed_blur_enabled {
                 return MediaOutcome::Placeholder {
-                    mask: aggregate_placeholder_mask(&unsatisfied_blurs, &self.policy),
+                    mask: aggregate_placeholder_mask(&unsatisfied_blurs, &self.policy, caller),
                     facts_rev,
                 };
             }
@@ -1281,7 +1300,10 @@ impl<'a> EvalAccumulator<'a> {
 fn unclassified_mask() -> MaskMetadata {
     MaskMetadata {
         policy_id: "unclassified".to_string(),
-        matched_policy_ids: vec!["unclassified".to_string()],
+        matched_policy_ids: vec![
+            "unclassified".to_string(),
+            MASK_NO_UNLOCK_MARKER.to_string(),
+        ],
         label: "Pending classification".to_string(),
         preset: PlaceholderPreset::Custom,
         requires_login: false,
@@ -1290,24 +1312,58 @@ fn unclassified_mask() -> MaskMetadata {
     }
 }
 
+fn policy_has_user_unlock_path(item: &CompiledPolicyItem, site_policy: &PublicSitePolicy) -> bool {
+    let has_branch = match item.action {
+        PolicyAction::Block => item.bypass.include_switcher || item.bypass.include_click,
+        PolicyAction::Blur => {
+            item.bypass.include_switcher
+                || (site_policy.fixed_blur_enabled && item.bypass.include_click)
+        }
+    };
+    let age_impossible =
+        item.bypass.require_age_18 && site_policy.age_policy == AgeVerificationPolicy::Off;
+    has_branch && !age_impossible
+}
+
 fn aggregate_placeholder_mask(
     unsatisfied: &[&CompiledPolicyItem],
     policy: &PublicSitePolicy,
+    caller: &CallerContext,
 ) -> MaskMetadata {
     let primary = unsatisfied[0];
-    let requires_age = unsatisfied.iter().any(|p| p.bypass.require_age_18)
-        && policy.age_policy != AgeVerificationPolicy::Off;
+    let mut matched_policy_ids: Vec<String> = unsatisfied.iter().map(|p| p.id.clone()).collect();
+    let has_user_unlock = unsatisfied
+        .iter()
+        .all(|p| policy_has_user_unlock_path(p, policy));
+
+    if !has_user_unlock {
+        matched_policy_ids.push(MASK_NO_UNLOCK_MARKER.to_string());
+        return MaskMetadata {
+            policy_id: primary.id.clone(),
+            matched_policy_ids,
+            label: primary.name.clone(),
+            preset: primary.preset,
+            requires_login: false,
+            requires_age: false,
+            requires_terms: false,
+        };
+    }
+
+    let caller_is_authenticated = caller.is_authenticated();
     let requires_login = unsatisfied
         .iter()
         .any(|p| p.bypass.require_gallery_login || p.bypass.exclude_anonymous)
-        || requires_age;
+        && !caller_is_authenticated;
+    let requires_age = unsatisfied.iter().any(|p| p.bypass.require_age_18)
+        && policy.age_policy != AgeVerificationPolicy::Off
+        && !caller.age_verified;
     let requires_terms = unsatisfied
         .iter()
         .any(|p| p.bypass.require_current_terms)
-        || (requires_age && policy.age_policy.requires_adult_assurance());
+        && !caller.terms_accepted;
     MaskMetadata {
         policy_id: primary.id.clone(),
-        matched_policy_ids: unsatisfied.iter().map(|p| p.id.clone()).collect(),
+        matched_policy_ids,
         label: primary.name.clone(),
         preset: primary.preset,
         requires_login,
@@ -1321,9 +1377,11 @@ fn aggregate_unknown_mask(
     _policy: &PublicSitePolicy,
 ) -> MaskMetadata {
     let primary = unknowns[0];
+    let mut matched_policy_ids: Vec<String> = unknowns.iter().map(|p| p.id.clone()).collect();
+    matched_policy_ids.push(MASK_NO_UNLOCK_MARKER.to_string());
     MaskMetadata {
         policy_id: primary.id.clone(),
-        matched_policy_ids: unknowns.iter().map(|p| p.id.clone()).collect(),
+        matched_policy_ids,
         label: format!("Pending classification ({})", primary.name),
         preset: primary.preset,
         requires_login: false,
@@ -2414,6 +2472,8 @@ mod tests {
             direct_grants: HashSet::new(),
             click_eligible: HashSet::from([PolicyRef::new("sensitive", 3)]),
             is_billing_waived: false,
+            age_verified: false,
+            terms_accepted: false,
         };
 
         let blur_img = ImageFacts {
@@ -2488,6 +2548,8 @@ mod tests {
             direct_grants: HashSet::new(),
             click_eligible: HashSet::from([PolicyRef::new("sensitive", 3)]),
             is_billing_waived: false,
+            age_verified: false,
+            terms_accepted: false,
         };
         let blur_img = ImageFacts::completed_with_floor(
             Some(0.05),
@@ -2554,7 +2616,142 @@ mod tests {
         assert!(sql.contains("IS FALSE"));
         // Post context policy (`r18` has `except_expr = post_tag:exempt_r18`) uses multi-parent check
         assert!(sql.contains("NOT EXISTS (SELECT 1 FROM post_images pi WHERE pi.image_id = i.id"));
-        // Blur policy (`sensitive`) is ALSO filtered in search for callers without direct_grant!
+        // Blur policy (`sensitive`) is ALSO filtered in Clear-only SQL (used by sitemaps & tag autocomplete).
         assert!(sql.matches("JOIN wd_tags wt ON wt.id = wti.wd_tag_id").count() >= 6);
+    }
+
+    #[test]
+    fn placeholder_mask_reflects_caller_auth_age_terms_and_no_unlock_path() {
+        let compiled = CompiledPolicy::compile(sample_policy_v3()).unwrap();
+        let explicit_img = ImageFacts::completed_with_floor(
+            Some(0.05),
+            HashMap::from([("explicit".into(), 0.90)]),
+        );
+
+        // 1. Guest (Anon) sees requires_login=true, requires_age=true, requires_terms=true.
+        let anon = CallerContext::anonymous();
+        match compiled.evaluate_image(&explicit_img, &anon) {
+            MediaOutcome::Placeholder { mask, .. } => {
+                assert_eq!(mask.policy_id, "r18");
+                assert!(mask.requires_login);
+                assert!(mask.requires_age);
+                assert!(mask.requires_terms);
+                assert!(!mask.matched_policy_ids.iter().any(|s| s == MASK_NO_UNLOCK_MARKER));
+            }
+            other => panic!("expected Placeholder for anon, got {other:?}"),
+        }
+
+        // 2. Signed-in user who has NOT verified 18+ or accepted Terms:
+        //    requires_login MUST be false (never bounce signed-in users back to /user/login!).
+        let signed_in_unverified = CallerContext {
+            actor: ActorBinding::User {
+                sub: "usr-1".into(),
+                sid: "sid-1".into(),
+            },
+            age_verified: false,
+            terms_accepted: false,
+            ..CallerContext::default()
+        };
+        match compiled.evaluate_image(&explicit_img, &signed_in_unverified) {
+            MediaOutcome::Placeholder { mask, .. } => {
+                assert!(!mask.requires_login, "signed-in user must not be asked to sign in");
+                assert!(mask.requires_age);
+                assert!(mask.requires_terms);
+                assert!(!mask.matched_policy_ids.iter().any(|s| s == MASK_NO_UNLOCK_MARKER));
+            }
+            other => panic!("expected Placeholder for unverified user, got {other:?}"),
+        }
+
+        // 3. Signed-in user who verified 18+ but has NOT accepted Terms:
+        let age_only_user = CallerContext {
+            age_verified: true,
+            terms_accepted: false,
+            ..signed_in_unverified.clone()
+        };
+        match compiled.evaluate_image(&explicit_img, &age_only_user) {
+            MediaOutcome::Placeholder { mask, .. } => {
+                assert!(!mask.requires_login);
+                assert!(!mask.requires_age);
+                assert!(mask.requires_terms);
+            }
+            other => panic!("expected Placeholder for age-verified user, got {other:?}"),
+        }
+
+        // 4. Signed-in user who satisfied BOTH 18+ and Terms (just hasn't enabled switcher yet):
+        let ready_user = CallerContext {
+            age_verified: true,
+            terms_accepted: true,
+            ..signed_in_unverified
+        };
+        match compiled.evaluate_image(&explicit_img, &ready_user) {
+            MediaOutcome::Placeholder { mask, .. } => {
+                assert!(!mask.requires_login);
+                assert!(!mask.requires_age);
+                assert!(!mask.requires_terms);
+                assert!(!mask.matched_policy_ids.iter().any(|s| s == MASK_NO_UNLOCK_MARKER));
+            }
+            other => panic!("expected Placeholder for switcher-off user, got {other:?}"),
+        }
+
+        // 5. CallerContext::from_assertion preserves caller_age_verified & caller_terms_accepted.
+        let assertion = GatewayAssertion {
+            v: site_access::GATEWAY_ASSERTION_VERSION,
+            aud: site_access::GATEWAY_ASSERTION_AUDIENCE.to_string(),
+            actor: ActorBinding::User {
+                sub: "usr-2".into(),
+                sid: "sid-2".into(),
+            },
+            rev: 7,
+            min_enforce_rev: 5,
+            digest: "0".repeat(64),
+            direct_grants: vec![],
+            click_eligible: vec![],
+            is_billing_waived: false,
+            caller_age_verified: true,
+            caller_terms_accepted: true,
+            exp: 2_000_000_000,
+        };
+        let from_ga = CallerContext::from_assertion(&assertion);
+        assert!(from_ga.is_authenticated());
+        assert!(from_ga.age_verified);
+        assert!(from_ga.terms_accepted);
+
+        // 6. Hard block with NO user unlock path (`!include_switcher && !include_click`)
+        //    marks `MASK_NO_UNLOCK_MARKER` so UI hides any misleading unlock CTA!
+        let mut locked_pol = PublicSitePolicy {
+            revision: 3,
+            min_enforce_rev: 1,
+            safety_enabled: true,
+            policies: vec![ContentPolicy {
+                id: "staff_only".into(),
+                grant_generation: 1,
+                enabled: true,
+                priority: 1,
+                name: "Staff Restricted".into(),
+                preset: PlaceholderPreset::Custom,
+                match_expr: "tag:explicit".into(),
+                except_expr: None,
+                default_tag_min: 0.45,
+                action: PolicyAction::Block,
+                bypass: PolicyBypass {
+                    include_live_admin: true,
+                    require_gallery_login: true,
+                    ..PolicyBypass::default()
+                },
+            }],
+            ..PublicSitePolicy::default()
+        };
+        locked_pol.refresh_policy_digest();
+        let locked_compiled = CompiledPolicy::compile(locked_pol).unwrap();
+        match locked_compiled.evaluate_image(&explicit_img, &anon) {
+            MediaOutcome::Placeholder { mask, .. } => {
+                assert_eq!(mask.policy_id, "staff_only");
+                assert!(!mask.requires_login);
+                assert!(!mask.requires_age);
+                assert!(!mask.requires_terms);
+                assert!(mask.matched_policy_ids.iter().any(|s| s == MASK_NO_UNLOCK_MARKER));
+            }
+            other => panic!("expected no-unlock Placeholder, got {other:?}"),
+        }
     }
 }

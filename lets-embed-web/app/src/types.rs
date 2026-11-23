@@ -1,4 +1,4 @@
-use leptos::prelude::{RwSignal, Set};
+use leptos::prelude::{GetUntracked, RwSignal, Set};
 use lets_embed_ui::{
     Density, GalleryCard, GalleryCardKind, GalleryMask, GalleryMaskPreset, GalleryMedia,
     GalleryMediaKind, ReportTargetKind, ViewerItem,
@@ -7,6 +7,11 @@ use search_types::{
     Author, MaskMetadata, PlaceholderPreset, Post, ProjectedImage, ProjectedVideo, Tag,
 };
 use serde::{Deserialize, Serialize};
+use site_access::{AgeGateTrigger, AgeVerificationPolicy};
+
+/// Reserved marker emitted in `MaskMetadata::matched_policy_ids` when a
+/// placeholder restriction has no user self-service unlock path.
+pub const MASK_NO_UNLOCK_MARKER: &str = "system:no_unlock";
 
 pub const MAX_SEARCH_LIMIT: i64 = 100;
 pub const DEFAULT_SEARCH_LIMIT: i64 = 50;
@@ -99,6 +104,16 @@ pub struct SiteUiConfig {
     pub notice_banner_key: String,
     pub rta_meta_enabled: bool,
     pub noindex_restricted: bool,
+    #[serde(default)]
+    pub age_policy: AgeVerificationPolicy,
+    #[serde(default)]
+    pub age_gate_trigger: AgeGateTrigger,
+    #[serde(default)]
+    pub caller_authenticated: bool,
+    #[serde(default)]
+    pub caller_age_verified: bool,
+    #[serde(default)]
+    pub caller_terms_accepted: bool,
 }
 
 /// Pending report dialog target `(kind, id, label)`.
@@ -109,8 +124,8 @@ pub struct ReportTarget {
     pub label: String,
 }
 
-/// Shared client-side Policy v3 safety invalidation epochs, similarity defaults, and
-/// report dialog trigger provided at the `<App/>` root.
+/// Shared client-side Policy v3 safety invalidation epochs, similarity defaults,
+/// age-gate modal state, and report dialog trigger provided at the `<App/>` root.
 #[derive(Clone, Copy)]
 pub struct SafetyUiState {
     /// Bumped on logout / account switch / opt-out / policy change via `BroadcastChannel`
@@ -126,6 +141,15 @@ pub struct SafetyUiState {
     pub notice_banner_enabled: RwSignal<bool>,
     pub notice_banner_html: RwSignal<Option<String>>,
     pub notice_banner_key: RwSignal<String>,
+    pub age_policy: RwSignal<AgeVerificationPolicy>,
+    pub age_gate_trigger: RwSignal<AgeGateTrigger>,
+    pub caller_authenticated: RwSignal<bool>,
+    pub caller_age_verified: RwSignal<bool>,
+    pub caller_terms_accepted: RwSignal<bool>,
+    pub age_gate_open: RwSignal<bool>,
+    /// True when `<AgeGateModal>` was triggered from a locked card's `"Confirm 18+ to unlock"`
+    /// CTA rather than an automatic site-wide splash.
+    pub age_gate_from_card: RwSignal<bool>,
     pub report_target: RwSignal<Option<ReportTarget>>,
 }
 
@@ -141,6 +165,13 @@ impl SafetyUiState {
             notice_banner_enabled: RwSignal::new(false),
             notice_banner_html: RwSignal::new(None),
             notice_banner_key: RwSignal::new(String::new()),
+            age_policy: RwSignal::new(AgeVerificationPolicy::Off),
+            age_gate_trigger: RwSignal::new(AgeGateTrigger::Off),
+            caller_authenticated: RwSignal::new(false),
+            caller_age_verified: RwSignal::new(false),
+            caller_terms_accepted: RwSignal::new(false),
+            age_gate_open: RwSignal::new(false),
+            age_gate_from_card: RwSignal::new(false),
             report_target: RwSignal::new(None),
         }
     }
@@ -160,9 +191,31 @@ impl SafetyUiState {
             } else {
                 0.0
             });
-        self.notice_banner_enabled.set(cfg.notice_banner_enabled);
-        self.notice_banner_html.set(cfg.notice_banner_html.clone());
+        // Update key & HTML before flipping `notice_banner_enabled` so NoticeBanner
+        // mounts directly with the final dismiss key and sanitized content.
         self.notice_banner_key.set(cfg.notice_banner_key.clone());
+        self.notice_banner_html.set(cfg.notice_banner_html.clone());
+        self.notice_banner_enabled.set(cfg.notice_banner_enabled);
+        self.age_policy.set(cfg.age_policy);
+        self.age_gate_trigger.set(cfg.age_gate_trigger);
+        self.caller_authenticated.set(cfg.caller_authenticated);
+        self.caller_age_verified.set(cfg.caller_age_verified);
+        self.caller_terms_accepted.set(cfg.caller_terms_accepted);
+    }
+
+    pub fn open_age_gate_from_card(&self) {
+        self.age_gate_from_card.set(true);
+        self.age_gate_open.set(true);
+    }
+
+    pub fn open_age_gate_site_wide(&self) {
+        self.age_gate_from_card.set(false);
+        self.age_gate_open.set(true);
+    }
+
+    pub fn close_age_gate(&self) {
+        self.age_gate_open.set(false);
+        self.age_gate_from_card.set(false);
     }
 
     pub fn open_report(&self, kind: ReportTargetKind, id: i64, label: impl Into<String>) {
@@ -291,16 +344,33 @@ pub const fn preset_to_ui(preset: PlaceholderPreset) -> GalleryMaskPreset {
     }
 }
 
+pub fn mask_has_no_unlock_path(mask: &MaskMetadata) -> bool {
+    mask.policy_id == "unclassified"
+        || mask
+            .matched_policy_ids
+            .iter()
+            .any(|id| id == MASK_NO_UNLOCK_MARKER)
+}
+
 pub fn mask_to_ui(mask: &MaskMetadata) -> GalleryMask {
+    let no_unlock = mask_has_no_unlock_path(mask);
     GalleryMask {
         rule_id: mask.policy_id.clone(),
         label: mask.label.clone(),
         preset: preset_to_ui(mask.preset),
-        reason: None,
-        requires_login: mask.requires_login,
-        requires_age: mask.requires_age,
-        requires_terms: mask.requires_terms,
-        cta_label: None,
+        reason: if no_unlock {
+            if mask.policy_id == "unclassified" || mask.label.starts_with("Pending classification") {
+                Some("Waiting for automated content classification.".to_string())
+            } else {
+                Some("Restricted by site content policy.".to_string())
+            }
+        } else {
+            None
+        },
+        requires_login: !no_unlock && mask.requires_login,
+        requires_age: !no_unlock && mask.requires_age,
+        requires_terms: !no_unlock && mask.requires_terms,
+        cta_label: no_unlock.then(String::new),
     }
 }
 
@@ -508,9 +578,47 @@ pub fn projected_image_to_viewer_item(
 pub fn unlock_href_for_mask(mask: &GalleryMask) -> &'static str {
     if mask.requires_login {
         "/user/login"
+    } else if mask.requires_age {
+        "/user/account#age-confirm"
+    } else if mask.requires_terms {
+        "/user/account#terms"
     } else {
-        "/user/account"
+        "/user/account#content-safety"
     }
+}
+
+/// Handle a user click on a locked Placeholder card's unlock CTA:
+/// - `requires_login` -> `/user/login`
+/// - `requires_age` -> opens `<AgeGateModal>` right on `/` (for `SelfAttestation`), or
+///   redirects to `/user/account#age-confirm` / `/user/login?next=/user/account%23age-confirm`
+///   under strict OIDC age verification
+/// - `requires_terms` -> `/user/account#terms`
+/// - otherwise -> `/user/account#content-safety` (`"Enable in Account Settings"`)
+pub fn handle_mask_unlock(mask: &GalleryMask, safety: Option<SafetyUiState>) {
+    if mask.resolved_cta_opt().is_none() {
+        return;
+    }
+    if mask.requires_login {
+        navigate_external("/user/login");
+        return;
+    }
+    if mask.requires_age {
+        if let Some(s) = safety {
+            if s.age_policy.get_untracked() != AgeVerificationPolicy::StrictProviderVerified18 {
+                s.open_age_gate_from_card();
+                return;
+            }
+            if s.caller_authenticated.get_untracked() {
+                navigate_external("/user/account#age-confirm");
+            } else {
+                navigate_external("/user/login?next=/user/account%23age-confirm");
+            }
+            return;
+        }
+        navigate_external("/user/account#age-confirm");
+        return;
+    }
+    navigate_external(unlock_href_for_mask(mask));
 }
 
 /// Navigate the browser top-level window to an external route (such as `/user/login`
@@ -531,8 +639,10 @@ pub fn navigate_external(href: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT, parse_url_limit, parse_url_min_similarity,
+        DEFAULT_SEARCH_LIMIT, MASK_NO_UNLOCK_MARKER, MAX_SEARCH_LIMIT, mask_to_ui, parse_url_limit,
+        parse_url_min_similarity, unlock_href_for_mask,
     };
+    use search_types::{MaskMetadata, PlaceholderPreset};
 
     #[test]
     fn parse_url_limit_defaults_non_positive_and_clamps_high() {
@@ -555,5 +665,74 @@ mod tests {
         assert_eq!(parse_url_min_similarity(Some("-0.1")), None);
         assert_eq!(parse_url_min_similarity(Some("1.2")), None);
         assert_eq!(parse_url_min_similarity(Some("NaN")), None);
+    }
+
+    #[test]
+    fn mask_to_ui_and_unlock_href_distinguish_login_age_terms_settings_and_no_unlock() {
+        let guest_mask = mask_to_ui(&MaskMetadata {
+            policy_id: "r18".into(),
+            matched_policy_ids: vec!["r18".into()],
+            label: "NSFW".into(),
+            preset: PlaceholderPreset::R18,
+            requires_login: true,
+            requires_age: true,
+            requires_terms: true,
+        });
+        assert_eq!(guest_mask.resolved_cta_opt().as_deref(), Some("Sign in to unlock"));
+        assert_eq!(unlock_href_for_mask(&guest_mask), "/user/login");
+
+        let age_mask = mask_to_ui(&MaskMetadata {
+            policy_id: "r18".into(),
+            matched_policy_ids: vec!["r18".into()],
+            label: "NSFW".into(),
+            preset: PlaceholderPreset::R18,
+            requires_login: false,
+            requires_age: true,
+            requires_terms: true,
+        });
+        assert_eq!(age_mask.resolved_cta_opt().as_deref(), Some("Confirm 18+ to unlock"));
+        assert_eq!(unlock_href_for_mask(&age_mask), "/user/account#age-confirm");
+
+        let terms_mask = mask_to_ui(&MaskMetadata {
+            policy_id: "r18".into(),
+            matched_policy_ids: vec!["r18".into()],
+            label: "NSFW".into(),
+            preset: PlaceholderPreset::R18,
+            requires_login: false,
+            requires_age: false,
+            requires_terms: true,
+        });
+        assert_eq!(terms_mask.resolved_cta_opt().as_deref(), Some("Accept Terms to unlock"));
+        assert_eq!(unlock_href_for_mask(&terms_mask), "/user/account#terms");
+
+        let settings_mask = mask_to_ui(&MaskMetadata {
+            policy_id: "r18".into(),
+            matched_policy_ids: vec!["r18".into()],
+            label: "NSFW".into(),
+            preset: PlaceholderPreset::R18,
+            requires_login: false,
+            requires_age: false,
+            requires_terms: false,
+        });
+        assert_eq!(
+            settings_mask.resolved_cta_opt().as_deref(),
+            Some("Enable in Account Settings")
+        );
+        assert_eq!(
+            unlock_href_for_mask(&settings_mask),
+            "/user/account#content-safety"
+        );
+
+        let no_unlock_mask = mask_to_ui(&MaskMetadata {
+            policy_id: "staff_only".into(),
+            matched_policy_ids: vec!["staff_only".into(), MASK_NO_UNLOCK_MARKER.into()],
+            label: "Staff Only".into(),
+            preset: PlaceholderPreset::Custom,
+            requires_login: false,
+            requires_age: false,
+            requires_terms: false,
+        });
+        assert_eq!(no_unlock_mask.cta_label.as_deref(), Some(""));
+        assert_eq!(no_unlock_mask.resolved_cta_opt(), None);
     }
 }
