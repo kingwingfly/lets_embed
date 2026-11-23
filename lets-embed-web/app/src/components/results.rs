@@ -6,8 +6,8 @@ use crate::{
     components::{BlurredMediaCard, LikeButton, LikeVariant, lightbox::Lightbox, viewer::Viewer},
     types::{
         AdvancedUploads, DEFAULT_SEARCH_LIMIT, GalleryDensity as Density, GalleryDensityState,
-        ImageQuery, Mode, PostItem, SafetyUiState, SearchResponse, UploadedImageSlot, mask_to_ui,
-        navigate_external, parse_url_limit, parse_url_min_similarity, unlock_href_for_mask,
+        ImageQuery, Mode, PostItem, SafetyUiState, SearchResponse, UploadedImageSlot,
+        handle_mask_unlock, mask_to_ui, parse_url_limit, parse_url_min_similarity,
     },
     util::{public_origin, set_document_title},
 };
@@ -656,7 +656,7 @@ pub fn Results(
     });
 
     let on_unlock = Callback::new(move |mask: GalleryMask| {
-        navigate_external(unlock_href_for_mask(&mask));
+        handle_mask_unlock(&mask, safety);
     });
 
     let render_item = move |placed: Placed| -> AnyView {
@@ -1370,6 +1370,7 @@ pub fn Results(
                                             mask=mask_to_ui(&mask)
                                             dimensions=(w, h)
                                             compact=true
+                                            on_unlock_click=on_unlock
                                         />
                                     }
                                     .into_any(),
@@ -1379,6 +1380,7 @@ pub fn Results(
                                                 mask=mask_to_ui(&mask)
                                                 dimensions=(w, h)
                                                 compact=true
+                                                on_unlock_click=on_unlock
                                             />
                                         }
                                         .into_any(),

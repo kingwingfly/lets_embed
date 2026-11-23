@@ -1,17 +1,22 @@
 //! Age & Legal tab:
 //! - Three-tier Age Verification Policy selector (left-aligned radio cards)
-//! - Age Gate Trigger (`Off`, `JustInTime`, `SiteWideSplash`)
+//! - Auto-selects `JustInTime` when switching `Off` -> `SelfAttestation` while trigger is `Off`
+//! - Auto-prefills `DEFAULT_NOTICE_BANNER_MD` when enabling notice banner with blank text
 //! - Versioned Markdown editors for `/terms`, `/privacy`, `/dmca`, `/content-policy`
-//! - Dismissible Cookie / Site Notice Banner, RTA adult meta & `noindex_restricted` with `<ToggleSwitch>`
-//! - GCP top-right toasts via `use_toast_store()`
+//! - Root-level persistent draft (`AdminDraftStore`) + GCP top-right toasts via `use_toast_store()`
 
 use leptos::prelude::*;
 use lets_embed_ui::{NoticeBanner, NoticeContent, NoticeTone, ToggleSwitch, use_toast_store};
-use site_access::{AgeGateTrigger, AgeVerificationPolicy, LegalDocConfig};
+use site_access::{
+    AgeGateTrigger, AgeVerificationPolicy, DEFAULT_NOTICE_BANNER_MD, LegalDocConfig,
+};
 use wasm_bindgen_futures::spawn_local;
 
-use crate::api::{
-    ActivationResult, SafetyConfigResp, SaveSafetyReq, SaveSafetyResp, post_json_activatable,
+use crate::{
+    api::{
+        ActivationResult, SafetyConfigResp, SaveSafetyReq, SaveSafetyResp, post_json_activatable,
+    },
+    drafts::use_admin_drafts,
 };
 
 #[component]
@@ -20,21 +25,7 @@ pub fn AgeLegalTab(
     on_saved: Callback<()>,
 ) -> impl IntoView {
     let toasts = use_toast_store();
-
-    let age_policy = RwSignal::new(AgeVerificationPolicy::Off);
-    let age_gate_trigger = RwSignal::new(AgeGateTrigger::Off);
-
-    let terms_version = RwSignal::new(1u32);
-    let terms_digest = RwSignal::new(String::new());
-    let terms_md = RwSignal::new(String::new());
-    let privacy_md = RwSignal::new(String::new());
-    let dmca_md = RwSignal::new(String::new());
-    let content_policy_md = RwSignal::new(String::new());
-    let notice_banner_enabled = RwSignal::new(false);
-    let notice_banner_md = RwSignal::new(String::new());
-    let rta_meta_enabled = RwSignal::new(false);
-    let noindex_restricted = RwSignal::new(false);
-    let revision = RwSignal::new(0u64);
+    let draft = use_admin_drafts().age_legal;
 
     let saving = RwSignal::new(false);
 
@@ -44,23 +35,13 @@ pub fn AgeLegalTab(
             .is_some_and(|cfg| cfg.policies.iter().any(|p| p.bypass.require_age_18))
     });
 
-    Effect::new(move |_| {
-        if let Some(cfg) = safety.get() {
-            revision.set(cfg.revision);
-            age_policy.set(cfg.age_policy);
-            age_gate_trigger.set(cfg.age_gate_trigger);
-            terms_version.set(cfg.legal.terms_version);
-            terms_digest.set(cfg.legal.terms_digest.clone());
-            terms_md.set(cfg.legal.terms_md.clone());
-            privacy_md.set(cfg.legal.privacy_md.clone());
-            dmca_md.set(cfg.legal.dmca_md.clone());
-            content_policy_md.set(cfg.legal.content_policy_md.clone());
-            notice_banner_enabled.set(cfg.legal.notice_banner_enabled);
-            notice_banner_md.set(cfg.legal.notice_banner_md.clone());
-            rta_meta_enabled.set(cfg.legal.rta_meta_enabled);
-            noindex_restricted.set(cfg.legal.noindex_restricted);
+    let on_discard = move |_| {
+        if let Some(cfg) = safety.get_untracked() {
+            draft.hydrate(&cfg);
+            draft.dirty.set(false);
+            toasts.info("Discarded unsaved Age & Legal changes", None);
         }
-    });
+    };
 
     let on_save = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
@@ -71,7 +52,7 @@ pub fn AgeLegalTab(
             return;
         };
 
-        let next_age_policy = age_policy.get_untracked();
+        let next_age_policy = draft.age_policy.get_untracked();
         if next_age_policy == AgeVerificationPolicy::Off
             && current.policies.iter().any(|p| p.bypass.require_age_18)
         {
@@ -88,26 +69,26 @@ pub fn AgeLegalTab(
         saving.set(true);
 
         let legal = LegalDocConfig {
-            terms_version: terms_version.get_untracked(),
-            terms_digest: terms_digest.get_untracked(),
-            terms_md: terms_md.get_untracked(),
-            privacy_md: privacy_md.get_untracked(),
-            dmca_md: dmca_md.get_untracked(),
-            content_policy_md: content_policy_md.get_untracked(),
-            notice_banner_md: notice_banner_md.get_untracked(),
-            notice_banner_enabled: notice_banner_enabled.get_untracked(),
-            rta_meta_enabled: rta_meta_enabled.get_untracked(),
-            noindex_restricted: noindex_restricted.get_untracked(),
+            terms_version: draft.terms_version.get_untracked(),
+            terms_digest: draft.terms_digest.get_untracked(),
+            terms_md: draft.terms_md.get_untracked(),
+            privacy_md: draft.privacy_md.get_untracked(),
+            dmca_md: draft.dmca_md.get_untracked(),
+            content_policy_md: draft.content_policy_md.get_untracked(),
+            notice_banner_md: draft.notice_banner_md.get_untracked(),
+            notice_banner_enabled: draft.notice_banner_enabled.get_untracked(),
+            rta_meta_enabled: draft.rta_meta_enabled.get_untracked(),
+            noindex_restricted: draft.noindex_restricted.get_untracked(),
         };
 
         let req = SaveSafetyReq {
-            revision: revision.get_untracked(),
+            revision: current.revision,
             safety_enabled: current.safety_enabled,
             policies: current.policies,
             unclassified_mode: current.unclassified_mode,
             fixed_blur_enabled: current.fixed_blur_enabled,
             age_policy: next_age_policy,
-            age_gate_trigger: age_gate_trigger.get_untracked(),
+            age_gate_trigger: draft.age_gate_trigger.get_untracked(),
             similarity: current.similarity,
             geo: current.geo,
             legal,
@@ -117,30 +98,36 @@ pub fn AgeLegalTab(
         spawn_local(async move {
             match post_json_activatable::<_, SaveSafetyResp>("/admin/api/safety", &req).await {
                 Ok(ActivationResult::Active(resp)) => {
-                    revision.set(resp.revision);
-                    terms_version.set(resp.legal.terms_version);
-                    terms_digest.set(resp.legal.terms_digest.clone());
-                    let mut detail = format!(
-                        "Terms v{} · min_enforce_rev #{}",
-                        resp.legal.terms_version, resp.min_enforce_rev
-                    );
-                    if resp.terms_bumped {
-                        detail.push_str(" · Terms bumped (users must re-accept)");
+                    draft.revision.set(resp.revision);
+                    draft.terms_version.set(resp.legal.terms_version);
+                    draft.terms_digest.set(resp.legal.terms_digest.clone());
+                    draft.dirty.set(false);
+                    if resp.unchanged {
+                        toasts.info(format!("No changes to save (rev #{})", resp.revision), None);
+                    } else {
+                        let mut detail = format!(
+                            "Terms v{} · min_enforce_rev #{}",
+                            resp.legal.terms_version, resp.min_enforce_rev
+                        );
+                        if resp.terms_bumped {
+                            detail.push_str(" · Terms bumped (users must re-accept)");
+                        }
+                        if !resp.auto_disabled_providers.is_empty() {
+                            detail.push_str(&format!(
+                                " · auto-disabled {} non-18+ provider(s)",
+                                resp.auto_disabled_providers.len()
+                            ));
+                        }
+                        toasts.success(
+                            format!("Published Age & Legal policy rev #{}", resp.revision),
+                            Some(detail),
+                        );
+                        on_saved.run(());
                     }
-                    if !resp.auto_disabled_providers.is_empty() {
-                        detail.push_str(&format!(
-                            " · auto-disabled {} non-18+ provider(s)",
-                            resp.auto_disabled_providers.len()
-                        ));
-                    }
-                    toasts.success(
-                        format!("Published Age & Legal policy rev #{}", resp.revision),
-                        Some(detail),
-                    );
-                    on_saved.run(());
                 }
                 Ok(ActivationResult::PendingActivation(pending)) => {
-                    revision.set(pending.revision);
+                    draft.revision.set(pending.revision);
+                    draft.dirty.set(false);
                     toasts.warning(
                         format!(
                             "Saved rev #{} to D1 — awaiting SitePolicyDO activation",
@@ -173,8 +160,11 @@ pub fn AgeLegalTab(
                         <input
                             type="radio"
                             name="age_policy"
-                            prop:checked=move || age_policy.get() == AgeVerificationPolicy::Off
-                            on:change=move |_| age_policy.set(AgeVerificationPolicy::Off)
+                            prop:checked=move || draft.age_policy.get() == AgeVerificationPolicy::Off
+                            on:change=move |_| {
+                                draft.age_policy.set(AgeVerificationPolicy::Off);
+                                draft.dirty.set(true);
+                            }
                         />
                         <span class="adm-radio-copy">
                             <strong>"Off"</strong>
@@ -185,8 +175,21 @@ pub fn AgeLegalTab(
                         <input
                             type="radio"
                             name="age_policy"
-                            prop:checked=move || age_policy.get() == AgeVerificationPolicy::SelfAttestation
-                            on:change=move |_| age_policy.set(AgeVerificationPolicy::SelfAttestation)
+                            prop:checked=move || draft.age_policy.get() == AgeVerificationPolicy::SelfAttestation
+                            on:change=move |_| {
+                                let prev = draft.age_policy.get_untracked();
+                                draft.age_policy.set(AgeVerificationPolicy::SelfAttestation);
+                                draft.dirty.set(true);
+                                if prev == AgeVerificationPolicy::Off
+                                    && draft.age_gate_trigger.get_untracked() == AgeGateTrigger::Off
+                                {
+                                    draft.age_gate_trigger.set(AgeGateTrigger::JustInTime);
+                                    toasts.info(
+                                        "Age Gate Trigger set to Just-in-Time so 18+ confirmation prompts appear",
+                                        None,
+                                    );
+                                }
+                            }
                         />
                         <span class="adm-radio-copy">
                             <strong>"Self-Attestation"</strong>
@@ -197,8 +200,11 @@ pub fn AgeLegalTab(
                         <input
                             type="radio"
                             name="age_policy"
-                            prop:checked=move || age_policy.get() == AgeVerificationPolicy::StrictProviderVerified18
-                            on:change=move |_| age_policy.set(AgeVerificationPolicy::StrictProviderVerified18)
+                            prop:checked=move || draft.age_policy.get() == AgeVerificationPolicy::StrictProviderVerified18
+                            on:change=move |_| {
+                                draft.age_policy.set(AgeVerificationPolicy::StrictProviderVerified18);
+                                draft.dirty.set(true);
+                            }
                         />
                         <span class="adm-radio-copy">
                             <strong>"Strict Provider-Verified 18+"</strong>
@@ -207,7 +213,7 @@ pub fn AgeLegalTab(
                     </label>
                 </div>
 
-                {move || (age_policy.get() == AgeVerificationPolicy::Off && has_age_gated_policies.get()).then(|| view! {
+                {move || (draft.age_policy.get() == AgeVerificationPolicy::Off && has_age_gated_policies.get()).then(|| view! {
                     <NoticeBanner
                         tone=NoticeTone::Warning
                         title="Active Policies Require Age 18+"
@@ -219,7 +225,7 @@ pub fn AgeLegalTab(
                     />
                 })}
 
-                {move || (age_policy.get() == AgeVerificationPolicy::StrictProviderVerified18).then(|| view! {
+                {move || (draft.age_policy.get() == AgeVerificationPolicy::StrictProviderVerified18).then(|| view! {
                     <NoticeBanner
                         tone=NoticeTone::Warning
                         title="Strict Provider-Verified 18+ Active"
@@ -234,7 +240,7 @@ pub fn AgeLegalTab(
                 <label class="adm-field">
                     <span>"Age Gate Trigger"</span>
                     <select
-                        prop:value=move || match age_gate_trigger.get() {
+                        prop:value=move || match draft.age_gate_trigger.get() {
                             AgeGateTrigger::Off => "off",
                             AgeGateTrigger::JustInTime => "just_in_time",
                             AgeGateTrigger::SiteWideSplash => "site_wide_splash",
@@ -245,7 +251,8 @@ pub fn AgeLegalTab(
                                 "site_wide_splash" => AgeGateTrigger::SiteWideSplash,
                                 _ => AgeGateTrigger::Off,
                             };
-                            age_gate_trigger.set(v);
+                            draft.age_gate_trigger.set(v);
+                            draft.dirty.set(true);
                         }
                     >
                         <option value="off">"Off"</option>
@@ -256,14 +263,20 @@ pub fn AgeLegalTab(
 
                 <div class="adm-toggle-grid">
                     <ToggleSwitch
-                        checked=Signal::derive(move || rta_meta_enabled.get())
-                        on_change=Callback::new(move |v| rta_meta_enabled.set(v))
+                        checked=Signal::derive(move || draft.rta_meta_enabled.get())
+                        on_change=Callback::new(move |v| {
+                            draft.rta_meta_enabled.set(v);
+                            draft.dirty.set(true);
+                        })
                         label="Emit RTA Adult Rating Meta Tags"
                         description="Adds RTA-5042-1996-1400-1577-RTA and `rating=adult` meta tags on public pages."
                     />
                     <ToggleSwitch
-                        checked=Signal::derive(move || noindex_restricted.get())
-                        on_change=Callback::new(move |v| noindex_restricted.set(v))
+                        checked=Signal::derive(move || draft.noindex_restricted.get())
+                        on_change=Callback::new(move |v| {
+                            draft.noindex_restricted.set(v);
+                            draft.dirty.set(true);
+                        })
                         label="`noindex` Restricted Pages"
                         description="Adds `noindex` robots directive to pages containing blocked adult/restricted items."
                     />
@@ -278,8 +291,16 @@ pub fn AgeLegalTab(
                     </div>
                 </div>
                 <ToggleSwitch
-                    checked=Signal::derive(move || notice_banner_enabled.get())
-                    on_change=Callback::new(move |v| notice_banner_enabled.set(v))
+                    checked=Signal::derive(move || draft.notice_banner_enabled.get())
+                    on_change=Callback::new(move |v| {
+                        draft.notice_banner_enabled.set(v);
+                        draft.dirty.set(true);
+                        if v && draft.notice_banner_md.get_untracked().trim().is_empty() {
+                            draft
+                                .notice_banner_md
+                                .set(DEFAULT_NOTICE_BANNER_MD.to_string());
+                        }
+                    })
                     label="Show dismissible site notice banner"
                     description="Displayed across gallery pages with localStorage dismissal."
                 />
@@ -287,9 +308,12 @@ pub fn AgeLegalTab(
                     <span>"Notice Banner Markdown"</span>
                     <textarea
                         rows="3"
-                        placeholder="This site uses strictly necessary session cookies…"
-                        prop:value=move || notice_banner_md.get()
-                        on:input=move |ev| notice_banner_md.set(event_target_value(&ev))
+                        placeholder=DEFAULT_NOTICE_BANNER_MD
+                        prop:value=move || draft.notice_banner_md.get()
+                        on:input=move |ev| {
+                            draft.notice_banner_md.set(event_target_value(&ev));
+                            draft.dirty.set(true);
+                        }
                     />
                 </label>
             </section>
@@ -302,9 +326,9 @@ pub fn AgeLegalTab(
                     </div>
                     <span class="adm-pill">
                         {move || {
-                            let d = terms_digest.get();
+                            let d = draft.terms_digest.get();
                             let short = if d.len() >= 12 { &d[..12] } else { d.as_str() };
-                            format!("Terms v{} ({short}…)", terms_version.get())
+                            format!("Terms v{} ({short}…)", draft.terms_version.get())
                         }}
                     </span>
                 </div>
@@ -313,41 +337,65 @@ pub fn AgeLegalTab(
                     <span>"Terms of Service (`/terms`)"</span>
                     <textarea
                         rows="8"
-                        prop:value=move || terms_md.get()
-                        on:input=move |ev| terms_md.set(event_target_value(&ev))
+                        prop:value=move || draft.terms_md.get()
+                        on:input=move |ev| {
+                            draft.terms_md.set(event_target_value(&ev));
+                            draft.dirty.set(true);
+                        }
                     />
                 </label>
                 <label class="adm-field">
                     <span>"Privacy Policy (`/privacy`)"</span>
                     <textarea
                         rows="6"
-                        prop:value=move || privacy_md.get()
-                        on:input=move |ev| privacy_md.set(event_target_value(&ev))
+                        prop:value=move || draft.privacy_md.get()
+                        on:input=move |ev| {
+                            draft.privacy_md.set(event_target_value(&ev));
+                            draft.dirty.set(true);
+                        }
                     />
                 </label>
                 <label class="adm-field">
                     <span>"DMCA & Copyright Policy (`/dmca`)"</span>
                     <textarea
                         rows="6"
-                        prop:value=move || dmca_md.get()
-                        on:input=move |ev| dmca_md.set(event_target_value(&ev))
+                        prop:value=move || draft.dmca_md.get()
+                        on:input=move |ev| {
+                            draft.dmca_md.set(event_target_value(&ev));
+                            draft.dirty.set(true);
+                        }
                     />
                 </label>
                 <label class="adm-field">
                     <span>"Content Policy (`/content-policy`)"</span>
                     <textarea
                         rows="6"
-                        prop:value=move || content_policy_md.get()
-                        on:input=move |ev| content_policy_md.set(event_target_value(&ev))
+                        prop:value=move || draft.content_policy_md.get()
+                        on:input=move |ev| {
+                            draft.content_policy_md.set(event_target_value(&ev));
+                            draft.dirty.set(true);
+                        }
                     />
                 </label>
             </section>
 
             <div class="adm-save-bar">
                 <span class="adm-sub">"All Markdown pages are sanitized server-side with `ammonia` before display."</span>
-                <button type="submit" class="adm-btn adm-btn--primary" disabled=move || saving.get()>
-                    {move || if saving.get() { "Publishing…" } else { "Save Age & Legal Policy" }}
-                </button>
+                <div class="adm-save-bar-actions">
+                    {move || draft.dirty.get().then(|| view! {
+                        <button
+                            type="button"
+                            class="adm-btn"
+                            disabled=move || saving.get()
+                            on:click=on_discard
+                        >
+                            "Discard changes"
+                        </button>
+                    })}
+                    <button type="submit" class="adm-btn adm-btn--primary" disabled=move || saving.get()>
+                        {move || if saving.get() { "Publishing…" } else { "Save Age & Legal Policy" }}
+                    </button>
+                </div>
             </div>
         </form>
     }

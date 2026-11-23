@@ -1,13 +1,12 @@
 //! Cloudflare Access-Style Content Safety Policy v3 Builder tab:
-//! - Clean left-aligned cards with `lets_embed_ui::ToggleSwitch` & left-aligned radio cards
-//! - Unified `lets_embed_ui::QueryBuilder` (`QueryBuilderMode::SafetyPolicy`) for both
-//!   primary `match_expr` AND collapsible optional `except_expr`
-//! - Keyboard-friendly `<ScoreInput>` (`0.01..=1.00`, `step=0.01`) for `default_tag_min`
-//! - Cloudflare Access-style Include (OR) / Require (AND) / Exclude (NOR) bypass rules
-//! - Balanced live `<ContentMaskCard>` preview without cramping `QueryBuilder`
-//! - GCP top-right toasts via `use_toast_store()` + two-phase activation handling
-
-use std::sync::atomic::{AtomicU64, Ordering};
+//! - Root-level persistent draft (`AdminDraftStore`) so switching tabs never loses edits
+//! - Yellow (`R18`), Purple (`Sensitive`), Red (`Blood`) preset colors across buttons,
+//!   folded/expanded rule badges, card accents, and live `<ContentMaskCard>` preview
+//! - Compact single-row `tag IN (...) >= 0.45` preset seeding
+//! - Foldable (collapsible) policy cards with 1-line summary header + Collapse/Expand all
+//! - Auto-enable Content Safety Engine when adding rules or enabling any rule while OFF
+//! - 1-click "Open Age & Legal tab →" inside `Require Age 18+` warning
+//! - No-op save detection info toast (`"No changes to save (rev #N)"`)
 
 use leptos::prelude::*;
 use lets_embed_ui::{
@@ -26,16 +25,16 @@ use site_access::{
 };
 use wasm_bindgen_futures::spawn_local;
 
-use crate::api::{
-    ActivationResult, FieldValidationError, SafetyConfigResp, SaveSafetyReq, SaveSafetyResp,
-    post_json_activatable,
+use crate::{
+    api::{
+        ActivationResult, SafetyConfigResp, SaveSafetyReq, SaveSafetyResp, post_json_activatable,
+    },
+    drafts::{
+        EditablePolicyCard, compact_safety_presets, normalize_preset_compact, preset_badge_label,
+        preset_button_label, preset_css_slug, use_admin_drafts,
+    },
+    tabs::AdminTab,
 };
-
-static NEXT_CARD_KEY: AtomicU64 = AtomicU64::new(1);
-
-fn alloc_key() -> u64 {
-    NEXT_CARD_KEY.fetch_add(1, Ordering::Relaxed)
-}
 
 fn to_ui_preset(p: PlaceholderPreset) -> GalleryMaskPreset {
     match p {
@@ -67,146 +66,14 @@ fn validate_expr_client(raw: &str, required: bool) -> Option<String> {
     }
 }
 
-fn parse_country_codes(raw: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for part in raw.split(|c: char| c == ',' || c.is_whitespace() || c == ';') {
-        let code = part.trim().to_ascii_uppercase();
-        if !code.is_empty() && !out.contains(&code) {
-            out.push(code);
-        }
-    }
-    out
-}
-
-fn draft_from_expr(raw: &str) -> QueryBuilderDraft {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return QueryBuilderDraft::for_mode(QueryBuilderMode::SafetyPolicy);
-    }
-    QueryBuilderDraft::from_query(QueryBuilderMode::SafetyPolicy, trimmed).unwrap_or_else(|_| {
-        let mut d = QueryBuilderDraft::for_mode(QueryBuilderMode::SafetyPolicy);
-        d.query = trimmed.to_string();
-        d
-    })
-}
-
-#[derive(Clone)]
-struct EditablePolicyCard {
-    key: u64,
-    persisted: bool,
-    id: RwSignal<String>,
-    grant_generation: RwSignal<u64>,
-    enabled: RwSignal<bool>,
-    priority: RwSignal<u16>,
-    name: RwSignal<String>,
-    preset: RwSignal<PlaceholderPreset>,
-    match_draft: RwSignal<QueryBuilderDraft>,
-    except_open: RwSignal<bool>,
-    except_draft: RwSignal<QueryBuilderDraft>,
-    default_tag_min: RwSignal<f32>,
-    action: RwSignal<PolicyAction>,
-    // Bypass Include (OR)
-    include_switcher: RwSignal<bool>,
-    include_click: RwSignal<bool>,
-    include_live_admin: RwSignal<bool>,
-    // Bypass Require (AND)
-    require_gallery_login: RwSignal<bool>,
-    require_age_18: RwSignal<bool>,
-    require_current_terms: RwSignal<bool>,
-    // Bypass Exclude (NOR)
-    exclude_anonymous: RwSignal<bool>,
-    exclude_countries_text: RwSignal<String>,
-}
-
-impl EditablePolicyCard {
-    fn from_policy(pol: &ContentPolicy, persisted: bool) -> Self {
-        let has_except = pol
-            .except_expr
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty());
-        Self {
-            key: alloc_key(),
-            persisted,
-            id: RwSignal::new(pol.id.clone()),
-            grant_generation: RwSignal::new(pol.grant_generation.max(1)),
-            enabled: RwSignal::new(pol.enabled),
-            priority: RwSignal::new(pol.priority),
-            name: RwSignal::new(pol.name.clone()),
-            preset: RwSignal::new(pol.preset),
-            match_draft: RwSignal::new(draft_from_expr(&pol.match_expr)),
-            except_open: RwSignal::new(has_except),
-            except_draft: RwSignal::new(draft_from_expr(
-                pol.except_expr.as_deref().unwrap_or(""),
-            )),
-            default_tag_min: RwSignal::new(pol.default_tag_min),
-            action: RwSignal::new(pol.action),
-            include_switcher: RwSignal::new(pol.bypass.include_switcher),
-            include_click: RwSignal::new(
-                pol.action == PolicyAction::Blur && pol.bypass.include_click,
-            ),
-            include_live_admin: RwSignal::new(pol.bypass.include_live_admin),
-            require_gallery_login: RwSignal::new(pol.bypass.require_gallery_login),
-            require_age_18: RwSignal::new(pol.bypass.require_age_18),
-            require_current_terms: RwSignal::new(pol.bypass.require_current_terms),
-            exclude_anonymous: RwSignal::new(pol.bypass.exclude_anonymous),
-            exclude_countries_text: RwSignal::new(pol.bypass.exclude_countries.join(", ")),
-        }
-    }
-
-    fn to_policy(&self) -> ContentPolicy {
-        let action = self.action.get_untracked();
-        let match_expr = self
-            .match_draft
-            .with_untracked(|d| d.query.trim().to_string());
-        let except_expr = if self.except_open.get_untracked() {
-            let ex = self
-                .except_draft
-                .with_untracked(|d| d.query.trim().to_string());
-            (!ex.is_empty()).then_some(ex)
-        } else {
-            None
-        };
-
-        ContentPolicy {
-            id: self.id.get_untracked().trim().to_ascii_lowercase(),
-            grant_generation: self.grant_generation.get_untracked().max(1),
-            enabled: self.enabled.get_untracked(),
-            priority: self.priority.get_untracked(),
-            name: self.name.get_untracked().trim().to_string(),
-            preset: self.preset.get_untracked(),
-            match_expr,
-            except_expr,
-            default_tag_min: self.default_tag_min.get_untracked(),
-            action,
-            bypass: PolicyBypass {
-                include_switcher: self.include_switcher.get_untracked(),
-                include_click: action == PolicyAction::Blur && self.include_click.get_untracked(),
-                include_live_admin: self.include_live_admin.get_untracked(),
-                require_gallery_login: self.require_gallery_login.get_untracked(),
-                require_age_18: self.require_age_18.get_untracked(),
-                require_current_terms: self.require_current_terms.get_untracked(),
-                exclude_anonymous: self.exclude_anonymous.get_untracked(),
-                exclude_countries: parse_country_codes(&self.exclude_countries_text.get_untracked()),
-            },
-        }
-    }
-}
-
 #[component]
 pub fn SafetyTab(
     safety: RwSignal<Option<SafetyConfigResp>>,
     on_saved: Callback<()>,
+    on_navigate: Callback<AdminTab>,
 ) -> impl IntoView {
     let toasts = use_toast_store();
-
-    let safety_enabled = RwSignal::new(false);
-    let unclassified_mode = RwSignal::new(UnclassifiedMode::Placeholder);
-    let fixed_blur_enabled = RwSignal::new(false);
-    let policy_cards = RwSignal::new(Vec::<EditablePolicyCard>::new());
-    let revision = RwSignal::new(0u64);
-    let min_enforce_rev = RwSignal::new(0u64);
-    let server_field_errors = RwSignal::new(Vec::<FieldValidationError>::new());
+    let draft = use_admin_drafts().safety;
 
     let saving = RwSignal::new(false);
 
@@ -217,25 +84,30 @@ pub fn SafetyTab(
             .unwrap_or(AgeVerificationPolicy::Off)
     });
 
-    Effect::new(move |_| {
-        if let Some(cfg) = safety.get() {
-            revision.set(cfg.revision);
-            min_enforce_rev.set(cfg.min_enforce_rev);
-            safety_enabled.set(cfg.safety_enabled);
-            unclassified_mode.set(cfg.unclassified_mode);
-            fixed_blur_enabled.set(cfg.fixed_blur_enabled);
-            let cards = cfg
-                .policies
-                .iter()
-                .map(|p| EditablePolicyCard::from_policy(p, true))
-                .collect();
-            policy_cards.set(cards);
-            server_field_errors.set(Vec::new());
-        }
+    let has_enabled_policies = Memo::new(move |_| {
+        draft
+            .policy_cards
+            .with(|cards| cards.iter().any(|c| c.enabled.get()))
     });
 
+    let any_expanded = Memo::new(move |_| {
+        draft
+            .policy_cards
+            .with(|cards| cards.iter().any(|c| !c.collapsed.get()))
+    });
+
+    let auto_enable_safety_if_off = move || {
+        if !draft.safety_enabled.get_untracked() {
+            draft.safety_enabled.set(true);
+            toasts.info(
+                "Content Safety filtering enabled automatically for your rule",
+                None,
+            );
+        }
+    };
+
     let add_policy_template = move |tpl: ContentPolicy| {
-        let existing = policy_cards.get_untracked();
+        let existing = draft.policy_cards.get_untracked();
         if existing.len() >= 16 {
             toasts.warning(
                 "Maximum policy limit reached",
@@ -255,7 +127,7 @@ pub fn SafetyTab(
             candidate = format!("{}-{suffix}", tpl.id);
             suffix += 1;
         }
-        let mut pol = tpl;
+        let mut pol = normalize_preset_compact(tpl);
         pol.id = candidate;
         pol.grant_generation = 1;
         pol.priority = max_prio.saturating_add(10);
@@ -263,7 +135,9 @@ pub fn SafetyTab(
         // Ensure new policies never silently default to live admin bypass!
         pol.bypass.include_live_admin = false;
         let label = pol.name.clone();
-        policy_cards.update(|list| list.push(EditablePolicyCard::from_policy(&pol, false)));
+        draft.push_new_policy(&pol);
+        draft.dirty.set(true);
+        auto_enable_safety_if_off();
         toasts.info(
             format!("Added policy \"{label}\""),
             Some("Configure selector & bypass rules, then click Publish Content Safety Policy.".to_string()),
@@ -295,6 +169,23 @@ pub fn SafetyTab(
         });
     };
 
+    let on_toggle_all_collapse = move |_| {
+        let collapse_next = any_expanded.get_untracked();
+        draft.policy_cards.with_untracked(|cards| {
+            for card in cards {
+                card.collapsed.set(collapse_next);
+            }
+        });
+    };
+
+    let on_discard = move |_| {
+        if let Some(cfg) = safety.get_untracked() {
+            draft.hydrate(&cfg, false);
+            draft.dirty.set(false);
+            toasts.info("Discarded unsaved Content Safety changes", None);
+        }
+    };
+
     let on_save = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         if saving.get_untracked() {
@@ -304,7 +195,8 @@ pub fn SafetyTab(
             return;
         };
 
-        let policies: Vec<ContentPolicy> = policy_cards
+        let policies: Vec<ContentPolicy> = draft
+            .policy_cards
             .get_untracked()
             .iter()
             .map(EditablePolicyCard::to_policy)
@@ -314,13 +206,13 @@ pub fn SafetyTab(
         // Age18+Off, invalid country codes, and term/depth limits before round-trip).
         let candidate = PublicSitePolicy {
             schema_version: SITE_POLICY_SCHEMA_VERSION,
-            revision: revision.get_untracked().saturating_add(1),
-            min_enforce_rev: min_enforce_rev.get_untracked(),
+            revision: current.revision.saturating_add(1),
+            min_enforce_rev: current.min_enforce_rev,
             policy_digest: String::new(),
             vocab_digest: WD_VOCAB_DIGEST.to_string(),
-            safety_enabled: safety_enabled.get_untracked(),
-            unclassified_mode: unclassified_mode.get_untracked(),
-            fixed_blur_enabled: fixed_blur_enabled.get_untracked(),
+            safety_enabled: draft.safety_enabled.get_untracked(),
+            unclassified_mode: draft.unclassified_mode.get_untracked(),
+            fixed_blur_enabled: draft.fixed_blur_enabled.get_untracked(),
             policies: policies.clone(),
             age_policy: current.age_policy,
             age_gate_trigger: current.age_gate_trigger,
@@ -335,14 +227,14 @@ pub fn SafetyTab(
         }
 
         saving.set(true);
-        server_field_errors.set(Vec::new());
+        draft.server_field_errors.set(Vec::new());
 
         let req = SaveSafetyReq {
-            revision: revision.get_untracked(),
-            safety_enabled: safety_enabled.get_untracked(),
+            revision: current.revision,
+            safety_enabled: draft.safety_enabled.get_untracked(),
             policies,
-            unclassified_mode: unclassified_mode.get_untracked(),
-            fixed_blur_enabled: fixed_blur_enabled.get_untracked(),
+            unclassified_mode: draft.unclassified_mode.get_untracked(),
+            fixed_blur_enabled: draft.fixed_blur_enabled.get_untracked(),
             age_policy: current.age_policy,
             age_gate_trigger: current.age_gate_trigger,
             similarity: current.similarity,
@@ -354,27 +246,33 @@ pub fn SafetyTab(
         spawn_local(async move {
             match post_json_activatable::<_, SaveSafetyResp>("/admin/api/safety", &req).await {
                 Ok(ActivationResult::Active(resp)) => {
-                    revision.set(resp.revision);
-                    min_enforce_rev.set(resp.min_enforce_rev);
-                    let mut detail = format!(
-                        "min_enforce_rev #{} · tightened={} · schema v3 active",
-                        resp.min_enforce_rev, resp.tightened
-                    );
-                    if !resp.auto_disabled_providers.is_empty() {
-                        detail.push_str(&format!(
-                            " · auto-disabled {} incompatible provider(s)",
-                            resp.auto_disabled_providers.len()
-                        ));
+                    draft.revision.set(resp.revision);
+                    draft.min_enforce_rev.set(resp.min_enforce_rev);
+                    draft.dirty.set(false);
+                    if resp.unchanged {
+                        toasts.info(format!("No changes to save (rev #{})", resp.revision), None);
+                    } else {
+                        let mut detail = format!(
+                            "min_enforce_rev #{} · tightened={} · schema v3 active",
+                            resp.min_enforce_rev, resp.tightened
+                        );
+                        if !resp.auto_disabled_providers.is_empty() {
+                            detail.push_str(&format!(
+                                " · auto-disabled {} incompatible provider(s)",
+                                resp.auto_disabled_providers.len()
+                            ));
+                        }
+                        toasts.success(
+                            format!("Published Content Safety Policy rev #{}", resp.revision),
+                            Some(detail),
+                        );
+                        on_saved.run(());
                     }
-                    toasts.success(
-                        format!("Published Content Safety Policy rev #{}", resp.revision),
-                        Some(detail),
-                    );
-                    on_saved.run(());
                 }
                 Ok(ActivationResult::PendingActivation(pending)) => {
-                    revision.set(pending.revision);
-                    min_enforce_rev.set(pending.min_enforce_rev);
+                    draft.revision.set(pending.revision);
+                    draft.min_enforce_rev.set(pending.min_enforce_rev);
+                    draft.dirty.set(false);
                     toasts.warning(
                         format!(
                             "Saved rev #{} to D1 — awaiting SitePolicyDO activation",
@@ -385,7 +283,7 @@ pub fn SafetyTab(
                     on_saved.run(());
                 }
                 Err(err) => {
-                    server_field_errors.set(err.field_errors);
+                    draft.server_field_errors.set(err.field_errors);
                     toasts.error("Failed to publish safety policy", Some(err.message));
                 }
             }
@@ -405,26 +303,36 @@ pub fn SafetyTab(
                         </p>
                     </div>
                     <span class="adm-pill">
-                        {move || format!("rev #{} · min_enforce #{} · v3", revision.get(), min_enforce_rev.get())}
+                        {move || format!(
+                            "rev #{} · min_enforce #{} · v3",
+                            draft.revision.get(),
+                            draft.min_enforce_rev.get()
+                        )}
                     </span>
                 </div>
 
                 <div class="adm-toggle-grid">
                     <ToggleSwitch
-                        checked=Signal::derive(move || safety_enabled.get())
-                        on_change=Callback::new(move |v| safety_enabled.set(v))
+                        checked=Signal::derive(move || draft.safety_enabled.get())
+                        on_change=Callback::new(move |v| {
+                            draft.safety_enabled.set(v);
+                            draft.dirty.set(true);
+                        })
                         label="Enable server-side content safety filtering"
                         description="Evaluates all active Block & Blur policies server-side before HTML, hydration, API, search, or media delivery."
                     />
                     <ToggleSwitch
-                        checked=Signal::derive(move || fixed_blur_enabled.get())
-                        on_change=Callback::new(move |v| fixed_blur_enabled.set(v))
+                        checked=Signal::derive(move || draft.fixed_blur_enabled.get())
+                        on_change=Callback::new(move |v| {
+                            draft.fixed_blur_enabled.set(v);
+                            draft.dirty.set(true);
+                        })
                         label="Fixed server-side blurred previews"
                         description="Serves locked Cloudflare Images previews (blur=80, width=360, webp) on /media/preview/* for Blur policies."
                     />
                 </div>
 
-                {move || (!fixed_blur_enabled.get()).then(|| view! {
+                {move || (!draft.fixed_blur_enabled.get()).then(|| view! {
                     <NoticeBanner
                         tone=NoticeTone::Info
                         title="Fixed Server Preview Disabled"
@@ -443,8 +351,11 @@ pub fn SafetyTab(
                             <input
                                 type="radio"
                                 name="unclassified_mode"
-                                prop:checked=move || unclassified_mode.get() == UnclassifiedMode::Placeholder
-                                on:change=move |_| unclassified_mode.set(UnclassifiedMode::Placeholder)
+                                prop:checked=move || draft.unclassified_mode.get() == UnclassifiedMode::Placeholder
+                                on:change=move |_| {
+                                    draft.unclassified_mode.set(UnclassifiedMode::Placeholder);
+                                    draft.dirty.set(true);
+                                }
                             />
                             <span class="adm-radio-copy">
                                 <strong>"Fail-closed Placeholder (Recommended)"</strong>
@@ -455,8 +366,11 @@ pub fn SafetyTab(
                             <input
                                 type="radio"
                                 name="unclassified_mode"
-                                prop:checked=move || unclassified_mode.get() == UnclassifiedMode::Continue
-                                on:change=move |_| unclassified_mode.set(UnclassifiedMode::Continue)
+                                prop:checked=move || draft.unclassified_mode.get() == UnclassifiedMode::Continue
+                                on:change=move |_| {
+                                    draft.unclassified_mode.set(UnclassifiedMode::Continue);
+                                    draft.dirty.set(true);
+                                }
                             />
                             <span class="adm-radio-copy">
                                 <strong>"Continue (Allow unclassified)"</strong>
@@ -484,21 +398,41 @@ pub fn SafetyTab(
                         </p>
                     </div>
                     <div class="adm-btn-group">
-                        {move || safety.get().map(|cfg| {
-                            cfg.presets.into_iter().map(|preset| {
-                                let label = format!("+ {}", preset.name);
-                                let tpl = preset.clone();
-                                view! {
-                                    <button
-                                        type="button"
-                                        class="adm-btn adm-btn--sm"
-                                        on:click=move |_| add_policy_template(tpl.clone())
-                                    >
-                                        {label}
-                                    </button>
-                                }
-                            }).collect_view()
-                        })}
+                        {move || {
+                            let presets = safety
+                                .get()
+                                .map(|cfg| {
+                                    if cfg.presets.is_empty() {
+                                        compact_safety_presets()
+                                    } else {
+                                        cfg.presets
+                                            .into_iter()
+                                            .map(normalize_preset_compact)
+                                            .collect()
+                                    }
+                                })
+                                .unwrap_or_else(compact_safety_presets);
+                            presets
+                                .into_iter()
+                                .map(|preset| {
+                                    let btn_class = format!(
+                                        "adm-btn adm-btn--sm adm-btn--preset-{}",
+                                        preset_css_slug(preset.preset)
+                                    );
+                                    let label = preset_button_label(preset.preset);
+                                    let tpl = preset.clone();
+                                    view! {
+                                        <button
+                                            type="button"
+                                            class=btn_class
+                                            on:click=move |_| add_policy_template(tpl.clone())
+                                        >
+                                            {label}
+                                        </button>
+                                    }
+                                })
+                                .collect_view()
+                        }}
                         <button
                             type="button"
                             class="adm-btn adm-btn--sm adm-btn--primary"
@@ -506,28 +440,38 @@ pub fn SafetyTab(
                         >
                             "+ Custom Policy"
                         </button>
+                        {move || (draft.policy_cards.with(Vec::len) >= 2).then(|| view! {
+                            <button
+                                type="button"
+                                class="adm-btn adm-btn--sm"
+                                on:click=on_toggle_all_collapse
+                            >
+                                {move || if any_expanded.get() { "Collapse all" } else { "Expand all" }}
+                            </button>
+                        })}
                     </div>
                 </div>
 
                 {move || {
-                    let list = policy_cards.get();
-                    if list.is_empty() {
+                    let is_empty = draft.policy_cards.with(Vec::is_empty);
+                    if is_empty {
                         view! {
                             <div class="adm-empty-card">
-                                "No content policies configured yet. Click a WD-Tagger preset button above (+ NSFW / Explicit, + Suggestive / Ecchi, + Blood / Gore) or + Custom Policy to create one."
+                                "No content policies configured yet. Click a WD-Tagger preset button above (+ NSFW, + Suggestive / Ecchi, + Blood / Violence) or + Custom Policy to create one."
                             </div>
                         }.into_any()
                     } else {
                         view! {
                             <div class="adm-stack">
                                 <For
-                                    each=move || policy_cards.get()
+                                    each=move || draft.policy_cards.get()
                                     key=|card| card.key
                                     let(card)
                                 >
                                     {
                                         let card_key = card.key;
                                         let persisted = card.persisted;
+                                        let collapsed_sig = card.collapsed;
                                         let id_sig = card.id;
                                         let gen_sig = card.grant_generation;
                                         let enabled_sig = card.enabled;
@@ -547,6 +491,8 @@ pub fn SafetyTab(
                                         let require_terms = card.require_current_terms;
                                         let exclude_anon = card.exclude_anonymous;
                                         let exclude_countries_text = card.exclude_countries_text;
+                                        let card_for_selector = card.clone();
+                                        let card_for_bypass = card.clone();
 
                                         let threshold_defaults = Signal::derive(move || QueryThresholdDefaults {
                                             tag_min_score: Some(default_tag_min.get()),
@@ -559,7 +505,7 @@ pub fn SafetyTab(
                                                 return Some(local_err);
                                             }
                                             let cur_id = id_sig.get();
-                                            server_field_errors.with(|errs| {
+                                            draft.server_field_errors.with(|errs| {
                                                 errs.iter()
                                                     .find(|e| e.policy_id.as_deref() == Some(cur_id.as_str()) && e.field == "match_expr")
                                                     .map(|e| e.message.clone())
@@ -575,7 +521,7 @@ pub fn SafetyTab(
                                                 return Some(local_err);
                                             }
                                             let cur_id = id_sig.get();
-                                            server_field_errors.with(|errs| {
+                                            draft.server_field_errors.with(|errs| {
                                                 errs.iter()
                                                     .find(|e| e.policy_id.as_deref() == Some(cur_id.as_str()) && e.field == "except_expr")
                                                     .map(|e| e.message.clone())
@@ -599,6 +545,11 @@ pub fn SafetyTab(
                                                     include_click.set(false);
                                                 }
                                             }
+                                            draft.dirty.set(true);
+                                        });
+
+                                        let on_query_change = Callback::new(move |_: QueryBuilderDraft| {
+                                            draft.dirty.set(true);
                                         });
 
                                         let any_include = Memo::new(move |_| {
@@ -608,82 +559,66 @@ pub fn SafetyTab(
                                         });
 
                                         view! {
-                                            <article class="adm-policy-card">
-                                                // Policy Header
-                                                <div class="adm-policy-head">
-                                                    <div class="adm-policy-head-fields">
-                                                        <label class="adm-field">
-                                                            <span>"Display Name"</span>
-                                                            <input
-                                                                type="text"
-                                                                placeholder="NSFW / Explicit"
-                                                                prop:value=move || name_sig.get()
-                                                                on:input=move |ev| name_sig.set(event_target_value(&ev))
-                                                            />
-                                                        </label>
-
-                                                        <label class="adm-field">
-                                                            <span class="adm-field-label-inline">
-                                                                <span>"Policy Slug ID"</span>
-                                                                <span class="adm-badge adm-mono">
-                                                                    {move || format!("gen #{}", gen_sig.get())}
-                                                                </span>
-                                                            </span>
-                                                            <input
-                                                                type="text"
-                                                                class=if persisted { "adm-mono is-immutable" } else { "adm-mono" }
-                                                                placeholder="r18"
-                                                                readonly=persisted
-                                                                title=if persisted {
-                                                                    "Immutable slug ID for persisted policy"
+                                            <article class=move || {
+                                                let slug = preset_css_slug(preset_sig.get());
+                                                let state = if collapsed_sig.get() { " is-collapsed" } else { "" };
+                                                let off = if !enabled_sig.get() { " is-disabled" } else { "" };
+                                                format!("adm-policy-card adm-policy-card--{slug}{state}{off}")
+                                            }>
+                                                // Always-visible 1-line foldable summary header
+                                                <div class="adm-policy-summary-bar">
+                                                    <button
+                                                        type="button"
+                                                        class="adm-policy-toggle-btn"
+                                                        aria-expanded=move || (!collapsed_sig.get()).to_string()
+                                                        on:click=move |_| collapsed_sig.update(|c| *c = !*c)
+                                                    >
+                                                        <span class="adm-policy-chevron" aria-hidden="true">
+                                                            {move || if collapsed_sig.get() { "▸" } else { "▾" }}
+                                                        </span>
+                                                        <span class=move || format!(
+                                                            "adm-preset-badge adm-preset-badge--{}",
+                                                            preset_css_slug(preset_sig.get())
+                                                        )>
+                                                            {move || preset_badge_label(preset_sig.get())}
+                                                        </span>
+                                                        <strong class="adm-policy-summary-name">
+                                                            {move || {
+                                                                let n = name_sig.get();
+                                                                if n.trim().is_empty() {
+                                                                    "Untitled Policy".to_string()
                                                                 } else {
-                                                                    "Lowercase ASCII slug (a-z0-9_-, max 32 chars)"
+                                                                    n
                                                                 }
-                                                                prop:value=move || id_sig.get()
-                                                                on:input=move |ev| {
-                                                                    if !persisted {
-                                                                        id_sig.set(event_target_value(&ev));
-                                                                    }
-                                                                }
-                                                            />
-                                                        </label>
-
-                                                        <label class="adm-field adm-field--narrow">
-                                                            <span>"Priority"</span>
-                                                            <input
-                                                                type="text"
-                                                                inputmode="numeric"
-                                                                class="adm-mono"
-                                                                prop:value=move || priority_sig.get().to_string()
-                                                                on:input=move |ev| {
-                                                                    if let Ok(v) = event_target_value(&ev).trim().parse::<u16>() {
-                                                                        priority_sig.set(v);
-                                                                    }
-                                                                }
-                                                            />
-                                                        </label>
-
-                                                        <label class="adm-field">
-                                                            <span>"Placeholder Art"</span>
-                                                            <select
-                                                                prop:value=move || to_ui_preset(preset_sig.get()).as_str().to_string()
-                                                                on:change=move |ev| {
-                                                                    let p = GalleryMaskPreset::parse(&event_target_value(&ev));
-                                                                    preset_sig.set(from_ui_preset(p));
-                                                                }
-                                                            >
-                                                                <option value="r18">"R-18 (18+ badge)"</option>
-                                                                <option value="sensitive">"Sensitive / Eye-off"</option>
-                                                                <option value="blood">"Blood / Warning"</option>
-                                                                <option value="custom">"Custom Shield"</option>
-                                                            </select>
-                                                        </label>
-                                                    </div>
+                                                            }}
+                                                        </strong>
+                                                        <span class=move || match action_sig.get() {
+                                                            PolicyAction::Block => "adm-action-pill adm-action-pill--block",
+                                                            PolicyAction::Blur => "adm-action-pill adm-action-pill--blur",
+                                                        }>
+                                                            {move || match action_sig.get() {
+                                                                PolicyAction::Block => "Block",
+                                                                PolicyAction::Blur => "Blur",
+                                                            }}
+                                                        </span>
+                                                        <span class="adm-policy-selector-summary adm-mono">
+                                                            {move || card_for_selector.selector_summary()}
+                                                        </span>
+                                                        <span class="adm-policy-bypass-summary">
+                                                            {move || card_for_bypass.bypass_summary()}
+                                                        </span>
+                                                    </button>
 
                                                     <div class="adm-policy-head-actions">
                                                         <ToggleSwitch
                                                             checked=Signal::derive(move || enabled_sig.get())
-                                                            on_change=Callback::new(move |v| enabled_sig.set(v))
+                                                            on_change=Callback::new(move |v| {
+                                                                enabled_sig.set(v);
+                                                                draft.dirty.set(true);
+                                                                if v {
+                                                                    auto_enable_safety_if_off();
+                                                                }
+                                                            })
                                                             label="Enabled"
                                                             compact=true
                                                         />
@@ -692,7 +627,8 @@ pub fn SafetyTab(
                                                             class="adm-btn adm-btn--danger adm-btn--sm"
                                                             on:click=move |_| {
                                                                 let removed = name_sig.get_untracked();
-                                                                policy_cards.update(|list| list.retain(|c| c.key != card_key));
+                                                                draft.policy_cards.update(|list| list.retain(|c| c.key != card_key));
+                                                                draft.dirty.set(true);
                                                                 toasts.info(
                                                                     format!("Removed policy \"{removed}\" from draft"),
                                                                     Some("Publish to apply this removal.".to_string()),
@@ -704,305 +640,436 @@ pub fn SafetyTab(
                                                     </div>
                                                 </div>
 
-                                                // Section 1: Content Selector (Full Width — Uncramped QueryBuilder!)
-                                                <div class="adm-policy-section">
-                                                    <div class="adm-policy-section-head">
-                                                        <span class="adm-step-num">"1"</span>
-                                                        <div>
-                                                            <h3>"Content Selector"</h3>
-                                                            <p class="adm-sub">
-                                                                "Matches items where Match is true and optional Exclude / Exception is false."
-                                                            </p>
-                                                        </div>
-                                                    </div>
-
-                                                    <QueryBuilder
-                                                        draft=match_draft
-                                                        mode=QueryBuilderMode::SafetyPolicy
-                                                        presets=PresetTemplate::builtins()
-                                                        show_presets=true
-                                                        threshold_defaults=threshold_defaults
-                                                        validation_error=match_err
-                                                        on_preset_select=on_preset_pick
-                                                    />
-
-                                                    <div class="adm-default-score-bar">
-                                                        <div class="adm-default-score-copy">
-                                                            <strong>"Default Tag Min Score"</strong>
-                                                            <small>"Fallback min confidence (0.01–1.00) for tags without an explicit >= score"</small>
-                                                        </div>
-                                                        <div class="adm-default-score-input">
-                                                            <ScoreInput
-                                                                value=Signal::derive(move || default_tag_min.get())
-                                                                on_change=Callback::new(move |v| default_tag_min.set(v))
-                                                                min=0.01
-                                                                max=1.00
-                                                                step=0.01
-                                                                aria_label="Default tag minimum score"
-                                                            />
-                                                        </div>
-                                                    </div>
-
-                                                    // Collapsible Optional Exclude / Exception (`except_expr`)
-                                                    <div class="adm-except-wrap">
-                                                        <div class="adm-except-bar">
-                                                            <button
-                                                                type="button"
-                                                                class="adm-btn adm-btn--sm"
-                                                                on:click=move |_| except_open.update(|v| *v = !*v)
-                                                            >
-                                                                {move || if except_open.get() {
-                                                                    "− Hide Exclude / Exception (except_expr)"
-                                                                } else {
-                                                                    "+ Add Exclude / Exception (except_expr)"
-                                                                }}
-                                                            </button>
-                                                            {move || except_open.get().then(|| view! {
-                                                                <button
-                                                                    type="button"
-                                                                    class="adm-btn adm-btn--sm adm-btn--danger"
-                                                                    on:click=move |_| {
-                                                                        except_draft.set(QueryBuilderDraft::for_mode(QueryBuilderMode::SafetyPolicy));
-                                                                        except_open.set(false);
+                                                // Smoothly collapsible rule editor body
+                                                <div
+                                                    class="adm-policy-body"
+                                                    aria-hidden=move || collapsed_sig.get().to_string()
+                                                >
+                                                    <div class="adm-policy-body-inner">
+                                                        // Editable Metadata Fields
+                                                        <div class="adm-policy-head-fields">
+                                                            <label class="adm-field">
+                                                                <span>"Display Name"</span>
+                                                                <input
+                                                                    type="text"
+                                                                    placeholder="NSFW / Explicit"
+                                                                    prop:value=move || name_sig.get()
+                                                                    on:input=move |ev| {
+                                                                        name_sig.set(event_target_value(&ev));
+                                                                        draft.dirty.set(true);
                                                                     }
-                                                                >
-                                                                    "Clear Exception"
-                                                                </button>
-                                                            })}
-                                                        </div>
-
-                                                        {move || except_open.get().then(|| view! {
-                                                            <div class="adm-except-panel">
-                                                                <div class="adm-except-title">
-                                                                    <strong>"Exclude / Exception (`except_expr`)"</strong>
-                                                                    <span class="adm-sub">
-                                                                        "Per-policy exemption: affects ONLY this policy (never overrides stricter matching policies)."
-                                                                    </span>
-                                                                </div>
-                                                                <QueryBuilder
-                                                                    draft=except_draft
-                                                                    mode=QueryBuilderMode::SafetyPolicy
-                                                                    show_presets=false
-                                                                    threshold_defaults=threshold_defaults
-                                                                    validation_error=except_err
                                                                 />
-                                                            </div>
-                                                        })}
-                                                    </div>
-                                                </div>
+                                                            </label>
 
-                                                // Sections 2 & 3 + Balanced Live Preview Sidebar
-                                                <div class="adm-policy-lower-grid">
-                                                    <div class="adm-policy-lower-main">
-                                                        // Section 2: Enforcement Action
-                                                        <div class="adm-policy-section">
-                                                            <div class="adm-policy-section-head">
-                                                                <span class="adm-step-num">"2"</span>
-                                                                <div>
-                                                                    <h3>"Enforcement Action"</h3>
-                                                                    <p class="adm-sub">
-                                                                        "Strict Policy v3 actions: Block or Blur only (use per-policy Exception above for exemptions)."
-                                                                    </p>
-                                                                </div>
-                                                            </div>
-
-                                                            <div class="adm-segmented" role="radiogroup" aria-label="Enforcement action">
-                                                                <button
-                                                                    type="button"
-                                                                    role="radio"
-                                                                    aria-checked=move || (action_sig.get() == PolicyAction::Block).to_string()
-                                                                    class=move || if action_sig.get() == PolicyAction::Block {
-                                                                        "adm-seg-btn is-active"
+                                                            <label class="adm-field">
+                                                                <span class="adm-field-label-inline">
+                                                                    <span>"Policy Slug ID"</span>
+                                                                    <span class="adm-badge adm-mono">
+                                                                        {move || format!("gen #{}", gen_sig.get())}
+                                                                    </span>
+                                                                </span>
+                                                                <input
+                                                                    type="text"
+                                                                    class=if persisted { "adm-mono is-immutable" } else { "adm-mono" }
+                                                                    placeholder="r18"
+                                                                    readonly=persisted
+                                                                    title=if persisted {
+                                                                        "Immutable slug ID for persisted policy"
                                                                     } else {
-                                                                        "adm-seg-btn"
+                                                                        "Lowercase ASCII slug (a-z0-9_-, max 32 chars)"
                                                                     }
-                                                                    on:click=move |_| {
-                                                                        action_sig.set(PolicyAction::Block);
-                                                                        include_click.set(false);
+                                                                    prop:value=move || id_sig.get()
+                                                                    on:input=move |ev| {
+                                                                        if !persisted {
+                                                                            id_sig.set(event_target_value(&ev));
+                                                                            draft.dirty.set(true);
+                                                                        }
+                                                                    }
+                                                                />
+                                                            </label>
+
+                                                            <label class="adm-field adm-field--narrow">
+                                                                <span>"Priority"</span>
+                                                                <input
+                                                                    type="text"
+                                                                    inputmode="numeric"
+                                                                    class="adm-mono"
+                                                                    prop:value=move || priority_sig.get().to_string()
+                                                                    on:input=move |ev| {
+                                                                        if let Ok(v) = event_target_value(&ev).trim().parse::<u16>() {
+                                                                            priority_sig.set(v);
+                                                                            draft.dirty.set(true);
+                                                                        }
+                                                                    }
+                                                                />
+                                                            </label>
+
+                                                            <label class="adm-field">
+                                                                <span>"Placeholder Art"</span>
+                                                                <select
+                                                                    prop:value=move || to_ui_preset(preset_sig.get()).as_str().to_string()
+                                                                    on:change=move |ev| {
+                                                                        let p = GalleryMaskPreset::parse(&event_target_value(&ev));
+                                                                        preset_sig.set(from_ui_preset(p));
+                                                                        draft.dirty.set(true);
                                                                     }
                                                                 >
-                                                                    <strong>"Block"</strong>
-                                                                    <small>"Hard Placeholder — zero media URLs or previews until directly bypassed"</small>
-                                                                </button>
-                                                                <button
-                                                                    type="button"
-                                                                    role="radio"
-                                                                    aria-checked=move || (action_sig.get() == PolicyAction::Blur).to_string()
-                                                                    class=move || if action_sig.get() == PolicyAction::Blur {
-                                                                        "adm-seg-btn is-active"
-                                                                    } else {
-                                                                        "adm-seg-btn"
-                                                                    }
-                                                                    on:click=move |_| {
-                                                                        action_sig.set(PolicyAction::Blur);
-                                                                    }
-                                                                >
-                                                                    <strong>"Blur"</strong>
-                                                                    <small>"Fixed Server Preview — supports optional Click to Reveal"</small>
-                                                                </button>
-                                                            </div>
-
-                                                            {move || (action_sig.get() == PolicyAction::Blur && !fixed_blur_enabled.get()).then(|| view! {
-                                                                <div class="adm-inline-info">
-                                                                    "Fixed server-side blurred previews are currently OFF. Until enabled above, this Blur policy safely renders as a hard Placeholder."
-                                                                </div>
-                                                            })}
+                                                                    <option value="r18">"R-18 (Yellow 18+ badge)"</option>
+                                                                    <option value="sensitive">"Sensitive (Purple Eye-off)"</option>
+                                                                    <option value="blood">"Blood / Violence (Red Warning)"</option>
+                                                                    <option value="custom">"Custom Shield"</option>
+                                                                </select>
+                                                            </label>
                                                         </div>
 
-                                                        // Section 3: Bypass / Unlock Rules (Cloudflare Access Style)
+                                                        // Section 1: Content Selector (Full Width — Uncramped QueryBuilder!)
                                                         <div class="adm-policy-section">
                                                             <div class="adm-policy-section-head">
-                                                                <span class="adm-step-num">"3"</span>
+                                                                <span class="adm-step-num">"1"</span>
                                                                 <div>
-                                                                    <h3>"Bypass / Unlock Rules"</h3>
+                                                                    <h3>"Content Selector"</h3>
                                                                     <p class="adm-sub">
-                                                                        "Bypass = any(Include) AND all(Require) AND none(Exclude). Empty Include never grants bypass."
+                                                                        "Matches items where Match is true and optional Exclude / Exception is false."
                                                                     </p>
                                                                 </div>
                                                             </div>
 
-                                                            <div class="adm-bypass-groups">
-                                                                // INCLUDE (OR)
-                                                                <div class="adm-bypass-group">
-                                                                    <div class="adm-bypass-group-head">
-                                                                        <span class="adm-bypass-tag adm-bypass-tag--include">"Include (OR)"</span>
-                                                                        <span class="adm-sub">"Caller must match at least 1 enabled branch"</span>
-                                                                    </div>
-                                                                    <div class="adm-bypass-toggles">
-                                                                        <ToggleSwitch
-                                                                            checked=Signal::derive(move || include_switcher.get())
-                                                                            on_change=Callback::new(move |v| include_switcher.set(v))
-                                                                            label="User Switcher"
-                                                                            description="Opt-in category toggle in /user/account bound to this policy's grant generation."
+                                                            <QueryBuilder
+                                                                draft=match_draft
+                                                                mode=QueryBuilderMode::SafetyPolicy
+                                                                presets=PresetTemplate::builtins()
+                                                                show_presets=true
+                                                                threshold_defaults=threshold_defaults
+                                                                validation_error=match_err
+                                                                on_change=on_query_change
+                                                                on_preset_select=on_preset_pick
+                                                            />
+
+                                                            <div class="adm-default-score-bar">
+                                                                <div class="adm-default-score-copy">
+                                                                    <strong>"Default Tag Min Score"</strong>
+                                                                    <small>"Fallback min confidence (0.01–1.00) for tags without an explicit >= score"</small>
+                                                                </div>
+                                                                <div class="adm-default-score-input">
+                                                                    <ScoreInput
+                                                                        value=Signal::derive(move || default_tag_min.get())
+                                                                        on_change=Callback::new(move |v| {
+                                                                            default_tag_min.set(v);
+                                                                            draft.dirty.set(true);
+                                                                        })
+                                                                        min=0.01
+                                                                        max=1.00
+                                                                        step=0.01
+                                                                        aria_label="Default tag minimum score"
+                                                                    />
+                                                                </div>
+                                                            </div>
+
+                                                            // Collapsible Optional Exclude / Exception (`except_expr`)
+                                                            <div class="adm-except-wrap">
+                                                                <div class="adm-except-bar">
+                                                                    <button
+                                                                        type="button"
+                                                                        class="adm-btn adm-btn--sm"
+                                                                        on:click=move |_| except_open.update(|v| *v = !*v)
+                                                                    >
+                                                                        {move || if except_open.get() {
+                                                                            "− Hide Exclude / Exception (except_expr)"
+                                                                        } else {
+                                                                            "+ Add Exclude / Exception (except_expr)"
+                                                                        }}
+                                                                    </button>
+                                                                    {move || except_open.get().then(|| view! {
+                                                                        <button
+                                                                            type="button"
+                                                                            class="adm-btn adm-btn--sm adm-btn--danger"
+                                                                            on:click=move |_| {
+                                                                                except_draft.set(QueryBuilderDraft::for_mode(QueryBuilderMode::SafetyPolicy));
+                                                                                except_open.set(false);
+                                                                                draft.dirty.set(true);
+                                                                            }
+                                                                        >
+                                                                            "Clear Exception"
+                                                                        </button>
+                                                                    })}
+                                                                </div>
+
+                                                                {move || except_open.get().then(|| view! {
+                                                                    <div class="adm-except-panel">
+                                                                        <div class="adm-except-title">
+                                                                            <strong>"Exclude / Exception (`except_expr`)"</strong>
+                                                                            <span class="adm-sub">
+                                                                                "Per-policy exemption: affects ONLY this policy (never overrides stricter matching policies)."
+                                                                            </span>
+                                                                        </div>
+                                                                        <QueryBuilder
+                                                                            draft=except_draft
+                                                                            mode=QueryBuilderMode::SafetyPolicy
+                                                                            show_presets=false
+                                                                            threshold_defaults=threshold_defaults
+                                                                            validation_error=except_err
+                                                                            on_change=on_query_change
                                                                         />
-                                                                        {move || (action_sig.get() == PolicyAction::Blur).then(|| view! {
-                                                                            <ToggleSwitch
-                                                                                checked=Signal::derive(move || include_click.get())
-                                                                                on_change=Callback::new(move |v| include_click.set(v))
-                                                                                label="Click to Reveal"
-                                                                                description="Allows object-bound single-item reveal via POST /api/safety/reveal (Blur policies only)."
-                                                                            />
-                                                                        })}
-                                                                        <ToggleSwitch
-                                                                            checked=Signal::derive(move || include_live_admin.get())
-                                                                            on_change=Callback::new(move |v| include_live_admin.set(v))
-                                                                            label="Live Admin Bypass"
-                                                                            description="Explicit opt-in: live staff CF Access identity only; browse cookie does NOT qualify."
-                                                                        />
                                                                     </div>
-                                                                    {move || (!any_include.get()).then(|| view! {
+                                                                })}
+                                                            </div>
+                                                        </div>
+
+                                                        // Sections 2 & 3 + Balanced Live Preview Sidebar
+                                                        <div class="adm-policy-lower-grid">
+                                                            <div class="adm-policy-lower-main">
+                                                                // Section 2: Enforcement Action
+                                                                <div class="adm-policy-section">
+                                                                    <div class="adm-policy-section-head">
+                                                                        <span class="adm-step-num">"2"</span>
+                                                                        <div>
+                                                                            <h3>"Enforcement Action"</h3>
+                                                                            <p class="adm-sub">
+                                                                                "Strict Policy v3 actions: Block or Blur only (use per-policy Exception above for exemptions)."
+                                                                            </p>
+                                                                        </div>
+                                                                    </div>
+
+                                                                    <div class="adm-segmented" role="radiogroup" aria-label="Enforcement action">
+                                                                        <button
+                                                                            type="button"
+                                                                            role="radio"
+                                                                            aria-checked=move || (action_sig.get() == PolicyAction::Block).to_string()
+                                                                            class=move || if action_sig.get() == PolicyAction::Block {
+                                                                                "adm-seg-btn is-active"
+                                                                            } else {
+                                                                                "adm-seg-btn"
+                                                                            }
+                                                                            on:click=move |_| {
+                                                                                action_sig.set(PolicyAction::Block);
+                                                                                include_click.set(false);
+                                                                                draft.dirty.set(true);
+                                                                            }
+                                                                        >
+                                                                            <strong>"Block"</strong>
+                                                                            <small>"Hard Placeholder — zero media URLs or previews until directly bypassed"</small>
+                                                                        </button>
+                                                                        <button
+                                                                            type="button"
+                                                                            role="radio"
+                                                                            aria-checked=move || (action_sig.get() == PolicyAction::Blur).to_string()
+                                                                            class=move || if action_sig.get() == PolicyAction::Blur {
+                                                                                "adm-seg-btn is-active"
+                                                                            } else {
+                                                                                "adm-seg-btn"
+                                                                            }
+                                                                            on:click=move |_| {
+                                                                                action_sig.set(PolicyAction::Blur);
+                                                                                draft.dirty.set(true);
+                                                                            }
+                                                                        >
+                                                                            <strong>"Blur"</strong>
+                                                                            <small>"Fixed Server Preview — supports optional Click to Reveal"</small>
+                                                                        </button>
+                                                                    </div>
+
+                                                                    {move || (action_sig.get() == PolicyAction::Blur && !draft.fixed_blur_enabled.get()).then(|| view! {
                                                                         <div class="adm-inline-info">
-                                                                            "No Include branch is enabled — this policy is strictly enforced for all callers (zero bypass)."
+                                                                            "Fixed server-side blurred previews are currently OFF. Until enabled above, this Blur policy safely renders as a hard Placeholder."
                                                                         </div>
                                                                     })}
                                                                 </div>
 
-                                                                // REQUIRE (AND)
-                                                                <div class="adm-bypass-group">
-                                                                    <div class="adm-bypass-group-head">
-                                                                        <span class="adm-bypass-tag adm-bypass-tag--require">"Require (AND)"</span>
-                                                                        <span class="adm-sub">"Every enabled requirement must pass"</span>
+                                                                // Section 3: Bypass / Unlock Rules (Cloudflare Access Style)
+                                                                <div class="adm-policy-section">
+                                                                    <div class="adm-policy-section-head">
+                                                                        <span class="adm-step-num">"3"</span>
+                                                                        <div>
+                                                                            <h3>"Bypass / Unlock Rules"</h3>
+                                                                            <p class="adm-sub">
+                                                                                "Bypass = any(Include) AND all(Require) AND none(Exclude). Empty Include never grants bypass."
+                                                                            </p>
+                                                                        </div>
                                                                     </div>
-                                                                    <div class="adm-bypass-toggles">
-                                                                        <ToggleSwitch
-                                                                            checked=Signal::derive(move || require_login.get())
-                                                                            on_change=Callback::new(move |v| require_login.set(v))
-                                                                            label="Gallery Login"
-                                                                            description="Requires an active, non-revoked, non-banned gallery account session."
-                                                                        />
-                                                                        <ToggleSwitch
-                                                                            checked=Signal::derive(move || require_age.get())
-                                                                            on_change=Callback::new(move |v| require_age.set(v))
-                                                                            label="Age 18+"
-                                                                            description="Requires verified 18+ status under the site Age Verification policy."
-                                                                        />
-                                                                        {move || (require_age.get() && site_age_policy.get() == AgeVerificationPolicy::Off).then(|| view! {
-                                                                            <div class="adm-inline-warn">
-                                                                                "Site Age Verification is currently OFF (in Age & Legal tab). Enable Self-Attestation or Strict 18+ before publishing require_age_18."
-                                                                            </div>
-                                                                        })}
-                                                                        <ToggleSwitch
-                                                                            checked=Signal::derive(move || require_terms.get())
-                                                                            on_change=Callback::new(move |v| require_terms.set(v))
-                                                                            label="Current Terms"
-                                                                            description="Requires acceptance of the exact active Terms version and SHA-256 digest."
-                                                                        />
-                                                                    </div>
-                                                                </div>
 
-                                                                // EXCLUDE (NOR)
-                                                                <div class="adm-bypass-group">
-                                                                    <div class="adm-bypass-group-head">
-                                                                        <span class="adm-bypass-tag adm-bypass-tag--exclude">"Exclude (NOR)"</span>
-                                                                        <span class="adm-sub">"Matching any exclusion always denies bypass"</span>
-                                                                    </div>
-                                                                    <div class="adm-bypass-toggles">
-                                                                        <ToggleSwitch
-                                                                            checked=Signal::derive(move || exclude_anon.get())
-                                                                            on_change=Callback::new(move |v| exclude_anon.set(v))
-                                                                            label="Anonymous Visitors"
-                                                                            description="Always deny bypass for visitors without a gallery session or live staff identity."
-                                                                        />
-                                                                        <label class="adm-field">
-                                                                            <span>"Exclude Countries (ISO-3166 alpha-2 deny list)"</span>
-                                                                            <input
-                                                                                type="text"
-                                                                                class="adm-mono"
-                                                                                placeholder="e.g. US, GB"
-                                                                                prop:value=move || exclude_countries_text.get()
-                                                                                on:input=move |ev| exclude_countries_text.set(event_target_value(&ev))
-                                                                            />
-                                                                            <small class="adm-field-hint">
-                                                                                "Comma-separated 2-letter codes. When non-empty, missing / unknown (XX) / Tor (T1) countries are automatically denied."
-                                                                            </small>
-                                                                        </label>
+                                                                    <div class="adm-bypass-groups">
+                                                                        // INCLUDE (OR)
+                                                                        <div class="adm-bypass-group">
+                                                                            <div class="adm-bypass-group-head">
+                                                                                <span class="adm-bypass-tag adm-bypass-tag--include">"Include (OR)"</span>
+                                                                                <span class="adm-sub">"Caller must match at least 1 enabled branch"</span>
+                                                                            </div>
+                                                                            <div class="adm-bypass-toggles">
+                                                                                <ToggleSwitch
+                                                                                    checked=Signal::derive(move || include_switcher.get())
+                                                                                    on_change=Callback::new(move |v| {
+                                                                                        include_switcher.set(v);
+                                                                                        draft.dirty.set(true);
+                                                                                    })
+                                                                                    label="User Switcher"
+                                                                                    description="Opt-in category toggle in /user/account bound to this policy's grant generation."
+                                                                                />
+                                                                                {move || (action_sig.get() == PolicyAction::Blur).then(|| view! {
+                                                                                    <ToggleSwitch
+                                                                                        checked=Signal::derive(move || include_click.get())
+                                                                                        on_change=Callback::new(move |v| {
+                                                                                            include_click.set(v);
+                                                                                            draft.dirty.set(true);
+                                                                                        })
+                                                                                        label="Click to Reveal"
+                                                                                        description="Allows object-bound single-item reveal via POST /api/safety/reveal (Blur policies only)."
+                                                                                    />
+                                                                                })}
+                                                                                <ToggleSwitch
+                                                                                    checked=Signal::derive(move || include_live_admin.get())
+                                                                                    on_change=Callback::new(move |v| {
+                                                                                        include_live_admin.set(v);
+                                                                                        draft.dirty.set(true);
+                                                                                    })
+                                                                                    label="Live Admin Bypass"
+                                                                                    description="Explicit opt-in: live staff CF Access identity only; browse cookie does NOT qualify."
+                                                                                />
+                                                                            </div>
+                                                                            {move || (!any_include.get()).then(|| view! {
+                                                                                <div class="adm-inline-info">
+                                                                                    "No Include branch is enabled — this policy is strictly enforced for all callers (zero bypass)."
+                                                                                </div>
+                                                                            })}
+                                                                        </div>
+
+                                                                        // REQUIRE (AND)
+                                                                        <div class="adm-bypass-group">
+                                                                            <div class="adm-bypass-group-head">
+                                                                                <span class="adm-bypass-tag adm-bypass-tag--require">"Require (AND)"</span>
+                                                                                <span class="adm-sub">"Every enabled requirement must pass"</span>
+                                                                            </div>
+                                                                            <div class="adm-bypass-toggles">
+                                                                                <ToggleSwitch
+                                                                                    checked=Signal::derive(move || require_login.get())
+                                                                                    on_change=Callback::new(move |v| {
+                                                                                        require_login.set(v);
+                                                                                        draft.dirty.set(true);
+                                                                                    })
+                                                                                    label="Gallery Login"
+                                                                                    description="Requires an active, non-revoked, non-banned gallery account session."
+                                                                                />
+                                                                                <ToggleSwitch
+                                                                                    checked=Signal::derive(move || require_age.get())
+                                                                                    on_change=Callback::new(move |v| {
+                                                                                        require_age.set(v);
+                                                                                        draft.dirty.set(true);
+                                                                                    })
+                                                                                    label="Age 18+"
+                                                                                    description="Requires verified 18+ status under the site Age Verification policy."
+                                                                                />
+                                                                                {move || (require_age.get() && site_age_policy.get() == AgeVerificationPolicy::Off).then(|| view! {
+                                                                                    <div class="adm-inline-warn adm-inline-warn--action">
+                                                                                        <span>
+                                                                                            "Site Age Verification is currently OFF (in Age & Legal tab). Enable Self-Attestation or Strict 18+ before publishing require_age_18 — your Safety rule draft will stay intact."
+                                                                                        </span>
+                                                                                        <button
+                                                                                            type="button"
+                                                                                            class="adm-btn adm-btn--sm adm-btn--warn-outline"
+                                                                                            on:click=move |_| on_navigate.run(AdminTab::AgeLegal)
+                                                                                        >
+                                                                                            "Open Age & Legal tab →"
+                                                                                        </button>
+                                                                                    </div>
+                                                                                })}
+                                                                                <ToggleSwitch
+                                                                                    checked=Signal::derive(move || require_terms.get())
+                                                                                    on_change=Callback::new(move |v| {
+                                                                                        require_terms.set(v);
+                                                                                        draft.dirty.set(true);
+                                                                                    })
+                                                                                    label="Current Terms"
+                                                                                    description="Requires acceptance of the exact active Terms version and SHA-256 digest."
+                                                                                />
+                                                                            </div>
+                                                                        </div>
+
+                                                                        // EXCLUDE (NOR)
+                                                                        <div class="adm-bypass-group">
+                                                                            <div class="adm-bypass-group-head">
+                                                                                <span class="adm-bypass-tag adm-bypass-tag--exclude">"Exclude (NOR)"</span>
+                                                                                <span class="adm-sub">"Matching any exclusion always denies bypass"</span>
+                                                                            </div>
+                                                                            <div class="adm-bypass-toggles">
+                                                                                <ToggleSwitch
+                                                                                    checked=Signal::derive(move || exclude_anon.get())
+                                                                                    on_change=Callback::new(move |v| {
+                                                                                        exclude_anon.set(v);
+                                                                                        draft.dirty.set(true);
+                                                                                    })
+                                                                                    label="Anonymous Visitors"
+                                                                                    description="Always deny bypass for visitors without a gallery session or live staff identity."
+                                                                                />
+                                                                                <label class="adm-field">
+                                                                                    <span>"Exclude Countries (ISO-3166 alpha-2 deny list)"</span>
+                                                                                    <input
+                                                                                        type="text"
+                                                                                        class="adm-mono"
+                                                                                        placeholder="e.g. US, GB"
+                                                                                        prop:value=move || exclude_countries_text.get()
+                                                                                        on:input=move |ev| {
+                                                                                            exclude_countries_text.set(event_target_value(&ev));
+                                                                                            draft.dirty.set(true);
+                                                                                        }
+                                                                                    />
+                                                                                    <small class="adm-field-hint">
+                                                                                        "Comma-separated 2-letter codes. When non-empty, missing / unknown (XX) / Tor (T1) countries are automatically denied."
+                                                                                    </small>
+                                                                                </label>
+                                                                            </div>
+                                                                        </div>
                                                                     </div>
                                                                 </div>
                                                             </div>
+
+                                                            // Balanced Live Preview Sidebar
+                                                            <aside class="adm-policy-preview-col">
+                                                                <div class="adm-preview-caption">"Live Placeholder Preview"</div>
+                                                                {move || {
+                                                                    let mask = GalleryMask {
+                                                                        rule_id: id_sig.get(),
+                                                                        label: {
+                                                                            let n = name_sig.get();
+                                                                            if n.trim().is_empty() {
+                                                                                "Restricted Content".to_string()
+                                                                            } else {
+                                                                                n
+                                                                            }
+                                                                        },
+                                                                        preset: to_ui_preset(preset_sig.get()),
+                                                                        reason: None,
+                                                                        requires_login: require_login.get(),
+                                                                        requires_age: require_age.get(),
+                                                                        requires_terms: require_terms.get(),
+                                                                        cta_label: None,
+                                                                    };
+                                                                    view! {
+                                                                        <ContentMaskCard
+                                                                            mask=mask
+                                                                            dimensions=(4, 3)
+                                                                            compact=true
+                                                                        />
+                                                                    }
+                                                                }}
+                                                                <div class="adm-preview-meta">
+                                                                    <span class=move || format!(
+                                                                        "adm-preset-badge adm-preset-badge--{}",
+                                                                        preset_css_slug(preset_sig.get())
+                                                                    )>
+                                                                        {move || preset_badge_label(preset_sig.get())}
+                                                                    </span>
+                                                                    <span class="adm-badge">
+                                                                        {move || match action_sig.get() {
+                                                                            PolicyAction::Block => "Action: Block",
+                                                                            PolicyAction::Blur => "Action: Blur",
+                                                                        }}
+                                                                    </span>
+                                                                    <span class="adm-badge adm-mono">
+                                                                        {move || format!("{}@{}", id_sig.get(), gen_sig.get())}
+                                                                    </span>
+                                                                </div>
+                                                            </aside>
                                                         </div>
                                                     </div>
-
-                                                    // Balanced Live Preview Sidebar
-                                                    <aside class="adm-policy-preview-col">
-                                                        <div class="adm-preview-caption">"Live Placeholder Preview"</div>
-                                                        {move || {
-                                                            let mask = GalleryMask {
-                                                                rule_id: id_sig.get(),
-                                                                label: {
-                                                                    let n = name_sig.get();
-                                                                    if n.trim().is_empty() {
-                                                                        "Restricted Content".to_string()
-                                                                    } else {
-                                                                        n
-                                                                    }
-                                                                },
-                                                                preset: to_ui_preset(preset_sig.get()),
-                                                                reason: None,
-                                                                requires_login: require_login.get(),
-                                                                requires_age: require_age.get(),
-                                                                requires_terms: require_terms.get(),
-                                                                cta_label: None,
-                                                            };
-                                                            view! {
-                                                                <ContentMaskCard
-                                                                    mask=mask
-                                                                    dimensions=(4, 3)
-                                                                    compact=true
-                                                                />
-                                                            }
-                                                        }}
-                                                        <div class="adm-preview-meta">
-                                                            <span class="adm-badge">
-                                                                {move || match action_sig.get() {
-                                                                    PolicyAction::Block => "Action: Block",
-                                                                    PolicyAction::Blur => "Action: Blur",
-                                                                }}
-                                                            </span>
-                                                            <span class="adm-badge adm-mono">
-                                                                {move || format!("{}@{}", id_sig.get(), gen_sig.get())}
-                                                            </span>
-                                                        </div>
-                                                    </aside>
                                                 </div>
                                             </article>
                                         }
@@ -1014,13 +1081,31 @@ pub fn SafetyTab(
                 }}
             </section>
 
+            {move || (!draft.safety_enabled.get() && has_enabled_policies.get()).then(|| view! {
+                <div class="adm-inline-warn adm-safety-off-notice" role="status">
+                    "Content Safety Engine is currently OFF — rules are saved as drafts and won't filter until enabled"
+                </div>
+            })}
+
             <div class="adm-save-bar">
                 <span class="adm-sub">
                     "Enforcement edits conservatively bump min_enforce_rev, advance grant_generation on scope changes, and activate via two-phase SitePolicyDO ACK."
                 </span>
-                <button type="submit" class="adm-btn adm-btn--primary" disabled=move || saving.get()>
-                    {move || if saving.get() { "Publishing…" } else { "Publish Content Safety Policy" }}
-                </button>
+                <div class="adm-save-bar-actions">
+                    {move || draft.dirty.get().then(|| view! {
+                        <button
+                            type="button"
+                            class="adm-btn"
+                            disabled=move || saving.get()
+                            on:click=on_discard
+                        >
+                            "Discard changes"
+                        </button>
+                    })}
+                    <button type="submit" class="adm-btn adm-btn--primary" disabled=move || saving.get()>
+                        {move || if saving.get() { "Publishing…" } else { "Publish Content Safety Policy" }}
+                    </button>
+                </div>
             </div>
         </form>
     }

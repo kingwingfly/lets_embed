@@ -96,6 +96,12 @@ pub struct TermsAcceptReq {
     pub sid: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgeConfirmReq {
+    #[serde(default)]
+    pub sid: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreviewBudgetReq {
     #[serde(default, alias = "path")]
@@ -252,4 +258,9 @@ pub async fn do_prefs_update(
 pub async fn do_terms_accept(env: &Env, do_key: &str, req: &TermsAcceptReq) -> Result<()> {
     let resp = call_do(env, do_key, Method::Post, "/terms-accept", Some(req)).await?;
     expect_ok(&resp, "do terms-accept")
+}
+
+pub async fn do_age_confirm(env: &Env, do_key: &str, req: &AgeConfirmReq) -> Result<()> {
+    let resp = call_do(env, do_key, Method::Post, "/age-confirm", Some(req)).await?;
+    expect_ok(&resp, "do age-confirm")
 }

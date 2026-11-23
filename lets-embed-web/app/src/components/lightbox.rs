@@ -3,10 +3,7 @@ use crate::{
         BlurredMediaCard, LikeButton, LikeVariant, Viewer,
         image_details::{list_post_images, list_post_videos},
     },
-    types::{
-        GalleryDensityState, PostItem, SafetyUiState, mask_to_ui, navigate_external,
-        unlock_href_for_mask,
-    },
+    types::{GalleryDensityState, PostItem, SafetyUiState, handle_mask_unlock, mask_to_ui},
     util::{
         encode_path, format_duration, layout_image_masonry, lock_body_scroll, navigate_from_modal,
         push_modal_history, trap_dialog_tab,
@@ -166,7 +163,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
     });
 
     let on_unlock = Callback::new(move |mask: GalleryMask| {
-        navigate_external(unlock_href_for_mask(&mask));
+        handle_mask_unlock(&mask, safety);
     });
 
     let render_videos = move || {

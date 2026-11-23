@@ -23,7 +23,7 @@ use site_access::{
 };
 
 use crate::{
-    api::{ProviderUpdateItem, SaveSafetyReq},
+    api::{ProviderUpdateItem, SaveAccessResp, SaveProvidersResp, SaveSafetyReq, SaveSafetyResp},
     crypto::{CryptoError, KeyRing, SecretKey},
     do_client::verify_do_activation_ack,
     security::{
@@ -34,8 +34,9 @@ use crate::{
     },
     settings::{
         AccessPolicy, ChainKind, LEGACY_UPGRADE_REQUIRED_MSG, SiteSettingsDocument,
-        build_catalog_field_errors, decode_site_settings_document,
-        ensure_v3_ready_for_non_safety_mutation, ensure_v3_ready_for_safety_mutation,
+        are_providers_unchanged, build_catalog_field_errors, compact_admin_safety_presets,
+        decode_site_settings_document, ensure_v3_ready_for_non_safety_mutation,
+        ensure_v3_ready_for_safety_mutation, is_access_unchanged, is_public_policy_unchanged,
         prepare_safety_update, valid_deposit_address, validate_provider_updates,
     },
 };
@@ -1150,4 +1151,219 @@ fn legacy_pre_v3_row_rejects_non_safety_mutations_and_unconfirmed_safety_saves()
         ensure_v3_ready_for_safety_mutation(v3_notice.as_deref(), false),
         Ok(())
     );
+}
+
+// ---------------------------------------------------------------------------
+// 8. No-Op Save Detection (Zero Spurious Revision Bumps) & Compact `IN` Presets
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_op_saves_do_not_bump_revision_for_access_safety_and_providers() {
+    // --- A. Access & Pricing ---
+    let stored_access = AccessPolicy {
+        login_required: false,
+        free_media_folders: vec!["/images/public".into()],
+        eth_deposit: "0x1111111111111111111111111111111111111111".into(),
+        ..AccessPolicy::default()
+    };
+    let mut rev = 7u64;
+
+    // Identical normalized payload (including trailing slash / case / whitespace normalization)
+    // is detected as unchanged and MUST NOT bump revision!
+    let noop_access = AccessPolicy {
+        free_media_folders: vec![" /images/public/ ".into()],
+        eth_deposit: " 0x1111111111111111111111111111111111111111 ".into(),
+        ..stored_access.clone()
+    }
+    .validate_and_normalize()
+    .expect("valid noop access");
+    assert!(is_access_unchanged(&stored_access, &noop_access));
+    if !is_access_unchanged(&stored_access, &noop_access) {
+        rev += 1;
+    }
+    assert_eq!(rev, 7, "no-op access save must not bump revision");
+
+    // Actual edit IS detected as changed and bumps revision.
+    let mut edited_access = stored_access.clone();
+    edited_access.signup_points += 500;
+    let edited_norm = edited_access.validate_and_normalize().unwrap();
+    assert!(!is_access_unchanged(&stored_access, &edited_norm));
+
+    // --- B. Content Safety / Similarity & Geo / Age & Legal ---
+    let mut stored_public = PublicSitePolicy {
+        schema_version: SITE_POLICY_SCHEMA_VERSION,
+        revision: 7,
+        min_enforce_rev: 5,
+        safety_enabled: true,
+        unclassified_mode: UnclassifiedMode::Placeholder,
+        fixed_blur_enabled: true,
+        policies: compact_admin_safety_presets(),
+        age_policy: AgeVerificationPolicy::SelfAttestation,
+        age_gate_trigger: AgeGateTrigger::JustInTime,
+        similarity: SimilarityDefaults {
+            dinov3_min: 0.25,
+            siglip2_min: 0.20,
+        },
+        geo: GeoPolicy {
+            blocked_countries: vec!["KP".into()],
+            block_unknown: false,
+            block_tor: true,
+        },
+        legal: LegalDocConfig::default(),
+        ..PublicSitePolicy::fresh_bootstrap()
+    };
+    stored_public.refresh_policy_digest();
+
+    let noop_safety_req = SaveSafetyReq {
+        revision: 7,
+        safety_enabled: stored_public.safety_enabled,
+        policies: stored_public.policies.clone(),
+        unclassified_mode: stored_public.unclassified_mode,
+        fixed_blur_enabled: stored_public.fixed_blur_enabled,
+        age_policy: stored_public.age_policy,
+        age_gate_trigger: stored_public.age_gate_trigger,
+        similarity: stored_public.similarity,
+        geo: GeoPolicy {
+            blocked_countries: vec![" kp ".into()],
+            ..stored_public.geo.clone()
+        },
+        legal: stored_public.legal.clone(),
+        confirm_policy_v3_migration: true,
+    };
+    let prepared_noop =
+        prepare_safety_update(&stored_public, &noop_safety_req, 8).expect("valid noop safety");
+    assert!(
+        is_public_policy_unchanged(&stored_public, &prepared_noop.next_policy),
+        "content-identical safety save must be detected as unchanged (ignoring next revision/digest)"
+    );
+    let legacy_notice: Option<&str> = None;
+    let effective_rev = if legacy_notice.is_none()
+        && is_public_policy_unchanged(&stored_public, &prepared_noop.next_policy)
+    {
+        stored_public.revision
+    } else {
+        prepared_noop.next_policy.revision
+    };
+    assert_eq!(effective_rev, 7, "no-op safety save must keep revision #7");
+
+    // Legacy upgrade MUST NOT be treated as unchanged even if fields look default.
+    let legacy_notice_some = Some("Legacy pre-v3 row");
+    let effective_rev_legacy = if legacy_notice_some.is_none()
+        && is_public_policy_unchanged(&stored_public, &prepared_noop.next_policy)
+    {
+        stored_public.revision
+    } else {
+        prepared_noop.next_policy.revision
+    };
+    assert_eq!(effective_rev_legacy, 8, "legacy upgrade must persist rev #8");
+
+    // Cosmetic edit (policy display name) IS detected as changed and bumps revision.
+    let mut cosmetic_req = noop_safety_req.clone();
+    cosmetic_req.policies[0].name = "Adult / R-18".into();
+    let prepared_cosmetic =
+        prepare_safety_update(&stored_public, &cosmetic_req, 8).expect("valid cosmetic edit");
+    assert!(!is_public_policy_unchanged(
+        &stored_public,
+        &prepared_cosmetic.next_policy
+    ));
+
+    // Similarity / Geo / Notice Banner edits ARE detected as changed.
+    let mut banner_req = noop_safety_req.clone();
+    banner_req.legal.notice_banner_enabled = true;
+    let prepared_banner =
+        prepare_safety_update(&stored_public, &banner_req, 8).expect("valid banner edit");
+    assert!(!is_public_policy_unchanged(
+        &stored_public,
+        &prepared_banner.next_policy
+    ));
+
+    // --- C. Auth Providers ---
+    // Fresh bootstrap (`enabled_providers = []`) vs all 9 default-disabled rows from UI => unchanged!
+    let all_disabled_items: Vec<ProviderUpdateItem> = AuthProviderId::ALL
+        .iter()
+        .map(|&id| ProviderUpdateItem {
+            id,
+            enabled: false,
+            display_name: None,
+            issuer: None,
+            public_client_id: None,
+            soft_birthday_check: false,
+            secret_value: None,
+            clear_secret: false,
+        })
+        .collect();
+    let validated_disabled =
+        validate_provider_updates(AgeVerificationPolicy::Off, &all_disabled_items)
+            .expect("valid default disabled providers");
+    assert!(
+        are_providers_unchanged(&[], &validated_disabled, false),
+        "submitting default disabled providers against empty bootstrap must be a no-op"
+    );
+
+    // Same public config WITH a secret update or clear MUST NOT be treated as unchanged.
+    assert!(
+        !are_providers_unchanged(&[], &validated_disabled, true),
+        "secret update/deletion must bypass no-op short-circuit"
+    );
+
+    // Enabling a provider MUST NOT be treated as unchanged.
+    let mut enable_google = all_disabled_items.clone();
+    enable_google
+        .iter_mut()
+        .find(|p| p.id == AuthProviderId::Google)
+        .unwrap()
+        .enabled = true;
+    let validated_google = validate_provider_updates(AgeVerificationPolicy::Off, &enable_google)
+        .expect("valid google enable");
+    assert!(!are_providers_unchanged(&[], &validated_google, false));
+    assert!(are_providers_unchanged(
+        &validated_google,
+        &validated_google,
+        false
+    ));
+
+    // Wire DTOs default `unchanged = false` when omitted and roundtrip `unchanged = true`.
+    let access_resp: SaveAccessResp = serde_json::from_str(
+        r#"{"ok":true,"pending_activation":false,"activation_status":"active","revision":7,"min_enforce_rev":5,"policy_digest":"d","digest":"d","access":{"login_required":true,"free_media_folders":[],"items":[{"price":1,"daily_free":0},{"price":5,"daily_free":0},{"price":100,"daily_free":0},{"price":10,"daily_free":0},{"price":100,"daily_free":0}],"plans":[{"price":20000,"views":2000,"searches":10},{"price":50000,"views":null,"searches":50}],"signup_points":3000,"points_per_usd":10000,"minimum_topup":1000,"eth_deposit":"","sol_deposit":""}}"#,
+    )
+    .expect("deserialize SaveAccessResp without unchanged");
+    assert!(!access_resp.unchanged);
+
+    let safety_resp: SaveSafetyResp = serde_json::from_str(
+        r#"{"ok":true,"unchanged":true,"pending_activation":false,"activation_status":"active","revision":7,"min_enforce_rev":5,"tightened":false,"terms_bumped":false,"auto_disabled_providers":[],"policy_digest":"d","vocab_digest":"v","policies":[],"legal":{}}"#,
+    )
+    .expect("deserialize SaveSafetyResp with unchanged=true");
+    assert!(safety_resp.unchanged);
+    assert_eq!(safety_resp.revision, 7);
+
+    let prov_resp: SaveProvidersResp = serde_json::from_str(
+        r#"{"ok":true,"unchanged":true,"pending_activation":false,"activation_status":"active","revision":7,"min_enforce_rev":5,"policy_digest":"d","digest":"d","age_policy":"off","current_kid":"k1:abc","has_prev_key":false,"providers":[]}"#,
+    )
+    .expect("deserialize SaveProvidersResp with unchanged=true");
+    assert!(prov_resp.unchanged);
+    assert_eq!(prov_resp.revision, 7);
+}
+
+#[test]
+fn compact_admin_safety_presets_use_single_tag_in_expr_and_validate_v3() {
+    let presets = compact_admin_safety_presets();
+    assert_eq!(presets.len(), 3);
+    for preset in &presets {
+        assert!(
+            preset.match_expr.starts_with("tag IN (") && preset.match_expr.ends_with(") >= 0.45"),
+            "preset '{}' must use compact `tag IN (...) >= 0.45` syntax, got: {}",
+            preset.id,
+            preset.match_expr
+        );
+        assert!(
+            !preset.match_expr.contains(" OR "),
+            "preset '{}' must not contain stacked OR clauses: {}",
+            preset.id,
+            preset.match_expr
+        );
+    }
+    let base = PublicSitePolicy::fresh_bootstrap();
+    let req = sample_safety_req(presets);
+    let prepared = prepare_safety_update(&base, &req, 1).expect("compact presets validate cleanly");
+    assert_eq!(prepared.next_policy.policies.len(), 3);
 }

@@ -6,9 +6,9 @@ pub mod safety;
 pub use advanced::{AdvancedSearchRequest, AdvancedSearchResult};
 pub use safety::{
     CLICK_REVEAL_MEDIA_CAP_TTL_SECS, CallerContext, CatalogValidationResult, CompiledPolicy,
-    ImageFacts, ImageParentPostFacts, MediaOutcome, MediaSigner, PUBLIC_MEDIA_CAP_TTL_SECS,
-    ParentPostFacts, RESTRICTED_MEDIA_CAP_TTL_SECS, RevealCheckResult, SafetyFilter,
-    SeedLockedError,
+    ImageFacts, ImageParentPostFacts, MASK_NO_UNLOCK_MARKER, MediaOutcome, MediaSigner,
+    PUBLIC_MEDIA_CAP_TTL_SECS, ParentPostFacts, RESTRICTED_MEDIA_CAP_TTL_SECS, RevealCheckResult,
+    SafetyFilter, SeedLockedError,
 };
 
 use std::{
@@ -1591,7 +1591,7 @@ impl Engine {
         tag: impl AsRef<str>,
         limit: i64,
         offset: i64,
-        safety: Option<&SafetyFilter<'_>>,
+        _safety: Option<&SafetyFilter<'_>>,
     ) -> anyhow::Result<Vec<Image>> {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
@@ -1636,12 +1636,8 @@ impl Engine {
             )
             SELECT i.id, i.name::TEXT AS name, i.width, i.height
             FROM img_match im
-            JOIN images i ON i.id = im.image_id
-            WHERE TRUE"#,
+            JOIN images i ON i.id = im.image_id"#,
         );
-        if let Some(sf) = safety {
-            sf.push_allowed_image_sql(&mut qb, "i");
-        }
         qb.push(" ORDER BY im.max_score DESC, im.image_id DESC LIMIT ");
         qb.push_bind(limit);
         qb.push(" OFFSET ");
@@ -1657,7 +1653,7 @@ impl Engine {
         limit: i64,
         offset: i64,
         min_similarity: Option<f32>,
-        safety: Option<&SafetyFilter<'_>>,
+        _safety: Option<&SafetyFilter<'_>>,
     ) -> anyhow::Result<Vec<Image>> {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
@@ -1675,7 +1671,6 @@ impl Engine {
             None,
             &std::collections::HashMap::new(),
             min_sim,
-            safety,
             limit,
             offset,
         )
@@ -1688,7 +1683,7 @@ impl Engine {
         limit: i64,
         offset: i64,
         min_similarity: Option<f32>,
-        safety: Option<&SafetyFilter<'_>>,
+        _safety: Option<&SafetyFilter<'_>>,
     ) -> anyhow::Result<Vec<Image>> {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
@@ -1705,7 +1700,6 @@ impl Engine {
             None,
             &std::collections::HashMap::new(),
             min_sim,
-            safety,
             limit,
             offset,
         )
@@ -1731,7 +1725,6 @@ impl Engine {
 
         // Single REPEATABLE READ READ ONLY transaction: authorize Clear seed, read its
         // `dinov3_embedding`, AND run the similar-images query against the SAME snapshot!
-        let safety_active = safety.is_some_and(SafetyFilter::is_filtering_active);
         let mut tx = safety::begin_repeatable_read_tx(&self.pool).await?;
         let id_vecs =
             Self::authorize_and_fetch_dino_seeds_in_tx(&mut tx, &[image_id], safety).await?;
@@ -1741,12 +1734,11 @@ impl Engine {
             image_id,
             exclude_post_id,
             min_sim,
-            safety,
             limit,
             offset,
         );
         tx.execute(VECTOR_STATEMENT_TIMEOUT_SQL).await?;
-        if exclude_post_id.is_some() || safety_active {
+        if exclude_post_id.is_some() {
             tx.execute("SET LOCAL hnsw.max_scan_tuples = 20000").await?;
         }
         let rows = qb.build().fetch_all(&mut *tx).await?;
@@ -1773,7 +1765,6 @@ impl Engine {
             bail!("Image #{image_id} not found or has no visual embedding")
         }
 
-        let safety_active = safety.is_some_and(SafetyFilter::is_filtering_active);
         let mut tx = safety::begin_repeatable_read_tx(&self.pool).await?;
         let id_vecs =
             Self::authorize_and_fetch_dino_seeds_in_tx(&mut tx, &[image_id], safety).await?;
@@ -1789,12 +1780,11 @@ impl Engine {
             image_id,
             exclude_post_id,
             min_sim,
-            safety,
             limit,
             offset,
         );
         tx.execute(VECTOR_STATEMENT_TIMEOUT_SQL).await?;
-        if exclude_post_id.is_some() || safety_active {
+        if exclude_post_id.is_some() {
             tx.execute("SET LOCAL hnsw.max_scan_tuples = 20000").await?;
         }
         let rows = qb.build().fetch_all(&mut *tx).await?;

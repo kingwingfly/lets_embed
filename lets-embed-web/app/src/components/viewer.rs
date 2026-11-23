@@ -8,7 +8,7 @@ use web_sys::TouchEvent;
 
 use crate::{
     components::{BlurredMediaCard, LikeButton, LikeVariant},
-    types::{SafetyUiState, mask_to_ui, navigate_external, unlock_href_for_mask},
+    types::{SafetyUiState, handle_mask_unlock, mask_to_ui},
     util::{lock_body_scroll, navigate_from_modal, push_modal_history, trap_dialog_tab},
 };
 
@@ -223,7 +223,7 @@ pub fn Viewer(
     };
 
     let on_unlock = Callback::new(move |mask: GalleryMask| {
-        navigate_external(unlock_href_for_mask(&mask));
+        handle_mask_unlock(&mask, safety);
     });
 
     let nav_slide = navigate.clone();

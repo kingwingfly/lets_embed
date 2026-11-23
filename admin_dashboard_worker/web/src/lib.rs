@@ -2,6 +2,7 @@
 //! (`ToastHost`, `QueryBuilder`, `ScoreInput`, `ToggleSwitch`, `FloatingHeader`).
 
 pub mod api;
+pub mod drafts;
 pub mod tabs;
 
 use leptos::prelude::*;
@@ -13,9 +14,10 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::{
     api::{
-        ActivationResult, OverviewResp, RetryActivationResp, SafetyConfigResp, get_json,
-        post_json_activatable,
+        ActivationResult, OverviewResp, ProvidersResp, RetryActivationResp, SafetyConfigResp,
+        get_json, post_json_activatable,
     },
+    drafts::provide_admin_drafts,
     tabs::{
         AdminTab, access::AccessTab, accounts::AccountsTab, age_legal::AgeLegalTab,
         providers::ProvidersTab, reports::ReportsTab, safety::SafetyTab,
@@ -38,8 +40,9 @@ fn set_window_hash(slug: &str) {
 
 #[component]
 pub fn AdminApp() -> impl IntoView {
-    // Provide global GCP-style top-right ToastStore at the root of `/admin`.
+    // Provide global GCP-style top-right ToastStore and root-level cross-tab AdminDraftStore.
     let toasts = provide_toast_store();
+    let drafts = provide_admin_drafts();
 
     let active_tab = RwSignal::new(initial_tab_from_window());
     let overview = RwSignal::new(Option::<OverviewResp>::None);
@@ -47,6 +50,11 @@ pub fn AdminApp() -> impl IntoView {
     let load_err = RwSignal::new(Option::<String>::None);
     let retrying = RwSignal::new(false);
     let providers_refresh = RwSignal::new(0u32);
+
+    let navigate_to = Callback::new(move |tab: AdminTab| {
+        active_tab.set(tab);
+        set_window_hash(tab.slug());
+    });
 
     let refresh_core = move || {
         spawn_local(async move {
@@ -72,6 +80,55 @@ pub fn AdminApp() -> impl IntoView {
         });
     };
 
+    let refresh_providers_if_loaded = move || {
+        if !drafts.providers.loaded.get_untracked() {
+            return;
+        }
+        spawn_local(async move {
+            if let Ok(resp) = get_json::<ProvidersResp>("/admin/api/providers").await {
+                if drafts.providers.dirty.get_untracked() {
+                    drafts.providers.sync_server_metadata(&resp);
+                } else {
+                    drafts.providers.hydrate(&resp);
+                }
+            }
+        });
+    };
+
+    // Hydrate root drafts ONLY when `!tab.dirty` so tab switches & cross-tab saves
+    // never overwrite unsaved edits. Always keep `revision` fresh to prevent stale-rev 409s.
+    Effect::new(move |_| {
+        if let Some(ov) = overview.get() {
+            if !drafts.access.dirty.get_untracked() {
+                drafts.access.hydrate(&ov);
+            } else {
+                drafts.access.revision.set(ov.revision);
+            }
+        }
+    });
+
+    Effect::new(move |_| {
+        if let Some(cfg) = safety.get() {
+            if !drafts.safety.dirty.get_untracked() {
+                drafts.safety.hydrate(&cfg, true);
+            } else {
+                drafts.safety.sync_revision(&cfg);
+            }
+
+            if !drafts.similarity_geo.dirty.get_untracked() {
+                drafts.similarity_geo.hydrate(&cfg);
+            } else {
+                drafts.similarity_geo.revision.set(cfg.revision);
+            }
+
+            if !drafts.age_legal.dirty.get_untracked() {
+                drafts.age_legal.hydrate(&cfg);
+            } else {
+                drafts.age_legal.revision.set(cfg.revision);
+            }
+        }
+    });
+
     Effect::new(move |_| {
         refresh_core();
     });
@@ -79,6 +136,7 @@ pub fn AdminApp() -> impl IntoView {
     let on_settings_saved = Callback::new(move |()| {
         refresh_core();
         providers_refresh.update(|n| *n = n.saturating_add(1));
+        refresh_providers_if_loaded();
     });
 
     let on_light_refresh = Callback::new(move |()| {
@@ -131,6 +189,7 @@ pub fn AdminApp() -> impl IntoView {
                     );
                     refresh_core();
                     providers_refresh.update(|n| *n = n.saturating_add(1));
+                    refresh_providers_if_loaded();
                 }
                 Ok(ActivationResult::PendingActivation(pending)) => {
                     toasts.warning(
@@ -263,12 +322,18 @@ pub fn AdminApp() -> impl IntoView {
                                     "adm-tab"
                                 }
                                 aria-selected=move || (active_tab.get() == tab).to_string()
-                                on:click=move |_| {
-                                    active_tab.set(tab);
-                                    set_window_hash(tab.slug());
-                                }
+                                on:click=move |_| navigate_to.run(tab)
                             >
                                 <span>{tab.label()}</span>
+                                {move || drafts.is_tab_dirty(tab).then(|| view! {
+                                    <span
+                                        class="adm-dirty-dot"
+                                        title="Unsaved draft changes"
+                                        aria-label="Unsaved draft changes"
+                                    >
+                                        "•"
+                                    </span>
+                                })}
                                 {(tab == AdminTab::Reports).then_some(move || {
                                     overview
                                         .get()
@@ -293,7 +358,11 @@ pub fn AdminApp() -> impl IntoView {
                             <AccountsTab on_mutated=on_light_refresh />
                         }.into_any(),
                         AdminTab::Safety => view! {
-                            <SafetyTab safety=safety on_saved=on_settings_saved />
+                            <SafetyTab
+                                safety=safety
+                                on_saved=on_settings_saved
+                                on_navigate=navigate_to
+                            />
                         }.into_any(),
                         AdminTab::SimilarityGeo => view! {
                             <SimilarityGeoTab safety=safety on_saved=on_settings_saved />

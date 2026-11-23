@@ -12,7 +12,7 @@ pub mod policy_sync;
 pub mod state;
 
 use crate::components::{ImageDetails, LikeStore, Results, SearchBar};
-use crate::types::{SafetyUiState, SiteUiConfig};
+use crate::types::{SafetyUiState, SiteUiConfig, navigate_external};
 use leptos::{prelude::*, task::spawn_local};
 use leptos_meta::{HashedStylesheet, Link, Meta, MetaTags, provide_meta_context};
 use leptos_router::{
@@ -21,18 +21,35 @@ use leptos_router::{
     path,
 };
 use lets_embed_ui::{
-    ReportDialog, ReportSubmission, ReportTargetKind, ToastHost, provide_toast_store,
+    AgeGateModal, ReportDialog, ReportSubmission, ReportTargetKind, ToastHost,
+    provide_toast_store, use_toast_store,
 };
+use site_access::{AgeGateTrigger, AgeVerificationPolicy};
 
 pub const SITE_DESCRIPTION: &str = "Explore and search curated artwork and photo albums by title, artist, tags, CLIP descriptions, and visual similarity on Let's Embed.";
 
+#[cfg(feature = "hydrate")]
+const GUEST_AGE_SPLASH_SESSION_KEY: &str = "lets-embed:age-splash-ack";
+
 pub fn shell(options: LeptosOptions) -> impl IntoView {
+    // Emit RTA adult rating meta tags strictly in SSR `<head>` (outside the
+    // Leptos-hydrated `<body><App /></body>` tree) so SSR and Hydrate DOM inside
+    // `<App />` are 100% identical and never trigger hydration cast panics.
+    #[cfg(feature = "ssr")]
+    let rta_meta_enabled = build_site_ui_config_from_context().rta_meta_enabled;
+    #[cfg(not(feature = "ssr"))]
+    let rta_meta_enabled = false;
+
     view! {
         <!DOCTYPE html>
         <html lang="en">
             <head>
                 <meta charset="utf-8"/>
                 <meta name="viewport" content="width=device-width, initial-scale=1"/>
+                {rta_meta_enabled.then(|| view! {
+                    <meta name="rating" content="RTA-5042-1996-1400-1577-RTA"/>
+                    <meta name="rating" content="adult"/>
+                })}
                 <AutoReload options=options.clone() />
                 <HydrationScripts options=options.clone() />
                 <MetaTags />
@@ -116,6 +133,219 @@ async fn post_content_report(sub: &ReportSubmission) -> Result<String, String> {
 #[cfg(not(feature = "hydrate"))]
 async fn post_content_report(_sub: &ReportSubmission) -> Result<String, String> {
     Err("Content reporting is only available in the browser.".to_string())
+}
+
+fn load_guest_age_splash_ack() -> bool {
+    #[cfg(feature = "hydrate")]
+    {
+        web_sys::window()
+            .and_then(|w| w.session_storage().ok().flatten())
+            .and_then(|s| s.get_item(GUEST_AGE_SPLASH_SESSION_KEY).ok().flatten())
+            .is_some_and(|v| v == "1")
+    }
+    #[cfg(not(feature = "hydrate"))]
+    {
+        false
+    }
+}
+
+fn save_guest_age_splash_ack() {
+    #[cfg(feature = "hydrate")]
+    {
+        if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
+            let _ = storage.set_item(GUEST_AGE_SPLASH_SESSION_KEY, "1");
+        }
+    }
+}
+
+fn broadcast_safety_invalidation(reason: &str) {
+    #[cfg(feature = "hydrate")]
+    {
+        use wasm_bindgen::JsValue;
+
+        let ts = js_sys::Date::now();
+        if let Ok(ch) = web_sys::BroadcastChannel::new(lets_embed_ui::browser::SAFETY_CHANNEL_NAME)
+        {
+            let payload = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(
+                &payload,
+                &JsValue::from_str("type"),
+                &JsValue::from_str("invalidate"),
+            );
+            let _ = js_sys::Reflect::set(
+                &payload,
+                &JsValue::from_str("reason"),
+                &JsValue::from_str(reason),
+            );
+            let _ = js_sys::Reflect::set(
+                &payload,
+                &JsValue::from_str("ts"),
+                &JsValue::from_f64(ts),
+            );
+            let _ = ch.post_message(&payload);
+            ch.close();
+        }
+        if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+            let _ = storage.set_item("lets-embed:safety-invalidate", &format!("{reason}:{ts:.0}"));
+        }
+    }
+    #[cfg(not(feature = "hydrate"))]
+    {
+        let _ = reason;
+    }
+}
+
+#[cfg(feature = "hydrate")]
+async fn post_age_confirm() -> Result<(), (u16, String)> {
+    use wasm_bindgen::{JsCast, JsValue};
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::{Headers, RequestInit, Response};
+
+    let window = web_sys::window().ok_or((0, "Browser window unavailable.".to_string()))?;
+    let opts = RequestInit::new();
+    opts.set_method("POST");
+
+    let headers = Headers::new().map_err(|e| (0, format!("{e:?}")))?;
+    headers
+        .set("Accept", "application/json")
+        .map_err(|e| (0, format!("{e:?}")))?;
+    headers
+        .set("Content-Type", "application/json")
+        .map_err(|e| (0, format!("{e:?}")))?;
+    headers
+        .set("X-Requested-With", "fetch")
+        .map_err(|e| (0, format!("{e:?}")))?;
+    opts.set_headers(&headers);
+    opts.set_body(&JsValue::from_str("{}"));
+
+    let resp = JsFuture::from(window.fetch_with_str_and_init("/user/api/age-confirm", &opts))
+        .await
+        .map_err(|e| (0, format!("Network error: {e:?}")))?;
+    let resp: Response = resp
+        .dyn_into()
+        .map_err(|_| (0, "Unexpected response type.".to_string()))?;
+    let status = resp.status();
+    if resp.ok() {
+        return Ok(());
+    }
+    let text = JsFuture::from(resp.text().map_err(|e| (status, format!("{e:?}")))?)
+        .await
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_default();
+    let msg = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .or_else(|| v.get("message"))
+                .and_then(|e| e.as_str())
+                .map(ToOwned::to_owned)
+        })
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| match status {
+            401 => "Please sign in to save your 18+ confirmation.".to_string(),
+            _ => format!("Age confirmation failed (HTTP {status})."),
+        });
+    Err((status, msg))
+}
+
+#[cfg(not(feature = "hydrate"))]
+async fn post_age_confirm() -> Result<(), (u16, String)> {
+    Err((
+        0,
+        "Age confirmation is only available in the browser.".to_string(),
+    ))
+}
+
+#[component]
+fn GlobalAgeGateModal() -> impl IntoView {
+    let safety = expect_context::<SafetyUiState>();
+    let toast = use_toast_store();
+    let submitting = RwSignal::new(false);
+    let error: RwSignal<Option<String>> = RwSignal::new(None);
+
+    let open = Signal::derive(move || safety.age_gate_open.get());
+    let is_authenticated = Signal::derive(move || safety.caller_authenticated.get());
+    let subtitle = Signal::derive(move || {
+        if safety.caller_authenticated.get() {
+            "Your 18+ confirmation will be saved to your account and the gallery will refresh immediately.".to_string()
+        } else if safety.age_gate_from_card.get() {
+            "Sign-in is required to record your 18+ confirmation on your account and unlock restricted cards. Confirming will take you to sign in.".to_string()
+        } else {
+            "Confirm for this browsing session, or sign in to save your 18+ confirmation on your account.".to_string()
+        }
+    });
+
+    Effect::new(move |_| {
+        if safety.age_gate_open.get() {
+            submitting.set(false);
+            error.set(None);
+        }
+    });
+
+    let dismiss_modal = move || {
+        if !safety.caller_authenticated.get_untracked() && !safety.age_gate_from_card.get_untracked()
+        {
+            save_guest_age_splash_ack();
+        }
+        safety.close_age_gate();
+    };
+
+    let on_close = Callback::new(move |()| dismiss_modal());
+    let on_leave = Callback::new(move |()| dismiss_modal());
+
+    let on_confirm = Callback::new(move |()| {
+        if submitting.get_untracked() {
+            return;
+        }
+        if !safety.caller_authenticated.get_untracked() {
+            if safety.age_gate_from_card.get_untracked() {
+                safety.close_age_gate();
+                navigate_external("/user/login?next=/user/account%23age-confirm");
+            } else {
+                save_guest_age_splash_ack();
+                safety.close_age_gate();
+            }
+            return;
+        }
+        submitting.set(true);
+        error.set(None);
+        spawn_local(async move {
+            match post_age_confirm().await {
+                Ok(()) => {
+                    let _ = safety.caller_age_verified.try_set(true);
+                    safety.close_age_gate();
+                    toast.success(
+                        "Age 18+ confirmed",
+                        Some("Your 18+ confirmation has been saved.".to_string()),
+                    );
+                    broadcast_safety_invalidation("policy_change");
+                    let _ = safety.reload_epoch.try_update(|e| *e = e.wrapping_add(1));
+                }
+                Err((status, msg)) => {
+                    if status == 401 {
+                        let _ = safety.caller_authenticated.try_set(false);
+                    }
+                    let _ = error.try_set(Some(msg.clone()));
+                    toast.error("Age confirmation failed", Some(msg));
+                }
+            }
+            let _ = submitting.try_set(false);
+        });
+    });
+
+    view! {
+        <AgeGateModal
+            open=open
+            subtitle=subtitle
+            is_authenticated=is_authenticated
+            submitting=Signal::derive(move || submitting.get())
+            error=Signal::derive(move || error.get())
+            on_confirm=on_confirm
+            on_leave=on_leave
+            on_close=on_close
+        />
+    }
 }
 
 #[component]
@@ -209,27 +439,48 @@ pub fn App() -> impl IntoView {
     provide_context(LikeStore::new());
 
     let safety_ui = SafetyUiState::new();
-    #[cfg(feature = "ssr")]
-    let initial_rta = build_site_ui_config_from_context().rta_meta_enabled;
-    #[cfg(not(feature = "ssr"))]
-    let initial_rta = false;
-
     provide_context(safety_ui);
 
+    // Apply `SiteUiConfig` strictly inside a client `Effect` (never synchronously during
+    // SSR or initial hydration) so NoticeBanner and AgeGateModal never diverge SSR/hydrate DOM.
     let site_config_res = OnceResource::new(async move { fetch_site_config().await.ok() });
+    let site_wide_age_checked = StoredValue::new(false);
     Effect::new(move |_| {
         if let Some(Some(cfg)) = site_config_res.get() {
             safety_ui.apply_site_config(&cfg);
+            if !site_wide_age_checked.get_value() {
+                site_wide_age_checked.set_value(true);
+                if cfg.age_policy == AgeVerificationPolicy::SelfAttestation
+                    && cfg.age_gate_trigger == AgeGateTrigger::SiteWideSplash
+                    && !cfg.caller_age_verified
+                    && (cfg.caller_authenticated || !load_guest_age_splash_ack())
+                {
+                    safety_ui.open_age_gate_site_wide();
+                }
+            }
         }
     });
+
+    // Re-sync SiteUiConfig on cross-tab auth / policy invalidations so caller flags stay fresh.
+    #[cfg(feature = "hydrate")]
+    {
+        let last_inv = StoredValue::new(safety_ui.invalidation_epoch.get_untracked());
+        Effect::new(move |_| {
+            let cur = safety_ui.invalidation_epoch.get();
+            if cur != last_inv.get_value() {
+                last_inv.set_value(cur);
+                spawn_local(async move {
+                    if let Ok(cfg) = fetch_site_config().await {
+                        safety_ui.apply_site_config(&cfg);
+                    }
+                });
+            }
+        });
+    }
 
     view! {
         <Meta property="og:site_name" content="Let's Embed"/>
         <Meta name="twitter:card" content="summary_large_image"/>
-        {initial_rta.then(|| view! {
-            <Meta name="rating" content="RTA-5042-1996-1400-1577-RTA"/>
-            <Meta name="rating" content="adult"/>
-        })}
         <Router>
             <div class="min-h-screen w-full flex flex-col overflow-x-clip bg-gradient-to-b from-sky-50 via-white to-sky-100">
                 <main class="flex-1 w-full">
@@ -252,6 +503,7 @@ pub fn App() -> impl IntoView {
                     </div>
                 </footer>
                 <GlobalReportDialog />
+                <GlobalAgeGateModal />
                 <ToastHost />
             </div>
         </Router>
@@ -261,26 +513,26 @@ pub fn App() -> impl IntoView {
 #[cfg(feature = "ssr")]
 fn build_site_ui_config(ctx: &state::RequestSafetyContext) -> SiteUiConfig {
     let pol = &ctx.policy.policy;
-    let notice_html = if pol.legal.notice_banner_enabled && !pol.legal.notice_banner_md.trim().is_empty() {
-        Some(legal::render_sanitized_markdown(&pol.legal.notice_banner_md))
-    } else {
-        None
-    };
-    let notice_key = if pol.legal.notice_banner_md.is_empty() {
-        String::new()
-    } else {
-        site_access::compute_terms_digest(&pol.legal.notice_banner_md)
-    };
+    let effective_notice_md = pol.legal.effective_notice_banner_md();
+    let notice_html = effective_notice_md.map(legal::render_sanitized_markdown);
+    let notice_key = effective_notice_md
+        .map(site_access::compute_terms_digest)
+        .unwrap_or_default();
     SiteUiConfig {
         is_managed: ctx.mode.is_managed(),
         safety_enabled: ctx.policy.is_enabled(),
         default_dinov3_min: pol.similarity.dinov3_min,
         default_siglip2_min: pol.similarity.siglip2_min,
-        notice_banner_enabled: pol.legal.notice_banner_enabled && notice_html.is_some(),
+        notice_banner_enabled: notice_html.is_some(),
         notice_banner_html: notice_html,
         notice_banner_key: notice_key,
         rta_meta_enabled: pol.legal.rta_meta_enabled,
         noindex_restricted: pol.legal.noindex_restricted,
+        age_policy: pol.age_policy,
+        age_gate_trigger: pol.age_gate_trigger,
+        caller_authenticated: ctx.caller.is_authenticated(),
+        caller_age_verified: ctx.caller.age_verified,
+        caller_terms_accepted: ctx.caller.terms_accepted,
     }
 }
 
@@ -364,28 +616,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ssr_emits_rta_adult_meta_tags_when_enabled_in_policy() {
+    async fn ssr_emits_rta_adult_meta_tags_in_shell_head_without_diverging_app_dom() {
         leptos_axum::generate_route_list(App);
-        let mut pol = site_access::PublicSitePolicy::default();
-        pol.legal.rta_meta_enabled = true;
-        pol.refresh_policy_digest();
-        let compiled = search_engine::CompiledPolicy::compile(pol).unwrap();
-        let ctx = state::RequestSafetyContext::standalone(std::sync::Arc::new(compiled), false);
 
-        let render = leptos_axum::render_app_to_stream(|| {
-            shell(
-                LeptosOptions::builder()
-                    .output_name("lets-embed-web")
-                    .build(),
-            )
-        });
-        let mut req = Request::builder().uri("/").body(Body::empty()).unwrap();
-        req.extensions_mut().insert(ctx);
-        let response = render(req).await;
-        let bytes = to_bytes(response.into_body(), 1_000_000).await.unwrap();
-        let html = std::str::from_utf8(&bytes).unwrap();
-        let (head, _) = html.split_once("</head>").expect("gallery document");
-        assert!(head.contains("RTA-5042-1996-1400-1577-RTA"));
-        assert!(head.contains(r#"content="adult""#));
+        let render_with = |rta_enabled: bool, notice_enabled: bool| async move {
+            let mut pol = site_access::PublicSitePolicy::default();
+            pol.legal.rta_meta_enabled = rta_enabled;
+            pol.legal.notice_banner_enabled = notice_enabled;
+            pol.legal.notice_banner_md = String::new();
+            pol.age_policy = AgeVerificationPolicy::SelfAttestation;
+            pol.age_gate_trigger = AgeGateTrigger::SiteWideSplash;
+            pol.refresh_policy_digest();
+            let compiled = search_engine::CompiledPolicy::compile(pol).unwrap();
+            let ctx = state::RequestSafetyContext::standalone(std::sync::Arc::new(compiled), false);
+
+            let render = leptos_axum::render_app_to_stream(|| {
+                shell(
+                    LeptosOptions::builder()
+                        .output_name("lets-embed-web")
+                        .build(),
+                )
+            });
+            let mut req = Request::builder().uri("/").body(Body::empty()).unwrap();
+            req.extensions_mut().insert(ctx);
+            let response = render(req).await;
+            let bytes = to_bytes(response.into_body(), 1_000_000).await.unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        };
+
+        let html_on = render_with(true, true).await;
+        let html_off = render_with(false, false).await;
+
+        let (head_on, body_on) = html_on.split_once("</head>").expect("rta-on document");
+        let (head_off, body_off) = html_off.split_once("</head>").expect("rta-off document");
+
+        assert!(head_on.contains("RTA-5042-1996-1400-1577-RTA"));
+        assert!(head_on.contains(r#"content="adult""#));
+        assert!(!head_off.contains("RTA-5042-1996-1400-1577-RTA"));
+
+        // Inside `<body>`, the `<App />` DOM before trailing `<script>` hydration payloads
+        // MUST be 100% identical regardless of `rta_meta_enabled` / `notice_banner_enabled` /
+        // `age_gate_trigger` so SSR and client hydration NEVER diverge!
+        let app_dom_on = body_on.split("<script").next().unwrap_or(body_on);
+        let app_dom_off = body_off.split("<script").next().unwrap_or(body_off);
+        assert_eq!(app_dom_on, app_dom_off);
+        assert!(!app_dom_on.contains("le-notice"));
+        assert!(!app_dom_on.contains("le-age-gate-dialog"));
+    }
+
+    #[test]
+    fn build_site_ui_config_uses_default_notice_banner_fallback_and_caller_flags() {
+        let mut pol = site_access::PublicSitePolicy::default();
+        pol.legal.notice_banner_enabled = true;
+        pol.legal.notice_banner_md = "   ".to_string();
+        pol.age_policy = AgeVerificationPolicy::SelfAttestation;
+        pol.age_gate_trigger = AgeGateTrigger::JustInTime;
+        pol.refresh_policy_digest();
+        let compiled = std::sync::Arc::new(search_engine::CompiledPolicy::compile(pol).unwrap());
+
+        let mut ctx = state::RequestSafetyContext::standalone(compiled, false);
+        ctx.caller = search_engine::CallerContext {
+            actor: site_access::ActorBinding::User {
+                sub: "usr-42".into(),
+                sid: "sid-42".into(),
+            },
+            age_verified: true,
+            terms_accepted: false,
+            ..search_engine::CallerContext::default()
+        };
+
+        let cfg = build_site_ui_config(&ctx);
+        assert!(cfg.notice_banner_enabled);
+        let html = cfg
+            .notice_banner_html
+            .as_deref()
+            .expect("default notice banner HTML");
+        assert!(html.contains("/content-policy"));
+        assert!(html.contains("/user/account"));
+        assert_eq!(
+            cfg.notice_banner_key,
+            site_access::compute_terms_digest(site_access::DEFAULT_NOTICE_BANNER_MD)
+        );
+        assert_eq!(cfg.age_policy, AgeVerificationPolicy::SelfAttestation);
+        assert_eq!(cfg.age_gate_trigger, AgeGateTrigger::JustInTime);
+        assert!(cfg.caller_authenticated);
+        assert!(cfg.caller_age_verified);
+        assert!(!cfg.caller_terms_accepted);
     }
 }

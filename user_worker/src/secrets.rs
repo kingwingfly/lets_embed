@@ -1,10 +1,9 @@
 //! Dedicated AES-256-GCM secret store for `provider_secrets` (fixes M3).
 //!
 //! Resolves the 32-byte AES-256-GCM key via `site_access::resolve_provider_aes_key`:
-//! 1. Explicit override `PROVIDER_SECRETS_KEY` (or legacy `SETTINGS_ENCRYPTION_KEY`)
-//! 2. RFC 5869 HKDF-SHA256 derivation from `SITE_SECRET` (`KeyDomain::ProviderSecrets`)
-//! 3. Optional `PROVIDER_SECRETS_KEY_PREV` (or legacy `SETTINGS_ENCRYPTION_KEY_PREV`)
-//!    for zero-downtime key rotation.
+//! 1. RFC 5869 HKDF-SHA256 derivation from `SITE_SECRET` (`KeyDomain::ProviderSecrets`)
+//! 2. Optional explicit override `PROVIDER_SECRETS_KEY` (takes precedence when set)
+//! 3. Optional `PROVIDER_SECRETS_KEY_PREV` for zero-downtime key rotation.
 //!
 //! NEVER derived from `JWT_SECRET` or `SESSION_SECRET`. Every decryption validates
 //! exact AAD = `"{deployment_id}|{provider_id}|{field_name}"` and fails closed.
@@ -67,7 +66,7 @@ impl fmt::Display for SecretError {
         match self {
             Self::MissingEncryptionKey => write!(
                 f,
-                "missing provider encryption key (configure SITE_SECRET, PROVIDER_SECRETS_KEY, or SETTINGS_ENCRYPTION_KEY)"
+                "missing provider encryption key (configure SITE_SECRET or optional PROVIDER_SECRETS_KEY)"
             ),
             Self::InvalidEncryptionKey(msg) => write!(f, "invalid encryption key: {msg}"),
             Self::InvalidNonceLength => write!(f, "invalid AES-GCM nonce length"),
@@ -178,8 +177,9 @@ impl KeyRing {
     }
 
     /// Resolve the active provider-secrets AES-256-GCM keyring via `site_access::kdf`:
-    /// - Current key precedence: `PROVIDER_SECRETS_KEY` > `SETTINGS_ENCRYPTION_KEY` > `SITE_SECRET` (HKDF `KeyDomain::ProviderSecrets`).
-    /// - Previous rotation key precedence: `PROVIDER_SECRETS_KEY_PREV` > `SETTINGS_ENCRYPTION_KEY_PREV`.
+    /// - Defaults to `SITE_SECRET` (HKDF `KeyDomain::ProviderSecrets`), with optional
+    ///   explicit `PROVIDER_SECRETS_KEY` override (and silent legacy alias compatibility).
+    /// - Optional `PROVIDER_SECRETS_KEY_PREV` rotation key.
     pub fn resolve(
         provider_secrets_key: Option<&str>,
         settings_encryption_key: Option<&str>,
@@ -283,7 +283,7 @@ fn encrypt_secret_with_nonce(
 }
 
 /// Decrypt a `provider_secrets` row validating AES-256-GCM tag and exact AAD.
-/// Supports zero-downtime key rotation via `SETTINGS_ENCRYPTION_KEY_PREV` and
+/// Supports zero-downtime key rotation via `PROVIDER_SECRETS_KEY_PREV` and
 /// ALWAYS fails closed on tag/AAD mismatch.
 pub fn decrypt_secret(
     ring: &KeyRing,
@@ -330,8 +330,8 @@ pub fn decrypt_secret(
     Err(SecretError::DecryptFailed)
 }
 
-/// Load a provider secret from D1 `provider_secrets` (decrypting with
-/// `SETTINGS_ENCRYPTION_KEY` / `SETTINGS_ENCRYPTION_KEY_PREV` and validating AAD).
+/// Load a provider secret from D1 `provider_secrets` (decrypting via the
+/// `SITE_SECRET` / `PROVIDER_SECRETS_KEY` keyring and validating AAD).
 ///
 /// If a row exists in D1 and decryption fails, this FAILS CLOSED (`Err`) and
 /// NEVER silently falls back to env vars. Only when no D1 row exists does it
@@ -591,5 +591,8 @@ mod tests {
             KeyRing::resolve(Some("  "), Some(""), Some(" "), None, None).unwrap_err(),
             SecretError::MissingEncryptionKey
         );
+        let err_msg = SecretError::MissingEncryptionKey.to_string();
+        assert!(err_msg.contains("SITE_SECRET"));
+        assert!(!err_msg.contains("SETTINGS_ENCRYPTION_KEY"));
     }
 }

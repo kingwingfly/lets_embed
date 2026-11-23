@@ -379,7 +379,6 @@ pub(crate) fn build_metadata_images_query(
     tag_map: &HashMap<String, Vec<i64>>,
     positive_tags: &[String],
     sort: AdvancedSort,
-    safety: Option<&SafetyFilter<'_>>,
     limit: i64,
     offset: i64,
 ) -> QueryBuilder<Postgres> {
@@ -390,9 +389,6 @@ pub(crate) fn build_metadata_images_query(
             "WITH matched AS (SELECT i.id, i.name::TEXT AS name, i.width, i.height FROM images i WHERE ",
         );
         push_image_predicate(&mut qb, meta, tag_map);
-        if let Some(sf) = safety {
-            sf.push_allowed_image_sql(&mut qb, "i");
-        }
         qb.push(") SELECT m.id, m.name, m.width, m.height FROM matched m ORDER BY ");
         if pos_tag_clauses.len() == 1 {
             push_tag_clause_score(&mut qb, &pos_tag_clauses[0]);
@@ -419,9 +415,6 @@ pub(crate) fn build_metadata_images_query(
         "SELECT i.id, i.name::TEXT AS name, i.width, i.height FROM images i WHERE ",
     );
     push_image_predicate(&mut qb, meta, tag_map);
-    if let Some(sf) = safety {
-        sf.push_allowed_image_sql(&mut qb, "i");
-    }
     qb.push(" ORDER BY i.id DESC LIMIT ");
     qb.push_bind(limit);
     qb.push(" OFFSET ");
@@ -434,12 +427,14 @@ pub(crate) fn build_metadata_images_query(
 /// negated leaves `NOT clip:`, `NOT dino:`, `NOT upload:`), with a hard `LIMIT`
 /// (zero `WITH TIES`), ranked by the first declared positive vector (`primary_positive_vector`)
 /// and stable asset ID `DESC`.
-#[allow(clippy::too_many_arguments)]
+///
+/// Matching rows are returned unfiltered and projected through Policy v3 (`project_images`)
+/// so locked items render cleanly as zero-leak `Placeholder` cards and blurred items render
+/// as `Blurred` cards (while stored `dino:<id>` seeds remain strictly Clear-only).
 pub(crate) fn build_vector_clauses_query(
     clauses: &[ResolvedVectorClause],
     meta_filter: Option<&QueryExpr>,
     tag_map: &HashMap<String, Vec<i64>>,
-    safety: Option<&SafetyFilter<'_>>,
     limit: i64,
     offset: i64,
 ) -> QueryBuilder<Postgres> {
@@ -470,9 +465,6 @@ pub(crate) fn build_vector_clauses_query(
         if let Some(meta) = meta_filter {
             qb.push(" AND ");
             push_image_predicate(&mut qb, meta, tag_map);
-        }
-        if let Some(sf) = safety {
-            sf.push_allowed_image_sql(&mut qb, "i");
         }
         qb.push(" ORDER BY i.");
         qb.push(primary.col);
@@ -539,9 +531,6 @@ pub(crate) fn build_vector_clauses_query(
         qb.push(" AND ");
         push_image_predicate(&mut qb, meta, tag_map);
     }
-    if let Some(sf) = safety {
-        sf.push_allowed_image_sql(&mut qb, "i");
-    }
     qb.push(" ORDER BY i.id DESC LIMIT ");
     qb.push(VECTOR_CANDIDATE_LIMIT);
     qb.push(") SELECT c.id, c.name, c.width, c.height FROM cands c JOIN images i ON i.id = c.id WHERE TRUE");
@@ -574,7 +563,6 @@ pub(crate) fn build_similar_images_query(
     seed_id: i64,
     exclude_post_id: Option<i64>,
     min_similarity: Option<f32>,
-    safety: Option<&SafetyFilter<'_>>,
     limit: i64,
     offset: i64,
 ) -> QueryBuilder<Postgres> {
@@ -590,9 +578,6 @@ pub(crate) fn build_similar_images_query(
         );
         qb.push_bind(post_id);
         qb.push(")");
-    }
-    if let Some(sf) = safety {
-        sf.push_allowed_image_sql(&mut qb, "i");
     }
     qb.push(" ORDER BY i.dinov3_embedding <=> ");
     qb.push_bind(seed_vec);
@@ -861,14 +846,7 @@ impl Engine {
 
         if !plan.has_vectors() {
             let images = self
-                .query_images_metadata_only(
-                    plan,
-                    &tag_map,
-                    req.sort,
-                    safety,
-                    req.limit,
-                    req.offset,
-                )
+                .query_images_metadata_only(plan, &tag_map, req.sort, req.limit, req.offset)
                 .await?;
             return Ok(AdvancedSearchResult::Images(images));
         }
@@ -959,7 +937,6 @@ impl Engine {
                 &resolved_clauses,
                 plan.meta_filter.as_ref(),
                 &tag_map,
-                safety,
                 req.limit,
                 req.offset,
             )
@@ -973,7 +950,6 @@ impl Engine {
         plan: &QueryPlan,
         tag_map: &HashMap<String, Vec<i64>>,
         sort: AdvancedSort,
-        safety: Option<&SafetyFilter<'_>>,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<Image>> {
@@ -1004,11 +980,8 @@ impl Engine {
                 qb.push_bind(min_score);
             }
             qb.push(
-                " GROUP BY wti.image_id) SELECT i.id, i.name::TEXT AS name, i.width, i.height FROM img_match im JOIN images i ON i.id = im.image_id WHERE TRUE",
+                " GROUP BY wti.image_id) SELECT i.id, i.name::TEXT AS name, i.width, i.height FROM img_match im JOIN images i ON i.id = im.image_id",
             );
-            if let Some(sf) = safety {
-                sf.push_allowed_image_sql(&mut qb, "i");
-            }
             qb.push(" ORDER BY im.max_score DESC, im.image_id DESC LIMIT ");
             qb.push_bind(limit);
             qb.push(" OFFSET ");
@@ -1022,7 +995,6 @@ impl Engine {
             tag_map,
             &plan.positive_tags,
             sort,
-            safety,
             limit,
             offset,
         );
@@ -1038,7 +1010,6 @@ impl Engine {
         meta_filter: Option<&QueryExpr>,
         tag_map: &HashMap<String, Vec<i64>>,
         min_similarity: Option<f32>,
-        safety: Option<&SafetyFilter<'_>>,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<Image>> {
@@ -1048,27 +1019,23 @@ impl Engine {
             vec,
             threshold: min_similarity,
         }];
-        self.query_images_vector_clauses(&clauses, meta_filter, tag_map, safety, limit, offset)
+        self.query_images_vector_clauses(&clauses, meta_filter, tag_map, limit, offset)
             .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn query_images_vector_clauses(
         &self,
         clauses: &[ResolvedVectorClause],
         meta_filter: Option<&QueryExpr>,
         tag_map: &HashMap<String, Vec<i64>>,
-        safety: Option<&SafetyFilter<'_>>,
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<Image>> {
-        let safety_active = safety.is_some_and(SafetyFilter::is_filtering_active);
-        let mut qb =
-            build_vector_clauses_query(clauses, meta_filter, tag_map, safety, limit, offset);
+        let mut qb = build_vector_clauses_query(clauses, meta_filter, tag_map, limit, offset);
 
         let mut tx = begin_repeatable_read_tx(&self.pool).await?;
         tx.execute(VECTOR_STATEMENT_TIMEOUT_SQL).await?;
-        if meta_filter.is_some() || safety_active || clauses.len() > 1 {
+        if meta_filter.is_some() || clauses.len() > 1 {
             tx.execute("SET LOCAL hnsw.max_scan_tuples = 20000").await?;
         }
         let rows = qb.build().fetch_all(&mut *tx).await?;
@@ -1180,7 +1147,7 @@ mod tests {
             },
         ];
 
-        let mut qb = build_vector_clauses_query(&clauses, None, &HashMap::new(), None, 50, 0);
+        let mut qb = build_vector_clauses_query(&clauses, None, &HashMap::new(), 50, 0);
         let built = qb.build();
         let sql_str = built.sql();
         let sql = sql_str.as_str();
@@ -1203,8 +1170,7 @@ mod tests {
             vec: v1.clone(),
             threshold: None,
         }];
-        let mut qb_neg =
-            build_vector_clauses_query(&neg_only, None, &HashMap::new(), None, 25, 0);
+        let mut qb_neg = build_vector_clauses_query(&neg_only, None, &HashMap::new(), 25, 0);
         let built_neg = qb_neg.build();
         let sql_str_neg = built_neg.sql();
         let sql_neg = sql_str_neg.as_str();
@@ -1214,7 +1180,7 @@ mod tests {
         assert!(sql_neg.contains("ORDER BY c.id DESC LIMIT"));
 
         // Similar images query ALSO uses hard LIMIT (zero WITH TIES)
-        let mut qb_sim = build_similar_images_query(v1, 42, Some(7), Some(0.6), None, 50, 0);
+        let mut qb_sim = build_similar_images_query(v1, 42, Some(7), Some(0.6), 50, 0);
         let built_sim = qb_sim.build();
         let sql_str_sim = built_sim.sql();
         let sql_sim = sql_str_sim.as_str();
@@ -1236,7 +1202,6 @@ mod tests {
             &tag_map,
             &plan_two.positive_tags,
             AdvancedSort::Relevance,
-            None,
             50,
             0,
         );
@@ -1251,5 +1216,137 @@ mod tests {
         );
         assert!(sql_two.contains("wti.score >= $2"));
         assert!(sql_two.contains("/ 2.0) DESC"));
+    }
+
+    #[test]
+    fn search_queries_return_matching_locked_items_for_placeholder_projection_while_seeds_stay_clear_only() {
+        use crate::safety::{CallerContext, CompiledPolicy, ImageFacts, MediaSigner};
+        use search_types::ProjectedImage;
+        use site_access::{
+            AgeVerificationPolicy, ContentPolicy, PlaceholderPreset, PolicyAction, PolicyBypass,
+            PublicSitePolicy,
+        };
+
+        // 1. Metadata, vector, and similar result SQL queries do NOT inject `push_caller_allowed_image_sql`
+        //    exclusion clauses so locked/blurred matches are returned and rendered as Placeholder/Blurred cards.
+        let mut tag_map = HashMap::new();
+        tag_map.insert("maid".to_string(), vec![77]);
+        let (_, plan) = parse_and_compile("tag:maid").unwrap();
+        let mut meta_qb = build_metadata_images_query(
+            plan.meta_filter.as_ref().unwrap(),
+            &tag_map,
+            &plan.positive_tags,
+            AdvancedSort::Relevance,
+            50,
+            0,
+        );
+        let meta_built = meta_qb.build();
+        let meta_sql_str = meta_built.sql();
+        let meta_sql = meta_sql_str.as_str();
+        assert!(
+            !meta_sql.contains("wd_min_persisted_score")
+                && !meta_sql.contains("process_status"),
+            "tag search must not drop locked items in SQL: {meta_sql}"
+        );
+
+        let seed_vec = HalfVector::from_f32_slice(&[1.0, 0.0, 0.0, 0.0]);
+        let mut sim_qb = build_similar_images_query(seed_vec, 10, None, Some(0.5), 20, 0);
+        let sim_built = sim_qb.build();
+        let sim_sql_str = sim_built.sql();
+        let sim_sql = sim_sql_str.as_str();
+        assert!(
+            !sim_sql.contains("wd_min_persisted_score")
+                && !sim_sql.contains("process_status"),
+            "similar results must not drop locked items in SQL: {sim_sql}"
+        );
+
+        // 2. Projecting a matched locked image yields zero-leak Placeholder while a blurred
+        //    image yields Blurred, and seed authorization strictly rejects both non-Clear outcomes.
+        let mut pol = PublicSitePolicy {
+            revision: 4,
+            min_enforce_rev: 2,
+            safety_enabled: true,
+            fixed_blur_enabled: true,
+            age_policy: AgeVerificationPolicy::SelfAttestation,
+            policies: vec![
+                ContentPolicy {
+                    id: "r18".into(),
+                    grant_generation: 1,
+                    enabled: true,
+                    priority: 10,
+                    name: "NSFW".into(),
+                    preset: PlaceholderPreset::R18,
+                    match_expr: "tag:explicit".into(),
+                    except_expr: None,
+                    default_tag_min: 0.45,
+                    action: PolicyAction::Block,
+                    bypass: PolicyBypass {
+                        include_switcher: true,
+                        require_gallery_login: true,
+                        require_age_18: true,
+                        ..PolicyBypass::default()
+                    },
+                },
+                ContentPolicy {
+                    id: "sensitive".into(),
+                    grant_generation: 1,
+                    enabled: true,
+                    priority: 20,
+                    name: "Suggestive".into(),
+                    preset: PlaceholderPreset::Sensitive,
+                    match_expr: "tag:lingerie".into(),
+                    except_expr: None,
+                    default_tag_min: 0.45,
+                    action: PolicyAction::Blur,
+                    bypass: PolicyBypass {
+                        include_switcher: true,
+                        include_click: true,
+                        ..PolicyBypass::default()
+                    },
+                },
+            ],
+            ..PublicSitePolicy::default()
+        };
+        pol.refresh_policy_digest();
+        let compiled = CompiledPolicy::compile(pol).unwrap();
+        let anon = CallerContext::anonymous();
+        let img = Image {
+            id: 501,
+            name: "secret/maid_r18".into(),
+            width: 800,
+            height: 1200,
+        };
+        let locked_facts = ImageFacts::completed_with_floor(
+            Some(0.05),
+            HashMap::from([("maid".into(), 0.95), ("explicit".into(), 0.92)]),
+        );
+        let locked_outcome = compiled.evaluate_image(&locked_facts, &anon);
+        assert!(
+            !locked_outcome.is_clear(),
+            "locked seed must fail Clear-only seed authorization"
+        );
+        let projected_locked =
+            compiled.project_image(&img, locked_outcome, &anon, &MediaSigner::Standalone);
+        assert!(matches!(
+            projected_locked,
+            ProjectedImage::Placeholder { id: 501, ref mask, .. }
+                if mask.policy_id == "r18" && mask.requires_login && mask.requires_age
+        ));
+
+        let blurred_facts = ImageFacts::completed_with_floor(
+            Some(0.05),
+            HashMap::from([("maid".into(), 0.95), ("lingerie".into(), 0.88)]),
+        );
+        let blurred_outcome = compiled.evaluate_image(&blurred_facts, &anon);
+        assert!(
+            !blurred_outcome.is_clear(),
+            "blurred seed must also fail Clear-only seed authorization"
+        );
+        let projected_blurred =
+            compiled.project_image(&img, blurred_outcome, &anon, &MediaSigner::Standalone);
+        assert!(matches!(
+            projected_blurred,
+            ProjectedImage::Blurred { id: 501, preview_url: None, .. }
+        ));
     }
 }

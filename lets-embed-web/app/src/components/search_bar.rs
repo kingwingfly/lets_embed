@@ -1179,7 +1179,7 @@ pub fn SearchBar() -> impl IntoView {
                 return None;
             }
             let html = safety.notice_banner_html.get()?;
-            let dismiss_key = safety.notice_banner_key.get_untracked();
+            let dismiss_key = safety.notice_banner_key.get();
             Some(view! {
                 <div class="w-full px-2 sm:px-3.5 mt-2">
                     <div class="max-w-[1640px] mx-auto">

@@ -18,10 +18,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use site_access::{
     AgeGateTrigger, AgeVerificationPolicy, AuthProviderId, AuthProviderPublicConfig, ChargeKind,
-    ContentPolicy, GeoPolicy, LegalDocConfig, PublicSitePolicy, SITE_POLICY_SCHEMA_VERSION,
-    SimilarityDefaults, compute_next_grant_generations,
-    compute_next_min_enforce_rev, compute_policy_digest, compute_terms_digest, is_eth_address,
-    is_sol_principal, validate_policy_set_with_mode,
+    ContentPolicy, DEFAULT_POLICY_TAG_MIN, GeoPolicy, LegalDocConfig, PlaceholderPreset,
+    PolicyAction, PolicyBypass, PublicSitePolicy, SITE_POLICY_SCHEMA_VERSION, SimilarityDefaults,
+    compute_next_grant_generations, compute_next_min_enforce_rev, compute_policy_digest,
+    compute_terms_digest, is_eth_address, is_sol_principal, validate_policy_set_with_mode,
 };
 use worker::{Env, Result};
 
@@ -720,6 +720,186 @@ pub fn validate_provider_updates(
 
     configs.sort_by_key(|c| c.id);
     Ok(configs)
+}
+
+// ---------------------------------------------------------------------------
+// Compact `tag IN (...)` Safety Presets & No-Op Save Detection Helpers
+// ---------------------------------------------------------------------------
+
+/// Built-in Policy v3 safety presets for the `/admin` builder using compact
+/// single-row `tag IN (...) >= 0.45` expressions (zero stacked `OR` clauses).
+pub fn compact_admin_safety_presets() -> Vec<ContentPolicy> {
+    vec![
+        ContentPolicy {
+            id: "r18".to_string(),
+            grant_generation: 1,
+            enabled: true,
+            priority: 10,
+            name: "NSFW / Explicit".to_string(),
+            preset: PlaceholderPreset::R18,
+            match_expr: "tag IN (explicit, nude, nipples, pussy, penis, sex, uncensored, censored, topless, bottomless) >= 0.45".to_string(),
+            except_expr: None,
+            default_tag_min: DEFAULT_POLICY_TAG_MIN,
+            action: PolicyAction::Block,
+            bypass: PolicyBypass {
+                include_switcher: true,
+                include_click: false,
+                include_live_admin: false,
+                require_gallery_login: true,
+                require_age_18: false,
+                require_current_terms: true,
+                exclude_anonymous: true,
+                exclude_countries: Vec::new(),
+            },
+        },
+        ContentPolicy {
+            id: "sensitive".to_string(),
+            grant_generation: 1,
+            enabled: true,
+            priority: 20,
+            name: "Suggestive / Ecchi".to_string(),
+            preset: PlaceholderPreset::Sensitive,
+            match_expr: "tag IN (questionable, sensitive, lingerie, bikini, underwear, panties, cleavage, bdsm) >= 0.45".to_string(),
+            except_expr: None,
+            default_tag_min: DEFAULT_POLICY_TAG_MIN,
+            action: PolicyAction::Blur,
+            bypass: PolicyBypass {
+                include_switcher: true,
+                include_click: true,
+                include_live_admin: false,
+                require_gallery_login: false,
+                require_age_18: false,
+                require_current_terms: false,
+                exclude_anonymous: false,
+                exclude_countries: Vec::new(),
+            },
+        },
+        ContentPolicy {
+            id: "blood".to_string(),
+            grant_generation: 1,
+            enabled: true,
+            priority: 30,
+            name: "Blood / Violence".to_string(),
+            preset: PlaceholderPreset::Blood,
+            match_expr: "tag IN (blood) >= 0.45".to_string(),
+            except_expr: None,
+            default_tag_min: DEFAULT_POLICY_TAG_MIN,
+            action: PolicyAction::Block,
+            bypass: PolicyBypass {
+                include_switcher: true,
+                include_click: false,
+                include_live_admin: false,
+                require_gallery_login: false,
+                require_age_18: false,
+                require_current_terms: false,
+                exclude_anonymous: false,
+                exclude_countries: Vec::new(),
+            },
+        },
+    ]
+}
+
+/// Returns `true` when normalized incoming [`AccessPolicy`] matches the currently
+/// stored [`AccessPolicy`], avoiding spurious D1 writes and revision bumps.
+pub fn is_access_unchanged(prev: &AccessPolicy, normalized_next: &AccessPolicy) -> bool {
+    prev == normalized_next
+}
+
+/// Returns `true` when a prepared [`PublicSitePolicy`] is content-identical to
+/// the currently stored v3 [`PublicSitePolicy`] (ignoring `revision` and
+/// `policy_digest`, which vary solely with `revision`), avoiding spurious D1
+/// writes and `SitePolicyDO` activations.
+pub fn is_public_policy_unchanged(prev: &PublicSitePolicy, next: &PublicSitePolicy) -> bool {
+    let PublicSitePolicy {
+        schema_version,
+        revision: _,
+        min_enforce_rev,
+        policy_digest: _,
+        vocab_digest,
+        safety_enabled,
+        unclassified_mode,
+        fixed_blur_enabled,
+        policies,
+        age_policy,
+        age_gate_trigger,
+        similarity,
+        legal,
+        geo,
+        enabled_providers,
+    } = prev;
+
+    *schema_version == next.schema_version
+        && *min_enforce_rev == next.min_enforce_rev
+        && *vocab_digest == next.vocab_digest
+        && *safety_enabled == next.safety_enabled
+        && *unclassified_mode == next.unclassified_mode
+        && *fixed_blur_enabled == next.fixed_blur_enabled
+        && *policies == next.policies
+        && *age_policy == next.age_policy
+        && *age_gate_trigger == next.age_gate_trigger
+        && *similarity == next.similarity
+        && *legal == next.legal
+        && *geo == next.geo
+        && *enabled_providers == next.enabled_providers
+}
+
+/// Expands and normalizes a slice of [`AuthProviderPublicConfig`] into canonical
+/// order across all [`AuthProviderId::ALL`] entries so fresh/sparse stored lists
+/// compare equal to full default-disabled submissions from the admin UI.
+pub fn canonical_provider_configs(
+    configured: &[AuthProviderPublicConfig],
+) -> Vec<AuthProviderPublicConfig> {
+    let mut out: Vec<AuthProviderPublicConfig> = AuthProviderId::ALL
+        .iter()
+        .map(|&id| {
+            let found = configured.iter().find(|c| c.id == id);
+            match found {
+                Some(c) => AuthProviderPublicConfig {
+                    id,
+                    enabled: c.enabled,
+                    display_name: c
+                        .display_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    issuer: c
+                        .issuer
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    public_client_id: c
+                        .public_client_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    soft_birthday_check: c.soft_birthday_check,
+                },
+                None => AuthProviderPublicConfig {
+                    id,
+                    enabled: false,
+                    display_name: None,
+                    issuer: None,
+                    public_client_id: None,
+                    soft_birthday_check: false,
+                },
+            }
+        })
+        .collect();
+    out.sort_by_key(|c| c.id);
+    out
+}
+
+/// Returns `true` when incoming provider public configs are canonically identical
+/// to stored configs AND no secret upserts or deletions were submitted.
+pub fn are_providers_unchanged(
+    prev: &[AuthProviderPublicConfig],
+    next: &[AuthProviderPublicConfig],
+    has_secret_mutations: bool,
+) -> bool {
+    !has_secret_mutations && canonical_provider_configs(prev) == canonical_provider_configs(next)
 }
 
 // ---------------------------------------------------------------------------

@@ -50,10 +50,8 @@ DEPLOYMENT_ID = "lets-embed-prod"
 # OPTIONAL PER-DOMAIN OVERRIDES (take precedence over `SITE_SECRET` for independent rotation):
 #   ADMIN_ASSERTION_SECRET       — explicit override for `X-Gallery-Admin-Assertion` (`aa2.`) HMAC verification.
 #   INTERNAL_API_SECRET          — explicit override for origin `/internal/*` calls.
-#   PROVIDER_SECRETS_KEY         — explicit 32-byte base64/hex AES-256-GCM key for `provider_secrets`
-#                                  (also accepts legacy alias `SETTINGS_ENCRYPTION_KEY`).
-#   PROVIDER_SECRETS_KEY_PREV    — previous 32-byte key during zero-downtime secret rotation
-#                                  (also accepts legacy alias `SETTINGS_ENCRYPTION_KEY_PREV` or `SITE_SECRET_PREV`).
+#   PROVIDER_SECRETS_KEY         — optional explicit 32-byte base64/hex AES-256-GCM key override for `provider_secrets`.
+#   PROVIDER_SECRETS_KEY_PREV    — optional previous 32-byte key during zero-downtime secret rotation (or `SITE_SECRET_PREV`).
 #   CF_ACCESS_CLIENT_ID          — optional Cloudflare Access service token ID for `APP_ORIGIN`.
 #   CF_ACCESS_CLIENT_SECRET      — optional Cloudflare Access service token secret for `APP_ORIGIN`.
 [secrets]

@@ -41,10 +41,9 @@ SOL_RPC_URL = "https://api.mainnet-beta.solana.com"
 # Optional per-purpose overrides (take precedence over SITE_SECRET when set):
 #   SESSION_SECRET              — Dedicated secret for revocable `v2.` session cookies (legacy alias: SESSION_V2_SECRET)
 #   INTERNAL_API_SECRET         — Dedicated secret for internal worker-to-worker API calls
-#   PROVIDER_SECRETS_KEY        — Dedicated 32-byte AES-256-GCM key (base64 or 64-char hex, optional "<kid>:" prefix)
-#                                 for decrypting `provider_secrets` (legacy alias: SETTINGS_ENCRYPTION_KEY)
-#   PROVIDER_SECRETS_KEY_PREV   — Previous 32-byte AES-256-GCM key during zero-downtime key rotation
-#                                 (legacy alias: SETTINGS_ENCRYPTION_KEY_PREV)
+#   PROVIDER_SECRETS_KEY        — Optional dedicated 32-byte AES-256-GCM key (base64 or 64-char hex, optional "<kid>:" prefix)
+#                                 for decrypting `provider_secrets` (defaults to HKDF from SITE_SECRET)
+#   PROVIDER_SECRETS_KEY_PREV   — Optional previous 32-byte AES-256-GCM key during zero-downtime key rotation
 #   JWT_SECRET                  — Optional legacy HS256 wallet session secret (only needed during legacy cutover)
 #   GOOGLE_CLIENT_SECRET / GITHUB_CLIENT_SECRET / X_CLIENT_SECRET / DISCORD_CLIENT_SECRET /
 #   OIDC_AGE_CLIENT_SECRET / TELEGRAM_BOT_TOKEN / EMAIL_API_KEY — optional env fallbacks if not stored in D1

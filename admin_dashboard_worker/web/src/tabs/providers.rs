@@ -1,75 +1,22 @@
 //! Auth Providers tab:
 //! - Configure all pluggable auth providers with clean left-aligned cards & `<ToggleSwitch>`
 //! - Inline disabled notice on non-age-capable providers under Strict Provider-Verified 18+
-//! - Masked write-only secret inputs encrypted via HKDF(`SITE_SECRET`) / `PROVIDER_SECRETS_KEY`
+//! - Masked write-only secret inputs encrypted via HKDF-SHA256 from `SITE_SECRET`
 //! - Zero-downtime AES-256-GCM key rotation trigger (`POST /admin/api/secrets/rotate`)
-//! - GCP top-right toasts via `use_toast_store()`
+//! - Root-level persistent draft (`AdminDraftStore`) + GCP top-right toasts via `use_toast_store()`
 
 use leptos::prelude::*;
 use lets_embed_ui::{NoticeBanner, NoticeContent, NoticeTone, ToggleSwitch, use_toast_store};
 use site_access::{AgeVerificationPolicy, AuthProviderId};
 use wasm_bindgen_futures::spawn_local;
 
-use crate::api::{
-    ActivationResult, ProviderUpdateItem, ProviderView, ProvidersResp, RotateSecretsResp,
-    SaveProvidersReq, format_ts_utc, get_json, post_json, post_json_activatable,
+use crate::{
+    api::{
+        ActivationResult, ProviderUpdateItem, ProvidersResp, RotateSecretsResp, SaveProvidersReq,
+        SaveProvidersResp, format_ts_utc, get_json, post_json, post_json_activatable,
+    },
+    drafts::{EditableProvider, use_admin_drafts},
 };
-
-#[derive(Clone)]
-struct EditableProvider {
-    id: AuthProviderId,
-    supports_strict: bool,
-    secret_field_name: Option<String>,
-    has_client_secret: RwSignal<bool>,
-    kid: RwSignal<Option<String>>,
-    updated_at: RwSignal<Option<i64>>,
-    updated_by: RwSignal<Option<String>>,
-    enabled: RwSignal<bool>,
-    display_name: RwSignal<String>,
-    issuer: RwSignal<String>,
-    public_client_id: RwSignal<String>,
-    soft_birthday_check: RwSignal<bool>,
-    secret_input: RwSignal<String>,
-    clear_secret: RwSignal<bool>,
-}
-
-impl EditableProvider {
-    fn from_view(v: &ProviderView) -> Self {
-        Self {
-            id: v.config.id,
-            supports_strict: v.supports_strict_age_verification,
-            secret_field_name: v.secret_field_name.clone(),
-            has_client_secret: RwSignal::new(v.has_client_secret),
-            kid: RwSignal::new(v.kid.clone()),
-            updated_at: RwSignal::new(v.updated_at),
-            updated_by: RwSignal::new(v.updated_by.clone()),
-            enabled: RwSignal::new(v.config.enabled),
-            display_name: RwSignal::new(v.config.display_name.clone().unwrap_or_default()),
-            issuer: RwSignal::new(v.config.issuer.clone().unwrap_or_default()),
-            public_client_id: RwSignal::new(v.config.public_client_id.clone().unwrap_or_default()),
-            soft_birthday_check: RwSignal::new(v.config.soft_birthday_check),
-            secret_input: RwSignal::new(String::new()),
-            clear_secret: RwSignal::new(false),
-        }
-    }
-
-    fn to_update(&self) -> ProviderUpdateItem {
-        let opt = |s: String| {
-            let t = s.trim().to_string();
-            (!t.is_empty()).then_some(t)
-        };
-        ProviderUpdateItem {
-            id: self.id,
-            enabled: self.enabled.get_untracked(),
-            display_name: opt(self.display_name.get_untracked()),
-            issuer: opt(self.issuer.get_untracked()),
-            public_client_id: opt(self.public_client_id.get_untracked()),
-            soft_birthday_check: self.soft_birthday_check.get_untracked(),
-            secret_value: opt(self.secret_input.get_untracked()),
-            clear_secret: self.clear_secret.get_untracked(),
-        }
-    }
-}
 
 fn client_id_label(id: AuthProviderId) -> &'static str {
     match id {
@@ -102,27 +49,25 @@ pub fn ProvidersTab(
     on_saved: Callback<()>,
 ) -> impl IntoView {
     let toasts = use_toast_store();
-
-    let revision = RwSignal::new(0u64);
-    let age_policy = RwSignal::new(AgeVerificationPolicy::Off);
-    let current_kid = RwSignal::new(String::new());
-    let has_prev_key = RwSignal::new(false);
-    let rows = RwSignal::new(Vec::<EditableProvider>::new());
+    let draft = use_admin_drafts().providers;
 
     let loading = RwSignal::new(false);
     let saving = RwSignal::new(false);
     let rotating = RwSignal::new(false);
 
-    let load_providers = move || {
+    let fetch_providers = move |force_hydrate: bool| {
         loading.set(true);
         spawn_local(async move {
             match get_json::<ProvidersResp>("/admin/api/providers").await {
                 Ok(resp) => {
-                    revision.set(resp.revision);
-                    age_policy.set(resp.age_policy);
-                    current_kid.set(resp.current_kid);
-                    has_prev_key.set(resp.has_prev_key);
-                    rows.set(resp.providers.iter().map(EditableProvider::from_view).collect());
+                    if force_hydrate || !draft.dirty.get_untracked() {
+                        draft.hydrate(&resp);
+                        if force_hydrate {
+                            draft.dirty.set(false);
+                        }
+                    } else {
+                        draft.sync_server_metadata(&resp);
+                    }
                 }
                 Err(err) => {
                     toasts.error("Failed to load auth providers", Some(err));
@@ -132,10 +77,25 @@ pub fn ProvidersTab(
         });
     };
 
-    Effect::new(move |_| {
-        let _ = refresh_epoch.get();
-        load_providers();
+    // Hydrate once on first mount; switching back to this tab preserves unsaved edits.
+    // Re-sync metadata whenever another tab saves (via `refresh_epoch`).
+    Effect::new(move |prev_epoch: Option<u32>| {
+        let cur_epoch = refresh_epoch.get();
+        if !draft.loaded.get_untracked() || prev_epoch.is_some_and(|p| p != cur_epoch) {
+            fetch_providers(false);
+        }
+        cur_epoch
     });
+
+    let on_discard = move |_| {
+        if let Some(snap) = draft.server_snapshot.get_untracked() {
+            draft.hydrate(&snap);
+            draft.dirty.set(false);
+            toasts.info("Discarded unsaved Auth Providers changes", None);
+        } else {
+            fetch_providers(true);
+        }
+    };
 
     let on_save = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
@@ -144,35 +104,40 @@ pub fn ProvidersTab(
         }
         saving.set(true);
 
-        let providers: Vec<ProviderUpdateItem> = rows
+        let providers: Vec<ProviderUpdateItem> = draft
+            .rows
             .get_untracked()
             .iter()
             .map(EditableProvider::to_update)
             .collect();
         let req = SaveProvidersReq {
-            revision: revision.get_untracked(),
+            revision: draft.revision.get_untracked(),
             providers,
         };
 
         spawn_local(async move {
-            match post_json_activatable::<_, ProvidersResp>("/admin/api/providers", &req).await {
+            match post_json_activatable::<_, SaveProvidersResp>("/admin/api/providers", &req).await
+            {
                 Ok(ActivationResult::Active(resp)) => {
-                    revision.set(resp.revision);
-                    age_policy.set(resp.age_policy);
-                    current_kid.set(resp.current_kid);
-                    has_prev_key.set(resp.has_prev_key);
-                    rows.set(resp.providers.iter().map(EditableProvider::from_view).collect());
-                    toasts.success(
-                        format!("Saved Auth Providers rev #{}", resp.revision),
-                        Some(
-                            "Secrets encrypted with AES-256-GCM in provider_secrets and activated on SitePolicyDO."
-                                .to_string(),
-                        ),
-                    );
-                    on_saved.run(());
+                    draft.dirty.set(false);
+                    if resp.unchanged {
+                        draft.revision.set(resp.revision);
+                        toasts.info(format!("No changes to save (rev #{})", resp.revision), None);
+                    } else {
+                        draft.hydrate(&resp);
+                        toasts.success(
+                            format!("Saved Auth Providers rev #{}", resp.revision),
+                            Some(
+                                "Secrets encrypted with AES-256-GCM in provider_secrets and activated on SitePolicyDO."
+                                    .to_string(),
+                            ),
+                        );
+                        on_saved.run(());
+                    }
                 }
                 Ok(ActivationResult::PendingActivation(pending)) => {
-                    revision.set(pending.revision);
+                    draft.revision.set(pending.revision);
+                    draft.dirty.set(false);
                     toasts.warning(
                         format!(
                             "Saved rev #{} to D1 — awaiting SitePolicyDO activation",
@@ -212,7 +177,7 @@ pub fn ProvidersTab(
                     } else {
                         toasts.warning("Secret rotation completed with failures", Some(detail));
                     }
-                    load_providers();
+                    fetch_providers(false);
                 }
                 Err(err) => {
                     toasts.error("Secret rotation failed", Some(err));
@@ -227,9 +192,9 @@ pub fn ProvidersTab(
             <section class="adm-card">
                 <div class="adm-card-head">
                     <div>
-                        <h2>"Encrypted Secret Keyring (`SITE_SECRET` / `PROVIDER_SECRETS_KEY`)"</h2>
+                        <h2>"Encrypted Secret Keyring (SITE_SECRET)"</h2>
                         <p class="adm-sub">
-                            "Provider secrets are encrypted with AES-256-GCM (derived via HKDF from `SITE_SECRET` or explicit `PROVIDER_SECRETS_KEY` / `SETTINGS_ENCRYPTION_KEY`), fresh 96-bit CSPRNG nonces, and deployment/provider/field AAD inside D1 `provider_secrets`."
+                            "Provider secrets are encrypted with AES-256-GCM (derived via HKDF-SHA256 from SITE_SECRET, or optional PROVIDER_SECRETS_KEY override) using fresh 96-bit CSPRNG nonces and deployment/provider/field AAD inside D1 provider_secrets."
                         </p>
                     </div>
                     <button
@@ -243,10 +208,10 @@ pub fn ProvidersTab(
                 </div>
                 <div class="adm-chips">
                     <span class="adm-badge adm-badge--ok">
-                        {move || format!("Active kid: {}", current_kid.get())}
+                        {move || format!("Active kid: {}", draft.current_kid.get())}
                     </span>
                     <span class="adm-badge">
-                        {move || if has_prev_key.get() {
+                        {move || if draft.has_prev_key.get() {
                             "Previous rotation key configured (zero-downtime rotation ready)"
                         } else {
                             "Single active key (no PREV key set)"
@@ -255,7 +220,7 @@ pub fn ProvidersTab(
                 </div>
             </section>
 
-            {move || (age_policy.get() == AgeVerificationPolicy::StrictProviderVerified18).then(|| view! {
+            {move || (draft.age_policy.get() == AgeVerificationPolicy::StrictProviderVerified18).then(|| view! {
                 <NoticeBanner
                     tone=NoticeTone::Warning
                     title="Strict Provider-Verified 18+ Policy Enforced"
@@ -269,7 +234,7 @@ pub fn ProvidersTab(
 
             <div class="adm-provider-grid">
                 <For
-                    each=move || rows.get()
+                    each=move || draft.rows.get()
                     key=|p| p.id.as_str()
                     let(prov)
                 >
@@ -278,7 +243,7 @@ pub fn ProvidersTab(
                         let supports_strict = prov.supports_strict;
                         let secret_field = prov.secret_field_name.clone();
                         let blocked_by_strict = Memo::new(move |_| {
-                            age_policy.get() == AgeVerificationPolicy::StrictProviderVerified18
+                            draft.age_policy.get() == AgeVerificationPolicy::StrictProviderVerified18
                                 && !supports_strict
                         });
                         let issuer_lbl = issuer_label(id);
@@ -296,7 +261,10 @@ pub fn ProvidersTab(
                                     </div>
                                     <ToggleSwitch
                                         checked=Signal::derive(move || prov.enabled.get() && !blocked_by_strict.get())
-                                        on_change=Callback::new(move |v| prov.enabled.set(v))
+                                        on_change=Callback::new(move |v| {
+                                            prov.enabled.set(v);
+                                            draft.dirty.set(true);
+                                        })
                                         disabled=Signal::derive(move || blocked_by_strict.get())
                                         label="Enabled"
                                         compact=true
@@ -321,7 +289,10 @@ pub fn ProvidersTab(
                                         type="text"
                                         placeholder=id.display_name()
                                         prop:value=move || prov.display_name.get()
-                                        on:input=move |ev| prov.display_name.set(event_target_value(&ev))
+                                        on:input=move |ev| {
+                                            prov.display_name.set(event_target_value(&ev));
+                                            draft.dirty.set(true);
+                                        }
                                     />
                                 </label>
 
@@ -332,7 +303,10 @@ pub fn ProvidersTab(
                                             type="url"
                                             placeholder="https://idp.example.com"
                                             prop:value=move || prov.issuer.get()
-                                            on:input=move |ev| prov.issuer.set(event_target_value(&ev))
+                                            on:input=move |ev| {
+                                                prov.issuer.set(event_target_value(&ev));
+                                                draft.dirty.set(true);
+                                            }
                                         />
                                     </label>
                                 })}
@@ -343,15 +317,21 @@ pub fn ProvidersTab(
                                         type="text"
                                         placeholder="Public client ID / username"
                                         prop:value=move || prov.public_client_id.get()
-                                        on:input=move |ev| prov.public_client_id.set(event_target_value(&ev))
+                                        on:input=move |ev| {
+                                            prov.public_client_id.set(event_target_value(&ev));
+                                            draft.dirty.set(true);
+                                        }
                                     />
                                 </label>
 
                                 {(id == AuthProviderId::Google).then(|| view! {
                                     <ToggleSwitch
                                         checked=Signal::derive(move || prov.soft_birthday_check.get())
-                                        on_change=Callback::new(move |v| prov.soft_birthday_check.set(v))
-                                        disabled=Signal::derive(move || age_policy.get() != AgeVerificationPolicy::SelfAttestation)
+                                        on_change=Callback::new(move |v| {
+                                            prov.soft_birthday_check.set(v);
+                                            draft.dirty.set(true);
+                                        })
+                                        disabled=Signal::derive(move || draft.age_policy.get() != AgeVerificationPolicy::SelfAttestation)
                                         label="Optional soft birthday pre-check"
                                         description="Self-Attestation only; never grants Verified18."
                                     />
@@ -394,12 +374,16 @@ pub fn ProvidersTab(
                                                     prov.clear_secret.set(false);
                                                 }
                                                 prov.secret_input.set(v);
+                                                draft.dirty.set(true);
                                             }
                                         />
                                         {move || prov.has_client_secret.get().then(|| view! {
                                             <ToggleSwitch
                                                 checked=Signal::derive(move || prov.clear_secret.get())
-                                                on_change=Callback::new(move |v| prov.clear_secret.set(v))
+                                                on_change=Callback::new(move |v| {
+                                                    prov.clear_secret.set(v);
+                                                    draft.dirty.set(true);
+                                                })
                                                 label="Delete stored secret on save"
                                                 compact=true
                                             />
@@ -416,9 +400,21 @@ pub fn ProvidersTab(
                 <span class="adm-sub">
                     {move || if loading.get() { "Loading providers…" } else { "Plaintext secrets are write-only and never returned after save." }}
                 </span>
-                <button type="submit" class="adm-btn adm-btn--primary" disabled=move || saving.get()>
-                    {move || if saving.get() { "Saving…" } else { "Save Auth Providers" }}
-                </button>
+                <div class="adm-save-bar-actions">
+                    {move || draft.dirty.get().then(|| view! {
+                        <button
+                            type="button"
+                            class="adm-btn"
+                            disabled=move || saving.get()
+                            on:click=on_discard
+                        >
+                            "Discard changes"
+                        </button>
+                    })}
+                    <button type="submit" class="adm-btn adm-btn--primary" disabled=move || saving.get()>
+                        {move || if saving.get() { "Saving…" } else { "Save Auth Providers" }}
+                    </button>
+                </div>
             </div>
         </form>
     }

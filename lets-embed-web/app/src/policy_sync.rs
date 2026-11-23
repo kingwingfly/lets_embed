@@ -330,6 +330,8 @@ mod tests {
             direct_grants: vec![],
             click_eligible: vec![],
             is_billing_waived: false,
+            caller_age_verified: false,
+            caller_terms_accepted: false,
             exp: 2_000_000_000,
         }
     }

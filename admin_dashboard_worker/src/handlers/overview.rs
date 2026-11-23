@@ -22,7 +22,7 @@ use crate::{
     security::AdminIdentity,
     settings::{
         ActivationOutcome, LEGACY_UNCLASSIFIED_NOTE, LoadedSettings,
-        ensure_v3_ready_for_non_safety_mutation,
+        ensure_v3_ready_for_non_safety_mutation, is_access_unchanged,
     },
 };
 
@@ -206,6 +206,22 @@ pub async fn save_access_settings(
         );
     }
 
+    if is_access_unchanged(&loaded.doc.access, &normalized_access) {
+        let policy_digest = compute_policy_digest(&loaded.doc.public);
+        return Json(SaveAccessResp {
+            ok: true,
+            unchanged: true,
+            pending_activation: loaded.activation_status.is_pending(),
+            activation_status: loaded.activation_status.as_str().to_string(),
+            revision: loaded.revision,
+            min_enforce_rev: loaded.doc.public.min_enforce_rev,
+            digest: policy_digest.clone(),
+            policy_digest,
+            access: loaded.doc.access,
+        })
+        .into_response();
+    }
+
     loaded.doc.access = normalized_access.clone();
     match LoadedSettings::save_and_activate(&st.env, req.revision, &loaded.doc, editor).await {
         Ok(Some(ActivationOutcome::Active {
@@ -219,6 +235,7 @@ pub async fn save_access_settings(
             );
             Json(SaveAccessResp {
                 ok: true,
+                unchanged: false,
                 pending_activation: false,
                 activation_status: ActivationStatus::Active.as_str().to_string(),
                 revision: ack.revision,
