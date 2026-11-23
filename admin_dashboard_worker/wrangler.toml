@@ -34,11 +34,14 @@ PUBLIC_URL = "https://lets-embed.louisfly.icu"
 DEPLOYMENT_ID = "lets-embed-prod"
 
 # Worker secrets; deploy fails until required secrets are set via `wrangler secret put`:
+#   ADMIN_ASSERTION_SECRET       — dedicated secret shared ONLY with gateway_worker to verify
+#                                  short-lived HMAC-signed X-Gallery-Admin-Assertion headers
+#                                  across Cloudflare's [assets] router hop.
 #   SETTINGS_ENCRYPTION_KEY      — 32-byte base64 or 64-char hex AES-256-GCM key for `provider_secrets`
 #                                  (MUST be dedicated; NEVER reuse JWT_SECRET!).
 #   SETTINGS_ENCRYPTION_KEY_PREV — (optional) previous 32-byte key during zero-downtime key rotation.
 [secrets]
-required = ["SETTINGS_ENCRYPTION_KEY"]
+required = ["ADMIN_ASSERTION_SECRET", "SETTINGS_ENCRYPTION_KEY"]
 
 [[d1_databases]]
 binding = "DB"

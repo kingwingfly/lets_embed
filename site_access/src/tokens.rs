@@ -30,6 +30,10 @@ pub const GATEWAY_ASSERTION_AUDIENCE: &str = "lets-embed-web";
 pub const GATEWAY_ASSERTION_TTL: u64 = 30;
 pub const GATEWAY_ASSERTION_DEFAULT_MAX_SKEW: u64 = 10;
 
+pub const ADMIN_ASSERTION_HEADER: &str = "x-gallery-admin-assertion";
+pub const ADMIN_ASSERTION_AUDIENCE: &str = "lets-embed-admin-dashboard-worker";
+pub const ADMIN_ASSERTION_TTL: u64 = 30;
+
 pub const ADMIN_CSRF_HEADER: &str = "x-admin-csrf";
 pub const USER_CSRF_HEADER: &str = "x-csrf-token";
 pub const POLICY_REVISION_HEADER: &str = "x-policy-revision";
@@ -41,6 +45,7 @@ pub const GALLERY_SWITCHERS_HEADER: &str = "x-gallery-switchers";
 /// authenticated headers of its own.
 pub const PRIVILEGED_REQUEST_HEADERS: &[&str] = &[
     GATEWAY_ASSERTION_HEADER,
+    ADMIN_ASSERTION_HEADER,
     POLICY_REVISION_HEADER,
     POLICY_MIN_REVISION_HEADER,
     GALLERY_SWITCHERS_HEADER,
@@ -552,6 +557,114 @@ pub fn verify_gateway_assertion(
     if assertion.exp > now.saturating_add(GATEWAY_ASSERTION_TTL).saturating_add(max_skew) {
         return Err(TokenError::InvalidClaims(
             "assertion exp exceeds maximum TTL",
+        ));
+    }
+    Ok(assertion)
+}
+
+// ---------------------------------------------------------------------------
+// Signed Admin Dashboard Assertion (`X-Gallery-Admin-Assertion`)
+//
+// Cloudflare Workers with `[assets]` route service bindings through an internal
+// assets router hop that drops `ctx.props`. A short-lived HMAC-SHA256 assertion
+// signed with a dedicated `ADMIN_ASSERTION_SECRET` shared strictly between
+// `gateway_worker` and `admin_dashboard_worker` survives that hop while
+// cryptographically proving Cloudflare Access authorization.
+// ---------------------------------------------------------------------------
+
+pub const ADMIN_ASSERTION_VERSION: u8 = 1;
+const ADMIN_ASSERTION_PREFIX: &str = "aa1.";
+const ADMIN_ASSERTION_MAC_DOMAIN: &[u8] = b"admin-assertion/v1\0";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminAssertion {
+    pub v: u8,
+    pub aud: String,
+    pub email: String,
+    pub exp: u64,
+}
+
+impl AdminAssertion {
+    pub fn validate(&self) -> Result<(), TokenError> {
+        if self.v != ADMIN_ASSERTION_VERSION {
+            return Err(TokenError::UnsupportedVersion(self.v));
+        }
+        if !is_clean_identifier(&self.aud, 128) {
+            return Err(TokenError::InvalidClaims(
+                "aud must be a clean non-empty identifier",
+            ));
+        }
+        if !is_clean_identifier(&self.email, 320) {
+            return Err(TokenError::InvalidClaims(
+                "email must be a clean non-empty identifier",
+            ));
+        }
+        if self.exp == 0 {
+            return Err(TokenError::InvalidClaims("exp must be non-zero"));
+        }
+        Ok(())
+    }
+}
+
+/// Signs an `AdminAssertion` for transmission in `X-Gallery-Admin-Assertion`.
+pub fn sign_admin_assertion(
+    assertion: &AdminAssertion,
+    secret: &[u8],
+) -> Result<String, TokenError> {
+    assertion.validate()?;
+    let json = serde_json::to_vec(assertion).map_err(|_| TokenError::InvalidPayload)?;
+    let payload = B64.encode(json);
+    let sig = domain_mac(
+        secret,
+        ADMIN_ASSERTION_MAC_DOMAIN,
+        &[ADMIN_ASSERTION_PREFIX.as_bytes(), payload.as_bytes()],
+    )?
+    .finalize()
+    .into_bytes();
+    Ok(format!(
+        "{ADMIN_ASSERTION_PREFIX}{payload}.{}",
+        B64.encode(sig)
+    ))
+}
+
+/// Verifies an `X-Gallery-Admin-Assertion` header value with constant-time HMAC
+/// verification, exact audience match, and bounded expiry checks.
+pub fn verify_admin_assertion(
+    header_value: &str,
+    secret: &[u8],
+    expected_aud: &str,
+    now: u64,
+    max_skew: u64,
+) -> Result<AdminAssertion, TokenError> {
+    let rest = header_value
+        .strip_prefix(ADMIN_ASSERTION_PREFIX)
+        .ok_or(TokenError::MalformedFormat)?;
+    let (payload, sig_b64) = rest.split_once('.').ok_or(TokenError::MalformedFormat)?;
+    if payload.is_empty() || sig_b64.is_empty() || sig_b64.contains('.') {
+        return Err(TokenError::MalformedFormat);
+    }
+    let sig = B64.decode(sig_b64).map_err(|_| TokenError::InvalidEncoding)?;
+    domain_mac(
+        secret,
+        ADMIN_ASSERTION_MAC_DOMAIN,
+        &[ADMIN_ASSERTION_PREFIX.as_bytes(), payload.as_bytes()],
+    )?
+    .verify_slice(&sig)
+    .map_err(|_| TokenError::InvalidSignature)?;
+
+    let raw = B64.decode(payload).map_err(|_| TokenError::InvalidEncoding)?;
+    let assertion: AdminAssertion =
+        serde_json::from_slice(&raw).map_err(|_| TokenError::InvalidPayload)?;
+    assertion.validate()?;
+    if assertion.aud != expected_aud {
+        return Err(TokenError::AudienceMismatch);
+    }
+    if now > assertion.exp.saturating_add(max_skew) {
+        return Err(TokenError::Expired);
+    }
+    if assertion.exp > now.saturating_add(ADMIN_ASSERTION_TTL).saturating_add(max_skew) {
+        return Err(TokenError::InvalidClaims(
+            "admin assertion exp exceeds maximum TTL",
         ));
     }
     Ok(assertion)

@@ -22,18 +22,19 @@ pub use policy::{
     compute_policy_digest,
 };
 pub use tokens::{
-    ADMIN_CSRF_HEADER, AUTH_TX_COOKIE, BillableMediaKind, GALLERY_SWITCHERS_HEADER,
-    GATEWAY_ASSERTION_AUDIENCE, GATEWAY_ASSERTION_DEFAULT_MAX_SKEW, GATEWAY_ASSERTION_HEADER,
-    GATEWAY_ASSERTION_TTL, GATEWAY_ASSERTION_VERSION, GatewayAssertion, LEGACY_APP_COOKIE,
-    LEGACY_TOKEN_COOKIE, LegacySessionClaims, MEDIA_CAP_ANON_SUB, MEDIA_CAP_VERSION,
-    MediaBillingKey, MediaCapKind, MediaCapability, POLICY_MIN_REVISION_HEADER,
+    ADMIN_ASSERTION_AUDIENCE, ADMIN_ASSERTION_HEADER, ADMIN_ASSERTION_TTL,
+    ADMIN_ASSERTION_VERSION, ADMIN_CSRF_HEADER, AUTH_TX_COOKIE, AdminAssertion, BillableMediaKind,
+    GALLERY_SWITCHERS_HEADER, GATEWAY_ASSERTION_AUDIENCE, GATEWAY_ASSERTION_DEFAULT_MAX_SKEW,
+    GATEWAY_ASSERTION_HEADER, GATEWAY_ASSERTION_TTL, GATEWAY_ASSERTION_VERSION, GatewayAssertion,
+    LEGACY_APP_COOKIE, LEGACY_TOKEN_COOKIE, LegacySessionClaims, MEDIA_CAP_ANON_SUB,
+    MEDIA_CAP_VERSION, MediaBillingKey, MediaCapKind, MediaCapability, POLICY_MIN_REVISION_HEADER,
     POLICY_REVISION_HEADER, PRIVILEGED_REQUEST_HEADER_PREFIXES, PRIVILEGED_REQUEST_HEADERS,
     SESSION_COOKIE, SESSION_V2_PREFIX, SESSION_V2_VERSION, STRIPPED_ORIGIN_COOKIES,
     SessionV2Claims, TokenError, USER_CSRF_HEADER, VerifiedSession, is_eth_address,
     is_privileged_request_header, is_sol_principal, is_valid_do_key, is_valid_legacy_principal,
-    sign_gateway_assertion, sign_legacy_session, sign_media_capability, sign_session_v2,
-    verify_gateway_assertion, verify_legacy_session, verify_media_capability, verify_session_any,
-    verify_session_v2,
+    sign_admin_assertion, sign_gateway_assertion, sign_legacy_session, sign_media_capability,
+    sign_session_v2, verify_admin_assertion, verify_gateway_assertion, verify_legacy_session,
+    verify_media_capability, verify_session_any, verify_session_v2,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

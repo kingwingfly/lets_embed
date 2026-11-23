@@ -26,10 +26,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use site_access::{
-    ADMIN_HEADER, ADMIN_VIEW_COOKIE, GATEWAY_ASSERTION_AUDIENCE, GATEWAY_ASSERTION_HEADER,
-    GATEWAY_ASSERTION_TTL, GATEWAY_ASSERTION_VERSION, GatewayAssertion, GuestReq, HoldReq,
-    HoldResp, MediaCapKind, PublicSitePolicy, SESSION_COOKIE, SessionContext,
-    compute_policy_digest, is_privileged_request_header, sign_gateway_assertion,
+    ADMIN_ASSERTION_AUDIENCE, ADMIN_ASSERTION_HEADER, ADMIN_ASSERTION_TTL,
+    ADMIN_ASSERTION_VERSION, ADMIN_HEADER, ADMIN_VIEW_COOKIE, AdminAssertion,
+    GATEWAY_ASSERTION_AUDIENCE, GATEWAY_ASSERTION_HEADER, GATEWAY_ASSERTION_TTL,
+    GATEWAY_ASSERTION_VERSION, GatewayAssertion, GuestReq, HoldReq, HoldResp, MediaCapKind,
+    PublicSitePolicy, SESSION_COOKIE, SessionContext, compute_policy_digest,
+    is_privileged_request_header, sign_admin_assertion, sign_gateway_assertion,
     verify_media_capability, verify_session_any,
 };
 use tower_cookies::{CookieManagerLayer, Cookies};
@@ -99,6 +101,7 @@ struct GatewayConfig {
     jwt_secret: Arc<Vec<u8>>,
     session_v2_secret: Arc<Vec<u8>>,
     gateway_assertion_secret: Arc<Vec<u8>>,
+    admin_assertion_secret: Arc<Vec<u8>>,
     media_cap_secret: Arc<Vec<u8>>,
     admin_email: Option<String>,
     visitor_country: Option<String>,
@@ -454,6 +457,7 @@ async fn router(env: Env, ctx: Context, visitor_country: Option<String>) -> Resu
         Err(_) => jwt_secret.clone(),
     };
     let gateway_assertion_secret = required_secret_bytes(&env, "GATEWAY_ASSERTION_SECRET")?;
+    let admin_assertion_secret = required_secret_bytes(&env, "ADMIN_ASSERTION_SECRET")?;
     let media_cap_secret = required_secret_bytes(&env, "MEDIA_CAP_SECRET")?;
     let upstreams = Upstreams::from_env(&env)?;
     let admin_email = access_admin(&ctx, &env).await?;
@@ -464,6 +468,7 @@ async fn router(env: Env, ctx: Context, visitor_country: Option<String>) -> Resu
             jwt_secret: Arc::new(jwt_secret),
             session_v2_secret: Arc::new(session_v2_secret),
             gateway_assertion_secret: Arc::new(gateway_assertion_secret),
+            admin_assertion_secret: Arc::new(admin_assertion_secret),
             media_cap_secret: Arc::new(media_cap_secret),
             admin_email,
             visitor_country,
@@ -584,7 +589,7 @@ fn log_backend_error(context: &str, err: &BackendError) {
 fn build_service_headers(
     headers: &HeaderMap,
     target: ServiceTarget,
-    admin_email: Option<&str>,
+    admin_auth: Option<(&str, &str)>,
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (k, v) in headers {
@@ -616,8 +621,12 @@ fn build_service_headers(
             if let Some(cookie) = sanitize_origin_cookie(headers) {
                 out.push(("cookie".to_string(), cookie));
             }
-            if let Some(email) = admin_email {
+            if let Some((email, signed_assertion)) = admin_auth {
                 out.push((ADMIN_HEADER.to_string(), email.to_string()));
+                out.push((
+                    ADMIN_ASSERTION_HEADER.to_string(),
+                    signed_assertion.to_string(),
+                ));
             }
         }
     }
@@ -794,10 +803,27 @@ async fn handle_admin_route(
             .map(|p| p.as_str())
             .unwrap_or("/admin")
             .to_string();
+        let admin_assertion = AdminAssertion {
+            v: ADMIN_ASSERTION_VERSION,
+            aud: ADMIN_ASSERTION_AUDIENCE.to_string(),
+            email: email.to_string(),
+            exp: backend.now_secs().saturating_add(ADMIN_ASSERTION_TTL),
+        };
+        let Ok(signed_admin_assertion) =
+            sign_admin_assertion(&admin_assertion, &cfg.admin_assertion_secret)
+        else {
+            return private_no_store(
+                (StatusCode::INTERNAL_SERVER_ERROR, "admin assertion failed").into_response(),
+            );
+        };
         let req = ForwardedServiceReq {
             path_and_query: pq,
             method: worker_method,
-            headers: build_service_headers(headers, ServiceTarget::AdminDashboard, Some(email)),
+            headers: build_service_headers(
+                headers,
+                ServiceTarget::AdminDashboard,
+                Some((email, &signed_admin_assertion)),
+            ),
             body,
         };
         match backend
@@ -1424,6 +1450,7 @@ mod tests {
     const TEST_JWT_SECRET: &[u8] = b"test-jwt-secret-key-0123456789";
     const TEST_V2_SECRET: &[u8] = b"test-session-v2-secret-9876543210";
     const TEST_ASSERTION_SECRET: &[u8] = b"test-gateway-assertion-secret-abcd";
+    const TEST_ADMIN_ASSERTION_SECRET: &[u8] = b"test-admin-assertion-secret-wxyz";
     const TEST_MEDIA_CAP_SECRET: &[u8] = b"test-media-cap-secret-efgh";
     const ETH_WALLET: &str = "0x1111111111111111111111111111111111111111";
 
@@ -1450,6 +1477,7 @@ mod tests {
             jwt_secret: Arc::new(TEST_JWT_SECRET.to_vec()),
             session_v2_secret: Arc::new(TEST_V2_SECRET.to_vec()),
             gateway_assertion_secret: Arc::new(TEST_ASSERTION_SECRET.to_vec()),
+            admin_assertion_secret: Arc::new(TEST_ADMIN_ASSERTION_SECRET.to_vec()),
             media_cap_secret: Arc::new(TEST_MEDIA_CAP_SECRET.to_vec()),
             admin_email: None,
             visitor_country: Some("US".to_string()),

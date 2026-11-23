@@ -8,7 +8,10 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use site_access::{ADMIN_CSRF_HEADER, ADMIN_HEADER, GeoPolicy};
+use site_access::{
+    ADMIN_ASSERTION_AUDIENCE, ADMIN_ASSERTION_HEADER, ADMIN_CSRF_HEADER, ADMIN_HEADER,
+    GATEWAY_ASSERTION_DEFAULT_MAX_SKEW, GeoPolicy, verify_admin_assertion,
+};
 use url::{Host, Url};
 
 use crate::api::ApiError;
@@ -88,6 +91,48 @@ pub fn require_admin_identity(admin_binding: bool, headers: &HeaderMap) -> Optio
         return None;
     }
     Some(trimmed)
+}
+
+/// Verifies an incoming request to `admin_dashboard_worker` at Step 0 (BEFORE routing or
+/// `ASSETS.fetch`).
+///
+/// Cloudflare Workers with `[assets]` route service bindings through an internal assets
+/// router hop that drops `ctx.props`. When `admin_assertion_secret` is configured (required
+/// in production `wrangler.toml`), authorization is proven cryptographically via the
+/// short-lived HMAC-signed `X-Gallery-Admin-Assertion` header matching `X-Gallery-Admin-Email`.
+/// When `admin_assertion_secret` is `None` (host unit tests), falls back to the privileged
+/// `admin_binding` prop check.
+pub fn verify_admin_request<'a>(
+    admin_binding: bool,
+    admin_assertion_secret: Option<&[u8]>,
+    headers: &'a HeaderMap,
+    now_secs: u64,
+) -> Option<&'a str> {
+    let email = single_header_str(headers, ADMIN_HEADER).ok()??;
+    let trimmed = email.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 320
+        || trimmed.chars().any(char::is_control)
+        || trimmed != email
+    {
+        return None;
+    }
+    if let Some(secret) = admin_assertion_secret {
+        let token = single_header_str(headers, ADMIN_ASSERTION_HEADER).ok()??;
+        let claims = verify_admin_assertion(
+            token,
+            secret,
+            ADMIN_ASSERTION_AUDIENCE,
+            now_secs,
+            GATEWAY_ASSERTION_DEFAULT_MAX_SKEW,
+        )
+        .ok()?;
+        if claims.email != trimmed {
+            return None;
+        }
+        return Some(trimmed);
+    }
+    admin_binding.then_some(trimmed)
 }
 
 /// Returns `true` for HTTP methods that mutate state and require full CSRF verification.

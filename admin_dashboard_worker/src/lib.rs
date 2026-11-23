@@ -40,7 +40,7 @@ use crate::{
     crypto::KeyRing,
     security::{
         apply_security_headers, forbidden, is_mutation_method, json_error, map_admin_asset_path,
-        require_admin_identity, verify_admin_mutation,
+        verify_admin_mutation, verify_admin_request,
     },
 };
 
@@ -212,13 +212,45 @@ async fn serve_static_asset(env: &Env, method: &Method, req_path: &str) -> Respo
 #[event(fetch)]
 async fn fetch(req: HttpRequest, env: Env, ctx: Context) -> Result<Response> {
     // STEP 0 — ZERO-BYPASS AUTH GUARD BEFORE ANY ROUTING OR STATIC ASSET ACCESS (H13).
-    let admin_binding = ctx
+    // Verify HMAC-signed `X-Gallery-Admin-Assertion` using dedicated `ADMIN_ASSERTION_SECRET`
+    // (survives Cloudflare's `[assets]` router hop where `ctx.props` is dropped).
+    let admin_assertion_secret = match env.secret("ADMIN_ASSERTION_SECRET") {
+        Ok(s) => {
+            let bytes = s.to_string().into_bytes();
+            if bytes.is_empty() {
+                worker::console_error!("ADMIN_ASSERTION_SECRET is empty");
+                return Ok(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Admin dashboard misconfigured",
+                ));
+            }
+            bytes
+        }
+        Err(_) => {
+            worker::console_error!("ADMIN_ASSERTION_SECRET secret is missing");
+            return Ok(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Admin dashboard misconfigured",
+            ));
+        }
+    };
+    let admin_binding_prop = ctx
         .props::<BindingProps>()
         .unwrap_or_default()
         .gallery_admin;
-    if require_admin_identity(admin_binding, req.headers()).is_none() {
+    let now_secs = worker::Date::now().as_millis() / 1000;
+    if verify_admin_request(
+        admin_binding_prop,
+        Some(&admin_assertion_secret),
+        req.headers(),
+        now_secs,
+    )
+    .is_none()
+    {
         return Ok(forbidden("Administrator access required"));
     }
+    // Cryptographic gateway assertion verified above.
+    let admin_binding = true;
 
     let path = req.uri().path().to_string();
     let method = req.method().clone();
