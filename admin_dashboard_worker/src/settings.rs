@@ -40,6 +40,37 @@ pub const MAX_NOTICE_BANNER_BYTES: usize = 8_000;
 
 pub const LEGACY_UNCLASSIFIED_NOTE: &str = "Pending or legacy-ingested images (`images.status != 'completed'` or missing `wd_min_persisted_score` coverage) fail closed to a Placeholder whenever Policy v3 restrictions evaluate to Unknown. Run `embed --retag-safety` against Postgres to backfill full WD-Tagger v3 coverage on existing media.";
 
+pub const LEGACY_UPGRADE_REQUIRED_MSG: &str = "Legacy pre-v3 policy detected; review and publish Content Safety Policy v3 first before updating other settings.";
+
+/// Fail-closed migration guard for all non-safety settings mutations (`access`,
+/// `providers`, `retry-activation`). Rejects writes whenever D1 holds a legacy
+/// pre-v3 `site_settings` row so non-safety saves can NEVER stamp `schema_version = 3`
+/// with empty `policies: []` and silently clear legacy safety enforcement.
+pub fn ensure_v3_ready_for_non_safety_mutation(
+    legacy_upgrade_notice: Option<&str>,
+) -> std::result::Result<(), &'static str> {
+    if legacy_upgrade_notice.is_some() {
+        return Err(LEGACY_UPGRADE_REQUIRED_MSG);
+    }
+    Ok(())
+}
+
+/// Fail-closed migration guard for `POST /admin/api/safety`.
+///
+/// When D1 holds a legacy pre-v3 row, ONLY an explicit Policy v3 publish from the
+/// Content Safety tab (`confirm_policy_v3_migration == true`) is permitted to perform
+/// the upgrade; partial saves from other tabs (`Similarity & Geo`, `Age & Legal`) or
+/// older clients (`confirm_policy_v3_migration == false`) are rejected with `409 Conflict`.
+pub fn ensure_v3_ready_for_safety_mutation(
+    legacy_upgrade_notice: Option<&str>,
+    confirm_policy_v3_migration: bool,
+) -> std::result::Result<(), &'static str> {
+    if legacy_upgrade_notice.is_some() && !confirm_policy_v3_migration {
+        return Err(LEGACY_UPGRADE_REQUIRED_MSG);
+    }
+    Ok(())
+}
+
 // Default pricing / plan constants matching `user_worker/src/config.rs`.
 pub const DEFAULT_POINTS_PER_USD: i64 = 10_000;
 pub const DEFAULT_COST_IMAGE_VIEW: i64 = 1;
@@ -979,15 +1010,13 @@ impl LoadedSettings {
         Ok(Some(outcome))
     }
 
-    /// Idempotent retry for the latest saved revision (`POST /admin/api/policy/retry-activation`).
-    pub async fn retry_latest_activation(env: &Env) -> Result<ActivationOutcome> {
-        let mut loaded = Self::load(env).await?;
-        if loaded.legacy_upgrade_notice.is_some() {
-            return Err(worker::Error::RustError(
-                "Latest revision uses legacy pre-v3 schema; publish Policy v3 from Content Safety first"
-                    .into(),
-            ));
-        }
+    /// Idempotent retry for an already-loaded Policy v3 revision (`POST /admin/api/policy/retry-activation`).
+    pub async fn retry_loaded_activation(
+        env: &Env,
+        mut loaded: Self,
+    ) -> Result<ActivationOutcome> {
+        ensure_v3_ready_for_non_safety_mutation(loaded.legacy_upgrade_notice.as_deref())
+            .map_err(|msg| worker::Error::RustError(msg.to_string()))?;
         loaded.doc.public.schema_version = SITE_POLICY_SCHEMA_VERSION;
         loaded.doc.public.revision = loaded.revision;
         loaded.doc.public.vocab_digest = WD_VOCAB_DIGEST.to_string();
@@ -996,6 +1025,12 @@ impl LoadedSettings {
         loaded.doc.public.policy_digest = digest.clone();
 
         Self::activate_saved_revision(env, &loaded.doc.public, &digest).await
+    }
+
+    /// Idempotent retry for the latest saved revision (`POST /admin/api/policy/retry-activation`).
+    pub async fn retry_latest_activation(env: &Env) -> Result<ActivationOutcome> {
+        let loaded = Self::load(env).await?;
+        Self::retry_loaded_activation(env, loaded).await
     }
 }
 

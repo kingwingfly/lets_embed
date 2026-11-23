@@ -324,6 +324,11 @@ pub struct SaveSafetyReq {
     pub similarity: SimilarityDefaults,
     pub geo: GeoPolicy,
     pub legal: LegalDocConfig,
+    /// Must be `true` ONLY when publishing explicitly from the Content Safety Policy v3
+    /// builder; defaults to `false` so non-safety tabs (`Similarity & Geo`, `Age & Legal`)
+    /// or older clients fail closed (`409 Conflict`) when D1 holds a legacy pre-v3 row.
+    #[serde(default)]
+    pub confirm_policy_v3_migration: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

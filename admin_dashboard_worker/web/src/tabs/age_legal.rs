@@ -111,6 +111,7 @@ pub fn AgeLegalTab(
             similarity: current.similarity,
             geo: current.geo,
             legal,
+            confirm_policy_v3_migration: false,
         };
 
         spawn_local(async move {

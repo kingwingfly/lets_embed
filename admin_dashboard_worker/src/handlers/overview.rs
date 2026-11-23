@@ -20,7 +20,10 @@ use crate::{
         pending_activation_response,
     },
     security::AdminIdentity,
-    settings::{ActivationOutcome, LEGACY_UNCLASSIFIED_NOTE, LoadedSettings},
+    settings::{
+        ActivationOutcome, LEGACY_UNCLASSIFIED_NOTE, LoadedSettings,
+        ensure_v3_ready_for_non_safety_mutation,
+    },
 };
 
 #[derive(Default, Deserialize)]
@@ -191,6 +194,12 @@ pub async fn save_access_settings(
             return internal_error();
         }
     };
+    if let Err(msg) =
+        ensure_v3_ready_for_non_safety_mutation(loaded.legacy_upgrade_notice.as_deref())
+    {
+        return conflict(msg);
+    }
+
     if loaded.revision != req.revision {
         return conflict(
             "Settings were updated in another session. Reload the dashboard and reapply your changes.",

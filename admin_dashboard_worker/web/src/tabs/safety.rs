@@ -348,6 +348,7 @@ pub fn SafetyTab(
             similarity: current.similarity,
             geo: current.geo,
             legal: current.legal,
+            confirm_policy_v3_migration: true,
         };
 
         spawn_local(async move {

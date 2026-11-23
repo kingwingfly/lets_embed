@@ -77,6 +77,7 @@ pub fn SimilarityGeoTab(
                 block_tor: block_tor.get_untracked(),
             },
             legal: current.legal,
+            confirm_policy_v3_migration: false,
         };
 
         spawn_local(async move {

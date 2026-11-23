@@ -29,6 +29,7 @@ use crate::{
     security::AdminIdentity,
     settings::{
         ActivationOutcome, LEGACY_UNCLASSIFIED_NOTE, LoadedSettings, build_catalog_field_errors,
+        ensure_v3_ready_for_non_safety_mutation, ensure_v3_ready_for_safety_mutation,
         prepare_safety_update,
     },
 };
@@ -95,6 +96,13 @@ pub async fn save_safety(
             return internal_error();
         }
     };
+
+    if let Err(msg) = ensure_v3_ready_for_safety_mutation(
+        loaded.legacy_upgrade_notice.as_deref(),
+        req.confirm_policy_v3_migration,
+    ) {
+        return conflict(msg);
+    }
 
     if loaded.revision != req.revision {
         return conflict(
@@ -202,7 +210,21 @@ pub async fn retry_policy_activation(
         Err(resp) => return resp,
     };
 
-    match LoadedSettings::retry_latest_activation(&st.env).await {
+    let loaded = match LoadedSettings::load(&st.env).await {
+        Ok(s) => s,
+        Err(e) => {
+            worker::console_error!("load site_settings failed: {e:?}");
+            return internal_error();
+        }
+    };
+
+    if let Err(msg) =
+        ensure_v3_ready_for_non_safety_mutation(loaded.legacy_upgrade_notice.as_deref())
+    {
+        return conflict(msg);
+    }
+
+    match LoadedSettings::retry_loaded_activation(&st.env, loaded).await {
         Ok(ActivationOutcome::Active {
             ack,
             min_enforce_rev,

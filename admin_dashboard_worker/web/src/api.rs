@@ -326,6 +326,7 @@ pub struct SaveSafetyReq {
     pub similarity: SimilarityDefaults,
     pub geo: GeoPolicy,
     pub legal: LegalDocConfig,
+    pub confirm_policy_v3_migration: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

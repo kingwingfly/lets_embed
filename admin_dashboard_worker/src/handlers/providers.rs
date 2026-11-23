@@ -33,7 +33,8 @@ use crate::{
     },
     security::AdminIdentity,
     settings::{
-        ActivationOutcome, LoadedSettings, secret_field_for_provider, validate_provider_updates,
+        ActivationOutcome, LoadedSettings, ensure_v3_ready_for_non_safety_mutation,
+        secret_field_for_provider, validate_provider_updates,
     },
 };
 
@@ -176,6 +177,12 @@ pub async fn save_providers(
             return internal_error();
         }
     };
+
+    if let Err(msg) =
+        ensure_v3_ready_for_non_safety_mutation(loaded.legacy_upgrade_notice.as_deref())
+    {
+        return conflict(msg);
+    }
 
     if loaded.revision != req.revision {
         return conflict(

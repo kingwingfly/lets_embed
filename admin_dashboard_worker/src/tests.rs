@@ -33,9 +33,10 @@ use crate::{
         validate_oidc_url, verify_admin_mutation, verify_admin_request,
     },
     settings::{
-        AccessPolicy, ChainKind, SiteSettingsDocument, build_catalog_field_errors,
-        decode_site_settings_document, prepare_safety_update, valid_deposit_address,
-        validate_provider_updates,
+        AccessPolicy, ChainKind, LEGACY_UPGRADE_REQUIRED_MSG, SiteSettingsDocument,
+        build_catalog_field_errors, decode_site_settings_document,
+        ensure_v3_ready_for_non_safety_mutation, ensure_v3_ready_for_safety_mutation,
+        prepare_safety_update, valid_deposit_address, validate_provider_updates,
     },
 };
 
@@ -78,6 +79,7 @@ fn sample_safety_req(policies: Vec<ContentPolicy>) -> SaveSafetyReq {
         },
         geo: GeoPolicy::default(),
         legal: LegalDocConfig::default(),
+        confirm_policy_v3_migration: true,
     }
 }
 
@@ -546,6 +548,7 @@ fn conservative_min_enforce_rev_and_grant_generation_bumps() {
         },
         geo: base.geo.clone(),
         legal: base.legal.clone(),
+        confirm_policy_v3_migration: true,
     };
     cosmetic_req.policies[0].name = "Adult Content".into();
     cosmetic_req.policies[0].preset = PlaceholderPreset::Custom;
@@ -1068,4 +1071,83 @@ fn flattened_site_settings_v3_roundtrips_and_validates_geo_and_access() {
         ChainKind::Ethereum,
         "0x0000000000000000000000000000000000000000"
     ));
+}
+
+#[test]
+fn legacy_pre_v3_row_rejects_non_safety_mutations_and_unconfirmed_safety_saves() {
+    // Legacy pre-v3 row (no schema_version: 3, safety_enabled: true with legacy rules)
+    let legacy_json = r#"{"login_required":false,"safety_enabled":true,"rules":[{"id":"r18","expr":"tag:explicit"}]}"#;
+    let (_legacy_doc, legacy_notice) =
+        decode_site_settings_document(5, legacy_json, SiteSettingsDocument::default())
+            .expect("decode legacy pre-v3 row");
+    assert!(legacy_notice.is_some());
+
+    // 1. All non-safety settings mutations (`save_access_settings`, `save_providers`,
+    //    `retry_policy_activation`) MUST fail closed until Content Safety publishes Policy v3.
+    assert_eq!(
+        ensure_v3_ready_for_non_safety_mutation(legacy_notice.as_deref()),
+        Err(LEGACY_UPGRADE_REQUIRED_MSG)
+    );
+
+    // 2. Non-safety tabs hitting `/admin/api/safety` (`Similarity & Geo`, `Age & Legal`)
+    //    or older clients omitting `confirm_policy_v3_migration` MUST fail closed too.
+    let mut partial_req = serde_json::to_value(sample_safety_req(vec![])).unwrap();
+    partial_req
+        .as_object_mut()
+        .unwrap()
+        .remove("confirm_policy_v3_migration");
+    let decoded_default: SaveSafetyReq =
+        serde_json::from_value(partial_req).expect("deserialize SaveSafetyReq without flag");
+    assert!(
+        !decoded_default.confirm_policy_v3_migration,
+        "omitted confirm_policy_v3_migration must default to false (fail-closed)"
+    );
+    assert_eq!(
+        ensure_v3_ready_for_safety_mutation(
+            legacy_notice.as_deref(),
+            decoded_default.confirm_policy_v3_migration
+        ),
+        Err(LEGACY_UPGRADE_REQUIRED_MSG)
+    );
+
+    // 3. ONLY explicit Content Safety Policy v3 publication (`confirm_policy_v3_migration == true`)
+    //    is allowed to perform the legacy -> v3 upgrade.
+    assert_eq!(
+        ensure_v3_ready_for_safety_mutation(legacy_notice.as_deref(), true),
+        Ok(())
+    );
+
+    // 4. Fresh installation (`revision = 0, "{}"`) has no legacy notice and permits all saves.
+    let (_fresh_doc, fresh_notice) =
+        decode_site_settings_document(0, "{}", SiteSettingsDocument::default())
+            .expect("decode fresh install");
+    assert!(fresh_notice.is_none());
+    assert_eq!(
+        ensure_v3_ready_for_non_safety_mutation(fresh_notice.as_deref()),
+        Ok(())
+    );
+    assert_eq!(
+        ensure_v3_ready_for_safety_mutation(fresh_notice.as_deref(), false),
+        Ok(())
+    );
+
+    // 5. After Policy v3 is published (`schema_version = 3`), all non-safety tabs work normally.
+    let mut v3_doc = SiteSettingsDocument::default();
+    v3_doc.public.revision = 6;
+    v3_doc.public.safety_enabled = true;
+    v3_doc.public.policies = builtin_safety_presets();
+    v3_doc.public.refresh_policy_digest();
+    let v3_json = serde_json::to_string(&v3_doc).unwrap();
+    let (_decoded_v3, v3_notice) =
+        decode_site_settings_document(6, &v3_json, SiteSettingsDocument::default())
+            .expect("decode v3 row");
+    assert!(v3_notice.is_none());
+    assert_eq!(
+        ensure_v3_ready_for_non_safety_mutation(v3_notice.as_deref()),
+        Ok(())
+    );
+    assert_eq!(
+        ensure_v3_ready_for_safety_mutation(v3_notice.as_deref(), false),
+        Ok(())
+    );
 }
