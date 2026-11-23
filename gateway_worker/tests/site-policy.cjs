@@ -18,6 +18,7 @@ const originalSolanaDeposit = '5tE57EgXH3HTpbtiEQxVzdJeg2NZgGaH2KSSwc7e63DR';
 const jwtSecret = 'local-jwt-secret-fixture';
 const sessionV2Secret = 'local-session-v2-secret-fixture';
 const assertionSecret = 'local-gateway-assertion-secret-fixture';
+const adminAssertionSecret = 'local-admin-assertion-secret-fixture';
 const mediaCapSecret = 'local-media-cap-secret-fixture';
 
 const adminHost = 'staff.gallery.test';
@@ -337,6 +338,7 @@ function gatewayWorkerConfig(name, hostname, access, onUpstream) {
       JWT_SECRET: jwtSecret,
       SESSION_V2_SECRET: sessionV2Secret,
       GATEWAY_ASSERTION_SECRET: assertionSecret,
+      ADMIN_ASSERTION_SECRET: adminAssertionSecret,
       MEDIA_CAP_SECRET: mediaCapSecret,
       CF_ACCESS_AUD: 'gallery-admin',
       CF_ACCESS_CLIENT_ID: 'local-svc-id',

@@ -22,6 +22,8 @@ invocation_logs = true
 #     against JWT_SECRET using site_access's built-in `"session/v2\0"` HMAC domain separation.
 #   GATEWAY_ASSERTION_SECRET — dedicated secret shared ONLY with lets-embed-web to sign short-lived
 #     X-Gateway-Assertion headers (30s TTL, audience "lets-embed-web").
+#   ADMIN_ASSERTION_SECRET — dedicated secret shared ONLY with lets-embed-admin-dashboard-worker
+#     to sign short-lived X-Gallery-Admin-Assertion headers (survives Cloudflare Assets router hops).
 #   MEDIA_CAP_SECRET — dedicated secret shared ONLY with lets-embed-web to verify per-object
 #     `/media/{image,video,preview}/{id}?cap=...` capability tokens.
 #
@@ -33,6 +35,7 @@ required = [
   "CF_ACCESS_CLIENT_SECRET",
   "JWT_SECRET",
   "GATEWAY_ASSERTION_SECRET",
+  "ADMIN_ASSERTION_SECRET",
   "MEDIA_CAP_SECRET",
 ]
 
