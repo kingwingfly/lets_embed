@@ -1,24 +1,145 @@
-//! Dedicated metadata-only Safety Rule parser and AST.
+//! Dedicated metadata-only Safety Rule parser, 3-valued logic (`TriBool`),
+//! canonical WD-Tagger vocabulary validation, and catalog reference extraction.
 //!
 //! Grammar (strictly metadata-only, zero vector/fuzzy/regex operators):
-//! - `tag:<exact_name>[>=<f32>]` (score in `(0.0, 1.0]`, finite)
+//! - `tag:<exact_name>[>= <score>]` (score in `0.01..=1.00` hundredths on new writes)
 //! - `post_tag:<exact_name>`
 //! - `author:<exact_name>`
 //! - `unclassified`
 //! - Boolean operators `AND`, `OR`, `NOT`, unary `-`, and parentheses `(...)`
 
-use std::{collections::BTreeSet, fmt};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    ops::{BitAnd, BitOr, Not},
+};
 
-pub const MAX_RULES_PER_POLICY: usize = 16;
-pub const MAX_TERMS_PER_RULE: usize = 32;
+use crate::{
+    query::{format_threshold_hundredths, parse_threshold_hundredths, validate_threshold_range},
+    wd_vocab::is_canonical_wd_tag,
+};
+
+pub const MAX_POLICIES_PER_SET: usize = 16;
+pub const MAX_RULES_PER_POLICY: usize = MAX_POLICIES_PER_SET;
+pub const MAX_TERMS_PER_POLICY: usize = 32;
+pub const MAX_TERMS_PER_RULE: usize = MAX_TERMS_PER_POLICY;
 pub const MAX_DEPTH: usize = 6;
-pub const MAX_TOTAL_TERMS_PER_POLICY: usize = 128;
+pub const MAX_TOTAL_TERMS_PER_SET: usize = 128;
+pub const MAX_TOTAL_TERMS_PER_POLICY: usize = MAX_TOTAL_TERMS_PER_SET;
 pub const MAX_RULE_LEN: usize = 2048;
+
+// ---------------------------------------------------------------------------
+// 3-Valued Logic (Kleene Strong K3)
+// ---------------------------------------------------------------------------
+
+/// 3-valued truth value for Policy v3 evaluation over potentially incomplete
+/// or unclassified image facts.
+///
+/// Algebra preserves:
+/// - `!Unknown = Unknown`
+/// - `True | Unknown = True`
+/// - `False & Unknown = False`
+/// - All other combinations involving `Unknown` yield `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum TriBool {
+    True,
+    False,
+    Unknown,
+}
+
+impl TriBool {
+    #[inline]
+    pub const fn from_bool(v: bool) -> Self {
+        if v { Self::True } else { Self::False }
+    }
+
+    #[inline]
+    pub const fn is_true(self) -> bool {
+        matches!(self, Self::True)
+    }
+
+    #[inline]
+    pub const fn is_false(self) -> bool {
+        matches!(self, Self::False)
+    }
+
+    #[inline]
+    pub const fn is_unknown(self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
+    #[inline]
+    pub const fn not(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            Self::Unknown => Self::Unknown,
+        }
+    }
+
+    #[inline]
+    pub const fn and(self, rhs: Self) -> Self {
+        match (self, rhs) {
+            (Self::False, _) | (_, Self::False) => Self::False,
+            (Self::True, Self::True) => Self::True,
+            _ => Self::Unknown,
+        }
+    }
+
+    #[inline]
+    pub const fn or(self, rhs: Self) -> Self {
+        match (self, rhs) {
+            (Self::True, _) | (_, Self::True) => Self::True,
+            (Self::False, Self::False) => Self::False,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl From<bool> for TriBool {
+    #[inline]
+    fn from(v: bool) -> Self {
+        Self::from_bool(v)
+    }
+}
+
+impl Not for TriBool {
+    type Output = Self;
+
+    #[inline]
+    fn not(self) -> Self::Output {
+        TriBool::not(self)
+    }
+}
+
+impl BitAnd for TriBool {
+    type Output = Self;
+
+    #[inline]
+    fn bitand(self, rhs: Self) -> Self::Output {
+        TriBool::and(self, rhs)
+    }
+}
+
+impl BitOr for TriBool {
+    type Output = Self;
+
+    #[inline]
+    fn bitor(self, rhs: Self) -> Self::Output {
+        TriBool::or(self, rhs)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Safety AST & Helpers
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SafetyPredicate {
-    /// Exact canonical WD-Tagger tag name with optional per-term score threshold in `(0.0, 1.0]`.
+    /// Exact canonical WD-Tagger tag name with optional per-term score threshold.
     WdTag {
         name: String,
         #[cfg_attr(feature = "serde", serde(default))]
@@ -48,7 +169,7 @@ pub struct SafetyRuleError {
 }
 
 impl SafetyRuleError {
-    fn new(message: impl Into<String>, position: Option<usize>) -> Self {
+    pub fn new(message: impl Into<String>, position: Option<usize>) -> Self {
         Self {
             message: message.into(),
             position,
@@ -85,6 +206,36 @@ impl SafetyExpr {
             Self::And(items) | Self::Or(items) => {
                 1 + items.iter().map(Self::max_depth).max().unwrap_or(0)
             }
+        }
+    }
+
+    /// Evaluates this expression using 3-valued Kleene logic (`TriBool`).
+    pub fn eval_tribool(&self, eval_leaf: &impl Fn(&SafetyPredicate) -> TriBool) -> TriBool {
+        match self {
+            Self::Predicate(pred) => eval_leaf(pred),
+            Self::Not(inner) => inner.eval_tribool(eval_leaf).not(),
+            Self::And(items) => items
+                .iter()
+                .fold(TriBool::True, |acc, item| acc.and(item.eval_tribool(eval_leaf))),
+            Self::Or(items) => items
+                .iter()
+                .fold(TriBool::False, |acc, item| acc.or(item.eval_tribool(eval_leaf))),
+        }
+    }
+
+    /// Evaluates Policy v3's `match_expr AND NOT except_expr` in 3-valued logic.
+    ///
+    /// When `except_expr` is `None`, evaluates `match_expr` directly.
+    /// When `except_expr` is `Some(ex)`, evaluates `match_val & !except_val`.
+    pub fn eval_policy_match(
+        match_expr: &Self,
+        except_expr: Option<&Self>,
+        eval_leaf: &impl Fn(&SafetyPredicate) -> TriBool,
+    ) -> TriBool {
+        let matched = match_expr.eval_tribool(eval_leaf);
+        match except_expr {
+            None => matched,
+            Some(ex) => matched.and(ex.eval_tribool(eval_leaf).not()),
         }
     }
 
@@ -179,7 +330,7 @@ impl SafetyExpr {
                     format_exact_name(name, out);
                     if let Some(score) = min_score {
                         out.push_str(">=");
-                        out.push_str(&score.to_string());
+                        out.push_str(&format_threshold_hundredths(*score));
                     }
                 }
                 SafetyPredicate::PostTag(name) => {
@@ -242,6 +393,33 @@ impl SafetyExpr {
             }
         }
     }
+}
+
+/// Validates EVERY `tag:<name>` leaf in `expr` (including inside `NOT` branches)
+/// against the bundled canonical 10,861-tag WD-Tagger v3 vocabulary.
+pub fn validate_wd_tags_in_expr(expr: &SafetyExpr) -> Result<(), SafetyRuleError> {
+    let unknown: Vec<String> = expr
+        .referenced_wd_tags()
+        .into_iter()
+        .filter(|name| !is_canonical_wd_tag(name))
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(SafetyRuleError::new(
+            format!(
+                "Unknown WD-Tagger v3 tag(s): {}",
+                unknown.join(", ")
+            ),
+            None,
+        ))
+    }
+}
+
+/// Extracts deduplicated, deterministically sorted `(post_tags, authors)` catalog
+/// references from `expr` so `/admin` can validate them against the origin catalog.
+pub fn collect_catalog_refs(expr: &SafetyExpr) -> (Vec<String>, Vec<String>) {
+    (expr.referenced_post_tags(), expr.referenced_authors())
 }
 
 fn format_exact_name(name: &str, out: &mut String) {
@@ -308,7 +486,11 @@ struct Token {
     pos: usize,
 }
 
-fn parse_threshold_value(raw: &str, pos: usize) -> Result<f32, SafetyRuleError> {
+fn parse_threshold_value(
+    raw: &str,
+    pos: usize,
+    strict_hundredths: bool,
+) -> Result<f32, SafetyRuleError> {
     if raw.is_empty() {
         return Err(SafetyRuleError::new(
             "Expected numeric score after '>='",
@@ -321,23 +503,31 @@ fn parse_threshold_value(raw: &str, pos: usize) -> Result<f32, SafetyRuleError> 
             Some(pos),
         ));
     }
-    let val = raw.parse::<f32>().map_err(|_| {
-        SafetyRuleError::new(
-            format!("Invalid score threshold '{raw}' (expected float in (0.0, 1.0])"),
-            Some(pos),
-        )
-    })?;
-    if !val.is_finite() || val <= 0.0 || val > 1.0 {
-        return Err(SafetyRuleError::new(
-            format!("Score threshold '{raw}' must be finite and in (0.0, 1.0]"),
-            Some(pos),
-        ));
+    if strict_hundredths {
+        parse_threshold_hundredths(raw).map_err(|e| SafetyRuleError::new(e.message, Some(pos)))
+    } else {
+        let val = raw.parse::<f32>().map_err(|_| {
+            SafetyRuleError::new(
+                format!("Invalid score threshold '{raw}' (expected float in (0.0, 1.0])"),
+                Some(pos),
+            )
+        })?;
+        validate_threshold_range(val).map_err(|e| SafetyRuleError::new(e.message, Some(pos)))
     }
-    Ok(val)
 }
 
 fn is_regex_literal(s: &str) -> bool {
     s.starts_with('/')
+}
+
+fn is_gte_at(chars: &[(usize, char)], i: usize) -> bool {
+    i + 1 < chars.len() && chars[i].1 == '>' && chars[i + 1].1 == '='
+}
+
+fn skip_ws(chars: &[(usize, char)], i: &mut usize) {
+    while *i < chars.len() && chars[*i].1.is_whitespace() {
+        *i += 1;
+    }
 }
 
 fn parse_quoted(chars: &[(usize, char)], i: &mut usize) -> Result<String, SafetyRuleError> {
@@ -387,7 +577,43 @@ fn read_unquoted_segment(chars: &[(usize, char)], i: &mut usize) -> String {
     out
 }
 
-fn tokenize(input: &str) -> Result<Vec<Token>, SafetyRuleError> {
+/// Checks for an optional `>= <score>` following a predicate value, allowing
+/// optional whitespace before and after `>=`.
+fn try_read_trailing_gte(
+    chars: &[(usize, char)],
+    i: &mut usize,
+) -> Result<Option<(String, usize)>, SafetyRuleError> {
+    let saved = *i;
+    skip_ws(chars, i);
+    if !is_gte_at(chars, *i) {
+        *i = saved;
+        return Ok(None);
+    }
+    let op_pos = chars[*i].0;
+    *i += 2; // consume `>=`
+    skip_ws(chars, i);
+    if *i >= chars.len() || matches!(chars[*i].1, '(' | ')' | '"') {
+        return Err(SafetyRuleError::new(
+            "Expected numeric score after '>='",
+            Some(op_pos),
+        ));
+    }
+    let score_pos = chars[*i].0;
+    let raw_score = read_unquoted_segment(chars, i);
+    // Reject duplicate `>=` even when separated by whitespace (`tag:blood >= 0.5 >= 0.6`).
+    let after_score = *i;
+    skip_ws(chars, i);
+    if is_gte_at(chars, *i) {
+        return Err(SafetyRuleError::new(
+            "Duplicate '>=' threshold in tag predicate",
+            Some(chars[*i].0),
+        ));
+    }
+    *i = after_score;
+    Ok(Some((raw_score, score_pos)))
+}
+
+fn tokenize(input: &str, strict_hundredths: bool) -> Result<Vec<Token>, SafetyRuleError> {
     if input.len() > MAX_RULE_LEN {
         return Err(SafetyRuleError::new(
             format!("Safety rule exceeds maximum length of {MAX_RULE_LEN} bytes"),
@@ -404,6 +630,12 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SafetyRuleError> {
         if ch.is_whitespace() {
             i += 1;
             continue;
+        }
+        if is_gte_at(&chars, i) {
+            return Err(SafetyRuleError::new(
+                "Unexpected '>=' (score thresholds are only allowed on tag: predicates)",
+                Some(char_pos),
+            ));
         }
         match ch {
             '(' => {
@@ -506,17 +738,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SafetyRuleError> {
 
                     let (name, trailing_score) = if chars[i].1 == '"' {
                         let quoted = parse_quoted(&chars, &mut i)?;
-                        let score_opt = if i + 1 < chars.len()
-                            && chars[i].1 == '>'
-                            && chars[i + 1].1 == '='
-                        {
-                            let score_pos = chars[i].0;
-                            i += 2;
-                            let raw_score = read_unquoted_segment(&chars, &mut i);
-                            Some((raw_score, score_pos))
-                        } else if i < chars.len()
+                        if i < chars.len()
                             && !chars[i].1.is_whitespace()
                             && !matches!(chars[i].1, '(' | ')')
+                            && !is_gte_at(&chars, i)
                         {
                             return Err(SafetyRuleError::new(
                                 format!(
@@ -525,9 +750,8 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SafetyRuleError> {
                                 ),
                                 Some(chars[i].0),
                             ));
-                        } else {
-                            None
-                        };
+                        }
+                        let score_opt = try_read_trailing_gte(&chars, &mut i)?;
                         (quoted, score_opt)
                     } else {
                         let val_pos = chars[i].0;
@@ -545,7 +769,40 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SafetyRuleError> {
                             ));
                         }
                         if let Some((lhs, rhs)) = raw.split_once(">=") {
-                            (lhs.to_string(), Some((rhs.to_string(), val_pos)))
+                            if rhs.is_empty() {
+                                // `tag:blood>= 0.45`: whitespace after `>=`
+                                skip_ws(&chars, &mut i);
+                                if i >= chars.len() || matches!(chars[i].1, '(' | ')' | '"') {
+                                    return Err(SafetyRuleError::new(
+                                        "Expected numeric score after '>='",
+                                        Some(val_pos),
+                                    ));
+                                }
+                                let score_pos = chars[i].0;
+                                let score_word = read_unquoted_segment(&chars, &mut i);
+                                let after_score = i;
+                                skip_ws(&chars, &mut i);
+                                if is_gte_at(&chars, i) {
+                                    return Err(SafetyRuleError::new(
+                                        "Duplicate '>=' threshold in tag predicate",
+                                        Some(chars[i].0),
+                                    ));
+                                }
+                                i = after_score;
+                                (lhs.to_string(), Some((score_word, score_pos)))
+                            } else {
+                                // Reject duplicate `>=` separated by whitespace after inline score
+                                let after_score = i;
+                                skip_ws(&chars, &mut i);
+                                if is_gte_at(&chars, i) {
+                                    return Err(SafetyRuleError::new(
+                                        "Duplicate '>=' threshold in tag predicate",
+                                        Some(chars[i].0),
+                                    ));
+                                }
+                                i = after_score;
+                                (lhs.to_string(), Some((rhs.to_string(), val_pos)))
+                            }
                         } else {
                             // Reject unsupported comparison operators like `>0.5`, `<=0.5`, `==0.5`
                             // attached directly after a tag name (e.g. `tag:blood>0.5`).
@@ -568,7 +825,8 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SafetyRuleError> {
                                     }
                                 }
                             }
-                            (raw, None)
+                            let score_opt = try_read_trailing_gte(&chars, &mut i)?;
+                            (raw, score_opt)
                         }
                     };
 
@@ -595,15 +853,14 @@ fn tokenize(input: &str) -> Result<Vec<Token>, SafetyRuleError> {
                     let predicate = match field {
                         SafetyField::Tag => {
                             let min_score = match trailing_score {
-                                Some((raw_score, score_pos)) => {
-                                    Some(parse_threshold_value(&raw_score, score_pos)?)
-                                }
+                                Some((raw_score, score_pos)) => Some(parse_threshold_value(
+                                    &raw_score,
+                                    score_pos,
+                                    strict_hundredths,
+                                )?),
                                 None => None,
                             };
-                            SafetyPredicate::WdTag {
-                                name,
-                                min_score,
-                            }
+                            SafetyPredicate::WdTag { name, min_score }
                         }
                         SafetyField::PostTag => {
                             if trailing_score.is_some() {
@@ -764,9 +1021,10 @@ impl Parser {
     }
 }
 
-/// Parses and validates a single metadata-only Safety Rule expression,
-/// enforcing `MAX_RULE_LEN`, `MAX_DEPTH`, and `MAX_TERMS_PER_RULE`.
-pub fn parse_safety_rule(input: &str) -> Result<SafetyExpr, SafetyRuleError> {
+fn parse_safety_rule_inner(
+    input: &str,
+    strict_hundredths: bool,
+) -> Result<SafetyExpr, SafetyRuleError> {
     if input.len() > MAX_RULE_LEN {
         return Err(SafetyRuleError::new(
             format!("Safety rule exceeds maximum length of {MAX_RULE_LEN} bytes"),
@@ -776,7 +1034,7 @@ pub fn parse_safety_rule(input: &str) -> Result<SafetyExpr, SafetyRuleError> {
     if input.trim().is_empty() {
         return Err(SafetyRuleError::new("Safety rule is empty", None));
     }
-    let tokens = tokenize(input)?;
+    let tokens = tokenize(input, strict_hundredths)?;
     if tokens.is_empty() {
         return Err(SafetyRuleError::new("Safety rule is empty", None));
     }
@@ -796,26 +1054,78 @@ pub fn parse_safety_rule(input: &str) -> Result<SafetyExpr, SafetyRuleError> {
         ));
     }
     let terms = expr.term_count();
-    if terms > MAX_TERMS_PER_RULE {
+    if terms > MAX_TERMS_PER_POLICY {
         return Err(SafetyRuleError::new(
-            format!("Safety rule has {terms} terms, exceeding maximum of {MAX_TERMS_PER_RULE}"),
+            format!("Safety rule has {terms} terms, exceeding maximum of {MAX_TERMS_PER_POLICY}"),
             None,
         ));
     }
     Ok(expr)
 }
 
-/// Validates an entire policy's safety rule list, enforcing `MAX_RULES_PER_POLICY`
-/// and `MAX_TOTAL_TERMS_PER_POLICY` in addition to per-rule limits.
+/// Parses and validates a single metadata-only Safety Rule expression,
+/// enforcing `MAX_RULE_LEN`, `MAX_DEPTH`, `MAX_TERMS_PER_POLICY`, and strict
+/// hundredths score thresholds (`0.01..=1.00`).
+pub fn parse_safety_rule(input: &str) -> Result<SafetyExpr, SafetyRuleError> {
+    parse_safety_rule_inner(input, true)
+}
+
+/// Parses a metadata-only Safety Rule while permitting legacy `(0.0, 1.0]`
+/// float precision (for migrating persisted pre-v3 policies).
+pub fn parse_safety_rule_legacy_precision(input: &str) -> Result<SafetyExpr, SafetyRuleError> {
+    parse_safety_rule_inner(input, false)
+}
+
+/// Parses and validates a Policy v3 `(match_expr, except_expr)` pair:
+/// - Enforces strict metadata-only grammar and AST depth `<= 6` on both.
+/// - Enforces combined term count `match_terms + except_terms <= 32`.
+/// - Validates EVERY `tag:<name>` leaf in both `match_expr` and `except_expr`
+///   (including inside `NOT`) against the canonical 10,861-tag WD-Tagger v3 vocab.
+pub fn validate_policy_expr_pair(
+    match_expr: &str,
+    except_expr: Option<&str>,
+) -> Result<(SafetyExpr, Option<SafetyExpr>), SafetyRuleError> {
+    let parsed_match = parse_safety_rule(match_expr)?;
+    validate_wd_tags_in_expr(&parsed_match)?;
+
+    let parsed_except = match except_expr.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw_except) => {
+            let ex = parse_safety_rule(raw_except).map_err(|e| {
+                SafetyRuleError::new(format!("except_expr: {}", e.message), e.position)
+            })?;
+            validate_wd_tags_in_expr(&ex).map_err(|e| {
+                SafetyRuleError::new(format!("except_expr: {}", e.message), e.position)
+            })?;
+            Some(ex)
+        }
+        None => None,
+    };
+
+    let combined_terms = parsed_match.term_count()
+        + parsed_except.as_ref().map_or(0, SafetyExpr::term_count);
+    if combined_terms > MAX_TERMS_PER_POLICY {
+        return Err(SafetyRuleError::new(
+            format!(
+                "Policy has {combined_terms} combined terms (match_expr + except_expr), exceeding maximum of {MAX_TERMS_PER_POLICY}"
+            ),
+            None,
+        ));
+    }
+
+    Ok((parsed_match, parsed_except))
+}
+
+/// Validates an entire policy's safety rule list, enforcing `MAX_POLICIES_PER_SET`
+/// and `MAX_TOTAL_TERMS_PER_SET` in addition to per-rule limits.
 pub fn validate_policy_rules<'a>(
     rules: impl IntoIterator<Item = &'a str>,
 ) -> Result<Vec<SafetyExpr>, SafetyRuleError> {
     let mut parsed = Vec::new();
     let mut total_terms = 0usize;
     for (idx, raw) in rules.into_iter().enumerate() {
-        if parsed.len() >= MAX_RULES_PER_POLICY {
+        if parsed.len() >= MAX_POLICIES_PER_SET {
             return Err(SafetyRuleError::new(
-                format!("Policy exceeds maximum of {MAX_RULES_PER_POLICY} safety rules"),
+                format!("Policy exceeds maximum of {MAX_POLICIES_PER_SET} safety rules"),
                 None,
             ));
         }
@@ -823,10 +1133,10 @@ pub fn validate_policy_rules<'a>(
             SafetyRuleError::new(format!("Rule #{}: {}", idx + 1, e.message), e.position)
         })?;
         total_terms += expr.term_count();
-        if total_terms > MAX_TOTAL_TERMS_PER_POLICY {
+        if total_terms > MAX_TOTAL_TERMS_PER_SET {
             return Err(SafetyRuleError::new(
                 format!(
-                    "Policy exceeds maximum of {MAX_TOTAL_TERMS_PER_POLICY} total safety terms"
+                    "Policy exceeds maximum of {MAX_TOTAL_TERMS_PER_SET} total safety terms"
                 ),
                 None,
             ));
@@ -841,8 +1151,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_all_allowed_predicates_and_extracts_references() {
-        let rule = r#"(tag:explicit>=0.75 OR tag:"eimi_(blue_archive)">=0.5 OR post_tag:r18_set) AND author:"artist_name" AND NOT tag:general AND -unclassified"#;
+    fn tribool_kleene_algebra_preserves_exact_truth_tables() {
+        use TriBool::{False as F, True as T, Unknown as U};
+
+        // NOT
+        assert_eq!(!T, F);
+        assert_eq!(!F, T);
+        assert_eq!(!U, U);
+
+        // AND
+        assert_eq!(T & T, T);
+        assert_eq!(T & F, F);
+        assert_eq!(F & T, F);
+        assert_eq!(F & F, F);
+        assert_eq!(F & U, F);
+        assert_eq!(U & F, F);
+        assert_eq!(T & U, U);
+        assert_eq!(U & T, U);
+        assert_eq!(U & U, U);
+
+        // OR
+        assert_eq!(T | T, T);
+        assert_eq!(T | F, T);
+        assert_eq!(F | T, T);
+        assert_eq!(F | F, F);
+        assert_eq!(T | U, T);
+        assert_eq!(U | T, T);
+        assert_eq!(F | U, U);
+        assert_eq!(U | F, U);
+        assert_eq!(U | U, U);
+
+        // Policy evaluation: `match_expr AND NOT except_expr`
+        let match_expr = parse_safety_rule("tag:blood").unwrap();
+        let except_expr = parse_safety_rule("post_tag:safe_override").unwrap();
+
+        // Match True, Except Unknown -> True & !Unknown = Unknown (fail-closed Placeholder!)
+        let res = SafetyExpr::eval_policy_match(&match_expr, Some(&except_expr), &|p| match p {
+            SafetyPredicate::WdTag { .. } => T,
+            SafetyPredicate::PostTag(_) => U,
+            _ => F,
+        });
+        assert_eq!(res, U);
+
+        // Match False, Except Unknown -> False & Unknown = False
+        let res = SafetyExpr::eval_policy_match(&match_expr, Some(&except_expr), &|p| match p {
+            SafetyPredicate::WdTag { .. } => F,
+            SafetyPredicate::PostTag(_) => U,
+            _ => F,
+        });
+        assert_eq!(res, F);
+
+        // Match Unknown, Except True -> Unknown & False = False (exempt!)
+        let res = SafetyExpr::eval_policy_match(&match_expr, Some(&except_expr), &|p| match p {
+            SafetyPredicate::WdTag { .. } => U,
+            SafetyPredicate::PostTag(_) => T,
+            _ => F,
+        });
+        assert_eq!(res, F);
+    }
+
+    #[test]
+    fn parses_all_allowed_predicates_whitespace_around_gte_and_extracts_catalog_refs() {
+        let rule = r#"(tag:explicit >= 0.75 OR tag:"eimi_(blue_archive)" >=0.50 OR post_tag:r18_set) AND author:"artist_name" AND NOT tag:general>= 0.20 AND -unclassified"#;
         let expr = parse_safety_rule(rule).expect("valid safety rule");
 
         assert_eq!(
@@ -853,8 +1223,9 @@ mod tests {
                 "general".to_string(),
             ]
         );
-        assert_eq!(expr.referenced_post_tags(), vec!["r18_set".to_string()]);
-        assert_eq!(expr.referenced_authors(), vec!["artist_name".to_string()]);
+        let (post_tags, authors) = collect_catalog_refs(&expr);
+        assert_eq!(post_tags, vec!["r18_set".to_string()]);
+        assert_eq!(authors, vec!["artist_name".to_string()]);
         assert!(expr.references_unclassified());
         assert_eq!(expr.term_count(), 6);
 
@@ -865,50 +1236,71 @@ mod tests {
     }
 
     #[test]
-    fn parses_builtin_preset_queries() {
+    fn validates_wd_tags_including_inside_not_and_except_expr() {
+        // Valid canonical WD tags pass
+        let (m, ex) = validate_policy_expr_pair(
+            "tag:blood >= 0.45 AND NOT tag:general",
+            Some("tag:sensitive OR post_tag:medical_diagram"),
+        )
+        .expect("canonical tags valid");
+        assert_eq!(m.term_count(), 2);
+        assert_eq!(ex.unwrap().term_count(), 2);
+
+        // Typo inside NOT in match_expr MUST be rejected
+        let err = validate_policy_expr_pair("tag:blood AND NOT tag:genral_typo", None)
+            .unwrap_err();
+        assert!(err.message.contains("genral_typo"));
+
+        // Typo inside except_expr MUST be rejected
+        let err =
+            validate_policy_expr_pair("tag:blood", Some("NOT tag:explict_typo")).unwrap_err();
+        assert!(err.message.contains("except_expr") && err.message.contains("explict_typo"));
+
+        // Combined term count (match_expr + except_expr > 32) MUST be rejected
+        let twenty = (0..20)
+            .map(|_| "tag:blood")
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let thirteen = (0..13)
+            .map(|_| "tag:explicit")
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        assert!(validate_policy_expr_pair(&twenty, Some(&thirteen)).is_err());
+    }
+
+    #[test]
+    fn parses_builtin_preset_queries_and_validates_all_against_wd_vocab() {
         let r18 = "tag:explicit OR tag:nude OR tag:nipples OR tag:pussy OR tag:penis OR tag:sex OR tag:uncensored OR tag:censored OR tag:topless OR tag:bottomless";
         let sensitive = "tag:questionable OR tag:sensitive OR tag:lingerie OR tag:bikini OR tag:underwear OR tag:panties OR tag:cleavage OR tag:bdsm";
         let blood = "tag:blood";
         let rules = validate_policy_rules([r18, sensitive, blood]).expect("presets valid");
         assert_eq!(rules.len(), 3);
-        assert_eq!(rules[0].referenced_wd_tags().len(), 10);
-        assert_eq!(rules[1].referenced_wd_tags().len(), 8);
-        assert_eq!(rules[2].referenced_wd_tags(), vec!["blood".to_string()]);
+        for expr in &rules {
+            validate_wd_tags_in_expr(expr).expect("all preset tags exist in WD vocab");
+        }
     }
 
     #[test]
     fn rejects_vector_fuzzy_bare_regex_and_empty_names() {
-        // Vector operators
         assert!(parse_safety_rule(r#"clip:"blood""#).is_err());
         assert!(parse_safety_rule("dino:12345").is_err());
         assert!(parse_safety_rule("upload:0").is_err());
         assert!(parse_safety_rule("tag:blood OR clip:gore").is_err());
-
-        // Unsupported search fields
         assert!(parse_safety_rule("title:nsfw").is_err());
         assert!(parse_safety_rule("all:nsfw").is_err());
-
-        // Bare/unscoped free text
         assert!(parse_safety_rule("blood").is_err());
         assert!(parse_safety_rule(r#""explicit""#).is_err());
         assert!(parse_safety_rule("tag:blood gore").is_err());
-
-        // Regexes (including regexes with trailing flags)
         assert!(parse_safety_rule("/blood.*/").is_err());
         assert!(parse_safety_rule("tag:/blood.*/").is_err());
         assert!(parse_safety_rule("tag:/blood.*/i").is_err());
-        assert!(parse_safety_rule("tag:/blood/gimsu").is_err());
         assert!(parse_safety_rule("regex:blood.*").is_err());
         assert!(parse_safety_rule("tag:blood~=0.5").is_err());
-
-        // Control chars and NUL bytes in quoted or unquoted names
         assert!(parse_safety_rule("tag:\"blood\0\"").is_err());
         assert!(parse_safety_rule("tag:\"blood\nline\"").is_err());
         assert!(parse_safety_rule("tag:blood\x00").is_err());
         assert!(parse_safety_rule("post_tag:\"foo\x07bar\"").is_err());
         assert!(parse_safety_rule("author:\"bob\r\"").is_err());
-
-        // Empty names
         assert!(parse_safety_rule("tag:").is_err());
         assert!(parse_safety_rule(r#"tag:"""#).is_err());
         assert!(parse_safety_rule(r#"tag:"   ""#).is_err());
@@ -919,9 +1311,25 @@ mod tests {
 
     #[test]
     fn validates_score_thresholds_strictly() {
-        assert!(parse_safety_rule("tag:blood>=0.001").is_ok());
-        assert!(parse_safety_rule("tag:blood>=1.0").is_ok());
-        assert!(parse_safety_rule("tag:blood>=1").is_ok());
+        // Valid hundredths (all 4 whitespace combos)
+        for q in [
+            "tag:blood>=0.01",
+            "tag:blood>= 0.01",
+            "tag:blood >=0.01",
+            "tag:blood >= 0.01",
+            "tag:blood>=1.0",
+            "tag:blood>=1.00",
+            "tag:blood>=1",
+            r#"tag:":>=" >= 0.50"#,
+        ] {
+            assert!(parse_safety_rule(q).is_ok(), "expected ok for {q}");
+        }
+
+        // Legacy precision preserved via dedicated migration helper
+        assert!(parse_safety_rule("tag:blood>=0.001").is_err());
+        assert!(parse_safety_rule("tag:blood>=0.456").is_err());
+        assert!(parse_safety_rule_legacy_precision("tag:blood>=0.001").is_ok());
+
         // Kaomoji tags containing '=' without numeric suffix remain valid
         assert_eq!(
             parse_safety_rule("tag:=_=").unwrap(),
@@ -931,61 +1339,68 @@ mod tests {
             })
         );
 
-        // Out of range or non-finite
-        assert!(parse_safety_rule("tag:blood>=0").is_err());
-        assert!(parse_safety_rule("tag:blood>=0.0").is_err());
-        assert!(parse_safety_rule("tag:blood>=-0.5").is_err());
-        assert!(parse_safety_rule("tag:blood>=1.01").is_err());
-        assert!(parse_safety_rule("tag:blood>=NaN").is_err());
-        assert!(parse_safety_rule("tag:blood>=inf").is_err());
-        assert!(parse_safety_rule("tag:blood>=-inf").is_err());
-        assert!(parse_safety_rule("tag:blood>=").is_err());
-        assert!(parse_safety_rule("tag:blood>0.5").is_err());
-        assert!(parse_safety_rule("tag:blood<=0.5").is_err());
-        assert!(parse_safety_rule("tag:blood=0.5").is_err());
-        assert!(parse_safety_rule("tag:blood==0.5").is_err());
-        assert!(parse_safety_rule("tag:blood>=0.5>=0.6").is_err());
-
-        // Score threshold disallowed on post_tag / author
-        assert!(parse_safety_rule("post_tag:nsfw>=0.5").is_err());
-        assert!(parse_safety_rule("author:bob>=0.5").is_err());
+        // Out of range, non-finite, duplicate, or invalid operators
+        for bad in [
+            "tag:blood>=0",
+            "tag:blood>=0.0",
+            "tag:blood>=-0.5",
+            "tag:blood >= -0.5",
+            "tag:blood>=1.01",
+            "tag:blood>=NaN",
+            "tag:blood>=inf",
+            "tag:blood>=-inf",
+            "tag:blood>=",
+            "tag:blood >= ",
+            "tag:blood>0.5",
+            "tag:blood<=0.5",
+            "tag:blood=0.5",
+            "tag:blood==0.5",
+            "tag:blood>=0.5>=0.6",
+            "tag:blood >= 0.5 >= 0.6",
+            "post_tag:nsfw>=0.5",
+            "post_tag:nsfw >= 0.5",
+            "author:bob>=0.5",
+            "author:bob >= 0.5",
+            "unclassified >= 0.5",
+        ] {
+            assert!(parse_safety_rule(bad).is_err(), "expected err for {bad}");
+        }
     }
 
     #[test]
     fn enforces_hard_policy_and_rule_limits() {
-        // MAX_RULE_LEN
         let oversized = format!("tag:{}", "a".repeat(MAX_RULE_LEN));
         assert!(parse_safety_rule(&oversized).is_err());
 
-        // MAX_TERMS_PER_RULE (33 terms)
-        let too_many_terms = (0..=MAX_TERMS_PER_RULE)
+        let too_many_terms = (0..=MAX_TERMS_PER_POLICY)
             .map(|i| format!("tag:t{i}"))
             .collect::<Vec<_>>()
             .join(" OR ");
         assert!(parse_safety_rule(&too_many_terms).is_err());
 
-        let exact_terms = (0..MAX_TERMS_PER_RULE)
+        let exact_terms = (0..MAX_TERMS_PER_POLICY)
             .map(|i| format!("tag:t{i}"))
             .collect::<Vec<_>>()
             .join(" OR ");
         assert!(parse_safety_rule(&exact_terms).is_ok());
 
-        // MAX_DEPTH (> 6)
         let deep_not = format!("{}tag:blood", "NOT ".repeat(MAX_DEPTH));
         assert!(parse_safety_rule(&deep_not).is_err());
-        let deep_parens = format!("{}tag:blood{}", "(".repeat(MAX_DEPTH + 1), ")".repeat(MAX_DEPTH + 1));
+        let deep_parens = format!(
+            "{}tag:blood{}",
+            "(".repeat(MAX_DEPTH + 1),
+            ")".repeat(MAX_DEPTH + 1)
+        );
         assert!(parse_safety_rule(&deep_parens).is_err());
 
-        // MAX_RULES_PER_POLICY (> 16)
-        let too_many_rules = vec!["tag:blood"; MAX_RULES_PER_POLICY + 1];
+        let too_many_rules = vec!["tag:blood"; MAX_POLICIES_PER_SET + 1];
         assert!(validate_policy_rules(too_many_rules).is_err());
 
-        // MAX_TOTAL_TERMS_PER_POLICY (> 128 across rules)
         let twenty_terms = (0..20)
             .map(|i| format!("tag:t{i}"))
             .collect::<Vec<_>>()
             .join(" OR ");
-        let seven_rules: Vec<&str> = (0..7).map(|_| twenty_terms.as_str()).collect(); // 140 terms > 128
+        let seven_rules: Vec<&str> = (0..7).map(|_| twenty_terms.as_str()).collect();
         assert!(validate_policy_rules(seven_rules).is_err());
     }
 }

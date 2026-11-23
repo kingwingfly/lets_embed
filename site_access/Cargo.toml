@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+search_types = { path = "../search_types", features = ["serde"] }
 serde.workspace = true
 serde_json.workspace = true
 base64 = "0.23"

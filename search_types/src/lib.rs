@@ -1,10 +1,25 @@
 pub mod projection;
 pub mod query;
 pub mod safety;
+pub mod wd_vocab;
 
 pub use projection::{
-    BlurDeliveryMode, MaskMetadata, ProjectedImage, ProjectedVideo, SimilarityThresholdError,
-    clamp_min_similarity, validate_min_similarity,
+    MaskMetadata, MediaKind, MediaVisibility, PlaceholderPreset, ProjectedImage, ProjectedVideo,
+    RenderedMedia, RenderedPost, RevealRequest, RevealResponse, SafetyProjection,
+    SimilarityThresholdError, clamp_min_similarity, validate_min_similarity,
+};
+pub use query::{
+    ClipClause, DinoClause, ThresholdError, UploadClause, VectorClause, VectorTarget,
+    format_threshold_hundredths, parse_threshold_hundredths, validate_threshold_hundredths_f32,
+    validate_threshold_range,
+};
+pub use safety::{
+    TriBool, collect_catalog_refs, parse_safety_rule, parse_safety_rule_legacy_precision,
+    validate_policy_expr_pair, validate_wd_tags_in_expr,
+};
+pub use wd_vocab::{
+    BUILTIN_SAFETY_PRESET_TAGS, WD_VOCAB_COUNT, WD_VOCAB_DIGEST, canonical_wd_vocab_bytes,
+    is_canonical_wd_tag, wd_vocab_count, wd_vocab_tags,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
