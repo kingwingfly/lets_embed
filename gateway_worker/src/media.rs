@@ -217,12 +217,14 @@ pub(crate) fn build_media_upstream_target(
 /// Returns `true` for the strict allowlist of read-only client headers forwarded
 /// to private media origins (`IMAGE_UPSTREAM` / `VIDEO_UPSTREAM`).
 ///
-/// For `MediaCapKind::Preview`, `Range` and `If-Range` are stripped so clients
-/// can never request raw byte ranges of a blurred preview.
+/// For `MediaCapKind::Preview`, `Range`, `If-Range`, and conditional validator
+/// headers (`If-None-Match`, `If-Modified-Since`, `If-Match`, `If-Unmodified-Since`)
+/// are stripped so previews never request raw byte ranges or receive `304`/`412`
+/// responses (previews always return `Cache-Control: private, no-store`).
 pub(crate) fn is_allowed_media_request_header(kind: MediaCapKind, name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    if kind == MediaCapKind::Preview && matches!(lower.as_str(), "range" | "if-range") {
-        return false;
+    if kind == MediaCapKind::Preview {
+        return matches!(lower.as_str(), "accept" | "accept-encoding" | "user-agent");
     }
     matches!(
         lower.as_str(),

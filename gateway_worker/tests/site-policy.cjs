@@ -593,6 +593,12 @@ function gatewayWorkerConfig(name, hostname, access, onUpstream, extra = {}) {
       };
       // Simulate Cloudflare Images `cf-resized` confirmation when `cf.image` is present.
       if (request.cf && request.cf.image) {
+        assert.equal(request.headers.get('range'), null);
+        assert.equal(request.headers.get('if-range'), null);
+        assert.equal(request.headers.get('if-none-match'), null);
+        assert.equal(request.headers.get('if-modified-since'), null);
+        assert.equal(request.headers.get('if-match'), null);
+        assert.equal(request.headers.get('if-unmodified-since'), null);
         headers['cf-resized'] = 'internal=ok/q=30 t=0.05';
       }
       return new Response('Gallery origin', { headers });
@@ -987,12 +993,14 @@ test('Policy v3 gateway enforces HKDF SITE_SECRET, zero implicit admin unlock, f
     })).status,
     403
   );
-  // Valid same-origin + X-Requested-With: fetch -> mints le_guest_sid cookie + ActorBinding::GuestSession in ga3.!
+  // Valid same-origin + X-Requested-With: fetch (even with spoofed X-Forwarded-Proto: http!) ->
+  // mints le_guest_sid cookie WITH Secure + ActorBinding::GuestSession in ga3.!
   const revealResp = await site('/api/safety/reveal', {
     method: 'POST',
     headers: {
       origin: appOrigin,
       'x-requested-with': 'fetch',
+      'x-forwarded-proto': 'http',
       'content-type': 'application/json',
     },
     body: revealBody,
@@ -1138,7 +1146,12 @@ test('Policy v3 gateway enforces HKDF SITE_SECRET, zero implicit admin unlock, f
     exp: now + 300,
   });
   const previewOk = await site(`/media/preview/42?cap=${previewCap}&blur=0`, {
-    headers: { cookie: `${adminViewCookie}; ${guestCookiePair}` },
+    headers: {
+      cookie: `${adminViewCookie}; ${guestCookiePair}`,
+      'if-none-match': '"etag-1"',
+      'if-modified-since': 'Wed, 21 Oct 2015 07:28:00 GMT',
+      range: 'bytes=0-100',
+    },
   });
   assert.equal(previewOk.status, 200);
   const previewCf = JSON.parse(previewOk.headers.get('x-test-cf'));

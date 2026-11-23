@@ -162,19 +162,13 @@ pub(crate) fn request_host<'a>(uri: &'a Uri, headers: &'a HeaderMap) -> Option<&
     Some(host)
 }
 
-pub(crate) fn is_https_request(uri: &Uri, headers: &HeaderMap) -> bool {
-    if uri
-        .scheme_str()
+/// Returns `true` unless the request URI explicitly uses `http://`.
+///
+/// SECURITY: Derives strictly from `uri.scheme_str()` and NEVER reads the
+/// untrusted client `X-Forwarded-Proto` header.
+pub(crate) fn is_https_request(uri: &Uri) -> bool {
+    !uri.scheme_str()
         .is_some_and(|s| s.eq_ignore_ascii_case("http"))
-    {
-        return false;
-    }
-    if let Ok(Some(xfp)) = single_header(headers, "x-forwarded-proto")
-        && xfp.trim().eq_ignore_ascii_case("http")
-    {
-        return false;
-    }
-    true
 }
 
 pub(crate) fn is_same_origin(uri: &Uri, headers: &HeaderMap) -> bool {

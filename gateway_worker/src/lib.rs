@@ -777,7 +777,7 @@ fn build_api_headers(
         }
     }
     if let Some(host) = request_host(uri, headers) {
-        let proto = if is_https_request(uri, headers) {
+        let proto = if is_https_request(uri) {
             "https"
         } else {
             "http"
@@ -1416,7 +1416,7 @@ async fn forward_gallery_request(
         actor = ActorBinding::GuestSession { gid };
         minted_guest_cookie = Some(guest_session_set_cookie_header(
             &signed_guest,
-            is_https_request(uri, headers),
+            is_https_request(uri),
         ));
     }
 
@@ -2723,11 +2723,13 @@ mod tests {
         );
         assert!(backend.upstream_calls.borrow().is_empty());
 
-        // 4. Valid guest POST /api/safety/reveal without le_guest_sid:
-        //    mints fresh le_guest_sid, passes ActorBinding::GuestSession in ga3., sets HttpOnly Secure cookie!
+        // 4. Valid guest POST /api/safety/reveal without le_guest_sid (even with spoofed X-Forwarded-Proto: http!):
+        //    mints fresh le_guest_sid, passes ActorBinding::GuestSession in ga3., sets HttpOnly Secure cookie,
+        //    and ignores untrusted X-Forwarded-Proto: http (forwards x-forwarded-proto: https)!
         let mut ok_hdrs = HeaderMap::new();
         ok_hdrs.insert("origin", "https://gallery.test".parse().unwrap());
         ok_hdrs.insert("x-requested-with", "fetch".parse().unwrap());
+        ok_hdrs.insert("x-forwarded-proto", "http".parse().unwrap());
         let resp = dispatch(
             &backend,
             &cfg,
@@ -2758,6 +2760,11 @@ mod tests {
         {
             let up = backend.upstream_calls.borrow();
             assert_eq!(up.len(), 1);
+            assert_eq!(
+                header_value(&up[0].headers, "x-forwarded-proto"),
+                Some("https"),
+                "untrusted X-Forwarded-Proto: http on HTTPS request must never spoof forwarded proto"
+            );
             let ga = verify_gateway_assertion(
                 header_value(&up[0].headers, GATEWAY_ASSERTION_HEADER).unwrap(),
                 &cfg.gateway_assertion_secret,
@@ -3049,10 +3056,23 @@ mod tests {
         };
         let ptok = sign_media_capability(&preview_cap, &cfg.media_cap_secret).unwrap();
 
-        // 4a. With fixed_blur_enabled == true and cf-resized: internal=ok -> 200 OK, locked blur, Range stripped!
+        // 4a. With fixed_blur_enabled == true and cf-resized: internal=ok -> 200 OK, locked blur,
+        //     Range/If-Range and conditional validator headers stripped!
         backend.upstream_calls.borrow_mut().clear();
         let mut preview_hdrs = guest_hdrs.clone();
         preview_hdrs.insert("range", "bytes=0-100".parse().unwrap());
+        preview_hdrs.insert("if-range", "\"etag-1\"".parse().unwrap());
+        preview_hdrs.insert("if-none-match", "\"etag-1\"".parse().unwrap());
+        preview_hdrs.insert(
+            "if-modified-since",
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        preview_hdrs.insert("if-match", "\"etag-1\"".parse().unwrap());
+        preview_hdrs.insert(
+            "if-unmodified-since",
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        preview_hdrs.insert("accept", "image/webp,*/*".parse().unwrap());
         let p_ok = dispatch(
             &backend,
             &cfg,
@@ -3067,7 +3087,24 @@ mod tests {
             // Preview queries /internal/facts-rev/image/88 (NOT /preview/88!)
             assert_eq!(up[0].url, "https://api.gallery.test/internal/facts-rev/image/88");
             assert_eq!(up[1].preview_blur, Some(LOCKED_PREVIEW_BLUR));
-            assert_eq!(header_value(&up[1].headers, "range"), None);
+            for stripped in [
+                "range",
+                "if-range",
+                "if-none-match",
+                "if-modified-since",
+                "if-match",
+                "if-unmodified-since",
+            ] {
+                assert_eq!(
+                    header_value(&up[1].headers, stripped),
+                    None,
+                    "Preview must strip {stripped}"
+                );
+            }
+            assert_eq!(
+                header_value(&up[1].headers, "accept"),
+                Some("image/webp,*/*")
+            );
         }
 
         // 4b. Transform unavailable (missing cf-resized) or error (`err=9524`) -> 502 Bad Gateway!
@@ -3682,6 +3719,9 @@ mod tests {
         );
         assert!(browse_route(&Method::POST, "/api/safety/reveal"));
         assert!(!browse_route(&Method::GET, "/api/safety/reveal"));
+        assert!(is_https_request(&"https://gallery.test/api/safety/reveal".parse().unwrap()));
+        assert!(is_https_request(&"/api/safety/reveal".parse().unwrap()));
+        assert!(!is_https_request(&"http://localhost:8787/api/safety/reveal".parse().unwrap()));
         assert_eq!(checked_media_method(&Method::GET), Some(worker::Method::Get));
         assert_eq!(checked_media_method(&Method::POST), None);
     }
