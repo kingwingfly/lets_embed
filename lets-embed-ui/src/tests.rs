@@ -1,12 +1,13 @@
 use crate::components::{
-    QueryBuilderDraft, QueryBuilderMode, QueryBuilderNode, QueryCombinator, QueryFieldKind,
-    clamp_chars, compute_menu_placement_from_metrics, format_query_nodes, format_score_for_step,
-    format_threshold, next_enabled_index, parse_committed_score, parse_live_score,
+    MenuPlacement, QueryBuilderDraft, QueryBuilderMode, QueryBuilderNode, QueryCombinator,
+    QueryConditionOp, QueryFieldKind, clamp_chars, compute_menu_placement_from_metrics,
+    format_query_list_condition, format_query_nodes, format_score_for_step, format_threshold,
+    merge_chip_values, next_enabled_index, parse_committed_score, parse_live_score,
     parse_query_to_nodes, parse_threshold_hundredths, quantize_score, quantize_threshold,
 };
 use crate::layout::{format_duration, layout_masonry};
 use crate::models::{
-    Density, GalleryBlurMode, GalleryMaskPreset, GalleryMedia, GalleryMediaKind,
+    Density, GalleryBlurMode, GalleryMask, GalleryMaskPreset, GalleryMedia, GalleryMediaKind,
     MAX_REPORT_NOTE_CHARS, NoticeContent, PresetTemplate, RuleConnector, SelectOption,
     SelectVariant, ViewerItem,
 };
@@ -76,7 +77,40 @@ fn sky_select_navigation_and_placement_logic() {
     );
     assert!(pl.open_above);
     assert!(pl.align_right);
-    assert_eq!(pl.max_height_px, 256);
+    assert!(pl.top_px.is_none());
+    assert_eq!(pl.bottom_px, Some(600.0 - 520.0 + 6.0));
+    assert_eq!(pl.max_height_px, 320);
+    // Clamped cleanly inside [12px, vw - est_width - 12px] on 375px phone
+    assert!(pl.left_px >= 12.0);
+    assert!(pl.left_px + pl.min_width_px <= 375.0 - 12.0 + 0.1);
+    let style = pl.inline_style();
+    assert!(style.contains("position:fixed;"));
+    assert!(style.contains("z-index:10050;"));
+    assert!(style.contains("bottom:86.0px;"));
+    assert!(style.contains("max-height:320px;"));
+
+    // Trigger near top opens below with exact `top` coordinate and horizontal clamping on 360px phone
+    let pl_below = compute_menu_placement_from_metrics(
+        100.0,
+        134.0,
+        200.0,
+        355.0,
+        360.0,
+        640.0,
+        7,
+        SelectVariant::SkyBox,
+    );
+    assert!(!pl_below.open_above);
+    assert_eq!(pl_below.top_px, Some(140.0));
+    assert!(pl_below.bottom_px.is_none());
+    assert!(pl_below.left_px >= 12.0);
+    assert!(pl_below.left_px + pl_below.max_width_px <= 360.0 - 12.0 + 0.1);
+    assert_eq!(pl_below.max_height_px, 320);
+    assert!(pl_below.inline_style().contains("top:140.0px;"));
+
+    // Verify MenuPlacement default also emits fixed z-index 10050
+    let def_style = MenuPlacement::default().inline_style();
+    assert!(def_style.contains("position:fixed;z-index:10050;"));
 }
 
 #[test]
@@ -254,6 +288,19 @@ fn ui_css_is_bundled_and_contains_mobile_density_breakpoints() {
     assert!(crate::UI_CSS.contains(".le-rule-group-paren"));
     assert!(crate::UI_CSS.contains(".le-toast-host"));
     assert!(crate::UI_CSS.contains("z-index: 9999;"));
+    assert!(crate::UI_CSS.contains("z-index: 10050;"));
+    assert!(crate::UI_CSS.contains(".le-qb-chips-box"));
+    assert!(crate::UI_CSS.contains(".le-age-gate-dialog"));
+    // Requested preset color palettes: R18 = yellow/amber, Sensitive = purple, Blood = red
+    assert!(crate::UI_CSS.contains("#eab308"));
+    assert!(crate::UI_CSS.contains("#fef9c3"));
+    assert!(crate::UI_CSS.contains("#854d0e"));
+    assert!(crate::UI_CSS.contains("#9333ea"));
+    assert!(crate::UI_CSS.contains("#f3e8ff"));
+    assert!(crate::UI_CSS.contains("#581c87"));
+    assert!(crate::UI_CSS.contains("#dc2626"));
+    assert!(crate::UI_CSS.contains("#fee2e2"));
+    assert!(crate::UI_CSS.contains("#991b1b"));
     assert!(crate::UI_CSS.contains(".le-qb-card"));
     assert!(crate::UI_CSS.contains(".le-qb-group"));
     assert!(crate::UI_CSS.contains(".le-qb-subcard"));
@@ -561,16 +608,17 @@ mod ssr_render_tests {
     use leptos::prelude::*;
 
     use crate::components::{
-        ContentMaskCard, DensityPicker, FloatingHeader, Lightbox, LikeButton, MAX_VISIBLE_TOASTS,
-        MasonryGallery, MinSimilaritySlider, NoticeBanner, OptionalScoreInput, QueryBuilder,
-        QueryCondition, QueryConnector, QueryGroup, QueryRuleBuilder, QueryThresholdDefaults,
-        ReportDialog, SafeModeToggle, ScoreInput, SkySelect, SpoilerOverlay, ToastHost, ToastKind,
-        ToggleSwitch, Viewer, provide_toast_store, use_toast_store,
+        AGE_GATE_LEGAL_COPY, AgeGateModal, ContentMaskCard, DensityPicker, FloatingHeader,
+        Lightbox, LikeButton, MAX_VISIBLE_TOASTS, MasonryGallery, MinSimilaritySlider,
+        NoticeBanner, OptionalScoreInput, QueryBuilder, QueryCondition, QueryConnector, QueryGroup,
+        QueryListCondition, QueryRuleBuilder, QueryThresholdDefaults, ReportDialog, SafeModeToggle,
+        ScoreInput, SkySelect, SpoilerOverlay, ToastHost, ToastKind, ToggleSwitch, Viewer,
+        provide_toast_store, render_select_menu_view, use_toast_store,
     };
     use crate::models::{
-        GalleryCard, GalleryCardKind, GalleryMask, LightboxAlbum, LikeTargetKind, LikeVariant,
-        NoticeTone, ReportReason, ReportTargetKind, RuleBlock, RuleBlockKind, RuleClause,
-        RuleDraft, RuleField, RuleGroupCombinator,
+        GalleryCard, GalleryCardKind, LightboxAlbum, LikeTargetKind, LikeVariant, NoticeTone,
+        ReportReason, ReportTargetKind, RuleBlock, RuleBlockKind, RuleClause, RuleDraft, RuleField,
+        RuleGroupCombinator,
     };
 
     fn sample_locked_mask(preset: GalleryMaskPreset) -> GalleryMask {
@@ -1088,6 +1136,7 @@ mod ssr_render_tests {
                                 threshold: None,
                             },
                         ],
+                        list_values: Default::default(),
                     }),
                 ],
                 query: r#"tag:maid>=0.45 AND clip:"sunlit garden">=0.25 AND dino:42>=0.7 AND upload:0>=0.65 AND (title:spring OR NOT author:alice)"#.into(),
@@ -1167,6 +1216,7 @@ mod ssr_render_tests {
                                 threshold: None,
                             },
                         ],
+                        list_values: Default::default(),
                     }),
                     QueryBuilderNode::Condition {
                         connector: QueryConnector::And,
@@ -1290,4 +1340,435 @@ mod ssr_render_tests {
         assert!(html.contains("Enable server-side content safety filtering"));
         assert!(html.contains("Evaluates policies before HTML, hydration, API, or media delivery."));
     }
+
+    #[test]
+    fn sky_select_fixed_menu_ssr_markup_emits_position_fixed_z_10050() {
+        let html = render_ssr(|| {
+            let menu_ref = NodeRef::<leptos::html::Div>::new();
+            let active = RwSignal::new(Some(0usize));
+            let pl = compute_menu_placement_from_metrics(
+                160.0,
+                194.0,
+                24.0,
+                164.0,
+                1280.0,
+                800.0,
+                7,
+                SelectVariant::SkyBox,
+            );
+            render_select_menu_view(
+                menu_ref,
+                77,
+                "le-select-list-77".to_string(),
+                "Condition field",
+                "sky-box",
+                vec![
+                    SelectOption::new("tag", "Tag"),
+                    SelectOption::new("dino", "Similar ID"),
+                    SelectOption::new("upload", "Upload Image"),
+                ],
+                "dino".to_string(),
+                pl,
+                active,
+                Callback::new(|_| {}),
+            )
+        });
+        assert!(html.contains(r#"role="listbox""#));
+        assert!(html.contains("position:fixed;z-index:10050;"));
+        assert!(html.contains("top:200.0px;"));
+        assert!(html.contains("Similar ID"));
+        assert!(html.contains("Upload Image"));
+    }
+
+    #[test]
+    fn query_builder_ssr_in_not_in_renders_multi_chip_editor_and_presets_colors() {
+        let html = render_ssr(|| {
+            let draft = RwSignal::new(
+                QueryBuilderDraft::from_query(
+                    QueryBuilderMode::SafetyPolicy,
+                    "tag IN (explicit, nude, nipples) >= 0.45 AND post_tag NOT IN (approved, safe)",
+                )
+                .expect("IN/NOT IN query parses"),
+            );
+            view! {
+                <QueryBuilder draft=draft mode=QueryBuilderMode::SafetyPolicy />
+            }
+        });
+        assert!(html.contains("le-qb-chips-box"));
+        assert!(html.contains("le-qb-chips-box is-negated"));
+        assert!(html.contains("le-qb-chip"));
+        assert!(html.contains("explicit"));
+        assert!(html.contains("nude"));
+        assert!(html.contains("nipples"));
+        assert!(html.contains("approved"));
+        assert!(html.contains("le-qb-op-select"));
+        assert!(html.contains("le-preset-btn--r18"));
+        assert!(html.contains("le-preset-btn--sensitive"));
+        assert!(html.contains("le-preset-btn--blood"));
+        assert!(html.contains("0.45"));
+    }
+
+    #[test]
+    fn content_mask_card_preset_colors_and_cta_resolution() {
+        // R18 = yellow/amber, Sensitive = purple, Blood = red
+        let r18_html = render_ssr(|| {
+            let mask = GalleryMask {
+                rule_id: "r18".into(),
+                label: "R-18 / Explicit".into(),
+                preset: GalleryMaskPreset::R18,
+                reason: None,
+                requires_login: false,
+                requires_age: true,
+                requires_terms: false,
+                cta_label: None,
+            };
+            view! { <ContentMaskCard mask=mask on_unlock_click=Callback::new(|_| {}) /> }
+        });
+        assert!(r18_html.contains("le-mask-card--r18"));
+        assert!(r18_html.contains("#eab308"));
+        assert!(r18_html.contains("#fef9c3"));
+        assert!(r18_html.contains("#854d0e"));
+        assert!(r18_html.contains("Confirm 18+ to unlock"));
+
+        let sens_html = render_ssr(|| {
+            let mask = GalleryMask {
+                rule_id: "sens".into(),
+                label: "Suggestive / Ecchi".into(),
+                preset: GalleryMaskPreset::Sensitive,
+                reason: None,
+                requires_login: false,
+                requires_age: false,
+                requires_terms: true,
+                cta_label: None,
+            };
+            view! { <ContentMaskCard mask=mask on_unlock_click=Callback::new(|_| {}) /> }
+        });
+        assert!(sens_html.contains("le-mask-card--sensitive"));
+        assert!(sens_html.contains("#9333ea"));
+        assert!(sens_html.contains("#f3e8ff"));
+        assert!(sens_html.contains("#581c87"));
+        assert!(sens_html.contains("Accept Terms to unlock"));
+
+        let blood_html = render_ssr(|| {
+            let mask = GalleryMask {
+                rule_id: "blood".into(),
+                label: "Blood / Violence".into(),
+                preset: GalleryMaskPreset::Blood,
+                reason: None,
+                requires_login: false,
+                requires_age: false,
+                requires_terms: false,
+                cta_label: None,
+            };
+            view! { <ContentMaskCard mask=mask on_unlock_click=Callback::new(|_| {}) /> }
+        });
+        assert!(blood_html.contains("le-mask-card--blood"));
+        assert!(blood_html.contains("#dc2626"));
+        assert!(blood_html.contains("#fee2e2"));
+        assert!(blood_html.contains("#991b1b"));
+        assert!(blood_html.contains("Enable in Account Settings"));
+
+        // Explicit empty cta_label: Some("") cleanly suppresses CTA button even with callback
+        let blocked_html = render_ssr(|| {
+            let mask = GalleryMask {
+                rule_id: "hard".into(),
+                label: "Permanently Restricted".into(),
+                preset: GalleryMaskPreset::Custom,
+                reason: Some("Not available in your region.".into()),
+                requires_login: false,
+                requires_age: false,
+                requires_terms: false,
+                cta_label: Some(String::new()),
+            };
+            view! { <ContentMaskCard mask=mask on_unlock_click=Callback::new(|_| {}) /> }
+        });
+        assert!(!blocked_html.contains("le-mask-cta"));
+    }
+
+    #[test]
+    fn age_gate_modal_ssr_renders_badge_copy_error_and_dismissible_state() {
+        let closed_html = render_ssr(|| {
+            view! {
+                <AgeGateModal
+                    open=Signal::derive(|| false)
+                    on_confirm=Callback::new(|_| {})
+                />
+            }
+        });
+        assert!(!closed_html.contains("le-age-gate-dialog"));
+
+        let open_html = render_ssr(|| {
+            view! {
+                <AgeGateModal
+                    open=Signal::derive(|| true)
+                    title=Signal::derive(|| "Confirm Your Age".to_string())
+                    is_authenticated=Signal::derive(|| true)
+                    submitting=Signal::derive(|| false)
+                    error=Signal::derive(|| Some("Verification failed — please retry.".to_string()))
+                    on_confirm=Callback::new(|_| {})
+                    on_leave=Callback::new(|_| {})
+                    on_close=Callback::new(|_| {})
+                />
+            }
+        });
+        assert!(open_html.contains(r#"role="dialog""#));
+        assert!(open_html.contains(r#"aria-modal="true""#));
+        assert!(open_html.contains(r#"data-dismissible="true""#));
+        assert!(open_html.contains("le-age-gate-close"));
+        assert!(open_html.contains("18+"));
+        assert!(open_html.contains("Confirm Your Age"));
+        assert!(open_html.contains(AGE_GATE_LEGAL_COPY));
+        assert!(open_html.contains("I am 18 or older \u{2014} Confirm"));
+        assert!(open_html.contains("Leave / Cancel"));
+        assert!(open_html.contains("Verification failed"));
+        assert!(open_html.contains("saved to your account"));
+
+        // Non-dismissible gate omits close button
+        let strict_html = render_ssr(|| {
+            view! {
+                <AgeGateModal
+                    open=Signal::derive(|| true)
+                    is_authenticated=Signal::derive(|| false)
+                    on_confirm=Callback::new(|_| {})
+                    on_leave=Callback::new(|_| {})
+                />
+            }
+        });
+        assert!(strict_html.contains(r#"data-dismissible="false""#));
+        assert!(!strict_html.contains("le-age-gate-close"));
+        assert!(strict_html.contains("this browsing session"));
+    }
+
+    #[test]
+    fn query_builder_ssr_list_condition_direct_render() {
+        let html = render_ssr(|| {
+            let draft = RwSignal::new(QueryBuilderDraft {
+                mode: QueryBuilderMode::AdvancedSearch,
+                nodes: vec![QueryBuilderNode::ListCondition {
+                    connector: QueryConnector::And,
+                    condition: QueryListCondition {
+                        id: 42,
+                        field: QueryFieldKind::Tag,
+                        values: vec!["maid".into(), "long hair".into()],
+                        negated: false,
+                        threshold: Some(0.55),
+                    },
+                }],
+                query: r#"tag IN (maid, "long hair") >= 0.55"#.into(),
+                active_preset: None,
+            });
+            view! { <QueryBuilder draft=draft mode=QueryBuilderMode::AdvancedSearch /> }
+        });
+        assert!(html.contains("le-qb-chips-box"));
+        assert!(html.contains("maid"));
+        assert!(html.contains("long hair"));
+        assert!(html.contains("0.55"));
+    }
+}
+
+#[test]
+fn query_builder_in_and_not_in_parse_format_presets_and_validation() {
+    let mut id = 500u64;
+    let mut alloc = || {
+        id += 1;
+        id
+    };
+
+    // Built-in Safety Presets produce 1 single compact WD Tag IN [...] >= 0.45 row
+    let builtins = PresetTemplate::builtins();
+    for preset_id in ["r18", "sensitive", "blood"] {
+        let tpl = builtins
+            .iter()
+            .find(|p| p.id == preset_id)
+            .expect("preset exists");
+        let nodes = parse_query_to_nodes(QueryBuilderMode::SafetyPolicy, &tpl.query, &mut alloc)
+            .unwrap_or_else(|e| panic!("preset {preset_id} must parse: {e}"));
+        assert_eq!(
+            nodes.len(),
+            1,
+            "preset {preset_id} must collapse to 1 single compact row"
+        );
+        match &nodes[0] {
+            QueryBuilderNode::ListCondition { condition, .. } => {
+                assert_eq!(condition.field, QueryFieldKind::Tag);
+                assert_eq!(condition.operator(), QueryConditionOp::In);
+                assert_eq!(condition.threshold, Some(0.45));
+                assert!(!condition.values.is_empty());
+            }
+            other => panic!("expected ListCondition for {preset_id}, got {other:?}"),
+        }
+        assert_eq!(format_query_nodes(&nodes), tpl.query);
+    }
+
+    // Round-trip IN, NOT IN, NOT ... IN, quoted items, space-separated lists, >= whitespace combos
+    for (mode, input, expected) in [
+        (
+            QueryBuilderMode::SafetyPolicy,
+            r#"tag IN (explicit, nude, "long hair") >= 0.45"#,
+            r#"tag IN (explicit, nude, "long hair") >= 0.45"#,
+        ),
+        (
+            QueryBuilderMode::SafetyPolicy,
+            "tag in (explicit nude)>=0.5",
+            "tag IN (explicit, nude) >= 0.50",
+        ),
+        (
+            QueryBuilderMode::SafetyPolicy,
+            "tag NOT IN (safe, general) >= 0.45",
+            "tag NOT IN (safe, general) >= 0.45",
+        ),
+        (
+            QueryBuilderMode::SafetyPolicy,
+            "NOT tag IN (explicit, nude) >=0.60",
+            "tag NOT IN (explicit, nude) >= 0.60",
+        ),
+        (
+            QueryBuilderMode::SafetyPolicy,
+            "-tag in (explicit, nude)>= 0.45",
+            "tag NOT IN (explicit, nude) >= 0.45",
+        ),
+        (
+            QueryBuilderMode::SafetyPolicy,
+            r#"post_tag IN (cosplay, "r 18") AND author NOT IN (alice, bob)"#,
+            r#"post_tag IN (cosplay, "r 18") AND author NOT IN (alice, bob)"#,
+        ),
+        (
+            QueryBuilderMode::SafetyPolicy,
+            "(tag IN (explicit, nude) >= 0.45 OR post_tag IN (nsfw, r18))",
+            "(tag IN (explicit, nude) >= 0.45 OR post_tag IN (nsfw, r18))",
+        ),
+        (
+            QueryBuilderMode::AdvancedSearch,
+            r#"tag IN (maid, apron) >= 0.45 AND author NOT IN ("alice smith", bob)"#,
+            r#"tag IN (maid, apron) >= 0.45 AND author NOT IN ("alice smith", bob)"#,
+        ),
+        // Bare English word "in" in AdvancedSearch must NOT break when not a field keyword
+        (
+            QueryBuilderMode::AdvancedSearch,
+            "cat in hat",
+            "all:cat AND all:in AND all:hat",
+        ),
+        (
+            QueryBuilderMode::AdvancedSearch,
+            "alice in (wonderland)",
+            "all:alice AND all:in AND all:wonderland",
+        ),
+    ] {
+        let nodes = parse_query_to_nodes(mode, input, &mut alloc)
+            .unwrap_or_else(|e| panic!("failed to parse {input:?} in {mode:?}: {e}"));
+        assert_eq!(format_query_nodes(&nodes), expected, "input={input:?}");
+    }
+
+    // Invalid IN / NOT IN forms must fail cleanly
+    for (mode, bad) in [
+        (QueryBuilderMode::SafetyPolicy, "tag IN ()"),
+        (QueryBuilderMode::SafetyPolicy, "tag NOT IN ()"),
+        (QueryBuilderMode::SafetyPolicy, "tag IN (explicit,)"),
+        (QueryBuilderMode::SafetyPolicy, "tag IN (,explicit)"),
+        (QueryBuilderMode::SafetyPolicy, "tag IN (explicit,,nude)"),
+        (QueryBuilderMode::SafetyPolicy, "tag IN (explicit"),
+        (QueryBuilderMode::SafetyPolicy, "NOT tag NOT IN (explicit)"),
+        (QueryBuilderMode::SafetyPolicy, "tag IN (explicit) >= 0.456"),
+        (QueryBuilderMode::SafetyPolicy, "tag IN (explicit) >= 0"),
+        (QueryBuilderMode::SafetyPolicy, "post_tag IN (a, b) >= 0.50"),
+        (QueryBuilderMode::SafetyPolicy, "author IN (a, b) >= 0.50"),
+        (QueryBuilderMode::SafetyPolicy, "unclassified IN (a)"),
+        (QueryBuilderMode::SafetyPolicy, "tag IN (/blood.*/)"),
+        // Non-list fields rejected in AdvancedSearch (dino/clip/upload/title/all are single-value only)
+        (QueryBuilderMode::AdvancedSearch, "dino IN (12, 34)"),
+        (QueryBuilderMode::AdvancedSearch, "clip IN (sunset, dawn)"),
+        (QueryBuilderMode::AdvancedSearch, "upload IN (0, 1)"),
+        (QueryBuilderMode::AdvancedSearch, "title IN (spring, summer)"),
+        (QueryBuilderMode::AdvancedSearch, "all IN (foo, bar)"),
+        (QueryBuilderMode::AdvancedSearch, "author IN (alice, bob) >= 0.50"),
+    ] {
+        assert!(
+            parse_query_to_nodes(mode, bad, &mut alloc).is_err(),
+            "expected parse error for {bad:?} in {mode:?}"
+        );
+    }
+
+    // Every element in IN (...) counts toward MAX_TERMS_PER_RULE
+    let too_many = format!(
+        "tag IN ({})",
+        (0..=MAX_TERMS_PER_RULE)
+            .map(|i| format!("t{i}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    assert!(parse_query_to_nodes(QueryBuilderMode::SafetyPolicy, &too_many, &mut alloc).is_err());
+
+    // Empty QueryListCondition formats to None; merge_chip_values trims, splits & deduplicates
+    let mut chips = vec!["explicit".to_string()];
+    assert!(merge_chip_values(&mut chips, " nude , explicit, nipples\n  nude  "));
+    assert_eq!(chips, vec!["explicit", "nude", "nipples"]);
+    assert!(!merge_chip_values(&mut chips, " , explicit , "));
+    assert_eq!(
+        format_query_list_condition(&crate::components::QueryListCondition {
+            id: 1,
+            field: QueryFieldKind::Tag,
+            values: vec![],
+            negated: false,
+            threshold: Some(0.45),
+        }),
+        None
+    );
+}
+
+#[test]
+fn gallery_mask_resolved_cta_distinguishes_requirements_and_empty_override() {
+    let base = GalleryMask {
+        rule_id: "r1".into(),
+        label: "Restricted".into(),
+        preset: GalleryMaskPreset::R18,
+        reason: None,
+        requires_login: false,
+        requires_age: false,
+        requires_terms: false,
+        cta_label: None,
+    };
+    assert_eq!(base.resolved_cta(), "Enable in Account Settings");
+    assert_eq!(
+        GalleryMask {
+            requires_login: true,
+            requires_age: true,
+            requires_terms: true,
+            ..base.clone()
+        }
+        .resolved_cta(),
+        "Sign in to unlock"
+    );
+    assert_eq!(
+        GalleryMask {
+            requires_age: true,
+            requires_terms: true,
+            ..base.clone()
+        }
+        .resolved_cta(),
+        "Confirm 18+ to unlock"
+    );
+    assert_eq!(
+        GalleryMask {
+            requires_terms: true,
+            ..base.clone()
+        }
+        .resolved_cta(),
+        "Accept Terms to unlock"
+    );
+    assert_eq!(
+        GalleryMask {
+            cta_label: Some("Click to reveal".into()),
+            ..base.clone()
+        }
+        .resolved_cta(),
+        "Click to reveal"
+    );
+    assert_eq!(
+        GalleryMask {
+            cta_label: Some(String::new()),
+            ..base
+        }
+        .resolved_cta_opt(),
+        None
+    );
 }

@@ -159,6 +159,14 @@ struct AtomValue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct InListToken {
+    prefix: String,
+    negated_in: bool,
+    items: Vec<(String, bool)>,
+    trailing_score: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Token {
     LParen,
     RParen,
@@ -166,6 +174,185 @@ enum Token {
     Or,
     Not,
     Atom(AtomToken),
+    InList(InListToken),
+}
+
+fn skip_ws_chars(chars: &[char], i: &mut usize) {
+    while *i < chars.len() && chars[*i].is_whitespace() {
+        *i += 1;
+    }
+}
+
+fn read_word_ci(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let mut i = start;
+    let mut word = String::new();
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() || matches!(c, '(' | ')' | ':' | '"' | ',') {
+            break;
+        }
+        word.push(c);
+        i += 1;
+    }
+    (!word.is_empty()).then_some((word, i))
+}
+
+fn try_consume_in_list_rule(
+    chars: &[char],
+    i: &mut usize,
+    prefix: &str,
+) -> Result<Option<InListToken>, String> {
+    let saved = *i;
+    let mut look = saved;
+    skip_ws_chars(chars, &mut look);
+    let Some((first_word, after_first)) = read_word_ci(chars, look) else {
+        return Ok(None);
+    };
+    let (negated_in, after_in) = if first_word.eq_ignore_ascii_case("IN") {
+        (false, after_first)
+    } else if first_word.eq_ignore_ascii_case("NOT") {
+        let mut next_pos = after_first;
+        skip_ws_chars(chars, &mut next_pos);
+        let Some((second_word, after_second)) = read_word_ci(chars, next_pos) else {
+            return Ok(None);
+        };
+        if !second_word.eq_ignore_ascii_case("IN") {
+            return Ok(None);
+        }
+        (true, after_second)
+    } else {
+        return Ok(None);
+    };
+
+    let mut paren_pos = after_in;
+    skip_ws_chars(chars, &mut paren_pos);
+    if chars.get(paren_pos) != Some(&'(') {
+        return Ok(None);
+    }
+
+    *i = paren_pos + 1; // consume '('
+    let mut items: Vec<(String, bool)> = Vec::new();
+    let mut closed = false;
+    let mut saw_comma = false;
+
+    while *i < chars.len() {
+        skip_ws_chars(chars, i);
+        if *i >= chars.len() {
+            break;
+        }
+        let c = chars[*i];
+        if c == ')' {
+            *i += 1;
+            closed = true;
+            break;
+        }
+        if c == '(' {
+            return Err("Nested `(` is not allowed inside `IN (...)` list".to_string());
+        }
+        if c == ',' {
+            if items.is_empty() || saw_comma {
+                return Err("Unexpected `,` inside `IN (...)` list".to_string());
+            }
+            saw_comma = true;
+            *i += 1;
+            continue;
+        }
+        if c == '"' {
+            *i += 1;
+            let mut text = String::new();
+            let mut q_closed = false;
+            while *i < chars.len() {
+                let qc = chars[*i];
+                if qc.is_control() {
+                    return Err(
+                        "Control characters are not allowed inside quoted values".to_string()
+                    );
+                }
+                if qc == '\\' {
+                    if *i + 1 >= chars.len() {
+                        return Err("Trailing backslash in quoted safety rule value".to_string());
+                    }
+                    let next = chars[*i + 1];
+                    if next.is_control() {
+                        return Err(
+                            "Control characters are not allowed inside quoted values".to_string()
+                        );
+                    }
+                    text.push(next);
+                    *i += 2;
+                    continue;
+                }
+                if qc == '"' {
+                    q_closed = true;
+                    *i += 1;
+                    break;
+                }
+                text.push(qc);
+                *i += 1;
+            }
+            if !q_closed {
+                return Err("Unclosed quote in safety rule `IN (...)` list".to_string());
+            }
+            if *i < chars.len() && !chars[*i].is_whitespace() && !matches!(chars[*i], ',' | ')') {
+                return Err("Unexpected trailing characters after quoted item in `IN (...)`".to_string());
+            }
+            items.push((text, true));
+            saw_comma = false;
+        } else {
+            let mut text = String::new();
+            while *i < chars.len() {
+                let uc = chars[*i];
+                if uc.is_whitespace() || matches!(uc, ',' | '(' | ')') {
+                    break;
+                }
+                if uc == '"' {
+                    return Err("Unexpected quote inside unquoted item in `IN (...)`".to_string());
+                }
+                text.push(uc);
+                *i += 1;
+            }
+            items.push((text, false));
+            saw_comma = false;
+        }
+    }
+
+    if !closed {
+        return Err("Unclosed `(` in `IN (...)` list".to_string());
+    }
+    if saw_comma {
+        return Err("Trailing `,` before `)` in `IN (...)` list".to_string());
+    }
+    if items.is_empty() {
+        return Err("Empty value list in `IN ()` is not allowed".to_string());
+    }
+
+    // Optional trailing `>= <score>` outside `)`
+    let after_rparen = *i;
+    skip_ws_chars(chars, i);
+    let trailing_score = if *i + 1 < chars.len() && chars[*i] == '>' && chars[*i + 1] == '=' {
+        *i += 2;
+        skip_ws_chars(chars, i);
+        let mut score_str = String::new();
+        while *i < chars.len() {
+            let sc = chars[*i];
+            if sc.is_whitespace() || matches!(sc, '(' | ')' | '"') {
+                break;
+            }
+            score_str.push(sc);
+            *i += 1;
+        }
+        Some(score_str)
+    } else {
+        *i = after_rparen;
+        None
+    };
+
+    Ok(Some(InListToken {
+        prefix: prefix.to_string(),
+        negated_in,
+        items,
+        trailing_score,
+    }))
 }
 
 fn tokenize(input: &str) -> Result<Vec<Token>, String> {
@@ -299,7 +486,13 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 "AND" | "and" => tokens.push(Token::And),
                 "OR" | "or" => tokens.push(Token::Or),
                 "NOT" | "not" => tokens.push(Token::Not),
-                _ => tokens.push(Token::Atom(AtomToken { prefix, rest: None })),
+                _ => {
+                    if let Some(in_list) = try_consume_in_list_rule(&chars, &mut i, &prefix)? {
+                        tokens.push(Token::InList(in_list));
+                    } else {
+                        tokens.push(Token::Atom(AtomToken { prefix, rest: None }));
+                    }
+                }
             }
         }
     }
@@ -505,6 +698,60 @@ fn parse_atom_to_clause(
     })
 }
 
+fn parse_in_list_to_clauses(
+    in_list: &InListToken,
+    outer_negated: bool,
+    next_id: &mut impl FnMut() -> u64,
+) -> Result<(bool, Vec<RuleClause>), String> {
+    if outer_negated && in_list.negated_in {
+        return Err("Double negation (`NOT ... NOT IN`) is not allowed".to_string());
+    }
+    let field = RuleField::parse(&in_list.prefix).ok_or_else(|| {
+        format!(
+            "Disallowed predicate `{}` in `IN (...)` safety rule (allowed: tag, post_tag, author)",
+            in_list.prefix
+        )
+    })?;
+    if field == RuleField::Unclassified {
+        return Err("`unclassified` does not support `IN (...)`".to_string());
+    }
+    let min_score = match &in_list.trailing_score {
+        None => None,
+        Some(raw) => {
+            if field != RuleField::Tag {
+                return Err(format!(
+                    "Score thresholds are only supported on `tag`, not `{}`",
+                    field.as_str()
+                ));
+            }
+            Some(parse_threshold_score(raw)?)
+        }
+    };
+    let mut clauses = Vec::with_capacity(in_list.items.len());
+    for (raw_val, quoted) in &in_list.items {
+        let trimmed = raw_val.trim();
+        if trimmed.is_empty() {
+            return Err("Empty value inside `IN (...)` list is not allowed".to_string());
+        }
+        if !*quoted {
+            if trimmed.contains(">=") {
+                return Err(
+                    "Place `>=` threshold outside `)` (e.g. `tag IN (a, b) >= 0.45`)".to_string(),
+                );
+            }
+            reject_disallowed_unquoted_syntax(trimmed, field.as_str())?;
+        }
+        clauses.push(RuleClause {
+            id: next_id(),
+            negated: false,
+            field,
+            value: trimmed.to_string(),
+            min_score,
+        });
+    }
+    Ok((outer_negated || in_list.negated_in, clauses))
+}
+
 /// Parse a flat or single-level-parenthesized metadata-only safety rule query
 /// into visual [`RuleBlock`] items, enforcing the same strict grammar rules and
 /// limits as `search_types::safety`.
@@ -547,7 +794,7 @@ pub fn parse_safety_rule_to_blocks(
                 Token::RParen => {
                     return Err("Unexpected `)` in safety rule query".to_string());
                 }
-                Token::Not | Token::Atom(_) | Token::LParen => {
+                Token::Not | Token::Atom(_) | Token::InList(_) | Token::LParen => {
                     return Err(
                         "Missing explicit `AND` or `OR` operator between predicates".to_string()
                     );
@@ -615,7 +862,7 @@ pub fn parse_safety_rule_to_blocks(
                                 inner_neg = false;
                                 pos += 1;
                             }
-                            Token::Not | Token::Atom(_) | Token::LParen => {
+                            Token::Not | Token::Atom(_) | Token::InList(_) | Token::LParen => {
                                 return Err(
                                     "Missing explicit `AND` or `OR` inside `(...)` group"
                                         .to_string(),
@@ -656,6 +903,31 @@ pub fn parse_safety_rule_to_blocks(
                                 ));
                             }
                             clauses.push(parse_atom_to_clause(atom, inner_neg, next_id)?);
+                            inner_neg = false;
+                            inner_expect_operand = false;
+                            pos += 1;
+                        }
+                        Token::InList(in_list) => {
+                            term_count += in_list.items.len();
+                            if term_count > MAX_TERMS_PER_RULE {
+                                return Err(format!(
+                                    "Safety rule exceeds maximum of {MAX_TERMS_PER_RULE} terms"
+                                ));
+                            }
+                            let (neg, mut list_clauses) =
+                                parse_in_list_to_clauses(in_list, inner_neg, next_id)?;
+                            if list_clauses.len() == 1 {
+                                let mut only = list_clauses.remove(0);
+                                only.negated = neg;
+                                clauses.push(only);
+                            } else if !neg && group_comb != Some(RuleGroupCombinator::And) {
+                                group_comb = Some(RuleGroupCombinator::Or);
+                                clauses.extend(list_clauses);
+                            } else {
+                                return Err(
+                                    "Nested `IN (...)` inside incompatible group requires top-level list".to_string(),
+                                );
+                            }
                             inner_neg = false;
                             inner_expect_operand = false;
                             pos += 1;
@@ -704,6 +976,49 @@ pub fn parse_safety_rule_to_blocks(
                     id: next_id(),
                     connector: block_conn,
                     kind: RuleBlockKind::Clause(clause),
+                });
+                pending_conn = RuleConnector::And;
+                pending_neg = false;
+                expect_operand = false;
+                pos += 1;
+            }
+            Token::InList(in_list) => {
+                term_count += in_list.items.len();
+                if term_count > MAX_TERMS_PER_RULE {
+                    return Err(format!(
+                        "Safety rule exceeds maximum of {MAX_TERMS_PER_RULE} terms"
+                    ));
+                }
+                let (is_negated, mut list_clauses) =
+                    parse_in_list_to_clauses(in_list, pending_neg, next_id)?;
+                if pending_conn == RuleConnector::Or && is_negated && list_clauses.len() > 1 {
+                    return Err(
+                        "Negated OR-list (`OR ... NOT IN (...)`) is not supported directly in legacy rule blocks"
+                            .to_string(),
+                    );
+                }
+                let block_conn = match (pending_conn, is_negated) {
+                    (RuleConnector::Or, true) => RuleConnector::Or,
+                    (RuleConnector::Or, false) => RuleConnector::Or,
+                    (_, true) => RuleConnector::Not,
+                    (c, false) => c,
+                };
+                let kind = if list_clauses.len() == 1 {
+                    let mut only = list_clauses.remove(0);
+                    if pending_conn == RuleConnector::Or && is_negated {
+                        only.negated = true;
+                    }
+                    RuleBlockKind::Clause(only)
+                } else {
+                    RuleBlockKind::Group {
+                        combinator: RuleGroupCombinator::Or,
+                        clauses: list_clauses,
+                    }
+                };
+                blocks.push(RuleBlock {
+                    id: next_id(),
+                    connector: block_conn,
+                    kind,
                 });
                 pending_conn = RuleConnector::And;
                 pending_neg = false;

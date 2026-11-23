@@ -4,6 +4,11 @@ use crate::models::{GalleryMask, GalleryMaskPreset};
 
 /// Bundled inline SVG illustration for each safety preset.
 /// Never references any external image URL or media asset.
+///
+/// Palette:
+/// - `R18`: Yellow / Amber (`#eab308` / `#ca8a04` / `#fef9c3` / `#854d0e` / `#fde047`)
+/// - `Sensitive` (Ecchi / Suggestive): Purple (`#9333ea` / `#7e22ce` / `#f3e8ff` / `#581c87` / `#d8b4fe`)
+/// - `Blood` (Blood / Violence): Red (`#dc2626` / `#b91c1c` / `#fee2e2` / `#991b1b` / `#fca5a5`)
 fn preset_illustration(preset: GalleryMaskPreset) -> AnyView {
     match preset {
         GalleryMaskPreset::R18 => view! {
@@ -16,12 +21,12 @@ fn preset_illustration(preset: GalleryMaskPreset) -> AnyView {
             >
                 <defs>
                     <linearGradient id="le-r18-ring" x1="12" y1="10" x2="76" y2="78" gradientUnits="userSpaceOnUse">
-                        <stop offset="0%" stop-color="#fb7185" />
-                        <stop offset="100%" stop-color="#e11d48" />
+                        <stop offset="0%" stop-color="#eab308" />
+                        <stop offset="100%" stop-color="#ca8a04" />
                     </linearGradient>
                 </defs>
-                <circle cx="44" cy="44" r="36" fill="#fff1f2" stroke="url(#le-r18-ring)" stroke-width="4" />
-                <circle cx="44" cy="44" r="28" fill="#ffe4e6" stroke="#fda4af" stroke-width="1.5" stroke-dasharray="4 3" />
+                <circle cx="44" cy="44" r="36" fill="#fefce8" stroke="url(#le-r18-ring)" stroke-width="4" />
+                <circle cx="44" cy="44" r="28" fill="#fef9c3" stroke="#fde047" stroke-width="1.8" stroke-dasharray="4 3" />
                 <text
                     x="44"
                     y="51"
@@ -30,7 +35,7 @@ fn preset_illustration(preset: GalleryMaskPreset) -> AnyView {
                     font-size="23"
                     font-weight="800"
                     letter-spacing="-0.5"
-                    fill="#be123c"
+                    fill="#854d0e"
                 >
                     "18+"
                 </text>
@@ -47,14 +52,14 @@ fn preset_illustration(preset: GalleryMaskPreset) -> AnyView {
             >
                 <path
                     d="M44 12L77 70C78.5 72.7 76.6 76 73.5 76H14.5C11.4 76 9.5 72.7 11 70L44 12Z"
-                    fill="#fef2f2"
+                    fill="#fee2e2"
                     stroke="#dc2626"
                     stroke-width="4"
                     stroke-linejoin="round"
                 />
                 <path
                     d="M44 31V51"
-                    stroke="#b91c1c"
+                    stroke="#991b1b"
                     stroke-width="5.5"
                     stroke-linecap="round"
                 />
@@ -70,16 +75,16 @@ fn preset_illustration(preset: GalleryMaskPreset) -> AnyView {
                 aria-hidden="true"
                 xmlns="http://www.w3.org/2000/svg"
             >
-                <rect x="10" y="10" width="68" height="68" rx="22" fill="#eef2ff" stroke="#818cf8" stroke-width="3.5" />
+                <rect x="10" y="10" width="68" height="68" rx="22" fill="#f3e8ff" stroke="#d8b4fe" stroke-width="3.5" />
                 <path
                     d="M21 44C26.5 34.5 34.8 30 44 30C53.2 30 61.5 34.5 67 44C61.5 53.5 53.2 58 44 58C34.8 58 26.5 53.5 21 44Z"
                     fill="#ffffff"
-                    stroke="#4f46e5"
+                    stroke="#9333ea"
                     stroke-width="3.2"
                     stroke-linejoin="round"
                 />
-                <circle cx="44" cy="44" r="7.5" fill="#c7d2fe" stroke="#4f46e5" stroke-width="3" />
-                <path d="M24 64L64 24" stroke="#4338ca" stroke-width="4" stroke-linecap="round" />
+                <circle cx="44" cy="44" r="7.5" fill="#e9d5ff" stroke="#7e22ce" stroke-width="3" />
+                <path d="M24 64L64 24" stroke="#581c87" stroke-width="4" stroke-linecap="round" />
             </svg>
         }
         .into_any(),
@@ -140,7 +145,7 @@ pub fn ContentMaskCard(
     };
     let badge = preset.short_badge();
     let reason = mask.resolved_reason();
-    let cta_text = mask.resolved_cta();
+    let cta_opt = mask.resolved_cta_opt();
     let rule_id = mask.rule_id.clone();
 
     let card_cls = if compact {
@@ -166,7 +171,7 @@ pub fn ContentMaskCard(
                 <span class="le-mask-badge">{badge}</span>
                 <div class="le-mask-title">{label}</div>
                 <p class="le-mask-reason">{reason}</p>
-                {on_unlock_click.map(|cb| {
+                {on_unlock_click.zip(cta_opt).map(|(cb, cta_text)| {
                     let mask_for_cb = mask.clone();
                     view! {
                         <button
