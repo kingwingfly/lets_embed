@@ -66,7 +66,7 @@ async fn call_me_api() -> Result<AccountState, String> {
         .dyn_into()
         .map_err(|_| "fetch result is not a Response".to_string())?;
 
-    if resp.status() == 401 {
+    if resp.status() == 401 || resp.status() == 404 {
         return Ok(AccountState::SignedOut);
     }
     if !resp.ok() {

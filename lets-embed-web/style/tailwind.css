@@ -155,6 +155,37 @@
     gap: 12px;
     width: 100%;
 }
+/* Responsive CSS multi-column fallback rendered during SSR (and before client
+   hydration measures viewport width) so crawlers & first paint immediately see
+   the gallery cards with zero hydration mismatch. */
+.gallery-ssr-grid {
+    columns: 2;
+    column-gap: 8px;
+    width: 100%;
+}
+.gallery-ssr-grid > .gallery-tile {
+    break-inside: avoid;
+    margin-bottom: 8px;
+}
+@media (min-width: 641px) {
+    .gallery-ssr-grid {
+        columns: 3;
+        column-gap: 12px;
+    }
+    .gallery-ssr-grid > .gallery-tile {
+        margin-bottom: 12px;
+    }
+}
+@media (min-width: 1024px) {
+    .gallery-ssr-grid {
+        columns: 4;
+    }
+}
+@media (min-width: 1400px) {
+    .gallery-ssr-grid {
+        columns: 5;
+    }
+}
 .gallery-col {
     flex: 1 1 0;
     min-width: 0;
@@ -338,13 +369,13 @@
         gap: 1px;
     }
     .gallery-density-btn {
-        padding: 4px 6.5px;
-        font-size: 11.5px;
+        padding: 4px 6px;
+        font-size: 11px;
     }
 }
 @media (max-width: 360px) {
     .gallery-density-btn {
-        padding: 4px 5.5px;
-        font-size: 11px;
+        padding: 3.5px 5px;
+        font-size: 10.5px;
     }
 }

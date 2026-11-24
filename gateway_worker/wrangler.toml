@@ -13,30 +13,59 @@ command = "cargo install -q \"worker-build@^0.9\" && worker-build --profile wasm
 enabled = true
 invocation_logs = true
 
-# Worker secrets; deploy fails until each is set with `wrangler secret put <NAME>`:
-#   CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET — Access service token for the upstreams
-#   JWT_SECRET — must equal lets-embed-user-worker's JWT_SECRET. Generate it once with
-#     `openssl rand -base64 48` and put the same value into both workers.
+# Recommended single master secret (`wrangler secret put SITE_SECRET`):
+#   SITE_SECRET — high-entropy (>= 32 bytes) master secret shared across workers &
+#     lets-embed-web. Generate with `openssl rand -base64 48`.
+#     Cryptographically isolated 256-bit domain subkeys are derived via RFC 5869
+#     HKDF-SHA256 (`site_access::kdf`):
+#       - KeyDomain::Session          (`ue_session` v2/legacy verification, guest IP hashing, browse pass)
+#       - KeyDomain::MediaCap         (`/media/{image,video,preview}/{id}?cap=...` v3 `mc3.` tokens)
+#       - KeyDomain::GatewayAssertion (`X-Gateway-Assertion` v3 `ga3.` header)
+#       - KeyDomain::InternalApi      (internal origin API authentication)
+#       - KeyDomain::GuestSession     (`le_guest_sid` signed guest click-to-reveal cookie)
+#       - KeyDomain::AdminAssertion   (`X-Gallery-Admin-Assertion` v2 `aa2.`, loaded LAZILY on `/admin*` only)
+#
+# Optional explicit per-purpose secret overrides (each takes precedence over SITE_SECRET
+# for independent zero-downtime rotation):
+#   JWT_SECRET, SESSION_V2_SECRET (or SESSION_SECRET), MEDIA_CAP_SECRET,
+#   GATEWAY_ASSERTION_SECRET, INTERNAL_API_SECRET, GUEST_SESSION_SECRET, ADMIN_ASSERTION_SECRET
+#
+# Optional Cloudflare Access service token (attached when private upstreams sit behind Access):
+#   CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET
+#
+# Optional staff allowlist (`[vars]` or secret):
+#   ADMIN_ALLOWED_EMAILS — comma-separated, case-insensitive list of staff emails.
+#     When non-empty, ONLY listed emails qualify for `/admin*` access AND `live_admin_email`.
+#
+# SECURITY: gateway_worker MUST NEVER hold PROVIDER_SECRETS_KEY
+# (provider secrets stay strictly isolated to lets-embed-user-worker and lets-embed-admin-dashboard-worker).
 [secrets]
-required = ["CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "JWT_SECRET"]
+required = [
+  "SITE_SECRET",
+]
 
 [[services]]
 binding = "USER_WORKER"
 service = "lets-embed-user-worker"
 
-# Only the gateway's verified admin path selects this binding.
+# Only the gateway's Cloudflare Access-verified `/admin` path selects this binding.
 [[services]]
-binding = "ADMIN_WORKER"
-service = "lets-embed-user-worker"
+binding = "ADMIN_DASHBOARD_WORKER"
+service = "lets-embed-admin-dashboard-worker"
 props = { gallery_admin = true }
 
 [vars]
-# Audience of the Access application protecting /user/admin and its descendants.
+# Audience of the Cloudflare Access application protecting `/admin` and its descendants.
 CF_ACCESS_AUD = "5700459f509f888154922a3f93bbf18d7dbd6b4be7fa472716693eb2fefb6ba5"
+# Optional comma-separated staff email allowlist (empty = any email passing CF_ACCESS_AUD).
+# ADMIN_ALLOWED_EMAILS = "ops@example.com,admin@example.com"
 # Upstream origins proxied by the gateway (trailing slashes are trimmed at runtime).
 API_UPSTREAM = "https://lets-embed-web.louisfly.icu"
 IMAGE_UPSTREAM = "https://lets-embed-image.louisfly.icu"
 VIDEO_UPSTREAM = "https://lets-embed-video.louisfly.icu"
 
 [durable_objects]
-bindings = [{ name = "USER_ACCOUNT", class_name = "UserAccount", script_name = "lets-embed-user-worker" }]
+bindings = [
+  { name = "USER_ACCOUNT", class_name = "UserAccount", script_name = "lets-embed-user-worker" },
+  { name = "SITE_POLICY", class_name = "SitePolicyDO", script_name = "lets-embed-user-worker" },
+]

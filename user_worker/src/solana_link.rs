@@ -1,33 +1,30 @@
-//! Link/unlink a Solana wallet to an Ethereum (SIWE) session.
-//!
-//! A Solana top-up tx has no on-chain link to a SIWE (Ethereum) session, so
-//! the user proves control of a Solana wallet once by signing a challenge; the
-//! linked address is then required to originate their SOL/SPL top-ups.
-//!
-//! - GET    /user/api/link_solana             -> 200 LinkStatusResp | 401
-//! - POST   /user/api/link_solana  LinkSolReq -> 200 LinkSolResp | 400 | 401 | 409
-//! - DELETE /user/api/link_solana             -> 200 (idempotent) | 400 | 401
+//! Link/unlink a Solana payment wallet (`purpose = 'payment'`) to any account,
+//! using atomic single-use `AuthChallengeDO` nonces and `user_identities`.
 
 use axum::{
     Json,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
+use site_access::{AssuranceLevel, AuthProviderId};
 use tower_cookies::Cookies;
 
-use crate::types::{ApiError, LinkSolReq, LinkSolResp, LinkStatusResp};
-use crate::{AppState, session};
+use crate::{
+    AppState, auth, challenge_do,
+    identity::{self, VerifiedExternalIdentity},
+    session,
+    types::{ApiError, LinkSolReq, LinkSolResp, LinkStatusResp},
+};
 
 const OFFCHAIN_SIGNING_DOMAIN: &[u8] = b"\xffsolana offchain";
 
-/// The exact message the wallet signs. MUST match the account-page JS byte for
-/// byte. `eth_addr` is the lowercase session address; `nonce` is single-use.
-pub fn challenge_message(eth_addr: &str, nonce: &str) -> String {
-    format!("Link Solana wallet to {eth_addr}\nNonce: {nonce}")
+/// The exact message the wallet signs. `account_id` is `user_id`; `nonce` is single-use.
+pub fn challenge_message(account_id: &str, nonce: &str) -> String {
+    format!("Link Solana wallet to {account_id}\nNonce: {nonce}")
 }
 
 fn api_err(code: StatusCode, msg: &str) -> Response {
@@ -38,8 +35,6 @@ fn internal_error() -> Response {
     api_err(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
 }
 
-/// Check whether `bytes` is either the raw `expected` challenge or a recognized
-/// Solana Off-Chain Message v0 envelope whose payload equals `expected` exactly.
 fn matches_challenge_bytes(bytes: &[u8], expected: &[u8], signer_pk: &[u8; 32]) -> bool {
     if bytes == expected {
         return true;
@@ -47,20 +42,15 @@ fn matches_challenge_bytes(bytes: &[u8], expected: &[u8], signer_pk: &[u8; 32]) 
     let Some(rest) = bytes.strip_prefix(OFFCHAIN_SIGNING_DOMAIN) else {
         return false;
     };
-    // Must be version 0.
     let Some((&0u8, after_ver)) = rest.split_first() else {
         return false;
     };
-    // Variant A (solana-offchain-message / Ledger v0):
-    // [format: u8 (0..=2)][len: u16 le][payload]
     if after_ver.len() >= 3 && after_ver[0] <= 2 {
         let len = u16::from_le_bytes([after_ver[1], after_ver[2]]) as usize;
         if after_ver.len() == 3 + len && &after_ver[3..] == expected {
             return true;
         }
     }
-    // Variant B (RFC v0 with 32-byte application domain + explicit signer list):
-    // [app_domain: 32][format: u8 (0..=2)][signer_count: u8 >= 1][signers: 32*n][len: u16 le][payload]
     if after_ver.len() >= 34 && after_ver[32] <= 2 {
         let count = usize::from(after_ver[33]);
         let header_end = 34usize.saturating_add(count.saturating_mul(32));
@@ -80,11 +70,6 @@ fn matches_challenge_bytes(bytes: &[u8], expected: &[u8], signer_pk: &[u8; 32]) 
     false
 }
 
-/// Pure ed25519 verification of a signed challenge. `solana_address_b58` is the
-/// base58 32-byte ed25519 public key; `signature_b58` is the base58 64-byte
-/// signature. When `signed_message_b64` is supplied by a Wallet Standard wallet,
-/// verifies that it is the exact challenge or a recognized Solana off-chain
-/// message envelope wrapping that exact challenge.
 pub(crate) fn verify_ed25519_challenge(
     solana_address_b58: &str,
     signature_b58: &str,
@@ -121,7 +106,6 @@ pub(crate) fn verify_ed25519_challenge(
     }
 }
 
-/// Convenience wrapper for raw-message ed25519 verification (kept for tests).
 #[cfg(test)]
 pub(crate) fn verify_ed25519_b58(
     solana_address_b58: &str,
@@ -134,47 +118,32 @@ pub(crate) fn verify_ed25519_b58(
 #[worker::send]
 pub async fn link(
     State(st): State<AppState>,
+    headers: HeaderMap,
     cookies: Cookies,
     Json(req): Json<LinkSolReq>,
 ) -> Response {
-    // 1) Session must be an Ethereum (SIWE) account; standalone Solana accounts
-    // already pay directly from their sign-in wallet.
-    let Some(addr) = session::session_address(&cookies, &st.jwt_secret) else {
-        return api_err(StatusCode::UNAUTHORIZED, "login required");
+    if let Err(r) = auth::require_same_origin(&st, &headers) {
+        return r;
+    }
+    let active = match identity::require_active_session(&st, &cookies).await {
+        Ok(a) => a,
+        Err(r) => return r,
     };
-    if !session::is_eth_address(&addr) {
-        return api_err(
-            StatusCode::BAD_REQUEST,
-            "Solana accounts already pay from their sign-in wallet.",
-        );
+    if !session::is_sol_principal(&req.solana_address) {
+        return api_err(StatusCode::BAD_REQUEST, "invalid Solana address");
     }
 
-    // 2) Single-use nonce: must exist in KV, then delete it.
-    let kv = match st.env.kv(crate::NONCE_BINDING) {
-        Ok(kv) => kv,
+    // Atomic single-use nonce consumption in `AuthChallengeDO`!
+    match challenge_do::consume_nonce(&st.env, &req.nonce, "wallet").await {
+        Ok(true) => {}
+        Ok(false) => return api_err(StatusCode::BAD_REQUEST, "unknown or expired nonce"),
         Err(e) => {
-            worker::console_error!("kv binding failed: {e:?}");
-            return internal_error();
-        }
-    };
-    let nonce_key = format!("nonce:{}", req.nonce);
-    match kv.get(&nonce_key).text().await {
-        Ok(Some(_)) => {}
-        Ok(None) => return api_err(StatusCode::BAD_REQUEST, "unknown or expired nonce"),
-        Err(e) => {
-            worker::console_error!("nonce get failed: {e:?}");
+            worker::console_error!("solana_link nonce consume failed: {e:?}");
             return internal_error();
         }
     }
-    if let Err(e) = kv.delete(&nonce_key).await {
-        worker::console_error!("nonce delete failed: {e:?}");
-        return internal_error();
-    }
 
-    // 3) Rebuild the challenge the wallet was asked to sign.
-    let msg = challenge_message(&addr, &req.nonce);
-
-    // 4) Verify the ed25519 signature (supporting optional Wallet Standard envelope).
+    let msg = challenge_message(&active.user_id, &req.nonce);
     if !verify_ed25519_challenge(
         &req.solana_address,
         &req.signature,
@@ -184,90 +153,42 @@ pub async fn link(
         return api_err(StatusCode::BAD_REQUEST, "signature verification failed");
     }
 
-    // 5) Uniqueness: `solana_address` is UNIQUE. Reject if already linked to a
-    // different account; otherwise link it to this session's account.
-    let db = match st.env.d1(crate::D1_BINDING) {
-        Ok(db) => db,
-        Err(e) => {
-            worker::console_error!("d1 binding failed: {e:?}");
-            return internal_error();
-        }
-    };
-
-    #[derive(Deserialize)]
-    struct OwnerRow {
-        address: String,
+    // Remove any previous `purpose = 'payment'` Solana wallet owned by THIS user
+    // before inserting the new one (preserving uniqueness & never stealing from others).
+    if let Ok(db) = st.env.d1(crate::D1_BINDING)
+        && let Ok(stmt) = db
+            .prepare(
+                "DELETE FROM user_identities \
+                 WHERE user_id = ?1 AND provider_id = 'siws' AND purpose = 'payment' AND subject != ?2",
+            )
+            .bind(&[active.user_id.as_str().into(), req.solana_address.as_str().into()])
+    {
+        let _ = stmt.run().await;
     }
 
-    // Coexistence rule: a Solana address is EITHER a standalone SIWS account OR a
-    // linked wallet, never both. If it's already a standalone account, refuse.
-    let standalone = match db
-        .prepare("SELECT address FROM users WHERE address = ?")
-        .bind(&[req.solana_address.as_str().into()])
-    {
-        Ok(stmt) => match stmt.first::<OwnerRow>(None).await {
-            Ok(row) => row.is_some(),
-            Err(e) => {
-                worker::console_error!("standalone lookup failed: {e:?}");
-                return internal_error();
-            }
-        },
-        Err(e) => {
-            worker::console_error!("standalone lookup bind failed: {e:?}");
-            return internal_error();
-        }
+    let ident = VerifiedExternalIdentity {
+        provider_id: AuthProviderId::Siws,
+        issuer: "solana:mainnet".to_string(),
+        subject: req.solana_address.clone(),
+        label: Some("Linked Solana payment wallet".to_string()),
+        verified_email: None,
+        assurance_level: AssuranceLevel::None,
+        assurance_method: None,
+        assurance_verified_at: None,
+        assurance_expires_at: None,
     };
-    if standalone {
-        return api_err(
-            StatusCode::CONFLICT,
-            "this wallet already has its own account — log in with it directly instead of linking",
-        );
-    }
-    let existing = match db
-        .prepare("SELECT address FROM users WHERE solana_address = ?")
-        .bind(&[req.solana_address.as_str().into()])
-    {
-        Ok(stmt) => match stmt.first::<OwnerRow>(None).await {
-            Ok(row) => row,
-            Err(e) => {
-                worker::console_error!("solana_address lookup failed: {e:?}");
-                return internal_error();
-            }
-        },
-        Err(e) => {
-            worker::console_error!("solana_address lookup bind failed: {e:?}");
-            return internal_error();
-        }
-    };
-    if let Some(owner) = existing
-        && owner.address != addr
-    {
-        return api_err(
-            StatusCode::CONFLICT,
-            "wallet already linked to another account",
-        );
+    if let Err(r) = identity::link_identity_atomic(&st, &active.user_id, &ident, "payment").await {
+        return r;
     }
 
-    let update = db
-        .prepare("UPDATE users SET solana_address = ? WHERE address = ?")
-        .bind(&[req.solana_address.as_str().into(), addr.as_str().into()]);
-    match update {
-        Ok(stmt) => {
-            if let Err(e) = stmt.run().await {
-                if format!("{e:?}").to_lowercase().contains("constraint") {
-                    return api_err(
-                        StatusCode::CONFLICT,
-                        "wallet already linked to another account",
-                    );
-                }
-                worker::console_error!("solana_address update failed: {e:?}");
-                return internal_error();
-            }
-        }
-        Err(e) => {
-            worker::console_error!("solana_address update bind failed: {e:?}");
-            return internal_error();
-        }
+    // Keep legacy `users.solana_address` synced if this is a migrated ETH user.
+    if session::is_eth_address(&active.user_id)
+        && let Ok(db) = st.env.d1(crate::D1_BINDING)
+        && let Ok(stmt) = db
+            .prepare("UPDATE users SET solana_address = ?1 WHERE address = ?2")
+            .bind(&[req.solana_address.as_str().into(), active.user_id.as_str().into()])
+    {
+        let _ = stmt.run().await;
     }
 
     Json(LinkSolResp {
@@ -278,7 +199,7 @@ pub async fn link(
 
 pub(crate) async fn linked_address(
     env: &worker::Env,
-    addr: &str,
+    user_id: &str,
 ) -> worker::Result<Option<String>> {
     #[derive(Deserialize)]
     struct Row {
@@ -287,20 +208,19 @@ pub(crate) async fn linked_address(
     let row = env
         .d1(crate::D1_BINDING)?
         .prepare("SELECT solana_address FROM users WHERE address = ?")
-        .bind(&[addr.into()])?
+        .bind(&[user_id.into()])?
         .first::<Row>(None)
         .await?;
     Ok(row.and_then(|r| r.solana_address))
 }
 
-/// Report the Solana wallet explicitly linked to the session, if any.
 #[worker::send]
 pub async fn link_status(State(st): State<AppState>, cookies: Cookies) -> Response {
-    let Some(addr) = session::session_address(&cookies, &st.jwt_secret) else {
-        return api_err(StatusCode::UNAUTHORIZED, "login required");
+    let active = match identity::require_active_session(&st, &cookies).await {
+        Ok(a) => a,
+        Err(r) => return r,
     };
-
-    match linked_address(&st.env, &addr).await {
+    match identity::linked_solana_wallet(&st, &active.user_id).await {
         Ok(solana_address) => Json(LinkStatusResp { solana_address }).into_response(),
         Err(e) => {
             worker::console_error!("solana_address status lookup failed: {e:?}");
@@ -310,40 +230,37 @@ pub async fn link_status(State(st): State<AppState>, cookies: Cookies) -> Respon
 }
 
 #[worker::send]
-pub async fn unlink(State(st): State<AppState>, cookies: Cookies) -> Response {
-    let Some(addr) = session::session_address(&cookies, &st.jwt_secret) else {
-        return api_err(StatusCode::UNAUTHORIZED, "login required");
-    };
-    if !session::is_eth_address(&addr) {
-        return api_err(
-            StatusCode::BAD_REQUEST,
-            "Solana accounts already pay from their sign-in wallet.",
-        );
+pub async fn unlink(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    cookies: Cookies,
+) -> Response {
+    if let Err(r) = auth::require_same_origin(&st, &headers) {
+        return r;
     }
-
+    let active = match identity::require_active_session(&st, &cookies).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
     let db = match st.env.d1(crate::D1_BINDING) {
         Ok(db) => db,
-        Err(e) => {
-            worker::console_error!("d1 binding failed: {e:?}");
-            return internal_error();
-        }
+        Err(_) => return internal_error(),
     };
-    let update = db
-        .prepare("UPDATE users SET solana_address = NULL WHERE address = ?")
-        .bind(&[addr.as_str().into()]);
-    match update {
-        Ok(stmt) => {
-            if let Err(e) = stmt.run().await {
-                worker::console_error!("solana_address clear failed: {e:?}");
-                return internal_error();
-            }
-        }
-        Err(e) => {
-            worker::console_error!("solana_address clear bind failed: {e:?}");
-            return internal_error();
-        }
+    if let Ok(stmt) = db
+        .prepare(
+            "DELETE FROM user_identities WHERE user_id = ?1 AND provider_id = 'siws' AND purpose = 'payment'",
+        )
+        .bind(&[active.user_id.as_str().into()])
+    {
+        let _ = stmt.run().await;
     }
-
+    if session::is_eth_address(&active.user_id)
+        && let Ok(stmt) = db
+            .prepare("UPDATE users SET solana_address = NULL WHERE address = ?1")
+            .bind(&[active.user_id.as_str().into()])
+    {
+        let _ = stmt.run().await;
+    }
     StatusCode::OK.into_response()
 }
 
@@ -358,7 +275,6 @@ mod tests {
         assert_eq!(m, "Link Solana wallet to 0xabc\nNonce: n1");
     }
 
-    /// Build a deterministic (pubkey_b58, sig_b58, msg) vector from a fixed seed.
     fn fixture() -> (String, String, String) {
         let seed: [u8; 32] = [
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
@@ -400,10 +316,8 @@ mod tests {
     #[test]
     fn verify_rejects_garbage_base58() {
         let (pk, sig, msg) = fixture();
-        // Non-base58 alphabet (contains '0', 'O', 'I', 'l') / wrong lengths.
         assert!(!verify_ed25519_b58("0OIl", &sig, &msg));
         assert!(!verify_ed25519_b58(&pk, "0OIl", &msg));
-        // Valid base58 but wrong length (not 32 / 64 bytes).
         let short = bs58::encode([0u8; 4]).into_string();
         assert!(!verify_ed25519_b58(&short, &sig, &msg));
         assert!(!verify_ed25519_b58(&pk, &short, &msg));
@@ -417,11 +331,10 @@ mod tests {
         let pk = bs58::encode(pk_bytes).into_string();
         let msg = challenge_message("0xd8da6bf26964af9d7eed9e03e53415d37aa96045", "nonce-env");
 
-        // Variant A: solana-offchain-message / Ledger v0 header
         let mut env_a = Vec::new();
         env_a.extend_from_slice(OFFCHAIN_SIGNING_DOMAIN);
-        env_a.push(0); // version 0
-        env_a.push(0); // restricted ASCII
+        env_a.push(0);
+        env_a.push(0);
         env_a.extend_from_slice(&(msg.len() as u16).to_le_bytes());
         env_a.extend_from_slice(msg.as_bytes());
         let sig_a = bs58::encode(sk.sign(&env_a).to_bytes()).into_string();
@@ -438,13 +351,12 @@ mod tests {
             Some(&B64.encode(&env_a))
         ));
 
-        // Variant B: RFC v0 with application domain + signer list
         let mut env_b = Vec::new();
         env_b.extend_from_slice(OFFCHAIN_SIGNING_DOMAIN);
-        env_b.push(0); // version 0
-        env_b.extend_from_slice(&[0xab; 32]); // app domain
-        env_b.push(1); // UTF-8
-        env_b.push(1); // 1 signer
+        env_b.push(0);
+        env_b.extend_from_slice(&[0xab; 32]);
+        env_b.push(1);
+        env_b.push(1);
         env_b.extend_from_slice(&pk_bytes);
         env_b.extend_from_slice(&(msg.len() as u16).to_le_bytes());
         env_b.extend_from_slice(msg.as_bytes());
@@ -456,7 +368,6 @@ mod tests {
             Some(&B64.encode(&env_b))
         ));
 
-        // Arbitrary prefix must be rejected even with a valid signature.
         let bad = format!("prefix:{msg}");
         let sig_bad = bs58::encode(sk.sign(bad.as_bytes()).to_bytes()).into_string();
         assert!(!verify_ed25519_challenge(

@@ -19,6 +19,8 @@ leptos-use-window = "0.20"
 leptos-use-window-scroll = "0.20"
 
 search_types = { path = "../../search_types", features = ["serde"] }
+site_access = { path = "../../site_access" }
+lets-embed-ui = { path = "../../lets-embed-ui", default-features = false }
 
 serde.workspace = true
 serde_json = "1"
@@ -33,7 +35,7 @@ web-sys = { version = "0.3", features = [
     "ScrollToOptions", "ScrollBehavior", "Window", "DomRect", "CanvasRenderingContext2d",
     "ImageBitmap", "FileList", "File", "Touch", "TouchEvent", "TouchList",
     "Request", "RequestInit", "Response", "Headers", "Storage",
-    "History", "PopStateEvent", "NodeList"
+    "History", "PopStateEvent", "NodeList", "BroadcastChannel"
 ] }
 
 tokio = { workspace = true, optional = true }
@@ -42,14 +44,22 @@ axum = { workspace = true, optional = true, features = ["macros"] }
 leptos_axum = { version = "0.8", optional = true }
 futures = { workspace = true, optional = true }
 base64 = { version = "0.23", optional = true }
+anyhow = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+arc-swap = { version = "1.9", optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"], optional = true }
+pulldown-cmark = { version = "0.13", optional = true }
+ammonia = { version = "4", optional = true }
 
 [features]
 default = []
-hydrate = ["leptos/hydrate", "dep:wasm-bindgen-futures"]
+hydrate = ["leptos/hydrate", "lets-embed-ui/hydrate", "dep:wasm-bindgen-futures"]
 ssr = [
     "leptos/ssr",
     "leptos_meta/ssr",
     "leptos_router/ssr",
+    "lets-embed-ui/ssr",
     "leptos-use-element-size/ssr",
     "leptos-use-event-listener/ssr",
     "leptos-use-intersection-observer/ssr",
@@ -62,4 +72,11 @@ ssr = [
     "dep:leptos_axum",
     "dep:futures",
     "dep:base64",
+    "dep:anyhow",
+    "dep:tracing",
+    "dep:url",
+    "dep:arc-swap",
+    "dep:reqwest",
+    "dep:pulldown-cmark",
+    "dep:ammonia",
 ]

@@ -1,6 +1,11 @@
 use std::{
-    collections::HashMap, io::Cursor, iter::repeat, path::PathBuf, sync::LazyLock,
-    thread::available_parallelism, time::Duration,
+    collections::{HashMap, HashSet},
+    io::Cursor,
+    iter::repeat,
+    path::PathBuf,
+    sync::{Arc, LazyLock},
+    thread::available_parallelism,
+    time::Duration,
 };
 
 use anyhow::bail;
@@ -54,17 +59,27 @@ pub struct EmbedCli {
     )]
     selected_tags: PathBuf,
 
-    /// wd-tagger top_k
+    /// wd-tagger top_k (retained for CLI compatibility; Policy v3 persists all tags >= `--min-persisted-score`)
     #[arg(long, alias = "tk", default_value_t = 36)]
     top_k: usize,
 
-    /// wd-tagger threshold for general tags
+    /// wd-tagger threshold for general tags (retained for CLI compatibility)
     #[arg(long, alias = "gth", default_value_t = 0.3)]
     general_threshold: f32,
 
-    /// wd-tagger threshold for character tags
+    /// wd-tagger threshold for character tags (retained for CLI compatibility)
     #[arg(long, alias = "cth", default_value_t = 0.75)]
     character_threshold: f32,
+
+    /// Policy v3 minimum persisted tag score floor in `(0.0, 1.0]`. Every tag with
+    /// `score >= min_persisted_score` is stored without `top_k` truncation, alongside
+    /// all 4 category-9 rating tags and all 20 built-in safety tags unconditionally.
+    #[arg(
+        long,
+        default_value_t = wd_tagger::DEFAULT_MIN_PERSISTED_SCORE,
+        value_parser = parse_min_persisted_score
+    )]
+    min_persisted_score: f32,
 
     /// CLIP vision onnx model path
     #[arg(
@@ -105,6 +120,30 @@ pub struct EmbedCli {
     /// whether to quit if `SELECT ... FOR UPDATE SKIP LOCKED` got no record
     #[arg(long, alias = "nq")]
     no_quit_while_empty: bool,
+
+    /// extra canonical WD-Tagger tag names to always persist regardless of `top_k` and
+    /// `general_threshold` (in addition to category-9 rating tags and built-in safety presets)
+    #[arg(long, value_delimiter = ',')]
+    safety_tags: Vec<String>,
+
+    /// backfill mode: re-run WD-Tagger only on already-`completed` images that are missing any
+    /// category-9 rating tag (`general`, `sensitive`, `questionable`, `explicit`), upserting
+    /// rating and safety tags without modifying embeddings or image status
+    #[arg(long)]
+    retag_safety: bool,
+}
+
+fn parse_min_persisted_score(raw: &str) -> Result<f32, String> {
+    let v: f32 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid min-persisted-score '{raw}'"))?;
+    if !v.is_finite() || v <= 0.0 || v > 1.0 {
+        return Err(format!(
+            "min-persisted-score {v} must be finite and in (0.0, 1.0]"
+        ));
+    }
+    Ok(v)
 }
 
 #[derive(Debug)]
@@ -175,10 +214,40 @@ impl EmbedCli {
         );
 
         let tags = wd_tagger::tags(self.selected_tags)?;
+        let vocab_digest = Arc::new(wd_tagger::compute_vocab_digest(&tags));
+        let min_persisted_score = self.min_persisted_score;
+        let _ = (self.top_k, self.general_threshold, self.character_threshold);
         let tags = tags.leak::<'static>();
+
+        let mut safety_tag_set = wd_tagger::default_safety_tag_set();
+        for tag in self.safety_tags {
+            let trimmed = tag.trim();
+            if !trimmed.is_empty() {
+                safety_tag_set.insert(trimmed.to_string());
+            }
+        }
+        let always_keep_tags = Arc::new(safety_tag_set);
 
         let ort_env = ort::init().with_name("embed").build()?;
         let wd_tagger_session = wd_tagger::model_with_env(&ort_env, self.wd_tagger_model)?;
+
+        if self.retag_safety {
+            return run_retag_safety(
+                pool,
+                op,
+                wd_tagger_session,
+                tags,
+                always_keep_tags,
+                RetagParams {
+                    min_persisted_score,
+                    vocab_digest,
+                    batch_size: self.batch_size.max(1),
+                },
+                cancel,
+            )
+            .await;
+        }
+
         let clip_vision_session = siglip2::model_with_env(&ort_env, self.clip_vision_model)?;
         let dinov3_session = dinov3::model_with_env(&ort_env, self.dinov3_model)?;
 
@@ -218,9 +287,8 @@ impl EmbedCli {
             infer(
                 wd_tagger_session,
                 tags,
-                self.top_k,
-                self.general_threshold,
-                self.character_threshold,
+                always_keep_tags,
+                min_persisted_score,
                 clip_vision_session,
                 dinov3_session,
                 batch_size,
@@ -229,7 +297,7 @@ impl EmbedCli {
                 device,
             )
         });
-        jhs.spawn(record(pool, rx__));
+        jhs.spawn(record(pool, rx__, min_persisted_score, vocab_digest));
 
         let mut failure: Option<Result<anyhow::Error, JoinError>> = None;
         while let Some(res) = jhs.join_next().await {
@@ -476,9 +544,8 @@ async fn convert_image(
 fn infer(
     mut wd_tagger_session: Session,
     tags: &'static [Tag],
-    top_k: usize,
-    general_threshold: f32,
-    character_threshold: f32,
+    always_keep_tags: Arc<HashSet<String>>,
+    min_persisted_score: f32,
     mut clip_vision_session: Session,
     mut dinov3_session: Session,
     batch_size: usize,
@@ -531,13 +598,12 @@ fn infer(
         let res = if some_ids.is_empty() {
             none_ids.into_iter().zip(repeat(None)).collect::<Vec<_>>()
         } else {
-            match wd_tagger::infer_tag(
+            match wd_tagger::infer_tag_with_coverage(
                 &mut wd_tagger_session,
                 wd_images,
                 tags,
-                top_k,
-                general_threshold,
-                character_threshold,
+                min_persisted_score,
+                Some(&always_keep_tags),
             )
             .and_then(|tags| {
                 Ok((
@@ -594,6 +660,8 @@ async fn record(
         Ticket,
         Vec<Tracker>,
     )>,
+    min_persisted_score: f32,
+    vocab_digest: Arc<String>,
 ) -> anyhow::Result<()> {
     /// batches merged into one write, see below
     const COALESCE: usize = 16;
@@ -650,6 +718,7 @@ async fn record(
         let span = tracing::info_span!(parent: None, "write", images = res.len(), failed = Empty);
 
         let pool = pool.clone();
+        let vocab_digest = Arc::clone(&vocab_digest);
         writes.spawn(
             async move {
                 let mut wd_ids = vec![];
@@ -742,6 +811,23 @@ async fn record(
                     .execute(&mut *conn)
                     .instrument(tracing::info_span!("complete images"))
                     .await?;
+
+                    // Policy v3 tag coverage metadata persisted via runtime query so `.sqlx/`
+                    // offline cache for existing `sqlx::query!` statements remains untouched.
+                    sqlx::query(
+                        r#"
+            UPDATE images
+            SET wd_min_persisted_score = $2,
+                wd_vocab_digest = $3
+            WHERE id = ANY($1::BIGINT[])
+        "#,
+                    )
+                    .bind(&completed_ids)
+                    .bind(min_persisted_score)
+                    .bind(vocab_digest.as_str())
+                    .execute(&mut *conn)
+                    .instrument(tracing::info_span!("record wd coverage"))
+                    .await?;
                 }
 
                 if !failed_ids.is_empty() {
@@ -788,4 +874,217 @@ async fn record(
         }
     }
     failure.map_or(Ok(()), Err)
+}
+
+#[derive(Debug, Clone)]
+struct RetagParams {
+    min_persisted_score: f32,
+    vocab_digest: Arc<String>,
+    batch_size: usize,
+}
+
+/// Backfills WD-Tagger floor-coverage tags, category-9 rating tags, safety-vocabulary
+/// tags, `wd_min_persisted_score`, and `wd_vocab_digest` for already-`completed` images
+/// that are missing any rating tag, lack floor coverage, have a looser floor than
+/// `min_persisted_score`, or carry a different vocabulary digest.
+///
+/// Uses runtime `sqlx::query` so `.sqlx` offline query metadata for the main
+/// ingestion pipeline remains unchanged.
+#[tracing::instrument(skip_all, err)]
+async fn run_retag_safety(
+    pool: PgPool,
+    op: Operator,
+    mut wd_tagger_session: Session,
+    tags: &'static [Tag],
+    always_keep_tags: Arc<HashSet<String>>,
+    params: RetagParams,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let rating_names: Vec<String> = wd_tagger::RATING_TAG_NAMES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let mut last_id: i64 = 0;
+    let mut processed: u64 = 0;
+
+    loop {
+        if cancel.is_cancelled() {
+            break;
+        }
+
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            r#"
+            SELECT i.id, i.name
+            FROM images i
+            WHERE i.status = 'completed'::process_status
+              AND i.id > $1
+              AND (
+                  i.wd_min_persisted_score IS NULL
+                  OR i.wd_min_persisted_score > $4
+                  OR i.wd_vocab_digest IS DISTINCT FROM $5
+                  OR (
+                      SELECT COUNT(*)
+                      FROM wd_tag_images wti
+                      JOIN wd_tags wt ON wt.id = wti.wd_tag_id
+                      WHERE wti.image_id = i.id
+                        AND wt.name = ANY($2)
+                  ) < $3
+              )
+            ORDER BY i.id ASC
+            LIMIT $6
+            "#,
+        )
+        .bind(last_id)
+        .bind(&rating_names)
+        .bind(rating_names.len() as i64)
+        .bind(params.min_persisted_score)
+        .bind(params.vocab_digest.as_str())
+        .bind(params.batch_size as i64)
+        .fetch_all(&pool)
+        .await?;
+
+        if rows.is_empty() {
+            tracing::info!(processed, "retag-safety backfill complete");
+            break;
+        }
+
+        last_id = rows.last().map(|(id, _)| *id).unwrap_or(last_id);
+
+        let mut batch_ids = Vec::with_capacity(rows.len());
+        let mut batch_inputs = Vec::with_capacity(rows.len());
+
+        for (id, name) in rows {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let buf = match op.read(&format!("{name}.webp")).await {
+                Ok(buf) => buf.to_bytes(),
+                Err(e) => {
+                    tracing::warn!(id, err = %e, "retag-safety: failed to read image");
+                    continue;
+                }
+            };
+            match tokio::task::spawn_blocking(move || wd_tagger::convert_image(Cursor::new(buf)))
+                .await?
+            {
+                Ok(hwc) => {
+                    batch_ids.push(id);
+                    batch_inputs.push(hwc);
+                }
+                Err(e) => {
+                    tracing::warn!(id, err = %e, "retag-safety: failed to decode image");
+                }
+            }
+        }
+
+        if batch_ids.is_empty() {
+            continue;
+        }
+
+        let keep = Arc::clone(&always_keep_tags);
+        let min_score = params.min_persisted_score;
+        let (session_back, inferred) = tokio::task::spawn_blocking(move || {
+            let res = wd_tagger::infer_tag_with_coverage(
+                &mut wd_tagger_session,
+                batch_inputs,
+                tags,
+                min_score,
+                Some(&keep),
+            );
+            (wd_tagger_session, res)
+        })
+        .await?;
+        wd_tagger_session = session_back;
+        let inferred = inferred?;
+
+        let mut wd_ids: Vec<i64> = Vec::new();
+        let mut tag_names: Vec<&str> = Vec::new();
+        let mut scores: Vec<f32> = Vec::new();
+
+        for (id, img_tags) in batch_ids.iter().copied().zip(inferred) {
+            for (tag, score) in img_tags {
+                wd_ids.push(id);
+                tag_names.push(tag.name.as_str());
+                scores.push(score);
+            }
+        }
+
+        let mut conn = pool.acquire().await?;
+        if !tag_names.is_empty() {
+            sqlx::query(
+                r#"
+                INSERT INTO wd_tags (name)
+                SELECT DISTINCT name FROM unnest($1::TEXT[]) AS _(name)
+                WHERE trim(name) != ''
+                ORDER BY name
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(&tag_names)
+            .execute(&mut *conn)
+            .await?;
+
+            sqlx::query(
+                r#"
+                INSERT INTO wd_tag_images (wd_tag_id, image_id, score)
+                SELECT wt.id, i.id, i.score
+                FROM unnest($1::BIGINT[], $2::TEXT[], $3::REAL[]) AS i(id, name, score)
+                JOIN wd_tags wt USING (name)
+                ON CONFLICT (wd_tag_id, image_id) DO UPDATE
+                SET score = EXCLUDED.score
+                "#,
+            )
+            .bind(&wd_ids)
+            .bind(&tag_names)
+            .bind(&scores)
+            .execute(&mut *conn)
+            .await?;
+        }
+
+        sqlx::query(
+            r#"
+            UPDATE images
+            SET wd_min_persisted_score = $2,
+                wd_vocab_digest = $3
+            WHERE id = ANY($1::BIGINT[])
+            "#,
+        )
+        .bind(&batch_ids)
+        .bind(params.min_persisted_score)
+        .bind(params.vocab_digest.as_str())
+        .execute(&mut *conn)
+        .await?;
+
+        processed += batch_ids.len() as u64;
+        tracing::info!(
+            processed,
+            last_id,
+            batch = batch_ids.len(),
+            "retag-safety batch updated"
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_defaults_min_persisted_score_and_validates_bounds() {
+        let cli = EmbedCli::try_parse_from(["embed"]).expect("default CLI args parse");
+        assert!((cli.min_persisted_score - wd_tagger::DEFAULT_MIN_PERSISTED_SCORE).abs() < 1e-6);
+
+        let custom = EmbedCli::try_parse_from(["embed", "--min-persisted-score", "0.02"])
+            .expect("custom floor parses");
+        assert!((custom.min_persisted_score - 0.02).abs() < 1e-6);
+
+        for invalid in ["0", "0.0", "-0.05", "1.01", "NaN", "inf", "abc"] {
+            assert!(
+                EmbedCli::try_parse_from(["embed", "--min-persisted-score", invalid]).is_err(),
+                "expected '{invalid}' to be rejected"
+            );
+        }
+    }
 }

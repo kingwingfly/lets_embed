@@ -5,32 +5,52 @@ workers_dev = false
 preview_urls = false
 
 [build]
-command = "cargo install -q \"worker-build@^0.9\" && worker-build --profile wasm-release"
+command = "./build-web.sh && cargo install -q \"worker-build@^0.9\" && worker-build --profile wasm-release"
+
+[assets]
+directory = "./assets"
+binding = "ASSETS"
+run_worker_first = true
+html_handling = "none"
 
 [observability.logs]
 enabled = true
 invocation_logs = true
 
 [vars]
-# Public hostname the SIWE message must be signed for (the lets-embed-gateway-worker's domain).
+# Public hostname the SIWE/SIWS messages and same-origin CSRF checks bind to.
 SIWE_DOMAIN = "lets-embed.louisfly.icu"
+# Pinned canonical origin used for OAuth/OIDC callbacks and email login links (L2).
+PUBLIC_URL = "https://lets-embed.louisfly.icu"
+# Deployment identifier bound into AES-256-GCM AAD for `provider_secrets` (M3).
+DEPLOYMENT_ID = "lets-embed-prod"
 # Ethereum JSON-RPC endpoint used to verify ETH/ERC-20 top-ups + Chainlink prices.
 RPC_URL = "https://cloudflare-eth.com"
 CHAIN_ID = "1"
 # Solana JSON-RPC endpoint used to verify SOL / SPL top-ups.
 SOL_RPC_URL = "https://api.mainnet-beta.solana.com"
 
-# Worker secrets; deploy fails until each is set with `wrangler secret put <NAME>`:
-#   JWT_SECRET — HS256 key for `ue_session`; must equal lets-embed-gateway-worker's JWT_SECRET.
-#     Generate it once with `openssl rand -base64 48` and put the same value into both workers.
-[secrets]
-required = ["JWT_SECRET"]
-
-# SIWE nonces, single-use, TTL-expired. Create the namespace and fill in the id:
-#   wrangler kv namespace create NONCES
-[[kv_namespaces]]
-binding = "NONCES"
-id = "1d3aa70037834252a25d895d60637774"
+# Worker secrets (configure via `wrangler secret put <NAME>`).
+# Recommended single-secret setup (RFC 5869 HKDF-SHA256 via `site_access::kdf`):
+#   SITE_SECRET                 — Single high-entropy master secret (>= 32 bytes; e.g. `openssl rand -base64 48`).
+#                                 Derives cryptographically isolated keys for:
+#                                 - Session (`KeyDomain::Session`)
+#                                 - InternalApi (`KeyDomain::InternalApi`)
+#                                 - ProviderSecrets AES-256-GCM (`KeyDomain::ProviderSecrets`)
+#
+# Optional per-purpose overrides (take precedence over SITE_SECRET when set):
+#   SESSION_SECRET              — Dedicated secret for revocable `v2.` session cookies (legacy alias: SESSION_V2_SECRET)
+#   INTERNAL_API_SECRET         — Dedicated secret for internal worker-to-worker API calls
+#   PROVIDER_SECRETS_KEY        — Optional dedicated 32-byte AES-256-GCM key (base64 or 64-char hex, optional "<kid>:" prefix)
+#                                 for decrypting `provider_secrets` (defaults to HKDF from SITE_SECRET)
+#   PROVIDER_SECRETS_KEY_PREV   — Optional previous 32-byte AES-256-GCM key during zero-downtime key rotation
+#   JWT_SECRET                  — Optional legacy HS256 wallet session secret (only needed during legacy cutover)
+#   GOOGLE_CLIENT_SECRET / GITHUB_CLIENT_SECRET / X_CLIENT_SECRET / DISCORD_CLIENT_SECRET /
+#   OIDC_AGE_CLIENT_SECRET / TELEGRAM_BOT_TOKEN / EMAIL_API_KEY — optional env fallbacks if not stored in D1
+#
+# Runtime fails closed if neither SITE_SECRET nor explicit per-purpose overrides are configured.
+# [secrets]
+# required = ["SITE_SECRET"]
 
 [[d1_databases]]
 binding = "DB"
@@ -38,8 +58,16 @@ database_name = "lets-embed"
 database_id = "ee6985fc-ed13-414f-8f85-8727c86f3b48"
 
 [durable_objects]
-bindings = [{ name = "USER_ACCOUNT", class_name = "UserAccount" }]
+bindings = [
+  { name = "USER_ACCOUNT", class_name = "UserAccount" },
+  { name = "AUTH_CHALLENGE", class_name = "AuthChallengeDO" },
+  { name = "SITE_POLICY", class_name = "SitePolicyDO" },
+]
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["UserAccount"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["AuthChallengeDO", "SitePolicyDO"]

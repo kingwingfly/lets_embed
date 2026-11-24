@@ -13,6 +13,8 @@ futures.workspace = true
 tokio.workspace = true
 
 search_engine = { path = "../../search_engine" }
+search_types = { path = "../../search_types", features = ["serde"] }
+site_access = { path = "../../site_access" }
 
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -27,3 +29,8 @@ app = { path = "../app", features = ["ssr"] }
 
 clap.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

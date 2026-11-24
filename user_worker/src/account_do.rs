@@ -13,9 +13,15 @@ use crate::types::{
 };
 use crate::{
     config,
+    do_client::{
+        AgeConfirmReq, DoPrefsConflictResp, PrefsUpdateReq, PreviewBudgetReq, PreviewBudgetResp,
+        SessionContextReq, SessionInfoResp, SessionIssueReq, SessionIssueResp,
+        SessionRevokeAllReq, SessionRevokeAllResp, SessionRevokeReq, TermsAcceptReq,
+    },
+    identity::{assurance_from_str, assurance_to_str},
     settings::{self, Policy},
 };
-use site_access::GuestReq;
+use site_access::{AssuranceLevel, GuestReq, PolicyRef, SessionContext};
 
 // ---------------------------------------------------------------------------
 // Pure decision logic (host-testable)
@@ -158,6 +164,274 @@ fn refund_window_counters(
 }
 
 const HOLD_TTL_SECS: i64 = 600;
+const PREVIEW_BUDGET_WINDOW_SECS: i64 = 300;
+const PREVIEW_BUDGET_MAX_PER_WINDOW: u32 = 240;
+
+/// Pure session-context evaluator (host-testable).
+#[derive(Debug, Clone)]
+pub(crate) struct StoredSessionSnapshot {
+    pub assurance_level: AssuranceLevel,
+    pub strict_age_ok: bool,
+    pub expires_at: u64,
+    pub revoked_at: Option<u64>,
+}
+
+/// Raw row loaded from DO SQLite `user_safety_state` BEFORE cold-load legacy Safe Mode migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawStoredSafetyRow {
+    pub enabled_switchers: Vec<PolicyRef>,
+    pub legacy_safe_mode: bool,
+    pub pref_version: u64,
+    pub terms_version: Option<u32>,
+    pub terms_digest: Option<String>,
+    pub self_attested_18: bool,
+    pub revoked_all_before: u64,
+}
+
+/// Active Policy v3 user safety state (Safe Mode removed; monotonic `pref_version`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredSafetyState {
+    pub enabled_switchers: Vec<PolicyRef>,
+    pub pref_version: u64,
+    pub terms_version: Option<u32>,
+    pub terms_digest: Option<String>,
+    pub self_attested_18: bool,
+    pub revoked_all_before: u64,
+}
+
+impl Default for StoredSafetyState {
+    fn default() -> Self {
+        Self {
+            enabled_switchers: Vec::new(),
+            pref_version: 1,
+            terms_version: None,
+            terms_digest: None,
+            self_attested_18: false,
+            revoked_all_before: 0,
+        }
+    }
+}
+
+/// Parse persisted `enabled_switchers_json` into validated, deduplicated `Vec<PolicyRef>`.
+///
+/// Accepts canonical `{"id": "...", "grant_generation": N}` objects AND compact `"<id>@<gen>"`
+/// strings. Legacy unversioned v2 policy IDs (without `grant_generation`) are dropped fail-closed
+/// so prior v2 opt-ins never silently grant v3 bypasses.
+pub(crate) fn parse_stored_policy_refs(raw_json: &str) -> Vec<PolicyRef> {
+    let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(raw_json) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        let parsed = if let Some(s) = item.as_str() {
+            PolicyRef::from_key(s.trim()).ok()
+        } else {
+            serde_json::from_value::<PolicyRef>(item)
+                .ok()
+                .filter(|p| p.validate().is_ok())
+        };
+        if let Some(pref) = parsed
+            && !out.contains(&pref)
+        {
+            out.push(pref);
+        }
+    }
+    out
+}
+
+/// Cold-load Safe Mode wipe migration (Codex MEDIUM #6):
+///
+/// If legacy `safe_mode == true`, atomically clears `enabled_switchers = []`,
+/// clears legacy `safe_mode = false`, increments `pref_version`, and returns
+/// `(migrated_state, needs_persist = true)` so the DO persists immediately
+/// BEFORE serving any `SessionContext`!
+pub(crate) fn migrate_legacy_safe_mode_on_load(
+    raw: RawStoredSafetyRow,
+) -> (StoredSafetyState, bool) {
+    let base_ver = raw.pref_version.max(1);
+    if raw.legacy_safe_mode {
+        (
+            StoredSafetyState {
+                enabled_switchers: Vec::new(),
+                pref_version: base_ver.saturating_add(1),
+                terms_version: raw.terms_version,
+                terms_digest: raw.terms_digest,
+                self_attested_18: raw.self_attested_18,
+                revoked_all_before: raw.revoked_all_before,
+            },
+            true,
+        )
+    } else {
+        (
+            StoredSafetyState {
+                enabled_switchers: raw.enabled_switchers,
+                pref_version: base_ver,
+                terms_version: raw.terms_version,
+                terms_digest: raw.terms_digest,
+                self_attested_18: raw.self_attested_18,
+                revoked_all_before: raw.revoked_all_before,
+            },
+            false,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PrefsUpdateOutcome {
+    Updated(StoredSafetyState),
+    VersionConflict { current: StoredSafetyState },
+}
+
+/// Pure optimistic-concurrency state transition for `UserAccount` DO `/prefs-update`.
+///
+/// When `expected_pref_version` is supplied and differs from `current.pref_version`,
+/// rejects with `VersionConflict` carrying fresh state without mutating.
+/// On success, atomically replaces `enabled_switchers` and increments `pref_version`.
+pub(crate) fn apply_prefs_update(
+    current: &StoredSafetyState,
+    enabled_switchers: Vec<PolicyRef>,
+    expected_pref_version: Option<u64>,
+) -> PrefsUpdateOutcome {
+    let cur_ver = current.pref_version.max(1);
+    if let Some(expected) = expected_pref_version
+        && expected != cur_ver
+    {
+        return PrefsUpdateOutcome::VersionConflict {
+            current: StoredSafetyState {
+                pref_version: cur_ver,
+                ..current.clone()
+            },
+        };
+    }
+    let mut deduped = Vec::with_capacity(enabled_switchers.len());
+    for pref in enabled_switchers {
+        if pref.validate().is_ok() && !deduped.contains(&pref) {
+            deduped.push(pref);
+        }
+    }
+    PrefsUpdateOutcome::Updated(StoredSafetyState {
+        enabled_switchers: deduped,
+        pref_version: cur_ver.saturating_add(1),
+        ..current.clone()
+    })
+}
+
+pub(crate) fn compute_session_context(
+    banned: bool,
+    suspended: bool,
+    requested_sid: Option<&str>,
+    session_row: Option<&StoredSessionSnapshot>,
+    safety: &StoredSafetyState,
+    now: u64,
+) -> SessionContext {
+    let pref_version = safety.pref_version.max(1);
+    if banned || suspended {
+        return SessionContext {
+            active: false,
+            banned,
+            suspended,
+            sid_valid: false,
+            assurance_level: AssuranceLevel::None,
+            strict_age_ok: false,
+            terms_version_accepted: safety.terms_version,
+            terms_digest_accepted: safety.terms_digest.clone(),
+            enabled_switchers: Vec::new(),
+            pref_version,
+        };
+    }
+
+    match requested_sid {
+        Some(_) => {
+            let Some(row) = session_row else {
+                return SessionContext {
+                    active: true,
+                    banned: false,
+                    suspended: false,
+                    sid_valid: false,
+                    assurance_level: AssuranceLevel::None,
+                    strict_age_ok: false,
+                    terms_version_accepted: safety.terms_version,
+                    terms_digest_accepted: safety.terms_digest.clone(),
+                    enabled_switchers: Vec::new(),
+                    pref_version,
+                };
+            };
+            let valid = row.revoked_at.is_none() && row.expires_at > now;
+            if !valid {
+                return SessionContext {
+                    active: true,
+                    banned: false,
+                    suspended: false,
+                    sid_valid: false,
+                    assurance_level: AssuranceLevel::None,
+                    strict_age_ok: false,
+                    terms_version_accepted: safety.terms_version,
+                    terms_digest_accepted: safety.terms_digest.clone(),
+                    enabled_switchers: Vec::new(),
+                    pref_version,
+                };
+            }
+            let effective_assurance = match row.assurance_level {
+                AssuranceLevel::None if safety.self_attested_18 => AssuranceLevel::SelfAttestation,
+                other => other,
+            };
+            let strict_age_ok = row.strict_age_ok && effective_assurance == AssuranceLevel::Verified18;
+            SessionContext {
+                active: true,
+                banned: false,
+                suspended: false,
+                sid_valid: true,
+                assurance_level: effective_assurance,
+                strict_age_ok,
+                terms_version_accepted: safety.terms_version,
+                terms_digest_accepted: safety.terms_digest.clone(),
+                enabled_switchers: safety.enabled_switchers.clone(),
+                pref_version,
+            }
+        }
+        None => {
+            // Legacy wallet cutover token (no `sid`): honored only if not banned and
+            // `session-revoke-all` has not invalidated prior sessions. Never grants strict_age_ok.
+            let legacy_valid = safety.revoked_all_before == 0;
+            let assurance = if safety.self_attested_18 {
+                AssuranceLevel::SelfAttestation
+            } else {
+                AssuranceLevel::None
+            };
+            SessionContext {
+                active: true,
+                banned: false,
+                suspended: false,
+                sid_valid: legacy_valid,
+                assurance_level: assurance,
+                strict_age_ok: false,
+                terms_version_accepted: safety.terms_version,
+                terms_digest_accepted: safety.terms_digest.clone(),
+                enabled_switchers: if !legacy_valid {
+                    Vec::new()
+                } else {
+                    safety.enabled_switchers.clone()
+                },
+                pref_version,
+            }
+        }
+    }
+}
+
+/// Pure preview transform rate budget decision (separate from clear-view billing).
+pub(crate) fn decide_preview_budget(
+    seen_in_window: bool,
+    window_count: u32,
+    max_per_window: u32,
+) -> (bool, u32) {
+    if seen_in_window {
+        return (true, max_per_window.saturating_sub(window_count));
+    }
+    if window_count >= max_per_window {
+        return (false, 0);
+    }
+    (true, max_per_window.saturating_sub(window_count + 1))
+}
 
 enum FreeOutcome {
     NotCovered,
@@ -195,6 +469,8 @@ pub struct UserAccount {
     handoff_last_purge: std::cell::Cell<i64>,
     holds_schema_ready: std::cell::Cell<bool>,
     holds_last_purge: std::cell::Cell<i64>,
+    sessions_schema_ready: std::cell::Cell<bool>,
+    sessions_last_purge: std::cell::Cell<i64>,
 }
 
 impl DurableObject for UserAccount {
@@ -206,6 +482,8 @@ impl DurableObject for UserAccount {
             handoff_last_purge: std::cell::Cell::new(0),
             holds_schema_ready: std::cell::Cell::new(false),
             holds_last_purge: std::cell::Cell::new(0),
+            sessions_schema_ready: std::cell::Cell::new(false),
+            sessions_last_purge: std::cell::Cell::new(0),
         }
     }
 
@@ -213,6 +491,47 @@ impl DurableObject for UserAccount {
         let path = req.path();
         // Routes that use DO SQLite/storage directly and do not need site policy loading.
         match (req.method(), path.as_str()) {
+            (Method::Post, "/session-context") => {
+                let text = req.text().await.unwrap_or_default();
+                let body: SessionContextReq = if text.trim().is_empty() {
+                    SessionContextReq { sid: None }
+                } else {
+                    serde_json::from_str(&text)
+                        .map_err(|e| worker::Error::RustError(e.to_string()))?
+                };
+                return self.session_context(body).await;
+            }
+            (Method::Post, "/session-issue") => {
+                return self.session_issue(req.json().await?).await;
+            }
+            (Method::Post, "/session-revoke") => {
+                return self.session_revoke(req.json().await?);
+            }
+            (Method::Post, "/session-revoke-all") => {
+                let text = req.text().await.unwrap_or_default();
+                let body: SessionRevokeAllReq = if text.trim().is_empty() {
+                    SessionRevokeAllReq::default()
+                } else {
+                    serde_json::from_str(&text)
+                        .map_err(|e| worker::Error::RustError(e.to_string()))?
+                };
+                return self.session_revoke_all(body);
+            }
+            (Method::Post, "/session-info") => {
+                return self.session_info(req.json().await?);
+            }
+            (Method::Post, "/prefs-update") => {
+                return self.prefs_update(req.json().await?).await;
+            }
+            (Method::Post, "/terms-accept") => {
+                return self.terms_accept(req.json().await?);
+            }
+            (Method::Post, "/age-confirm") => {
+                return self.age_confirm(req.json().await?);
+            }
+            (Method::Post, "/preview-budget") => {
+                return self.preview_budget(req.json().await?).await;
+            }
             (Method::Post, "/handoff-start") => {
                 return self.handoff_start(req.json().await?);
             }
@@ -1162,7 +1481,491 @@ impl UserAccount {
 
     async fn ban(&self, req: BanReq, policy: &Policy) -> Result<Response> {
         self.state.storage().put("banned", req.banned).await?;
+        if req.banned {
+            // Immediately revoke ALL active revocable `v2` sessions on ban (H8).
+            let _ = self.revoke_all_sessions_internal(&SessionRevokeAllReq::default())?;
+        }
         json(&self.status_resp(policy).await?, 200)
+    }
+
+    // -----------------------------------------------------------------------
+    // Revocable `v2` sessions, content safety prefs, Terms & Preview Budget
+    // -----------------------------------------------------------------------
+
+    fn ensure_session_tables(&self, now: i64) -> Result<worker::SqlStorage> {
+        let db = self.state.storage().sql();
+        if !self.sessions_schema_ready.get() {
+            db.exec(
+                "CREATE TABLE IF NOT EXISTS sessions (\
+                    sid TEXT PRIMARY KEY,\
+                    auth_method TEXT NOT NULL,\
+                    identity_key TEXT NOT NULL,\
+                    assurance_level TEXT NOT NULL,\
+                    strict_age_ok INTEGER NOT NULL DEFAULT 0,\
+                    created_at INTEGER NOT NULL,\
+                    expires_at INTEGER NOT NULL,\
+                    revoked_at INTEGER\
+                )",
+                None,
+            )?;
+            db.exec(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_at)",
+                None,
+            )?;
+            db.exec(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_ident ON sessions(identity_key)",
+                None,
+            )?;
+            db.exec(
+                "CREATE TABLE IF NOT EXISTS user_safety_state (\
+                    id INTEGER PRIMARY KEY CHECK (id = 1),\
+                    enabled_switchers_json TEXT NOT NULL DEFAULT '[]',\
+                    safe_mode INTEGER NOT NULL DEFAULT 0,\
+                    pref_version INTEGER NOT NULL DEFAULT 1,\
+                    terms_version INTEGER,\
+                    terms_digest TEXT,\
+                    terms_accepted_at INTEGER,\
+                    self_attested_18 INTEGER NOT NULL DEFAULT 0,\
+                    revoked_all_before INTEGER NOT NULL DEFAULT 0\
+                )",
+                None,
+            )?;
+            // Upgrade pre-v3 DOs that created `user_safety_state` before `pref_version` existed.
+            #[derive(serde::Deserialize)]
+            struct ColInfo {
+                name: String,
+            }
+            let cols: Vec<ColInfo> = db
+                .exec("PRAGMA table_info(user_safety_state)", None)?
+                .to_array()?;
+            if !cols.iter().any(|c| c.name == "pref_version") {
+                db.exec(
+                    "ALTER TABLE user_safety_state ADD COLUMN pref_version INTEGER NOT NULL DEFAULT 1",
+                    None,
+                )?;
+            }
+            db.exec(
+                "CREATE TABLE IF NOT EXISTS preview_budget (\
+                    window_start INTEGER NOT NULL,\
+                    item_key TEXT NOT NULL,\
+                    PRIMARY KEY (window_start, item_key)\
+                ) WITHOUT ROWID",
+                None,
+            )?;
+            self.sessions_schema_ready.set(true);
+        }
+        if now.saturating_sub(self.sessions_last_purge.get()) >= 300 {
+            let _ = db.exec(
+                "DELETE FROM sessions WHERE expires_at <= ?1",
+                vec![(now.saturating_sub(3600)).into()],
+            );
+            let current_window = now / PREVIEW_BUDGET_WINDOW_SECS;
+            let _ = db.exec(
+                "DELETE FROM preview_budget WHERE window_start < ?1",
+                vec![current_window.into()],
+            );
+            self.sessions_last_purge.set(now);
+        }
+        Ok(db)
+    }
+
+    fn read_safety_state(&self, db: &worker::SqlStorage) -> Result<StoredSafetyState> {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            enabled_switchers_json: String,
+            safe_mode: i64,
+            pref_version: i64,
+            terms_version: Option<i64>,
+            terms_digest: Option<String>,
+            self_attested_18: i64,
+            revoked_all_before: i64,
+        }
+        let rows: Vec<Row> = db
+            .exec(
+                "SELECT enabled_switchers_json, safe_mode, pref_version, terms_version, terms_digest, \
+                 self_attested_18, revoked_all_before FROM user_safety_state WHERE id = 1",
+                None,
+            )?
+            .to_array()?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(StoredSafetyState::default());
+        };
+        let raw = RawStoredSafetyRow {
+            enabled_switchers: parse_stored_policy_refs(&row.enabled_switchers_json),
+            legacy_safe_mode: row.safe_mode != 0,
+            pref_version: row.pref_version.max(1) as u64,
+            terms_version: row.terms_version.and_then(|v| u32::try_from(v).ok()),
+            terms_digest: row.terms_digest,
+            self_attested_18: row.self_attested_18 != 0,
+            revoked_all_before: row.revoked_all_before.max(0) as u64,
+        };
+        let (migrated, needs_persist) = migrate_legacy_safe_mode_on_load(raw);
+        if needs_persist {
+            // Cold-load legacy Safe Mode wipe migration (Codex MEDIUM #6):
+            // persist cleared `enabled_switchers = []`, `safe_mode = 0`, and incremented
+            // `pref_version` immediately BEFORE serving any `SessionContext`!
+            db.exec(
+                "UPDATE user_safety_state \
+                 SET enabled_switchers_json = '[]', safe_mode = 0, pref_version = ?1 \
+                 WHERE id = 1",
+                vec![(migrated.pref_version as i64).into()],
+            )?;
+        }
+        Ok(migrated)
+    }
+
+    async fn session_context(&self, req: SessionContextReq) -> Result<Response> {
+        let now = now_secs();
+        let banned = self.get_or("banned", false).await?;
+        let suspended = self.get_or("suspended", false).await?;
+        let db = self.ensure_session_tables(now as i64)?;
+        let safety = self.read_safety_state(&db)?;
+
+        let session_row = if let Some(sid) = req.sid.as_deref() {
+            #[derive(serde::Deserialize)]
+            struct SRow {
+                assurance_level: String,
+                strict_age_ok: i64,
+                expires_at: i64,
+                revoked_at: Option<i64>,
+            }
+            let rows: Vec<SRow> = db
+                .exec(
+                    "SELECT assurance_level, strict_age_ok, expires_at, revoked_at \
+                     FROM sessions WHERE sid = ?1",
+                    vec![sid.into()],
+                )?
+                .to_array()?;
+            rows.into_iter().next().map(|r| StoredSessionSnapshot {
+                assurance_level: assurance_from_str(&r.assurance_level),
+                strict_age_ok: r.strict_age_ok != 0,
+                expires_at: r.expires_at.max(0) as u64,
+                revoked_at: r.revoked_at.map(|v| v.max(0) as u64),
+            })
+        } else {
+            None
+        };
+
+        let ctx = compute_session_context(
+            banned,
+            suspended,
+            req.sid.as_deref(),
+            session_row.as_ref(),
+            &safety,
+            now,
+        );
+        json(&ctx, 200)
+    }
+
+    async fn session_issue(&self, req: SessionIssueReq) -> Result<Response> {
+        if self.get_or("banned", false).await? {
+            return Response::error("banned", 403);
+        }
+        let now = now_secs();
+        let db = self.ensure_session_tables(now as i64)?;
+        let strict_flag: i64 =
+            if req.strict_age_ok && req.assurance_level == AssuranceLevel::Verified18 {
+                1
+            } else {
+                0
+            };
+        db.exec(
+            "INSERT OR REPLACE INTO sessions \
+             (sid, auth_method, identity_key, assurance_level, strict_age_ok, created_at, expires_at, revoked_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+            vec![
+                req.sid.clone().into(),
+                req.auth_method.into(),
+                req.identity_key.into(),
+                assurance_to_str(req.assurance_level).into(),
+                strict_flag.into(),
+                (now as i64).into(),
+                (req.expires_at as i64).into(),
+            ],
+        )?;
+        json(
+            &SessionIssueResp {
+                sid: req.sid,
+                created_at: now,
+                expires_at: req.expires_at,
+            },
+            200,
+        )
+    }
+
+    fn session_revoke(&self, req: SessionRevokeReq) -> Result<Response> {
+        let now = now_secs() as i64;
+        let db = self.ensure_session_tables(now)?;
+        db.exec(
+            "UPDATE sessions SET revoked_at = ?1 WHERE sid = ?2 AND revoked_at IS NULL",
+            vec![now.into(), req.sid.into()],
+        )?;
+        Response::ok("")
+    }
+
+    fn revoke_all_sessions_internal(&self, req: &SessionRevokeAllReq) -> Result<u64> {
+        let now = now_secs() as i64;
+        let db = self.ensure_session_tables(now)?;
+        #[derive(serde::Deserialize)]
+        struct CountRow {
+            n: i64,
+        }
+        let count = if let Some(ident) = req.identity_key.as_deref() {
+            let c: Vec<CountRow> = db
+                .exec(
+                    "SELECT COUNT(*) AS n FROM sessions WHERE identity_key = ?1 AND revoked_at IS NULL",
+                    vec![ident.into()],
+                )?
+                .to_array()?;
+            db.exec(
+                "UPDATE sessions SET revoked_at = ?1 WHERE identity_key = ?2 AND revoked_at IS NULL",
+                vec![now.into(), ident.into()],
+            )?;
+            c.first().map_or(0, |r| r.n.max(0) as u64)
+        } else if req.strict_only {
+            let c: Vec<CountRow> = db
+                .exec(
+                    "SELECT COUNT(*) AS n FROM sessions WHERE strict_age_ok != 0 AND revoked_at IS NULL",
+                    None,
+                )?
+                .to_array()?;
+            db.exec(
+                "UPDATE sessions SET revoked_at = ?1 WHERE strict_age_ok != 0 AND revoked_at IS NULL",
+                vec![now.into()],
+            )?;
+            c.first().map_or(0, |r| r.n.max(0) as u64)
+        } else {
+            let c: Vec<CountRow> = db
+                .exec(
+                    "SELECT COUNT(*) AS n FROM sessions WHERE revoked_at IS NULL",
+                    None,
+                )?
+                .to_array()?;
+            db.exec(
+                "UPDATE sessions SET revoked_at = ?1 WHERE revoked_at IS NULL",
+                vec![now.into()],
+            )?;
+            // Also invalidate any legacy cutover sessions that lack a `sid`.
+            db.exec(
+                "INSERT INTO user_safety_state (id, revoked_all_before) VALUES (1, ?1) \
+                 ON CONFLICT(id) DO UPDATE SET revoked_all_before = excluded.revoked_all_before",
+                vec![now.into()],
+            )?;
+            c.first().map_or(0, |r| r.n.max(0) as u64)
+        };
+        Ok(count)
+    }
+
+    fn session_revoke_all(&self, req: SessionRevokeAllReq) -> Result<Response> {
+        let revoked = self.revoke_all_sessions_internal(&req)?;
+        json(&SessionRevokeAllResp { revoked }, 200)
+    }
+
+    fn session_info(&self, req: SessionRevokeReq) -> Result<Response> {
+        let now = now_secs();
+        let db = self.ensure_session_tables(now as i64)?;
+        #[derive(serde::Deserialize)]
+        struct SRow {
+            sid: String,
+            auth_method: String,
+            identity_key: String,
+            assurance_level: String,
+            strict_age_ok: i64,
+            created_at: i64,
+            expires_at: i64,
+            revoked_at: Option<i64>,
+        }
+        let rows: Vec<SRow> = db
+            .exec(
+                "SELECT sid, auth_method, identity_key, assurance_level, strict_age_ok, \
+                 created_at, expires_at, revoked_at FROM sessions WHERE sid = ?1",
+                vec![req.sid.into()],
+            )?
+            .to_array()?;
+        let Some(row) = rows.into_iter().next() else {
+            return Response::error("session not found", 404);
+        };
+        let active = row.revoked_at.is_none() && (row.expires_at.max(0) as u64) > now;
+        json(
+            &SessionInfoResp {
+                sid: row.sid,
+                auth_method: row.auth_method,
+                identity_key: row.identity_key,
+                assurance_level: assurance_from_str(&row.assurance_level),
+                strict_age_ok: row.strict_age_ok != 0,
+                created_at: row.created_at.max(0) as u64,
+                expires_at: row.expires_at.max(0) as u64,
+                active,
+            },
+            200,
+        )
+    }
+
+    async fn prefs_update(&self, req: PrefsUpdateReq) -> Result<Response> {
+        for pref in &req.enabled_switchers {
+            if let Err(e) = pref.validate() {
+                return Response::error(format!("invalid switcher ref: {e}"), 400);
+            }
+        }
+        let now = now_secs();
+        let db = self.ensure_session_tables(now as i64)?;
+        let current = self.read_safety_state(&db)?;
+        let next = match apply_prefs_update(
+            &current,
+            req.enabled_switchers,
+            req.expected_pref_version,
+        ) {
+            PrefsUpdateOutcome::Updated(n) => n,
+            PrefsUpdateOutcome::VersionConflict { current } => {
+                return json(
+                    &DoPrefsConflictResp {
+                        error: "Preferences were updated in another tab; refreshed to latest state."
+                            .to_string(),
+                        pref_version: current.pref_version,
+                        enabled_switchers: current.enabled_switchers,
+                    },
+                    409,
+                );
+            }
+        };
+        let sw_json = serde_json::to_string(&next.enabled_switchers)
+            .map_err(|e| worker::Error::RustError(e.to_string()))?;
+        db.exec(
+            "INSERT INTO user_safety_state (id, enabled_switchers_json, safe_mode, pref_version) \
+             VALUES (1, ?1, 0, ?2) \
+             ON CONFLICT(id) DO UPDATE SET \
+                enabled_switchers_json = excluded.enabled_switchers_json, \
+                safe_mode = 0, \
+                pref_version = excluded.pref_version",
+            vec![sw_json.into(), (next.pref_version as i64).into()],
+        )?;
+        let banned = self.get_or("banned", false).await?;
+        let suspended = self.get_or("suspended", false).await?;
+        let safety = self.read_safety_state(&db)?;
+        let ctx = compute_session_context(banned, suspended, None, None, &safety, now);
+        json(&ctx, 200)
+    }
+
+    fn terms_accept(&self, req: TermsAcceptReq) -> Result<Response> {
+        let now = now_secs() as i64;
+        let db = self.ensure_session_tables(now)?;
+        let self_attest_flag: i64 = if req.self_attestation == Some(true) {
+            1
+        } else {
+            0
+        };
+        db.exec(
+            "INSERT INTO user_safety_state \
+             (id, terms_version, terms_digest, terms_accepted_at, self_attested_18) \
+             VALUES (1, ?1, ?2, ?3, ?4) \
+             ON CONFLICT(id) DO UPDATE SET \
+                terms_version = excluded.terms_version, \
+                terms_digest = excluded.terms_digest, \
+                terms_accepted_at = excluded.terms_accepted_at, \
+                self_attested_18 = MAX(user_safety_state.self_attested_18, excluded.self_attested_18)",
+            vec![
+                i64::from(req.terms_version).into(),
+                req.terms_digest.into(),
+                (req.accepted_at as i64).into(),
+                self_attest_flag.into(),
+            ],
+        )?;
+        if req.self_attestation == Some(true)
+            && let Some(sid) = req.sid.as_deref()
+        {
+            // Self-attestation upgrades `none` -> `self_attestation` ONLY (NEVER `verified_18`!).
+            db.exec(
+                "UPDATE sessions SET assurance_level = 'self_attestation' \
+                 WHERE sid = ?1 AND assurance_level = 'none'",
+                vec![sid.into()],
+            )?;
+        }
+        Response::ok("")
+    }
+
+    /// Record standalone 18+ self-attestation without modifying Terms acceptance state.
+    fn age_confirm(&self, req: AgeConfirmReq) -> Result<Response> {
+        let now = now_secs() as i64;
+        let db = self.ensure_session_tables(now)?;
+        let _ = self.read_safety_state(&db)?;
+        db.exec(
+            "INSERT INTO user_safety_state (id, self_attested_18) \
+             VALUES (1, 1) \
+             ON CONFLICT(id) DO UPDATE SET self_attested_18 = 1",
+            None,
+        )?;
+        if let Some(sid) = req.sid.as_deref() {
+            // Self-attestation upgrades `none` -> `self_attestation` ONLY (NEVER `verified_18`!).
+            db.exec(
+                "UPDATE sessions SET assurance_level = 'self_attestation' \
+                 WHERE sid = ?1 AND assurance_level = 'none'",
+                vec![sid.into()],
+            )?;
+        }
+        Response::ok("")
+    }
+
+    /// Separate preview transform rate budget — NEVER touches clear-view `balance`,
+    /// `seen:{day}`, `free_usage`, `charge_holds`, `win_views`, or `total_views` (M1)!
+    async fn preview_budget(&self, req: PreviewBudgetReq) -> Result<Response> {
+        if !req.guest && self.get_or("banned", false).await? {
+            return Response::error("banned", 403);
+        }
+        let now = now_secs() as i64;
+        let db = self.ensure_session_tables(now)?;
+        let window_start = now / PREVIEW_BUDGET_WINDOW_SECS;
+        let retry_after = ((window_start + 1) * PREVIEW_BUDGET_WINDOW_SECS - now).max(1) as u64;
+        let item_key = if req.key.trim().is_empty() {
+            format!("preview:anon:{now}")
+        } else {
+            req.key
+        };
+
+        #[derive(serde::Deserialize)]
+        struct Stats {
+            seen: i64,
+            cnt: i64,
+        }
+        let stats: Stats = db
+            .exec(
+                "SELECT EXISTS(SELECT 1 FROM preview_budget WHERE window_start = ?1 AND item_key = ?2) AS seen, \
+                 COUNT(*) AS cnt FROM preview_budget WHERE window_start = ?1",
+                vec![window_start.into(), item_key.clone().into()],
+            )?
+            .one()?;
+
+        let seen = stats.seen != 0;
+        let count = stats.cnt.max(0) as u32;
+        let limit = if req.guest {
+            PREVIEW_BUDGET_MAX_PER_WINDOW / 2
+        } else {
+            PREVIEW_BUDGET_MAX_PER_WINDOW
+        };
+        let (allowed, remaining) = decide_preview_budget(seen, count, limit);
+        if !allowed {
+            return json(
+                &PreviewBudgetResp {
+                    allowed: false,
+                    remaining: 0,
+                    retry_after_secs: retry_after,
+                },
+                429,
+            );
+        }
+        if !req.head && !seen {
+            db.exec(
+                "INSERT OR IGNORE INTO preview_budget (window_start, item_key) VALUES (?1, ?2)",
+                vec![window_start.into(), item_key.into()],
+            )?;
+        }
+        json(
+            &PreviewBudgetResp {
+                allowed: true,
+                remaining,
+                retry_after_secs: retry_after,
+            },
+            200,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -1853,5 +2656,252 @@ mod tests {
             refund_window_counters("description", 100, None, NOW as i64, 50, 3),
             None
         );
+    }
+
+    #[test]
+    fn session_context_enforces_revocation_ban_suspension_and_strict_age() {
+        let safety = StoredSafetyState {
+            enabled_switchers: vec![PolicyRef::new("r18", 2), PolicyRef::new("blood", 1)],
+            pref_version: 3,
+            terms_version: Some(2),
+            terms_digest: Some("abcd".into()),
+            self_attested_18: true,
+            revoked_all_before: 0,
+        };
+        let active_verified = StoredSessionSnapshot {
+            assurance_level: AssuranceLevel::Verified18,
+            strict_age_ok: true,
+            expires_at: NOW + 3600,
+            revoked_at: None,
+        };
+
+        // Active verified session
+        let ctx = compute_session_context(
+            false,
+            false,
+            Some("sid1"),
+            Some(&active_verified),
+            &safety,
+            NOW,
+        );
+        assert!(ctx.active && !ctx.banned && !ctx.suspended && ctx.sid_valid && ctx.strict_age_ok);
+        assert_eq!(ctx.assurance_level, AssuranceLevel::Verified18);
+        assert_eq!(
+            ctx.enabled_switchers,
+            vec![PolicyRef::new("r18", 2), PolicyRef::new("blood", 1)]
+        );
+        assert_eq!(ctx.pref_version, 3);
+
+        // Revoked session immediately fails sid_valid and clears switchers
+        let revoked = StoredSessionSnapshot {
+            revoked_at: Some(NOW - 1),
+            ..active_verified.clone()
+        };
+        let ctx_rev =
+            compute_session_context(false, false, Some("sid1"), Some(&revoked), &safety, NOW);
+        assert!(!ctx_rev.sid_valid);
+        assert!(!ctx_rev.strict_age_ok);
+        assert!(ctx_rev.enabled_switchers.is_empty());
+
+        // Expired session immediately fails sid_valid
+        let expired = StoredSessionSnapshot {
+            expires_at: NOW,
+            ..active_verified.clone()
+        };
+        assert!(
+            !compute_session_context(false, false, Some("sid1"), Some(&expired), &safety, NOW)
+                .sid_valid
+        );
+
+        // Banned account forces active=false, sid_valid=false, empty switchers
+        let ctx_ban = compute_session_context(
+            true,
+            false,
+            Some("sid1"),
+            Some(&active_verified),
+            &safety,
+            NOW,
+        );
+        assert!(!ctx_ban.active && ctx_ban.banned && !ctx_ban.sid_valid);
+        assert!(ctx_ban.enabled_switchers.is_empty());
+
+        // Suspended account forces active=false, suspended=true, empty switchers
+        let ctx_susp = compute_session_context(
+            false,
+            true,
+            Some("sid1"),
+            Some(&active_verified),
+            &safety,
+            NOW,
+        );
+        assert!(!ctx_susp.active && ctx_susp.suspended && !ctx_susp.sid_valid);
+        assert!(ctx_susp.enabled_switchers.is_empty());
+
+        // Self-attestation upgrades `None` -> `SelfAttestation`, NEVER `Verified18` or `strict_age_ok`
+        let plain_session = StoredSessionSnapshot {
+            assurance_level: AssuranceLevel::None,
+            strict_age_ok: true, // even if mistakenly set, invariant enforces false!
+            expires_at: NOW + 3600,
+            revoked_at: None,
+        };
+        let ctx_self = compute_session_context(
+            false,
+            false,
+            Some("sid2"),
+            Some(&plain_session),
+            &safety,
+            NOW,
+        );
+        assert!(ctx_self.sid_valid);
+        assert_eq!(ctx_self.assurance_level, AssuranceLevel::SelfAttestation);
+        assert!(!ctx_self.strict_age_ok);
+    }
+
+    #[test]
+    fn preview_budget_dedupes_and_caps_separately_from_clear_balance() {
+        assert_eq!(decide_preview_budget(false, 0, 240), (true, 239));
+        assert_eq!(decide_preview_budget(true, 240, 240), (true, 0));
+        assert_eq!(decide_preview_budget(false, 240, 240), (false, 0));
+    }
+
+    #[test]
+    fn cold_load_legacy_safe_mode_wipes_switchers_and_bumps_pref_version() {
+        let active_verified = StoredSessionSnapshot {
+            assurance_level: AssuranceLevel::Verified18,
+            strict_age_ok: true,
+            expires_at: NOW + 3600,
+            revoked_at: None,
+        };
+
+        // Case 1: Legacy safe_mode == true with previously saved switchers MUST wipe switchers
+        // to [] AND bump pref_version AND request immediate persistence BEFORE serving SessionContext!
+        let legacy_safe_on = RawStoredSafetyRow {
+            enabled_switchers: vec![PolicyRef::new("r18", 1), PolicyRef::new("blood", 1)],
+            legacy_safe_mode: true,
+            pref_version: 4,
+            terms_version: Some(1),
+            terms_digest: Some("abcd".into()),
+            self_attested_18: true,
+            revoked_all_before: 0,
+        };
+        let (migrated, needs_persist) = migrate_legacy_safe_mode_on_load(legacy_safe_on);
+        assert!(needs_persist);
+        assert!(migrated.enabled_switchers.is_empty());
+        assert_eq!(migrated.pref_version, 5);
+        assert_eq!(migrated.terms_version, Some(1));
+
+        let ctx = compute_session_context(
+            false,
+            false,
+            Some("sid1"),
+            Some(&active_verified),
+            &migrated,
+            NOW,
+        );
+        assert!(ctx.enabled_switchers.is_empty());
+        assert_eq!(ctx.pref_version, 5);
+
+        // Case 2: Legacy safe_mode == false preserves PolicyRef switchers without bumping pref_version
+        let legacy_safe_off = RawStoredSafetyRow {
+            enabled_switchers: vec![PolicyRef::new("r18", 2)],
+            legacy_safe_mode: false,
+            pref_version: 4,
+            terms_version: Some(1),
+            terms_digest: Some("abcd".into()),
+            self_attested_18: true,
+            revoked_all_before: 0,
+        };
+        let (kept, needs_persist2) = migrate_legacy_safe_mode_on_load(legacy_safe_off);
+        assert!(!needs_persist2);
+        assert_eq!(kept.enabled_switchers, vec![PolicyRef::new("r18", 2)]);
+        assert_eq!(kept.pref_version, 4);
+    }
+
+    #[test]
+    fn prefs_update_enforces_monotonic_pref_version_and_rejects_stale_tab_409() {
+        let initial = StoredSafetyState {
+            enabled_switchers: vec![PolicyRef::new("r18", 1)],
+            pref_version: 3,
+            terms_version: Some(1),
+            terms_digest: Some("abcd".into()),
+            self_attested_18: true,
+            revoked_all_before: 0,
+        };
+
+        // Tab A submits matching expected_pref_version == 3 -> succeeds and bumps pref_version to 4
+        let updated = match apply_prefs_update(&initial, vec![], Some(3)) {
+            PrefsUpdateOutcome::Updated(s) => s,
+            other => panic!("expected Updated, got {other:?}"),
+        };
+        assert!(updated.enabled_switchers.is_empty());
+        assert_eq!(updated.pref_version, 4);
+
+        // Stale Tab B still thinks pref_version == 3 and tries to re-enable r18 -> VersionConflict (409)!
+        match apply_prefs_update(&updated, vec![PolicyRef::new("r18", 1)], Some(3)) {
+            PrefsUpdateOutcome::VersionConflict { current } => {
+                assert_eq!(current.pref_version, 4);
+                assert!(current.enabled_switchers.is_empty());
+            }
+            other => panic!("expected VersionConflict, got {other:?}"),
+        }
+
+        // Future expected_pref_version (99) also rejected with VersionConflict!
+        assert!(matches!(
+            apply_prefs_update(&updated, vec![PolicyRef::new("r18", 1)], Some(99)),
+            PrefsUpdateOutcome::VersionConflict { .. }
+        ));
+
+        // Omitting expected_pref_version succeeds and still bumps monotonically (4 -> 5)
+        let bumped = match apply_prefs_update(
+            &updated,
+            vec![PolicyRef::new("r18", 2), PolicyRef::new("r18", 2)],
+            None,
+        ) {
+            PrefsUpdateOutcome::Updated(s) => s,
+            other => panic!("expected Updated, got {other:?}"),
+        };
+        assert_eq!(bumped.pref_version, 5);
+        assert_eq!(bumped.enabled_switchers, vec![PolicyRef::new("r18", 2)]);
+    }
+
+    #[test]
+    fn parse_stored_policy_refs_accepts_v3_and_drops_unversioned_legacy_strings() {
+        let raw = r#"[{"id":"r18","grant_generation":2},"blood@1","legacy_unversioned",{"id":"bad","grant_generation":0},"r18@2"]"#;
+        let parsed = parse_stored_policy_refs(raw);
+        assert_eq!(
+            parsed,
+            vec![PolicyRef::new("r18", 2), PolicyRef::new("blood", 1)]
+        );
+    }
+
+    #[test]
+    fn standalone_age_confirm_sets_self_attestation_without_requiring_terms() {
+        let safety = StoredSafetyState {
+            enabled_switchers: Vec::new(),
+            pref_version: 1,
+            terms_version: None,
+            terms_digest: None,
+            self_attested_18: true,
+            revoked_all_before: 0,
+        };
+        let plain_session = StoredSessionSnapshot {
+            assurance_level: AssuranceLevel::None,
+            strict_age_ok: false,
+            expires_at: NOW + 3600,
+            revoked_at: None,
+        };
+        let ctx = compute_session_context(
+            false,
+            false,
+            Some("sid-age"),
+            Some(&plain_session),
+            &safety,
+            NOW,
+        );
+        assert!(ctx.sid_valid);
+        assert_eq!(ctx.assurance_level, AssuranceLevel::SelfAttestation);
+        assert!(!ctx.strict_age_ok);
+        assert_eq!(ctx.terms_version_accepted, None);
+        assert_eq!(ctx.terms_digest_accepted, None);
     }
 }

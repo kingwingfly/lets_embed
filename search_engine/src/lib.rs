@@ -1,11 +1,19 @@
 #![feature(iterator_try_collect, portable_simd)]
 
 mod advanced;
+pub mod safety;
 
 pub use advanced::{AdvancedSearchRequest, AdvancedSearchResult};
+pub use safety::{
+    CLICK_REVEAL_MEDIA_CAP_TTL_SECS, CallerContext, CatalogValidationResult, CompiledPolicy,
+    ImageFacts, ImageParentPostFacts, MASK_NO_UNLOCK_MARKER, MediaOutcome, MediaSigner,
+    PUBLIC_MEDIA_CAP_TTL_SECS, ParentPostFacts, RESTRICTED_MEDIA_CAP_TTL_SECS, RevealCheckResult,
+    SafetyFilter, SeedLockedError,
+};
 
 use std::{
     borrow::Borrow,
+    collections::HashMap,
     fmt,
     future::ready,
     hash::{DefaultHasher, Hash, Hasher},
@@ -21,9 +29,22 @@ use futures::{Stream, StreamExt as _};
 use moka::future::Cache;
 use ort::session::Session;
 use pgvector::HalfVector;
-use search_types::{Author, Image, ImageDetails, Post, PostMeta, Tag, Video, VideoDetails};
-use sqlx::{Executor as _, PgPool, Row as _, postgres::PgPoolOptions};
+use search_types::{
+    Author, Image, ImageDetails, Post, PostMeta, ProjectedImage, ProjectedVideo, Tag, Video,
+    VideoDetails, validate_min_similarity,
+};
+use site_access::PublicSitePolicy;
+use sqlx::{Executor as _, PgPool, Postgres, QueryBuilder, Row as _, postgres::PgPoolOptions};
 use tokenizers::{EncodeInput, Tokenizer};
+
+/// Maximum concurrent ONNX inference tasks permitted across CLIP + DINOv3 (DoS guard M2).
+pub const DEFAULT_MAX_CONCURRENT_INFERENCE: usize = 4;
+/// Maximum time a request will wait to acquire an ONNX inference slot before failing fast.
+pub const INFERENCE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Default Postgres statement timeout for metadata queries (DoS guard M2: 5s).
+pub const METADATA_STATEMENT_TIMEOUT_SQL: &str = "SET statement_timeout = '5s'";
+/// Transaction-local Postgres statement timeout for vector HNSW queries (DoS guard M2: 15s).
+pub const VECTOR_STATEMENT_TIMEOUT_SQL: &str = "SET LOCAL statement_timeout = '15s'";
 
 /// Compact post summary returned by batch preview lookups.
 #[derive(Debug, Clone)]
@@ -44,6 +65,13 @@ pub struct PostGalleryCover {
     pub cover_video: Option<Video>,
     pub image_count: usize,
     pub video_count: usize,
+}
+
+/// Canonical post entry for XML sitemap generation (one cover image URL per post).
+#[derive(Debug, Clone)]
+pub struct SitemapPostEntry {
+    pub cover_image_id: i64,
+    pub lastmod: Option<String>,
 }
 
 /// Escape `%`, `_`, and `\` so user input is treated as a literal substring in `ILIKE`.
@@ -205,6 +233,7 @@ pub struct Engine {
     clip_text_session: Option<LazyModel>,
     tokenizer: Option<Arc<Tokenizer>>,
     dinov3_session: Option<LazyModel>,
+    inference_sem: Arc<tokio::sync::Semaphore>,
 }
 
 impl Engine {
@@ -218,9 +247,12 @@ impl Engine {
         idle_timeout: Option<Duration>,
     ) -> anyhow::Result<Self> {
         dotenvy::dotenv().ok();
+        let database_url = dotenvy::var("DATABASE_URL")
+            .map_err(|e| anyhow::anyhow!("DATABASE_URL environment variable must be set: {e}"))?;
         let pool = PgPoolOptions::new()
             .after_connect(|conn, _meta| {
                 Box::pin(async move {
+                    conn.execute(METADATA_STATEMENT_TIMEOUT_SQL).await?;
                     conn.execute("SET hnsw.ef_search = 1000").await?;
                     conn.execute("SET hnsw.iterative_scan = strict_order")
                         .await?;
@@ -228,7 +260,7 @@ impl Engine {
                     Ok(())
                 })
             })
-            .connect(&dotenvy::var("DATABASE_URL").unwrap())
+            .connect(&database_url)
             .await?;
 
         if clip_text_model_path.is_some() ^ tokenizer_config_path.is_some() {
@@ -268,7 +300,184 @@ impl Engine {
             clip_text_session,
             tokenizer,
             dinov3_session,
+            inference_sem: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_MAX_CONCURRENT_INFERENCE,
+            )),
         })
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Construct a lightweight `Engine` backed by a lazy `PgPool` with no ONNX models.
+    /// Useful for offline/HTTP router tests that do not execute database queries.
+    pub fn connect_lazy_without_models(database_url: &str) -> anyhow::Result<Self> {
+        let pool = PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(500))
+            .connect_lazy(database_url)?;
+        Ok(Self {
+            pool,
+            clip_text_session: None,
+            tokenizer: None,
+            dinov3_session: None,
+            inference_sem: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_MAX_CONCURRENT_INFERENCE,
+            )),
+        })
+    }
+
+    /// Compile a [`PublicSitePolicy`] into a Policy v3 [`CompiledPolicy`] (pure,
+    /// zero DB tag-ID lookup).
+    pub fn compile_policy(&self, policy: PublicSitePolicy) -> anyhow::Result<CompiledPolicy> {
+        CompiledPolicy::compile(policy)
+    }
+
+    /// Authoritative single-snapshot `facts_rev` lookup backing `GET /internal/facts-rev/{kind}/{id}`.
+    pub async fn lookup_facts_rev(
+        &self,
+        kind: search_types::MediaKind,
+        asset_id: i64,
+    ) -> anyhow::Result<Option<u64>> {
+        safety::lookup_facts_rev(&self.pool, kind, asset_id).await
+    }
+
+    /// Exact catalog validation backing `POST /internal/validate-safety-catalog`.
+    pub async fn validate_safety_catalog(
+        &self,
+        post_tags: &[String],
+        authors: &[String],
+    ) -> anyhow::Result<CatalogValidationResult> {
+        safety::validate_safety_catalog(&self.pool, post_tags, authors).await
+    }
+
+    /// Single-snapshot Policy v3 evaluation for `POST /api/safety/reveal`.
+    pub async fn evaluate_single_asset_for_reveal(
+        &self,
+        kind: search_types::MediaKind,
+        asset_id: i64,
+        policy: &CompiledPolicy,
+        caller: &CallerContext,
+    ) -> anyhow::Result<RevealCheckResult> {
+        safety::evaluate_single_asset_for_reveal(&self.pool, kind, asset_id, policy, caller).await
+    }
+
+    /// Single-snapshot Policy v3 evaluation by canonical DB filename (Standalone Media Guard).
+    pub async fn evaluate_asset_by_name(
+        &self,
+        kind: search_types::MediaKind,
+        canonical_name: &str,
+        policy: &CompiledPolicy,
+        caller: &CallerContext,
+    ) -> anyhow::Result<Option<(i64, MediaOutcome)>> {
+        safety::evaluate_asset_by_name(&self.pool, kind, canonical_name, policy, caller).await
+    }
+
+    /// Evaluate Policy v3 outcomes and authoritative `facts_rev` for a batch of image IDs
+    /// in a single `REPEATABLE READ READ ONLY` transaction snapshot.
+    pub async fn evaluate_images(
+        &self,
+        image_ids: &[i64],
+        policy: &CompiledPolicy,
+        caller: &CallerContext,
+    ) -> anyhow::Result<HashMap<i64, MediaOutcome>> {
+        let mut out = HashMap::with_capacity(image_ids.len());
+        if image_ids.is_empty() {
+            return Ok(out);
+        }
+        let facts_map = safety::load_image_facts(&self.pool, image_ids, policy).await?;
+        for &id in image_ids {
+            let outcome = match facts_map.get(&id) {
+                Some(facts) => policy.evaluate_image(facts, caller),
+                None => policy.evaluate_image(&ImageFacts::default(), caller),
+            };
+            out.insert(id, outcome);
+        }
+        Ok(out)
+    }
+
+    /// Project a slice of images into typed Policy v3 [`ProjectedImage`] values before serialization.
+    pub async fn project_images(
+        &self,
+        images: &[Image],
+        policy: &CompiledPolicy,
+        caller: &CallerContext,
+        signer: &MediaSigner,
+    ) -> anyhow::Result<Vec<ProjectedImage>> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        // In Standalone mode with safety disabled, skip DB facts lookup completely (zero overhead!).
+        if !policy.is_enabled() && matches!(signer, MediaSigner::Standalone) {
+            return Ok(images
+                .iter()
+                .map(|img| {
+                    policy.project_image(
+                        img,
+                        MediaOutcome::Clear {
+                            matched_blocks: Vec::new(),
+                            matched_blurs: Vec::new(),
+                            facts_rev: 1,
+                        },
+                        caller,
+                        signer,
+                    )
+                })
+                .collect());
+        }
+        let ids: Vec<i64> = images.iter().map(|i| i.id).collect();
+        let outcomes = self.evaluate_images(&ids, policy, caller).await?;
+        let mut out = Vec::with_capacity(images.len());
+        for img in images {
+            let outcome = outcomes
+                .get(&img.id)
+                .cloned()
+                .unwrap_or_else(|| policy.evaluate_image(&ImageFacts::default(), caller));
+            out.push(policy.project_image(img, outcome, caller, signer));
+        }
+        Ok(out)
+    }
+
+    /// Project a slice of videos into typed Policy v3 [`ProjectedVideo`] values before serialization,
+    /// inheriting BOTH `Block` and `Blur` outcomes across parent post(s) and sibling images.
+    pub async fn project_videos(
+        &self,
+        videos: &[Video],
+        policy: &CompiledPolicy,
+        caller: &CallerContext,
+        signer: &MediaSigner,
+    ) -> anyhow::Result<Vec<ProjectedVideo>> {
+        if videos.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !policy.is_enabled() && matches!(signer, MediaSigner::Standalone) {
+            return Ok(videos
+                .iter()
+                .map(|vid| {
+                    policy.project_video(
+                        vid,
+                        MediaOutcome::Clear {
+                            matched_blocks: Vec::new(),
+                            matched_blurs: Vec::new(),
+                            facts_rev: 1,
+                        },
+                        caller,
+                        signer,
+                    )
+                })
+                .collect());
+        }
+        let ids: Vec<i64> = videos.iter().map(|v| v.id).collect();
+        let outcomes = safety::evaluate_videos_batch(&self.pool, &ids, policy, caller).await?;
+        let mut out = Vec::with_capacity(videos.len());
+        for vid in videos {
+            let outcome = outcomes
+                .get(&vid.id)
+                .cloned()
+                .unwrap_or_else(|| policy.evaluate_video_posts(&[], 1, caller));
+            out.push(policy.project_video(vid, outcome, caller, signer));
+        }
+        Ok(out)
     }
 
     pub async fn newest_posts<'a>(
@@ -553,8 +762,16 @@ impl Engine {
         let Some(clip_text_lazy) = self.clip_text_session.clone() else {
             bail!("clip_text_session not enabled")
         };
+        let permit = tokio::time::timeout(
+            INFERENCE_ACQUIRE_TIMEOUT,
+            Arc::clone(&self.inference_sem).acquire_owned(),
+        )
+        .await
+        .map_err(|_| anyhow!("inference queue busy; please retry"))?
+        .map_err(|e| anyhow!("{e}"))?;
         let clip_text_session = clip_text_lazy.session().await?;
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let mut clip_text_session = clip_text_session.blocking_lock();
             let embeddings = siglip2::infer_text(&tokenizer, &mut clip_text_session, describes)?
                 .into_iter()
@@ -579,7 +796,7 @@ impl Engine {
             anyhow::Ok(embedding)
         })
         .await
-        .unwrap()
+        .map_err(|e| anyhow!("clip inference task panicked: {e}"))?
     }
 
     async fn search_clip_inner<'a>(
@@ -661,12 +878,23 @@ impl Engine {
         let Some(dinov3_lazy) = self.dinov3_session.as_ref() else {
             bail!("dinov3_session not enabled")
         };
+        let inf_permit = tokio::time::timeout(
+            INFERENCE_ACQUIRE_TIMEOUT,
+            Arc::clone(&self.inference_sem).acquire_owned(),
+        )
+        .await
+        .map_err(|_| anyhow!("inference queue busy; please retry"))?
+        .map_err(|e| anyhow!("{e}"))?;
         let dinov3_session = dinov3_lazy.session().await?;
-        let permit = Arc::clone(&PREPROCESS_SEM)
-            .acquire_owned()
-            .await
-            .map_err(|e| anyhow!("{e}"))?;
+        let permit = tokio::time::timeout(
+            INFERENCE_ACQUIRE_TIMEOUT,
+            Arc::clone(&PREPROCESS_SEM).acquire_owned(),
+        )
+        .await
+        .map_err(|_| anyhow!("image preprocess queue busy; please retry"))?
+        .map_err(|e| anyhow!("{e}"))?;
         tokio::task::spawn_blocking(move || {
+            let _inf_permit = inf_permit;
             let _permit = permit;
             let converted = images
                 .into_iter()
@@ -940,6 +1168,52 @@ impl Engine {
             })
             .try_collect()
             .map_err(Into::into)
+    }
+
+    /// Batch-fetch video metadata fields for a slice of video IDs in one query.
+    pub async fn videos_by_ids(&self, ids: &[i64]) -> anyhow::Result<Vec<Video>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT id, name::TEXT AS name, width, height, duration
+            FROM videos
+            WHERE id = ANY($1::BIGINT[])
+            "#,
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| -> sqlx::Result<Video> {
+                Ok(Video {
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    width: r.try_get("width")?,
+                    height: r.try_get("height")?,
+                    duration: r.try_get("duration")?,
+                })
+            })
+            .try_collect()
+            .map_err(Into::into)
+    }
+
+    /// Fetch the title of a single post by ID (`None` if the post does not exist).
+    pub async fn post_title_by_id(&self, post_id: i64) -> anyhow::Result<Option<String>> {
+        let row = sqlx::query(
+            r#"
+            SELECT title::TEXT AS title
+            FROM posts
+            WHERE id = $1
+            LIMIT 1
+            "#,
+        )
+        .bind(post_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| r.try_get("title")).transpose().map_err(Into::into)
     }
 
     /// Batch-fetch post titles, deterministic cover images (`MIN(image_id)`), and
@@ -1308,6 +1582,17 @@ impl Engine {
         limit: i64,
         offset: i64,
     ) -> anyhow::Result<Vec<Image>> {
+        self.search_images_by_tag_vec_with_safety(tag, limit, offset, None)
+            .await
+    }
+
+    pub async fn search_images_by_tag_vec_with_safety(
+        &self,
+        tag: impl AsRef<str>,
+        limit: i64,
+        offset: i64,
+        _safety: Option<&SafetyFilter<'_>>,
+    ) -> anyhow::Result<Vec<Image>> {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
         }
@@ -1319,18 +1604,29 @@ impl Engine {
         let pat_raw = format!("%{}%", escape_like(raw));
         let pat_under = format!("%{}%", escape_like(&underscored));
 
-        let rows = sqlx::query(
-            r#"
-            WITH
-            pos_tags AS (
+        let mut qb = QueryBuilder::<Postgres>::new(
+            r#"WITH pos_tags AS (
                 SELECT wt.id AS tag_id
                 FROM wd_tags wt
-                WHERE wt.name ILIKE $1 ESCAPE '\'
-                   OR ($2 <> $1 AND wt.name ILIKE $2 ESCAPE '\')
+                WHERE wt.name ILIKE "#,
+        );
+        qb.push_bind(pat_raw.clone());
+        qb.push(r" ESCAPE '\' OR (");
+        qb.push_bind(pat_under.clone());
+        qb.push(" <> ");
+        qb.push_bind(pat_raw.clone());
+        qb.push(" AND wt.name ILIKE ");
+        qb.push_bind(pat_under);
+        qb.push(
+            r#" ESCAPE '\')
                 UNION
                 SELECT tt.tag_id
                 FROM wd_tag_translations tt
-                WHERE tt.translation ILIKE $1 ESCAPE '\'
+                WHERE tt.translation ILIKE "#,
+        );
+        qb.push_bind(pat_raw);
+        qb.push(
+            r#" ESCAPE '\'
             ),
             img_match AS (
                 SELECT wti.image_id, MAX(wti.score) AS max_score
@@ -1340,18 +1636,14 @@ impl Engine {
             )
             SELECT i.id, i.name::TEXT AS name, i.width, i.height
             FROM img_match im
-            JOIN images i ON i.id = im.image_id
-            ORDER BY im.max_score DESC, im.image_id DESC
-            LIMIT $3 OFFSET $4
-            "#,
-        )
-        .bind(pat_raw)
-        .bind(pat_under)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+            JOIN images i ON i.id = im.image_id"#,
+        );
+        qb.push(" ORDER BY im.max_score DESC, im.image_id DESC LIMIT ");
+        qb.push_bind(limit);
+        qb.push(" OFFSET ");
+        qb.push_bind(offset);
 
+        let rows = qb.build().fetch_all(&self.pool).await?;
         advanced::map_image_rows(rows)
     }
 
@@ -1360,21 +1652,25 @@ impl Engine {
         describe: &str,
         limit: i64,
         offset: i64,
+        min_similarity: Option<f32>,
+        _safety: Option<&SafetyFilter<'_>>,
     ) -> anyhow::Result<Vec<Image>> {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
         }
+        let min_sim = validate_min_similarity(min_similarity).map_err(|e| anyhow!("{e}"))?;
         let raw = describe.trim();
         if raw.is_empty() {
             bail!("description should not be empty")
         }
         let vec = self.clip_text_vec_cached(raw).await?;
-        let hv = advanced::combine_unit_vectors(&[(*vec).clone()], &[], siglip2::EMBED_DIM)?;
+        let hv = advanced::unit_halfvec(&vec, siglip2::EMBED_DIM)?;
         self.query_images_single_vector(
             "clip_embedding",
             hv,
             None,
             &std::collections::HashMap::new(),
+            min_sim,
             limit,
             offset,
         )
@@ -1386,20 +1682,24 @@ impl Engine {
         bytes: Vec<u8>,
         limit: i64,
         offset: i64,
+        min_similarity: Option<f32>,
+        _safety: Option<&SafetyFilter<'_>>,
     ) -> anyhow::Result<Vec<Image>> {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
         }
+        let min_sim = validate_min_similarity(min_similarity).map_err(|e| anyhow!("{e}"))?;
         if bytes.is_empty() {
             bail!("uploaded image is empty")
         }
         let vec = self.dinov3_upload_vec_cached(bytes).await?;
-        let hv = advanced::combine_unit_vectors(&[(*vec).clone()], &[], dinov3::EMBED_DIM)?;
+        let hv = advanced::unit_halfvec(&vec, dinov3::EMBED_DIM)?;
         self.query_images_single_vector(
             "dinov3_embedding",
             hv,
             None,
             &std::collections::HashMap::new(),
+            min_sim,
             limit,
             offset,
         )
@@ -1412,34 +1712,84 @@ impl Engine {
         exclude_post_id: Option<i64>,
         limit: i64,
         offset: i64,
+        min_similarity: Option<f32>,
+        safety: Option<&SafetyFilter<'_>>,
     ) -> anyhow::Result<Vec<Image>> {
         if limit < 0 || offset < 0 {
             bail!("both limit and offset should >= 0")
         }
+        let min_sim = validate_min_similarity(min_similarity).map_err(|e| anyhow!("{e}"))?;
         if image_id <= 0 {
             bail!("Image #{image_id} not found or has no visual embedding")
         }
-        let id_vecs = self.fetch_dino_id_vectors(&[image_id]).await?;
-        let seed_vec =
-            advanced::combine_unit_vectors(&[id_vecs[&image_id].clone()], &[], dinov3::EMBED_DIM)?;
+
+        // Single REPEATABLE READ READ ONLY transaction: authorize Clear seed, read its
+        // `dinov3_embedding`, AND run the similar-images query against the SAME snapshot!
+        let mut tx = safety::begin_repeatable_read_tx(&self.pool).await?;
+        let id_vecs =
+            Self::authorize_and_fetch_dino_seeds_in_tx(&mut tx, &[image_id], safety).await?;
+        let seed_vec = advanced::unit_halfvec(&id_vecs[&image_id], dinov3::EMBED_DIM)?;
         let mut qb = advanced::build_similar_images_query(
             seed_vec,
             image_id,
             exclude_post_id,
+            min_sim,
             limit,
             offset,
         );
+        tx.execute(VECTOR_STATEMENT_TIMEOUT_SQL).await?;
         if exclude_post_id.is_some() {
-            let mut tx = self.pool.begin().await?;
-            tx.execute("SET TRANSACTION READ ONLY").await?;
             tx.execute("SET LOCAL hnsw.max_scan_tuples = 20000").await?;
-            let rows = qb.build().fetch_all(&mut *tx).await?;
-            tx.commit().await?;
-            advanced::map_image_rows(rows)
-        } else {
-            let rows = qb.build().fetch_all(&self.pool).await?;
-            advanced::map_image_rows(rows)
         }
+        let rows = qb.build().fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        advanced::map_image_rows(rows)
+    }
+
+    /// Single-snapshot similarity search for a seed image ID that authorizes the seed,
+    /// reads its embedding, looks up its parent post to exclude same-album duplicates,
+    /// and executes the bounded HNSW query inside ONE `REPEATABLE READ READ ONLY` transaction.
+    pub async fn search_similar_images_for_seed(
+        &self,
+        image_id: i64,
+        limit: i64,
+        offset: i64,
+        min_similarity: Option<f32>,
+        safety: Option<&SafetyFilter<'_>>,
+    ) -> anyhow::Result<Vec<Image>> {
+        if limit < 0 || offset < 0 {
+            bail!("both limit and offset should >= 0")
+        }
+        let min_sim = validate_min_similarity(min_similarity).map_err(|e| anyhow!("{e}"))?;
+        if image_id <= 0 {
+            bail!("Image #{image_id} not found or has no visual embedding")
+        }
+
+        let mut tx = safety::begin_repeatable_read_tx(&self.pool).await?;
+        let id_vecs =
+            Self::authorize_and_fetch_dino_seeds_in_tx(&mut tx, &[image_id], safety).await?;
+        let seed_vec = advanced::unit_halfvec(&id_vecs[&image_id], dinov3::EMBED_DIM)?;
+        let exclude_post_id: Option<i64> = sqlx::query_scalar(
+            "SELECT post_id FROM post_images WHERE image_id = $1 ORDER BY post_id ASC LIMIT 1",
+        )
+        .bind(image_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let mut qb = advanced::build_similar_images_query(
+            seed_vec,
+            image_id,
+            exclude_post_id,
+            min_sim,
+            limit,
+            offset,
+        );
+        tx.execute(VECTOR_STATEMENT_TIMEOUT_SQL).await?;
+        if exclude_post_id.is_some() {
+            tx.execute("SET LOCAL hnsw.max_scan_tuples = 20000").await?;
+        }
+        let rows = qb.build().fetch_all(&mut *tx).await?;
+        tx.commit().await?;
+        advanced::map_image_rows(rows)
     }
 
     /// Fetch authors attached to a post (for Lightbox headers).
@@ -1472,6 +1822,17 @@ impl Engine {
     /// ranked by exact > prefix > substring match, with aliases attached.
     /// Uses prefix-only matching when `< 3` characters so `pg_trgm` GIN indexes stay active.
     pub async fn suggest_tags(&self, query: &str, limit: i64) -> anyhow::Result<Vec<Tag>> {
+        self.suggest_tags_with_safety(query, limit, None).await
+    }
+
+    /// Suggest WD tags while omitting tags that appear ONLY on images locked for the caller
+    /// when safety rules are active (anti-oracle defense H5).
+    pub async fn suggest_tags_with_safety(
+        &self,
+        query: &str,
+        limit: i64,
+        safety: Option<&SafetyFilter<'_>>,
+    ) -> anyhow::Result<Vec<Tag>> {
         let raw = query.trim();
         if raw.is_empty() {
             return Ok(vec![]);
@@ -1485,60 +1846,119 @@ impl Engine {
         let prefix_raw = format!("{esc_raw}%");
         let prefix_under = format!("{esc_under}%");
 
-        let rows = sqlx::query(
-            r#"
-            WITH matched AS (
-                SELECT wt.id, wt.name::TEXT AS name,
-                       CASE
-                           WHEN lower(wt.name) = lower($1) OR lower(wt.name) = lower($2) THEN 0
-                           WHEN wt.name ILIKE $5 ESCAPE '\' OR ($6 <> $5 AND wt.name ILIKE $6 ESCAPE '\') THEN 1
-                           ELSE 2
-                       END AS rank
-                FROM wd_tags wt
-                WHERE wt.name ILIKE $3 ESCAPE '\'
-                   OR ($4 <> $3 AND wt.name ILIKE $4 ESCAPE '\')
-                UNION ALL
-                SELECT wt.id, wt.name::TEXT AS name,
-                       CASE
-                           WHEN lower(tt.translation) = lower($1) THEN 0
-                           WHEN tt.translation ILIKE $5 ESCAPE '\' THEN 1
-                           ELSE 2
-                       END AS rank
-                FROM wd_tag_translations tt
-                JOIN wd_tags wt ON wt.id = tt.tag_id
-                WHERE tt.translation ILIKE $3 ESCAPE '\'
-            ),
-            best AS (
-                SELECT id, name, MIN(rank) AS best_rank
-                FROM matched
-                GROUP BY id, name
-                ORDER BY best_rank ASC, length(name) ASC, name ASC
-                LIMIT $7
+        if !safety.is_some_and(SafetyFilter::is_filtering_active) {
+            let rows = sqlx::query(
+                r#"
+                WITH matched AS (
+                    SELECT wt.id, wt.name::TEXT AS name,
+                           CASE
+                               WHEN lower(wt.name) = lower($1) OR lower(wt.name) = lower($2) THEN 0
+                               WHEN wt.name ILIKE $5 ESCAPE '\' OR ($6 <> $5 AND wt.name ILIKE $6 ESCAPE '\') THEN 1
+                               ELSE 2
+                           END AS rank
+                    FROM wd_tags wt
+                    WHERE wt.name ILIKE $3 ESCAPE '\'
+                       OR ($4 <> $3 AND wt.name ILIKE $4 ESCAPE '\')
+                    UNION ALL
+                    SELECT wt.id, wt.name::TEXT AS name,
+                           CASE
+                               WHEN lower(tt.translation) = lower($1) THEN 0
+                               WHEN tt.translation ILIKE $5 ESCAPE '\' THEN 1
+                               ELSE 2
+                           END AS rank
+                    FROM wd_tag_translations tt
+                    JOIN wd_tags wt ON wt.id = tt.tag_id
+                    WHERE tt.translation ILIKE $3 ESCAPE '\'
+                ),
+                best AS (
+                    SELECT id, name, MIN(rank) AS best_rank
+                    FROM matched
+                    GROUP BY id, name
+                    ORDER BY best_rank ASC, length(name) ASC, name ASC
+                    LIMIT $7
+                )
+                SELECT
+                    b.id,
+                    b.name,
+                    COALESCE(
+                        array_agg(DISTINCT tt.translation::TEXT ORDER BY tt.translation::TEXT)
+                            FILTER (WHERE tt.translation IS NOT NULL),
+                        ARRAY[]::TEXT[]
+                    ) AS aliases
+                FROM best b
+                LEFT JOIN wd_tag_translations tt ON tt.tag_id = b.id
+                GROUP BY b.id, b.name, b.best_rank
+                ORDER BY b.best_rank ASC, length(b.name) ASC, b.name ASC
+                "#,
             )
-            SELECT
-                b.id,
-                b.name,
-                COALESCE(
-                    array_agg(DISTINCT tt.translation::TEXT ORDER BY tt.translation::TEXT)
-                        FILTER (WHERE tt.translation IS NOT NULL),
-                    ARRAY[]::TEXT[]
-                ) AS aliases
-            FROM best b
-            LEFT JOIN wd_tag_translations tt ON tt.tag_id = b.id
-            GROUP BY b.id, b.name, b.best_rank
-            ORDER BY b.best_rank ASC, length(b.name) ASC, b.name ASC
-            "#,
-        )
-        .bind(raw)
-        .bind(&underscored)
-        .bind(&pat_raw)
-        .bind(&pat_under)
-        .bind(&prefix_raw)
-        .bind(&prefix_under)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+            .bind(raw)
+            .bind(&underscored)
+            .bind(&pat_raw)
+            .bind(&pat_under)
+            .bind(&prefix_raw)
+            .bind(&prefix_under)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
 
+            return rows
+                .into_iter()
+                .map(|r| -> sqlx::Result<Tag> {
+                    Ok(Tag {
+                        id: r.try_get("id")?,
+                        name: r.try_get("name")?,
+                        aliases: r.try_get("aliases")?,
+                        score: None,
+                    })
+                })
+                .try_collect()
+                .map_err(Into::into);
+        }
+
+        let sf = safety.expect("checked active above");
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "WITH matched AS (SELECT wt.id, wt.name::TEXT AS name, CASE WHEN lower(wt.name) = lower(",
+        );
+        qb.push_bind(raw.to_string());
+        qb.push(") OR lower(wt.name) = lower(");
+        qb.push_bind(underscored.clone());
+        qb.push(") THEN 0 WHEN wt.name ILIKE ");
+        qb.push_bind(prefix_raw.clone());
+        qb.push(r" ESCAPE '\' OR (");
+        qb.push_bind(prefix_under.clone());
+        qb.push(" <> ");
+        qb.push_bind(prefix_raw.clone());
+        qb.push(" AND wt.name ILIKE ");
+        qb.push_bind(prefix_under);
+        qb.push(r" ESCAPE '\') THEN 1 ELSE 2 END AS rank FROM wd_tags wt WHERE (wt.name ILIKE ");
+        qb.push_bind(pat_raw.clone());
+        qb.push(r" ESCAPE '\' OR (");
+        qb.push_bind(pat_under.clone());
+        qb.push(" <> ");
+        qb.push_bind(pat_raw.clone());
+        qb.push(" AND wt.name ILIKE ");
+        qb.push_bind(pat_under);
+        qb.push(
+            r" ESCAPE '\')) UNION ALL SELECT wt.id, wt.name::TEXT AS name, CASE WHEN lower(tt.translation) = lower(",
+        );
+        qb.push_bind(raw.to_string());
+        qb.push(") THEN 0 WHEN tt.translation ILIKE ");
+        qb.push_bind(prefix_raw);
+        qb.push(
+            r" ESCAPE '\' THEN 1 ELSE 2 END AS rank FROM wd_tag_translations tt JOIN wd_tags wt ON wt.id = tt.tag_id WHERE tt.translation ILIKE ",
+        );
+        qb.push_bind(pat_raw);
+        qb.push(
+            r" ESCAPE '\'), dedup AS (SELECT id, name, MIN(rank) AS best_rank FROM matched GROUP BY id, name), visible AS (SELECT d.id, d.name, d.best_rank FROM dedup d WHERE EXISTS (SELECT 1 FROM wd_tag_images wti JOIN images i ON i.id = wti.image_id WHERE wti.wd_tag_id = d.id",
+        );
+        sf.push_allowed_image_sql(&mut qb, "i");
+        qb.push(") ORDER BY d.best_rank ASC, length(d.name) ASC, d.name ASC LIMIT ");
+        qb.push_bind(limit);
+        qb.push(
+            ") SELECT b.id, b.name, COALESCE(array_agg(DISTINCT tt.translation::TEXT ORDER BY tt.translation::TEXT) FILTER (WHERE tt.translation IS NOT NULL), ARRAY[]::TEXT[]) AS aliases FROM visible b LEFT JOIN wd_tag_translations tt ON tt.tag_id = b.id GROUP BY b.id, b.name, b.best_rank ORDER BY b.best_rank ASC, length(b.name) ASC, b.name ASC",
+        );
+
+        let rows = qb.build().fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|r| -> sqlx::Result<Tag> {
                 Ok(Tag {
@@ -1555,6 +1975,17 @@ impl Engine {
     /// Suggest authors matching `query`, ranked by exact > prefix > substring.
     /// Uses prefix-only matching when `< 3` characters so `pg_trgm` GIN indexes stay active.
     pub async fn suggest_authors(&self, query: &str, limit: i64) -> anyhow::Result<Vec<Author>> {
+        self.suggest_authors_with_safety(query, limit, None).await
+    }
+
+    /// Safety-aware author autocomplete: when `safety` filtering is active, only
+    /// suggests authors that have at least one caller-allowed Clear image.
+    pub async fn suggest_authors_with_safety(
+        &self,
+        query: &str,
+        limit: i64,
+        safety: Option<&SafetyFilter<'_>>,
+    ) -> anyhow::Result<Vec<Author>> {
         let raw = query.trim();
         if raw.is_empty() {
             return Ok(vec![]);
@@ -1564,28 +1995,31 @@ impl Engine {
         let pat = autocomplete_like_pattern(raw, &esc);
         let prefix = format!("{esc}%");
 
-        let rows = sqlx::query(
-            r#"
-            SELECT id, name::TEXT AS name
-            FROM authors
-            WHERE name ILIKE $2 ESCAPE '\'
-            ORDER BY
-                CASE
-                    WHEN lower(name) = lower($1) THEN 0
-                    WHEN name ILIKE $3 ESCAPE '\' THEN 1
-                    ELSE 2
-                END ASC,
-                length(name) ASC,
-                name ASC
-            LIMIT $4
-            "#,
-        )
-        .bind(raw)
-        .bind(&pat)
-        .bind(&prefix)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut qb = QueryBuilder::<Postgres>::new(
+            r#"SELECT a.id, a.name::TEXT AS name FROM authors a WHERE a.name ILIKE "#,
+        );
+        qb.push_bind(pat);
+        qb.push(r#" ESCAPE '\'"#);
+
+        if let Some(sf) = safety.filter(|s| s.is_filtering_active()) {
+            qb.push(
+                " AND EXISTS (SELECT 1 FROM author_posts ap \
+                 JOIN post_images pi ON pi.post_id = ap.post_id \
+                 JOIN images i ON i.id = pi.image_id \
+                 WHERE ap.author_id = a.id",
+            );
+            sf.push_allowed_image_sql(&mut qb, "i");
+            qb.push(")");
+        }
+
+        qb.push(" ORDER BY CASE WHEN lower(a.name) = lower(");
+        qb.push_bind(raw.to_string());
+        qb.push(") THEN 0 WHEN a.name ILIKE ");
+        qb.push_bind(prefix);
+        qb.push(r#" ESCAPE '\' THEN 1 ELSE 2 END ASC, length(a.name) ASC, a.name ASC LIMIT "#);
+        qb.push_bind(limit);
+
+        let rows = qb.build().fetch_all(&self.pool).await?;
 
         rows.into_iter()
             .map(|r| -> sqlx::Result<Author> {
@@ -1601,6 +2035,17 @@ impl Engine {
     /// Suggest post titles matching `query`, ranked by exact > prefix > newest.
     /// Uses prefix-only matching when `< 3` characters so `pg_trgm` GIN indexes stay active.
     pub async fn suggest_titles(&self, query: &str, limit: i64) -> anyhow::Result<Vec<Post>> {
+        self.suggest_titles_with_safety(query, limit, None).await
+    }
+
+    /// Safety-aware post title autocomplete: when `safety` filtering is active, only
+    /// suggests posts that contain at least one caller-allowed Clear image.
+    pub async fn suggest_titles_with_safety(
+        &self,
+        query: &str,
+        limit: i64,
+        safety: Option<&SafetyFilter<'_>>,
+    ) -> anyhow::Result<Vec<Post>> {
         let raw = query.trim();
         if raw.is_empty() {
             return Ok(vec![]);
@@ -1610,27 +2055,30 @@ impl Engine {
         let pat = autocomplete_like_pattern(raw, &esc);
         let prefix = format!("{esc}%");
 
-        let rows = sqlx::query(
-            r#"
-            SELECT id, title::TEXT AS title
-            FROM posts
-            WHERE title ILIKE $2 ESCAPE '\'
-            ORDER BY
-                CASE
-                    WHEN lower(title) = lower($1) THEN 0
-                    WHEN title ILIKE $3 ESCAPE '\' THEN 1
-                    ELSE 2
-                END ASC,
-                id DESC
-            LIMIT $4
-            "#,
-        )
-        .bind(raw)
-        .bind(&pat)
-        .bind(&prefix)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let mut qb = QueryBuilder::<Postgres>::new(
+            r#"SELECT p.id, p.title::TEXT AS title FROM posts p WHERE p.title ILIKE "#,
+        );
+        qb.push_bind(pat);
+        qb.push(r#" ESCAPE '\'"#);
+
+        if let Some(sf) = safety.filter(|s| s.is_filtering_active()) {
+            qb.push(
+                " AND EXISTS (SELECT 1 FROM post_images pi \
+                 JOIN images i ON i.id = pi.image_id \
+                 WHERE pi.post_id = p.id",
+            );
+            sf.push_allowed_image_sql(&mut qb, "i");
+            qb.push(")");
+        }
+
+        qb.push(" ORDER BY CASE WHEN lower(p.title) = lower(");
+        qb.push_bind(raw.to_string());
+        qb.push(") THEN 0 WHEN p.title ILIKE ");
+        qb.push_bind(prefix);
+        qb.push(r#" ESCAPE '\' THEN 1 ELSE 2 END ASC, p.id DESC LIMIT "#);
+        qb.push_bind(limit);
+
+        let rows = qb.build().fetch_all(&self.pool).await?;
 
         rows.into_iter()
             .map(|r| -> sqlx::Result<Post> {
@@ -1712,6 +2160,114 @@ impl Engine {
             authors,
             tags: vec![], // TODO: tag video
         })
+    }
+
+    /// Count distinct posts that have at least one image (for XML sitemap sizing).
+    pub async fn sitemap_post_count(&self) -> anyhow::Result<i64> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(DISTINCT post_id)::BIGINT FROM post_images")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count)
+    }
+
+    /// Count distinct posts eligible for anonymous sitemap indexing, honoring
+    /// `policy.legal.noindex_restricted` when safety rules are enabled.
+    pub async fn sitemap_post_count_with_policy(
+        &self,
+        policy: &CompiledPolicy,
+    ) -> anyhow::Result<i64> {
+        if !(policy.is_enabled() && policy.policy.legal.noindex_restricted) {
+            return self.sitemap_post_count().await;
+        }
+        let anon = CallerContext::anonymous();
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "WITH covers AS (SELECT DISTINCT ON (pi.post_id) pi.post_id, pi.image_id FROM post_images pi ORDER BY pi.post_id, pi.image_id ASC) SELECT COUNT(*)::BIGINT FROM covers c JOIN images i ON i.id = c.image_id WHERE TRUE",
+        );
+        policy.push_caller_allowed_image_sql(&mut qb, &anon, "i");
+        let row = qb.build().fetch_one(&self.pool).await?;
+        let count: i64 = row.try_get(0)?;
+        Ok(count)
+    }
+
+    /// Return a page of canonical post cover image IDs + UTC `YYYY-MM-DD` dates
+    /// ordered newest-first for XML sitemap generation.
+    pub async fn sitemap_post_entries(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<SitemapPostEntry>> {
+        if limit <= 0 || offset < 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                (SELECT pi.image_id
+                 FROM post_images pi
+                 WHERE pi.post_id = p.id
+                 ORDER BY pi.image_id ASC
+                 LIMIT 1) AS cover_id,
+                to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS lastmod
+            FROM posts p
+            WHERE EXISTS (SELECT 1 FROM post_images pi WHERE pi.post_id = p.id)
+            ORDER BY p.id DESC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(cover_image_id) = row.try_get::<Option<i64>, _>("cover_id")? {
+                let lastmod: Option<String> = row.try_get("lastmod")?;
+                out.push(SitemapPostEntry {
+                    cover_image_id,
+                    lastmod,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Return a page of canonical post cover image IDs strictly under the anonymous safe view,
+    /// omitting restricted covers when `policy.legal.noindex_restricted` is enabled.
+    pub async fn sitemap_post_entries_with_policy(
+        &self,
+        policy: &CompiledPolicy,
+        limit: i64,
+        offset: i64,
+    ) -> anyhow::Result<Vec<SitemapPostEntry>> {
+        if limit <= 0 || offset < 0 {
+            return Ok(Vec::new());
+        }
+        if !(policy.is_enabled() && policy.policy.legal.noindex_restricted) {
+            return self.sitemap_post_entries(limit, offset).await;
+        }
+        let anon = CallerContext::anonymous();
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "WITH covers AS (SELECT DISTINCT ON (pi.post_id) pi.post_id, pi.image_id FROM post_images pi ORDER BY pi.post_id, pi.image_id ASC) SELECT c.image_id AS cover_id, to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS lastmod FROM covers c JOIN posts p ON p.id = c.post_id JOIN images i ON i.id = c.image_id WHERE TRUE",
+        );
+        policy.push_caller_allowed_image_sql(&mut qb, &anon, "i");
+        qb.push(" ORDER BY p.id DESC LIMIT ");
+        qb.push_bind(limit);
+        qb.push(" OFFSET ");
+        qb.push_bind(offset);
+
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let cover_image_id: i64 = row.try_get("cover_id")?;
+            let lastmod: Option<String> = row.try_get("lastmod")?;
+            out.push(SitemapPostEntry {
+                cover_image_id,
+                lastmod,
+            });
+        }
+        Ok(out)
     }
 }
 

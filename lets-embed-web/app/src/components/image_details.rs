@@ -1,18 +1,23 @@
 use crate::{
-    components::{Lightbox, LikeButton, LikeVariant, Results, Viewer},
-    types::{ImageQuery, ImageQueryPayload, PostItem},
-    util::{encode_path, format_duration, layout_image_masonry, set_document_title},
+    components::{BlurredMediaCard, Lightbox, LikeButton, LikeVariant, Results, Viewer},
+    types::{
+        ImageQuery, ImageQueryPayload, PostItem, ProjectedImageDetails, SafetyUiState,
+        handle_mask_unlock, mask_to_ui,
+    },
+    util::{format_duration, layout_image_masonry, public_origin, set_document_title},
 };
 
 #[cfg(feature = "hydrate")]
 use leptos::{ev, task::spawn_local};
 use leptos::{ev::PointerEvent, html, prelude::*};
+use leptos_meta::{Link, Meta, Title};
 use leptos_router::hooks::{use_location, use_navigate, use_params_map, use_query_map};
 use leptos_use_element_size::{UseElementSizeReturn, use_element_size};
 #[cfg(feature = "hydrate")]
 use leptos_use_event_listener::use_event_listener;
+use lets_embed_ui::{ContentMaskCard, GalleryMask, ReportTargetKind};
 use search_types::{
-    Image, ImageDetails as ImageDetailsData, Tag, Video,
+    MediaKind, ProjectedImage, ProjectedVideo, Tag,
     query::{QueryExpr, SearchField},
 };
 use wasm_bindgen::{JsCast, JsValue};
@@ -21,29 +26,68 @@ use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, HtmlImageElement};
 /// Maximum number of aliases joined inline when "Show aliases" is toggled on.
 const MAX_INLINE_ALIASES: usize = 6;
 
+/// Build a concise meta description (~155 chars) from DB-backed post title,
+/// authors, top tags, and image dimensions.
+fn build_detail_description(
+    title: &str,
+    authors: &[search_types::Author],
+    tags: &[Tag],
+    width: i32,
+    height: i32,
+) -> String {
+    let mut parts = Vec::new();
+    if !authors.is_empty() {
+        let names = authors
+            .iter()
+            .take(3)
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("{title} by {names}"));
+    } else {
+        parts.push(title.to_string());
+    }
+    if !tags.is_empty() {
+        let tag_list = tags
+            .iter()
+            .take(8)
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!("Tags: {tag_list}"));
+    }
+    if width > 0 && height > 0 {
+        parts.push(format!("{width}×{height}"));
+    }
+    parts.push("Explore the full album and visually similar images on Let's Embed.".to_string());
+    let joined = parts.join(" · ");
+    if joined.chars().count() <= 165 {
+        joined
+    } else {
+        let truncated: String = joined.chars().take(162).collect();
+        format!("{truncated}…")
+    }
+}
+
 /// Build an Advanced Search URL targeting a single WD tag or multilingual alias.
 fn tag_search_href(value: &str) -> String {
     let query = QueryExpr::Term {
         field: SearchField::Tag,
         value: value.to_string(),
+        threshold: None,
     }
     .format_query();
     format!("/?mode=advanced&adv={}", urlencoding::encode(&query))
 }
 
-/// Interactive hover/focus popover state for a tag pill, rendered with `position: fixed`
-/// so it is never clipped by the scrollable tag box and stays open when moving into it.
 #[derive(Clone, Debug, PartialEq)]
 struct TagTooltip {
     tag_id: i64,
     name: String,
     aliases: Vec<String>,
     score_pct: Option<u8>,
-    /// Horizontal center in viewport pixels (clamped safely on render).
     x: f64,
-    /// Anchor Y in viewport pixels (flush with pill edge; outer padding bridges the hover gap).
     y: f64,
-    /// When true, anchor below the pill instead of above it.
     below: bool,
 }
 
@@ -54,7 +98,6 @@ fn build_tag_tooltip(tag: &Tag, el: &web_sys::Element) -> TagTooltip {
         .and_then(|v| v.as_f64())
         .unwrap_or(1024.0);
     let x = (rect.left() + rect.width() / 2.0).clamp(156.0, (vw - 156.0).max(156.0));
-    // Account for the sticky header height + scrollable popover height before flipping.
     let below = rect.top() < 260.0;
     let y = if below { rect.bottom() } else { rect.top() };
     let score_pct = tag.score.map(|s| (s.clamp(0.0, 1.0) * 100.0).round() as u8);
@@ -69,7 +112,7 @@ fn build_tag_tooltip(tag: &Tag, el: &web_sys::Element) -> TagTooltip {
     }
 }
 
-/// selected region in original image coordinate
+/// Selected region in original image coordinates.
 #[derive(Clone, Copy)]
 struct Region {
     x: u32,
@@ -139,11 +182,10 @@ pub fn ImageDetails() -> impl IntoView {
     }
 }
 
-/// Aspect-ratio masonry for the post album sidebar on `/details/:id`, arranging
-/// each image by its natural dimensions just like the home gallery.
+/// Aspect-ratio masonry for the post album sidebar on `/details/:id`.
 #[component]
 fn PostAlbumMasonry(
-    images: Vec<Image>,
+    images: Vec<ProjectedImage>,
     current_image_id: i64,
     on_zoom: Callback<usize>,
 ) -> impl IntoView {
@@ -167,6 +209,11 @@ fn PostAlbumMasonry(
         images_store.with_value(|imgs| layout_image_masonry(imgs, count))
     });
 
+    let safety = use_context::<SafetyUiState>();
+    let on_unlock = Callback::new(move |mask: GalleryMask| {
+        handle_mask_unlock(&mask, safety);
+    });
+
     view! {
         <div
             node_ref=container_ref
@@ -183,44 +230,96 @@ fn PostAlbumMasonry(
                             each=move || {
                                 cols.with(|c| c.get(col_idx).cloned().unwrap_or_default())
                             }
-                            key=|(_, im)| im.id
+                            key=|(_, im)| im.id()
                             let((i, image))
                         >
                             {
-                                let is_current = image.id == current_image_id;
-                                let (w, h) = if image.width > 0 && image.height > 0 {
-                                    (image.width, image.height)
+                                let img_id = image.id();
+                                let is_current = img_id == current_image_id;
+                                let (raw_w, raw_h) = (image.width(), image.height());
+                                let (w, h) = if raw_w > 0 && raw_h > 0 {
+                                    (raw_w, raw_h)
                                 } else {
                                     (4, 3)
                                 };
                                 let aspect_style = format!("aspect-ratio:{w}/{h};");
-                                let cls = if is_current {
-                                    "relative block w-full p-0 border-0 rounded-lg overflow-hidden bg-sky-100 \
-                                     cursor-zoom-in ring-2 ring-sky-400 hover:opacity-85 \
-                                     hover:scale-[1.02] transition-all focus-visible:outline-2 focus-visible:outline-sky-500"
-                                } else {
-                                    "relative block w-full p-0 border-0 rounded-lg overflow-hidden bg-sky-100 \
-                                     cursor-zoom-in hover:opacity-85 hover:scale-[1.02] \
-                                     transition-all focus-visible:outline-2 focus-visible:outline-sky-500"
-                                };
-                                view! {
-                                    <button
-                                        type="button"
-                                        aria-label=format!("Zoom album image {}", i + 1)
-                                        class=cls
-                                        style=aspect_style
-                                        on:click=move |_| on_zoom.run(i)
-                                    >
-                                        <img
-                                            loading="lazy"
-                                            decoding="async"
-                                            width=w
-                                            height=h
-                                            class="block w-full h-full object-cover select-none"
-                                            src=format!("/images/{}.webp", encode_path(&image.name))
-                                            alt=image.name.clone()
-                                        />
-                                    </button>
+                                let ring_cls = if is_current { "ring-2 ring-sky-400" } else { "" };
+
+                                match image {
+                                    ProjectedImage::Clear { url, name, .. } => {
+                                        let alt = name
+                                            .filter(|s| !s.is_empty())
+                                            .unwrap_or_else(|| format!("Image #{img_id}"));
+                                        let cls = format!(
+                                            "relative block w-full p-0 border-0 rounded-lg overflow-hidden bg-sky-100 \
+                                             cursor-zoom-in hover:opacity-85 hover:scale-[1.02] transition-all \
+                                             focus-visible:outline-2 focus-visible:outline-sky-500 {ring_cls}"
+                                        );
+                                        view! {
+                                            <button
+                                                type="button"
+                                                aria-label=format!("Zoom album image {}", i + 1)
+                                                class=cls
+                                                style=aspect_style
+                                                on:click=move |_| on_zoom.run(i)
+                                            >
+                                                <img
+                                                    loading="lazy"
+                                                    decoding="async"
+                                                    width=w
+                                                    height=h
+                                                    class="block w-full h-full object-cover select-none"
+                                                    src=url
+                                                    alt=alt
+                                                />
+                                            </button>
+                                        }
+                                        .into_any()
+                                    }
+                                    ProjectedImage::Blurred {
+                                        preview_url,
+                                        can_click_reveal,
+                                        policy_rev,
+                                        label,
+                                        preset,
+                                        ..
+                                    } => {
+                                        let open_cb = Callback::new(move |()| on_zoom.run(i));
+                                        let alt = format!("Image #{img_id}");
+                                        view! {
+                                            <div class=format!("rounded-lg overflow-hidden {ring_cls}")>
+                                                <BlurredMediaCard
+                                                    kind=MediaKind::Image
+                                                    asset_id=img_id
+                                                    width=w
+                                                    height=h
+                                                    preview_url=preview_url.unwrap_or_default()
+                                                    can_click_reveal=can_click_reveal
+                                                    policy_rev=policy_rev
+                                                    label=label
+                                                    preset=preset
+                                                    alt=alt
+                                                    compact=true
+                                                    on_open=open_cb
+                                                />
+                                            </div>
+                                        }
+                                        .into_any()
+                                    }
+                                    ProjectedImage::Placeholder { mask, .. } => {
+                                        let ui_mask = mask_to_ui(&mask);
+                                        view! {
+                                            <div class=format!("rounded-lg overflow-hidden {ring_cls}")>
+                                                <ContentMaskCard
+                                                    mask=ui_mask
+                                                    dimensions=(w, h)
+                                                    compact=true
+                                                    on_unlock_click=on_unlock
+                                                />
+                                            </div>
+                                        }
+                                        .into_any()
+                                    }
                                 }
                             }
                         </For>
@@ -234,35 +333,78 @@ fn PostAlbumMasonry(
 #[component]
 fn ImageDetailPage(id: String) -> impl IntoView {
     let img_query = expect_context::<ImageQuery>();
+    let safety = use_context::<SafetyUiState>();
+    let id_stored = StoredValue::new(id);
 
-    let details = OnceResource::new(async move {
-        fetch_image_details(Some(id))
-            .await
-            .map_err(|e| e.to_string())
-    });
-    let post_images = OnceResource::new(async move {
-        let details = details.await?;
-        let Some(post_id) = details.post.map(|p| p.id) else {
-            return Ok(Vec::new());
-        };
-        list_post_images(post_id).await.map_err(|e| e.to_string())
-    });
-    let post_videos = OnceResource::new(async move {
-        let details = details.await?;
-        let Some(post_id) = details.post.map(|p| p.id) else {
-            return Ok(Vec::new());
-        };
-        list_post_videos(post_id).await.map_err(|e| e.to_string())
-    });
+    let details = Resource::new(
+        move || {
+            let epoch = safety.map(|s| s.reload_epoch.get()).unwrap_or(0);
+            (id_stored.get_value(), epoch)
+        },
+        move |(id_val, _epoch)| async move {
+            fetch_image_details(Some(id_val))
+                .await
+                .map_err(|e| e.to_string())
+        },
+    );
+    let post_images = Resource::new(
+        move || {
+            let epoch = safety.map(|s| s.reload_epoch.get()).unwrap_or(0);
+            let pid = details
+                .get()
+                .and_then(|res| res.ok())
+                .and_then(|d| d.post.map(|p| p.id));
+            (pid, epoch)
+        },
+        move |(pid, _epoch)| async move {
+            let Some(post_id) = pid else {
+                return Ok(Vec::new());
+            };
+            list_post_images(post_id).await.map_err(|e| e.to_string())
+        },
+    );
+    let post_videos = Resource::new(
+        move || {
+            let epoch = safety.map(|s| s.reload_epoch.get()).unwrap_or(0);
+            let pid = details
+                .get()
+                .and_then(|res| res.ok())
+                .and_then(|d| d.post.map(|p| p.id));
+            (pid, epoch)
+        },
+        move |(pid, _epoch)| async move {
+            let Some(post_id) = pid else {
+                return Ok(Vec::new());
+            };
+            list_post_videos(post_id).await.map_err(|e| e.to_string())
+        },
+    );
 
     let lightbox: RwSignal<Option<PostItem>> = RwSignal::new(None);
     let viewer: RwSignal<Option<usize>> = RwSignal::new(None);
     let current_post_id: RwSignal<Option<i64>> = RwSignal::new(None);
-    let post_images_store: StoredValue<Vec<Image>> = StoredValue::new(Vec::new());
+    let post_images_store: StoredValue<Vec<ProjectedImage>> = StoredValue::new(Vec::new());
     let post_images_count: RwSignal<Option<usize>> = RwSignal::new(None);
-    // Dedicated snapshot handed to `<Viewer>` so zooming before `post_images` resolves
-    // never overwrites `post_images_store`.
-    let viewer_images_store: StoredValue<Vec<Image>> = StoredValue::new(Vec::new());
+    let viewer_images_store: StoredValue<Vec<ProjectedImage>> = StoredValue::new(Vec::new());
+    let post_videos_store: StoredValue<Vec<ProjectedVideo>> = StoredValue::new(Vec::new());
+    let post_videos_count: RwSignal<Option<usize>> = RwSignal::new(None);
+
+    // Immediately wipe media and close modals on cross-tab safety invalidation.
+    if let Some(s) = safety {
+        let last_epoch = StoredValue::new(s.invalidation_epoch.get_untracked());
+        Effect::new(move |_| {
+            let cur = s.invalidation_epoch.get();
+            if cur != last_epoch.get_value() {
+                last_epoch.set_value(cur);
+                lets_embed_ui::browser::wipe_media_elements_in(None);
+                viewer.set(None);
+                lightbox.set(None);
+                post_images_store.set_value(Vec::new());
+                viewer_images_store.set_value(Vec::new());
+                post_videos_store.set_value(Vec::new());
+            }
+        });
+    }
 
     Effect::new(move |_| {
         if let Some(Ok(d)) = details.get() {
@@ -270,7 +412,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                 .post
                 .as_ref()
                 .map(|p| p.title.clone())
-                .unwrap_or_else(|| format!("Image #{}", d.image.id));
+                .unwrap_or_else(|| format!("Image #{}", d.image.id()));
             set_document_title(&page_title);
             current_post_id.set(d.post.map(|p| p.id));
         }
@@ -289,8 +431,6 @@ fn ImageDetailPage(id: String) -> impl IntoView {
             }
         }
     });
-    let post_videos_store: StoredValue<Vec<Video>> = StoredValue::new(Vec::new());
-    let post_videos_count: RwSignal<Option<usize>> = RwSignal::new(None);
     Effect::new(move |_| {
         if let Some(res) = post_videos.get() {
             match res {
@@ -362,7 +502,6 @@ fn ImageDetailPage(id: String) -> impl IntoView {
         );
     };
 
-    // Dismiss the interactive tag popover on window scroll or Escape (WCAG 1.4.13).
     #[cfg(feature = "hydrate")]
     {
         let _ = use_event_listener(window(), ev::scroll, move |_| {
@@ -394,6 +533,10 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                 None => view! { <Viewer images=viewer_images_store index=viewer /> }.into_any(),
             })
     };
+
+    let on_unlock = Callback::new(move |mask: GalleryMask| {
+        handle_mask_unlock(&mask, safety);
+    });
 
     let render_author_pill = |name: String| {
         let href = format!("/?mode=author&q={}&limit=50", urlencoding::encode(&name));
@@ -529,16 +672,21 @@ fn ImageDetailPage(id: String) -> impl IntoView {
         }
     };
 
-    let render_details = move |ImageDetailsData {
+    let render_details = move |ProjectedImageDetails {
                                    image,
                                    post,
                                    authors,
                                    tags,
+                                   og_image_allowed,
+                                   noindex,
                                }| {
-        let image_id = image.id;
-        let image_width = image.width;
-        let image_height = image.height;
-        let original_src = format!("/images/{}.webp", encode_path(&image.name));
+        let image_id = image.id();
+        let (image_width, image_height) = (image.width(), image.height());
+        let clear_url = match &image {
+            ProjectedImage::Clear { url, .. } => Some(url.clone()),
+            _ => None,
+        };
+        let is_not_clear = !image.is_clear();
         let tag_count = tags.len();
         let any_aliases = tags.iter().any(|t| !t.aliases.is_empty());
 
@@ -578,7 +726,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                 if !imgs.is_empty() {
                     let idx = preferred_idx
                         .filter(|&i| i < imgs.len())
-                        .or_else(|| imgs.iter().position(|im| im.id == image_id))
+                        .or_else(|| imgs.iter().position(|im| im.id() == image_id))
                         .unwrap_or(0);
                     viewer_images_store.set_value(imgs);
                     viewer.set(Some(idx));
@@ -634,8 +782,6 @@ fn ImageDetailPage(id: String) -> impl IntoView {
             };
 
         let on_down = move |ev: PointerEvent| {
-            // Only respond to primary pointer / left mouse button so context-menu
-            // right-clicks, middle-clicks, and multi-touch pinch don't open Viewer.
             if !ev.is_primary() || (ev.pointer_type() == "mouse" && ev.button() != 0) {
                 return;
             }
@@ -748,22 +894,39 @@ fn ImageDetailPage(id: String) -> impl IntoView {
             }
         };
 
-        view! {
-            <div class="flex flex-col md:flex-row w-full gap-3 md:gap-4 p-3 md:p-4 md:h-[72vh]">
-                <div
-                    node_ref=container_ref
-                    class="relative w-full h-[45vh] md:h-full md:flex-1 md:min-w-0 shrink-0
-                            flex items-center justify-center bg-sky-100/70 ring-1 ring-sky-200 rounded-2xl overflow-hidden"
-                >
+        let seo_title = post
+            .as_ref()
+            .map(|p| p.title.clone())
+            .unwrap_or_else(|| format!("Image #{image_id}"));
+        let full_title = format!("{seo_title} \u{00B7} Let's Embed");
+        let seo_description =
+            build_detail_description(&seo_title, &authors, &tags, image_width, image_height);
+        let origin = public_origin();
+        let canonical_url = origin.as_ref().map(|o| format!("{o}/details/{image_id}"));
+        let og_image_url = if og_image_allowed {
+            origin
+                .as_ref()
+                .zip(clear_url.as_ref())
+                .map(|(o, u)| format!("{o}{u}"))
+        } else {
+            None
+        };
+
+        let hero_stage = match image {
+            ProjectedImage::Clear { url, name, .. } => {
+                let alt = name
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| format!("Image #{image_id}"));
+                let open_zoom_hero = open_zoom_btn.clone();
+                view! {
                     <img
                         node_ref=img_ref
                         loading="lazy"
                         decoding="async"
                         class="max-w-full max-h-full object-contain select-none"
-                        src=original_src.clone()
-                        alt=image.name.clone()
+                        src=url
+                        alt=alt
                     />
-
                     <div
                         node_ref=overlay_ref
                         class="absolute inset-0 cursor-crosshair touch-none select-none"
@@ -775,26 +938,19 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                             sel_box.set(None);
                         }
                     />
-
-                    {
-                        move || sel_box.get().map(|(l, t, w, h)| view! {
-                            <div
-                                class="absolute border-2 border-sky-400 bg-sky-400/20
-                                        pointer-events-none rounded-sm"
-                                style=format!("left:{l}px;top:{t}px;width:{w}px;height:{h}px;")
-                            />
-                        })
-                    }
-
-                    {
-                        move || (sel_box.get().is_none() && drag_origin.get().is_none()).then(|| view! {
-                            <div class="hidden sm:block absolute bottom-2 left-2 pointer-events-none px-2.5 py-1 rounded-full
-                                        bg-slate-900/55 text-white/90 text-[11px] font-medium backdrop-blur-xs">
-                                "Click to zoom · Drag to crop-search"
-                            </div>
-                        })
-                    }
-
+                    {move || sel_box.get().map(|(l, t, w, h)| view! {
+                        <div
+                            class="absolute border-2 border-sky-400 bg-sky-400/20
+                                    pointer-events-none rounded-sm"
+                            style=format!("left:{l}px;top:{t}px;width:{w}px;height:{h}px;")
+                        />
+                    })}
+                    {move || (sel_box.get().is_none() && drag_origin.get().is_none()).then(|| view! {
+                        <div class="hidden sm:block absolute bottom-2 left-2 pointer-events-none px-2.5 py-1 rounded-full
+                                    bg-slate-900/55 text-white/90 text-[11px] font-medium backdrop-blur-xs">
+                            "Click to zoom · Drag to crop-search"
+                        </div>
+                    })}
                     <button
                         type="button"
                         title="View full screen"
@@ -803,27 +959,103 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                backdrop-blur-xs transition-colors cursor-pointer"
                         on:click=move |ev| {
                             ev.stop_propagation();
-                            open_zoom_btn(None);
+                            open_zoom_hero(None);
                         }
                     >
                         "Zoom \u{2922}"
                     </button>
+                    {move || sel_box.get().map(|_| view! {
+                        <button
+                            type="button"
+                            aria-label="Clear crop selection"
+                            title="Clear crop selection"
+                            class="absolute top-2 left-2 z-10 w-7 h-7 flex items-center justify-center
+                                    rounded-full bg-black/60 text-white text-sm
+                                    hover:bg-black/80 transition-colors cursor-pointer"
+                            on:click=on_clear.clone()
+                        >
+                            "✕"
+                        </button>
+                    })}
+                }
+                .into_any()
+            }
+            ProjectedImage::Blurred {
+                preview_url,
+                can_click_reveal,
+                policy_rev,
+                width: sw,
+                height: sh,
+                label,
+                preset,
+                ..
+            } => {
+                let open_zoom_spoiler = open_zoom_btn.clone();
+                let open_cb = Callback::new(move |()| open_zoom_spoiler(None));
+                let alt = format!("Image #{image_id}");
+                view! {
+                    <div class="w-full h-full flex items-center justify-center p-2">
+                        <div class="w-full max-w-[min(100%,640px)] max-h-full overflow-hidden rounded-xl">
+                            <BlurredMediaCard
+                                kind=MediaKind::Image
+                                asset_id=image_id
+                                width=sw
+                                height=sh
+                                preview_url=preview_url.unwrap_or_default()
+                                can_click_reveal=can_click_reveal
+                                policy_rev=policy_rev
+                                label=label
+                                preset=preset
+                                alt=alt
+                                on_open=open_cb
+                            />
+                        </div>
+                    </div>
+                }
+                .into_any()
+            }
+            ProjectedImage::Placeholder { mask, .. } => {
+                let ui_mask = mask_to_ui(&mask);
+                view! {
+                    <div class="w-full h-full flex items-center justify-center p-4">
+                        <div class="w-full max-w-md">
+                            <ContentMaskCard
+                                mask=ui_mask
+                                dimensions=(image_width, image_height)
+                                on_unlock_click=on_unlock
+                            />
+                        </div>
+                    </div>
+                }
+                .into_any()
+            }
+        };
 
-                    {
-                        move || sel_box.get().map(|_| view! {
-                            <button
-                                type="button"
-                                aria-label="Clear crop selection"
-                                title="Clear crop selection"
-                                class="absolute top-2 left-2 z-10 w-7 h-7 flex items-center justify-center
-                                        rounded-full bg-black/60 text-white text-sm
-                                        hover:bg-black/80 transition-colors cursor-pointer"
-                                on:click=on_clear.clone()
-                            >
-                                "✕"
-                            </button>
-                        })
-                    }
+        view! {
+            <Title text=full_title.clone()/>
+            <Meta name="description" content=seo_description.clone()/>
+            <Meta property="og:type" content="article"/>
+            <Meta property="og:title" content=full_title/>
+            <Meta property="og:description" content=seo_description/>
+            {noindex.then(|| view! {
+                <Meta name="robots" content="noindex, nofollow"/>
+            })}
+            {canonical_url.map(|url| view! {
+                <Link rel="canonical" href=url.clone()/>
+                <Meta property="og:url" content=url/>
+            })}
+            {og_image_url.map(|img_url| view! {
+                <Meta property="og:image" content=img_url/>
+                <Meta property="og:image:width" content=image_width.to_string()/>
+                <Meta property="og:image:height" content=image_height.to_string()/>
+            })}
+            <div class="flex flex-col md:flex-row w-full gap-3 md:gap-4 p-3 md:p-4 md:h-[72vh]">
+                <div
+                    node_ref=container_ref
+                    class="relative w-full h-[45vh] md:h-full md:flex-1 md:min-w-0 shrink-0
+                            flex items-center justify-center bg-sky-100/70 ring-1 ring-sky-200 rounded-2xl overflow-hidden"
+                >
+                    {hero_stage}
                 </div>
 
                 <div class="w-full md:w-96 lg:w-[28rem] xl:w-[32rem] md:shrink-0
@@ -840,7 +1072,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                 title="Open full post album"
                                 on:click=move |_| open_lightbox()
                             >
-                                <span class="line-clamp-2 min-w-0">{ p.title }</span>
+                                <h1 class="line-clamp-2 min-w-0 m-0 text-inherit font-inherit">{ p.title }</h1>
                                 <span class="shrink-0 text-xs font-semibold px-2.5 py-1 rounded-full bg-sky-100 text-sky-700 whitespace-nowrap">
                                     {album_badge}
                                 </span>
@@ -865,6 +1097,23 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                             >
                                 "\u{2605} Favorites"
                             </a>
+                            {move || safety.filter(|s| s.is_managed.get()).map(|s| view! {
+                                <button
+                                    type="button"
+                                    title="Report content"
+                                    class="inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm font-medium
+                                           text-rose-700 bg-rose-50 ring-1 ring-rose-200 hover:bg-rose-100 transition-colors cursor-pointer"
+                                    on:click=move |_| {
+                                        s.open_report(
+                                            ReportTargetKind::Image,
+                                            image_id,
+                                            format!("Image #{image_id}"),
+                                        );
+                                    }
+                                >
+                                    "Report"
+                                </button>
+                            })}
                         </div>
                         <div class="flex items-center justify-center flex-wrap gap-1.5 text-xs text-slate-500">
                             <button
@@ -885,15 +1134,17 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                     {format!("{image_width} × {image_height}")}
                                 </span>
                             })}
-                            <a
-                                href=original_src
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                class="px-2 py-0.5 rounded-full bg-slate-100 hover:bg-sky-100 hover:text-sky-700
-                                       text-slate-600 font-medium transition-colors"
-                            >
-                                "Original \u{2197}"
-                            </a>
+                            {clear_url.filter(|_| !is_not_clear).map(|orig_href| view! {
+                                <a
+                                    href=orig_href
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    class="px-2 py-0.5 rounded-full bg-slate-100 hover:bg-sky-100 hover:text-sky-700
+                                           text-slate-600 font-medium transition-colors"
+                                >
+                                    "Original \u{2197}"
+                                </a>
+                            })}
                         </div>
                     </div>
 
@@ -922,6 +1173,11 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                     </button>
                                 })}
                             </div>
+                        })}
+                        {is_not_clear.then(|| view! {
+                            <p class="text-xs text-slate-500 px-1 py-0.5 m-0">
+                                "Tag metadata is hidden while this item is restricted."
+                            </p>
                         })}
                         {
                             let authors_store = StoredValue::new(authors);
@@ -992,37 +1248,124 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                             <div class="flex-1 min-w-0 max-h-[40vh] overflow-y-auto md:max-h-none md:min-h-0 pr-1">
                                                 <div class="flex flex-col gap-2">
                                                     {
-                                                        videos.into_iter().map(|v| {
-                                                            let vid_id = v.id;
-                                                            let aspect = if v.width > 0 && v.height > 0 {
-                                                                format!("aspect-ratio:{}/{};", v.width, v.height)
-                                                            } else {
-                                                                "aspect-ratio:16/9;".to_string()
-                                                            };
-                                                            let dur = (v.duration > 0).then(|| format_duration(v.duration));
-                                                            view! {
-                                                                <div class="relative group rounded-lg overflow-hidden bg-black">
-                                                                    <video
-                                                                        class="w-full block bg-black object-contain select-none"
-                                                                        style=aspect
-                                                                        controls
-                                                                        playsinline
-                                                                        preload="metadata"
-                                                                        src=format!("/videos/{}", encode_path(&v.name))
-                                                                    />
-                                                                    <div class="absolute top-1.5 right-1.5 z-10">
-                                                                        <LikeButton
-                                                                            kind="video"
-                                                                            target_id=vid_id
-                                                                            variant=LikeVariant::Card
+                                                        videos.into_iter().map(|v| match v {
+                                                            ProjectedVideo::Clear {
+                                                                id: vid_id,
+                                                                url,
+                                                                width,
+                                                                height,
+                                                                duration,
+                                                                ..
+                                                            } => {
+                                                                let aspect = if width > 0 && height > 0 {
+                                                                    format!("aspect-ratio:{width}/{height};")
+                                                                } else {
+                                                                    "aspect-ratio:16/9;".to_string()
+                                                                };
+                                                                let dur = (duration > 0).then(|| format_duration(duration));
+                                                                view! {
+                                                                    <div class="relative group rounded-lg overflow-hidden bg-black">
+                                                                        <video
+                                                                            class="w-full block bg-black object-contain select-none"
+                                                                            style=aspect
+                                                                            controls
+                                                                            playsinline
+                                                                            preload="metadata"
+                                                                            src=url
                                                                         />
+                                                                        <div class="absolute top-1.5 right-1.5 z-10">
+                                                                            <LikeButton
+                                                                                kind="video"
+                                                                                target_id=vid_id
+                                                                                variant=LikeVariant::Card
+                                                                            />
+                                                                        </div>
+                                                                        {dur.map(|d| view! {
+                                                                            <span class="absolute top-1.5 left-1.5 z-10 pointer-events-none px-2 py-0.5 rounded-full bg-black/70 text-white text-[11px] font-medium tabular-nums">
+                                                                                {d}
+                                                                            </span>
+                                                                        })}
                                                                     </div>
-                                                                    {dur.map(|d| view! {
-                                                                        <span class="absolute top-1.5 left-1.5 z-10 pointer-events-none px-2 py-0.5 rounded-full bg-black/70 text-white text-[11px] font-medium tabular-nums">
-                                                                            {d}
-                                                                        </span>
-                                                                    })}
-                                                                </div>
+                                                                }
+                                                                .into_any()
+                                                            }
+                                                            ProjectedVideo::Blurred {
+                                                                id: vid_id,
+                                                                preview_url,
+                                                                can_click_reveal,
+                                                                policy_rev,
+                                                                label,
+                                                                preset,
+                                                                width,
+                                                                height,
+                                                                duration,
+                                                                ..
+                                                            } => {
+                                                                let dur = (duration > 0).then(|| format_duration(duration));
+                                                                view! {
+                                                                    <div class="relative group rounded-lg overflow-hidden bg-slate-900">
+                                                                        <BlurredMediaCard
+                                                                            kind=MediaKind::Video
+                                                                            asset_id=vid_id
+                                                                            width=width
+                                                                            height=height
+                                                                            preview_url=preview_url.unwrap_or_default()
+                                                                            can_click_reveal=can_click_reveal
+                                                                            policy_rev=policy_rev
+                                                                            label=label
+                                                                            preset=preset
+                                                                            alt=format!("Video #{vid_id}")
+                                                                            compact=true
+                                                                        />
+                                                                        <div class="absolute top-1.5 right-1.5 z-10">
+                                                                            <LikeButton
+                                                                                kind="video"
+                                                                                target_id=vid_id
+                                                                                variant=LikeVariant::Card
+                                                                            />
+                                                                        </div>
+                                                                        {dur.map(|d| view! {
+                                                                            <span class="absolute top-1.5 left-1.5 z-10 pointer-events-none px-2 py-0.5 rounded-full bg-black/70 text-white text-[11px] font-medium tabular-nums">
+                                                                                {d}
+                                                                            </span>
+                                                                        })}
+                                                                    </div>
+                                                                }
+                                                                .into_any()
+                                                            }
+                                                            ProjectedVideo::Placeholder {
+                                                                id: vid_id,
+                                                                width,
+                                                                height,
+                                                                duration,
+                                                                mask,
+                                                                ..
+                                                            } => {
+                                                                let dur = (duration > 0).then(|| format_duration(duration));
+                                                                let ui_mask = mask_to_ui(&mask);
+                                                                view! {
+                                                                    <div class="relative group rounded-lg overflow-hidden bg-slate-900">
+                                                                        <ContentMaskCard
+                                                                            mask=ui_mask
+                                                                            dimensions=(width, height)
+                                                                            compact=true
+                                                                            on_unlock_click=on_unlock
+                                                                        />
+                                                                        <div class="absolute top-1.5 right-1.5 z-10">
+                                                                            <LikeButton
+                                                                                kind="video"
+                                                                                target_id=vid_id
+                                                                                variant=LikeVariant::Card
+                                                                            />
+                                                                        </div>
+                                                                        {dur.map(|d| view! {
+                                                                            <span class="absolute top-1.5 left-1.5 z-10 pointer-events-none px-2 py-0.5 rounded-full bg-black/70 text-white text-[11px] font-medium tabular-nums">
+                                                                                {d}
+                                                                            </span>
+                                                                        })}
+                                                                    </div>
+                                                                }
+                                                                .into_any()
                                                             }
                                                         })
                                                         .collect_view()
@@ -1049,8 +1392,6 @@ fn ImageDetailPage(id: String) -> impl IntoView {
             } else {
                 "translate(-50%, -100%)"
             };
-            // Invisible outer padding bridges the gap between the tag pill and card
-            // so moving the cursor into the popover never dismisses it.
             let bridge_cls = if tip.below { "fixed z-[45] pt-2" } else { "fixed z-[45] pb-2" };
             let style = format!("left:{:.1}px;top:{:.1}px;transform:{transform};", tip.x, tip.y);
             let canonical_href = tag_search_href(&tip.name);
@@ -1146,9 +1487,17 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                 move || {
                     details.get().map(|details| match details {
                         Ok(details) => render_details(details).into_any(),
-                        Err(e) => view! {
-                            <div class="text-rose-500 p-4">{ e.to_string() }</div>
-                        }.into_any(),
+                        Err(e) => {
+                            #[cfg(feature = "ssr")]
+                            if let Some(resp) = use_context::<leptos_axum::ResponseOptions>() {
+                                resp.set_status(axum::http::StatusCode::NOT_FOUND);
+                            }
+                            view! {
+                                <Title text="Not Found · Let's Embed"/>
+                                <Meta name="robots" content="noindex"/>
+                                <div class="text-rose-500 p-4">{ e.to_string() }</div>
+                            }.into_any()
+                        }
                     })
                 }
             }
@@ -1160,9 +1509,8 @@ fn ImageDetailPage(id: String) -> impl IntoView {
 }
 
 #[server(endpoint = "fetch_image_details")]
-async fn fetch_image_details(id: Option<String>) -> Result<ImageDetailsData, ServerFnError> {
-    use crate::state::AppState;
-
+async fn fetch_image_details(id: Option<String>) -> Result<ProjectedImageDetails, ServerFnError> {
+    use crate::state::{AppState, RequestSafetyContext};
     use std::sync::Arc;
 
     use axum::extract::State;
@@ -1174,50 +1522,86 @@ async fn fetch_image_details(id: Option<String>) -> Result<ImageDetailsData, Ser
         .ok_or::<ServerFnError>(ServerFnError::Args("invalid id".to_string()))?;
 
     let state = expect_context::<AppState>();
+    let ctx = RequestSafetyContext::from_leptos_context(&state)?;
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
-    engine
-        .image_details(id)
+    fn to_err(e: impl std::fmt::Display) -> ServerFnError {
+        ServerFnError::Response(e.to_string())
+    }
+
+    let details = engine.image_details(id).await.map_err(to_err)?;
+    let outcomes = engine
+        .evaluate_images(&[id], &ctx.policy, &ctx.caller)
         .await
-        .map_err(|e| ServerFnError::Response(e.to_string()))
+        .map_err(to_err)?;
+    let outcome = outcomes.get(&id).cloned().unwrap_or_else(|| {
+        ctx.policy
+            .evaluate_image(&search_engine::ImageFacts::default(), &ctx.caller)
+    });
+    let projected = ctx
+        .policy
+        .project_image(&details.image, outcome.clone(), &ctx.caller, &ctx.signer);
+    let is_clear = projected.is_clear();
+    let public_safe_clear = is_clear && outcome.is_public_safe_clear();
+    let noindex = !public_safe_clear && ctx.policy.policy.legal.noindex_restricted;
+
+    Ok(ProjectedImageDetails {
+        image: projected,
+        post: details.post,
+        authors: details.authors,
+        // Withhold restricted WD-tags & per-tag scores whenever image is not Clear (Placeholder or Blurred).
+        tags: if is_clear { details.tags } else { Vec::new() },
+        og_image_allowed: public_safe_clear,
+        noindex,
+    })
 }
 
 #[server(endpoint = "list_post_images")]
-pub async fn list_post_images(post_id: i64) -> Result<Vec<Image>, ServerFnError> {
-    use crate::state::AppState;
-
+pub async fn list_post_images(post_id: i64) -> Result<Vec<ProjectedImage>, ServerFnError> {
+    use crate::state::{AppState, RequestSafetyContext};
     use std::sync::Arc;
 
     use axum::extract::State;
     use leptos_axum::extract_with_state;
     use search_engine::Engine;
 
+    fn to_err(e: impl std::fmt::Display) -> ServerFnError {
+        ServerFnError::Response(e.to_string())
+    }
+
     let state = expect_context::<AppState>();
+    let ctx = RequestSafetyContext::from_leptos_context(&state)?;
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
+    let raw = engine.list_post_images(post_id).await.map_err(to_err)?;
     engine
-        .list_post_images(post_id)
+        .project_images(&raw, &ctx.policy, &ctx.caller, &ctx.signer)
         .await
-        .map_err(|e| ServerFnError::Response(e.to_string()))
+        .map_err(to_err)
 }
 
 #[server(endpoint = "list_post_videos")]
-pub async fn list_post_videos(post_id: i64) -> Result<Vec<Video>, ServerFnError> {
-    use crate::state::AppState;
-
+pub async fn list_post_videos(post_id: i64) -> Result<Vec<ProjectedVideo>, ServerFnError> {
+    use crate::state::{AppState, RequestSafetyContext};
     use std::sync::Arc;
 
     use axum::extract::State;
     use leptos_axum::extract_with_state;
     use search_engine::Engine;
 
+    fn to_err(e: impl std::fmt::Display) -> ServerFnError {
+        ServerFnError::Response(e.to_string())
+    }
+
     let state = expect_context::<AppState>();
+    let ctx = RequestSafetyContext::from_leptos_context(&state)?;
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
+    let raw = engine.list_post_videos(post_id).await.map_err(to_err)?;
     engine
-        .list_post_videos(post_id)
+        .project_videos(&raw, &ctx.policy, &ctx.caller, &ctx.signer)
         .await
-        .map_err(|e| ServerFnError::Response(e.to_string()))
+        .map_err(to_err)
 }
 
 #[cfg(test)]

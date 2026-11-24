@@ -506,6 +506,9 @@ async fn call_like_mutate(
     headers
         .set("Content-Type", "application/json")
         .map_err(|e| format!("{e:?}"))?;
+    headers
+        .set(site_access::USER_CSRF_HEADER, "1")
+        .map_err(|e| format!("{e:?}"))?;
     opts.set_headers(&headers);
     let body = serde_json::json!({ "kind": kind, "target_id": target_id }).to_string();
     opts.set_body(&JsValue::from_str(&body));

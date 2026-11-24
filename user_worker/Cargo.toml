@@ -14,9 +14,10 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 site_access = { path = "../site_access" }
 worker = { version = "0.9", features = ["http", "axum", "d1"] }
-futures = { workspace = true }
 # required by the code #[durable_object] generates
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
 axum = { workspace = true, features = ["macros", "form", "json", "query"] }
 tower-service = "0.3"
 tower-cookies = "0.11"
@@ -26,8 +27,13 @@ serde.workspace = true
 serde_json.workspace = true
 serde-wasm-bindgen = "0.6"
 percent-encoding = "2"
+url = { workspace = true }
+urlencoding = "2"
 hmac = "0.13"
 sha2 = "0.11"
+subtle = "2.6"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+num-bigint = "0.4"
 base64 = "0.23"
 k256 = { version = "0.14", default-features = false, features = ["ecdsa", "alloc"] }
 sha3 = "0.12"
@@ -41,3 +47,6 @@ solana-system-interface = { version = "3", features = ["bincode"] }
 spl-associated-token-account-interface = "2"
 spl-token-interface = "2"
 bincode = "1.3"
+
+[dev-dependencies]
+futures = { workspace = true }
