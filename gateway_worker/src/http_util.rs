@@ -287,10 +287,38 @@ pub(crate) fn extract_single_cookie<'a>(headers: &'a HeaderMap, target: &str) ->
     }
 }
 
+/// Percent-decodes RFC 3986 `%XX` escapes in a cookie name (without translating `+`)
+/// to match `cookie::Cookie::parse_encoded` used by `tower-cookies` in `user_worker`.
+fn percent_decode_cookie_name(raw: &str) -> String {
+    if !raw.contains('%') {
+        return raw.to_string();
+    }
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Strips admin, Cloudflare Access, and guest-reveal cookies before forwarding to
-/// `USER_WORKER` while preserving single-occurrence `__Host-ue_session` and `__Host-auth_tx`.
-/// Duplicate occurrences of auth cookies are dropped fail-closed to prevent parser
-/// differentials against `tower-cookies` last-wins behavior (Cycle 3 H5).
+/// `USER_WORKER` while preserving single-occurrence literal `__Host-ue_session` and
+/// `__Host-auth_tx`. Percent-encoded spoofs (e.g. `%5F_Host-ue_session`) are dropped
+/// unconditionally and literal duplicate occurrences of auth cookies are dropped
+/// fail-closed to prevent parser differentials against `tower-cookies` (Cycle 3 H5 / Cycle 4 I1).
 pub(crate) fn sanitize_user_worker_cookie(headers: &HeaderMap) -> Option<String> {
     let dup_session = matches!(
         extract_single_cookie(headers, site_access::SESSION_COOKIE),
@@ -304,11 +332,23 @@ pub(crate) fn sanitize_user_worker_cookie(headers: &HeaderMap) -> Option<String>
     for raw in headers.get_all("cookie").iter().filter_map(|v| v.to_str().ok()) {
         for cookie in raw.split(';').map(str::trim).filter(|c| !c.is_empty()) {
             let name = cookie.split('=').next().unwrap_or("").trim();
-            if name != ADMIN_VIEW_COOKIE
-                && name != GUEST_SESSION_COOKIE
-                && name != LEGACY_GUEST_SESSION_COOKIE
-                && name != LEGACY_SESSION_COOKIE
-                && name != "CF_Authorization"
+            let decoded = percent_decode_cookie_name(name);
+            let is_encoded = decoded != name;
+            let is_stripped_sensitive = matches!(
+                decoded.as_str(),
+                ADMIN_VIEW_COOKIE
+                    | GUEST_SESSION_COOKIE
+                    | LEGACY_GUEST_SESSION_COOKIE
+                    | LEGACY_SESSION_COOKIE
+                    | "CF_Authorization"
+            );
+            let is_encoded_auth_spoof = is_encoded
+                && matches!(
+                    decoded.as_str(),
+                    site_access::SESSION_COOKIE | site_access::AUTH_TX_COOKIE
+                );
+            if !is_stripped_sensitive
+                && !is_encoded_auth_spoof
                 && !(dup_session && name == site_access::SESSION_COOKIE)
                 && !(dup_auth_tx && name == site_access::AUTH_TX_COOKIE)
             {

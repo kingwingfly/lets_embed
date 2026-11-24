@@ -4374,4 +4374,30 @@ mod tests {
         );
         assert_eq!(resp_302.status(), StatusCode::BAD_GATEWAY);
     }
+
+    #[test]
+    fn sanitize_user_worker_cookie_drops_percent_encoded_and_duplicate_auth_cookies() {
+        let mut hdrs = HeaderMap::new();
+        let raw = format!(
+            "__Host-ue_session=real; %5F_Host-ue_session=evil; __Host%2Dauth_tx=evil_tx; %43F_Authorization=cf_tok; {}=1; theme=dark",
+            site_access::ADMIN_VIEW_COOKIE
+        );
+        hdrs.insert("cookie", raw.parse().unwrap());
+        assert_eq!(
+            http_util::sanitize_user_worker_cookie(&hdrs).as_deref(),
+            Some("__Host-ue_session=real; theme=dark")
+        );
+
+        let mut dup = HeaderMap::new();
+        dup.insert(
+            "cookie",
+            "__Host-ue_session=a; __Host-ue_session=b; __Host-auth_tx=ok"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            http_util::sanitize_user_worker_cookie(&dup).as_deref(),
+            Some("__Host-auth_tx=ok")
+        );
+    }
 }

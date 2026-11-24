@@ -2582,6 +2582,16 @@ pub fn QueryBuilder(
                                                             {
                                                                 apply_top_field_change(node, next_field);
                                                             }
+                                                            // Vector clauses cannot be combined with OR (Cycle 4 I9).
+                                                            if effective_mode == QueryBuilderMode::AdvancedSearch
+                                                                && next_field.is_vector()
+                                                            {
+                                                                for n in &mut d.nodes {
+                                                                    if n.connector() == QueryConnector::Or {
+                                                                        n.set_connector(QueryConnector::And);
+                                                                    }
+                                                                }
+                                                            }
                                                         });
                                                         sync_from_nodes();
                                                     }

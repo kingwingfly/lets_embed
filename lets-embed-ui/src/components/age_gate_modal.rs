@@ -2,7 +2,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use leptos::{ev, html, prelude::*};
 
-use crate::browser::{lock_body_scroll, trap_dialog_tab, use_window_keydown};
+use crate::browser::{
+    is_top_modal, lock_body_scroll, push_modal_layer, trap_dialog_tab, use_window_keydown,
+};
 
 static NEXT_AGE_GATE_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -62,6 +64,7 @@ fn AgeGateModalInner(
     on_close: Option<Callback<()>>,
 ) -> impl IntoView {
     lock_body_scroll();
+    let modal_layer = push_modal_layer();
 
     let modal_id = NEXT_AGE_GATE_ID.fetch_add(1, Ordering::Relaxed);
     let title_id = format!("le-age-gate-title-{modal_id}");
@@ -76,6 +79,9 @@ fn AgeGateModalInner(
     });
 
     use_window_keydown(false, move |e: ev::KeyboardEvent| {
+        if !is_top_modal(modal_layer) {
+            return;
+        }
         if e.key() == "Tab" {
             trap_dialog_tab(&e, dialog_ref.get_untracked());
             return;

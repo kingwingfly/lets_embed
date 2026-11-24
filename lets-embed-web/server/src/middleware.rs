@@ -302,24 +302,16 @@ fn extract_client_ip(
     {
         return Some(ip);
     }
-    if trust_proxy {
-        for hdr in ["cf-connecting-ip", "x-real-ip"] {
-            if let Some(raw) = extract_single_header(headers, hdr)
-                && let Ok(ip) = raw.parse::<IpAddr>()
-            {
-                return Some(ip);
-            }
-        }
-        if let Some(xff) = headers
+    if trust_proxy
+        && let Some(xff) = headers
             .get_all("x-forwarded-for")
             .iter()
             .next_back()
             .and_then(|v| v.to_str().ok())
-            && let Some(last) = xff.rsplit(',').next().map(str::trim)
-            && let Ok(ip) = last.parse::<IpAddr>()
-        {
-            return Some(ip);
-        }
+        && let Some(last) = xff.rsplit(',').next().map(str::trim)
+        && let Ok(ip) = last.parse::<IpAddr>()
+    {
+        return Some(ip);
     }
     peer_ip
 }
@@ -559,4 +551,40 @@ pub async fn safety_and_auth_middleware(
     }
 
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_client_ip_ignores_spoofed_cf_and_x_real_ip_under_trust_proxy() {
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("cf-connecting-ip", HeaderValue::from_static("198.51.100.99"));
+        hdrs.insert("x-real-ip", HeaderValue::from_static("198.51.100.88"));
+        hdrs.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.1, 198.51.100.10"),
+        );
+
+        // Standalone --trust-proxy MUST use rightmost X-Forwarded-For, ignoring spoofed
+        // CF-Connecting-IP and X-Real-IP (Cycle 4 I4).
+        assert_eq!(
+            extract_client_ip(&hdrs, Some(peer), false, true),
+            Some("198.51.100.10".parse().unwrap())
+        );
+
+        // Without XFF, Standalone --trust-proxy falls back to peer IP (not spoofed headers).
+        let mut no_xff = HeaderMap::new();
+        no_xff.insert("cf-connecting-ip", HeaderValue::from_static("198.51.100.99"));
+        no_xff.insert("x-real-ip", HeaderValue::from_static("198.51.100.88"));
+        assert_eq!(extract_client_ip(&no_xff, Some(peer), false, true), Some(peer));
+
+        // Managed Mode (trust_cf_ip=true, trust_proxy=false) honors CF-Connecting-IP.
+        assert_eq!(
+            extract_client_ip(&hdrs, Some(peer), true, false),
+            Some("198.51.100.99".parse().unwrap())
+        );
+    }
 }

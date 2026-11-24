@@ -424,8 +424,7 @@ pub async fn list_accounts(
             let identities = identities_map.remove(&r.id).unwrap_or_default();
             let live_plan = live_status
                 .as_ref()
-                .and_then(|s| s.plan.clone())
-                .or(r.plan);
+                .map_or(r.plan, |s| s.plan.clone());
             let live_banned = live_status
                 .as_ref()
                 .map_or(r.banned != 0, |s| s.banned);
@@ -504,8 +503,7 @@ async fn load_single_account(
     let live_status = do_client::user_status(env, &r.account_do_key).await.ok();
     let live_plan = live_status
         .as_ref()
-        .and_then(|s| s.plan.clone())
-        .or(r.plan);
+        .map_or(r.plan, |s| s.plan.clone());
     let live_banned = live_status.as_ref().map_or(r.banned != 0, |s| s.banned);
     Ok(Some(AccountEntryResp {
         id: r.id.clone(),

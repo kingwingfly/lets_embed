@@ -763,7 +763,7 @@ async fn record(
                 // can never strand images as completed with NULL coverage (Cycle 2 A-5).
                 // Acquire deterministic ascending row locks on parent posts, sibling videos,
                 // and images before mutating so concurrent writers cannot deadlock on
-                // Policy v3 facts_rev trigger updates (Cycle 3 P2-2).
+                // Policy v3 facts_rev trigger updates (Cycle 3 H9 / Cycle 4 I5).
                 if !completed_ids.is_empty() {
                     use sqlx::Connection as _;
 
@@ -772,37 +772,7 @@ async fn record(
                         .instrument(tracing::info_span!("begin record transaction"))
                         .await?;
 
-                    sqlx::query(
-                        r#"SELECT id FROM posts
-                           WHERE id IN (SELECT post_id FROM post_images WHERE image_id = ANY($1::BIGINT[]))
-                           ORDER BY id FOR NO KEY UPDATE"#,
-                    )
-                    .bind(&completed_ids)
-                    .execute(&mut *tx)
-                    .instrument(tracing::info_span!("lock parent posts"))
-                    .await?;
-
-                    sqlx::query(
-                        r#"SELECT id FROM videos
-                           WHERE id IN (
-                               SELECT pv.video_id FROM post_videos pv
-                               JOIN post_images pi ON pi.post_id = pv.post_id
-                               WHERE pi.image_id = ANY($1::BIGINT[])
-                           )
-                           ORDER BY id FOR NO KEY UPDATE"#,
-                    )
-                    .bind(&completed_ids)
-                    .execute(&mut *tx)
-                    .instrument(tracing::info_span!("lock sibling videos"))
-                    .await?;
-
-                    sqlx::query(
-                        r#"SELECT id FROM images WHERE id = ANY($1::BIGINT[]) ORDER BY id FOR NO KEY UPDATE"#,
-                    )
-                    .bind(&completed_ids)
-                    .execute(&mut *tx)
-                    .instrument(tracing::info_span!("lock target images"))
-                    .await?;
+                    lock_images_and_siblings_for_update(&mut tx, &completed_ids).await?;
 
                     sqlx::query(
                         r#"DELETE FROM wd_tag_images WHERE image_id = ANY($1::BIGINT[])"#,
@@ -876,6 +846,13 @@ async fn record(
                 }
 
                 if !failed_ids.is_empty() {
+                    use sqlx::Connection as _;
+
+                    let mut tx = conn
+                        .begin()
+                        .instrument(tracing::info_span!("begin reset failed transaction"))
+                        .await?;
+                    lock_images_and_siblings_for_update(&mut tx, &failed_ids).await?;
                     sqlx::query!(
                         r#"
             UPDATE images SET status = 'pending'::process_status
@@ -884,9 +861,12 @@ async fn record(
         "#,
                         &failed_ids
                     )
-                    .execute(&mut *conn)
+                    .execute(&mut *tx)
                     .instrument(tracing::info_span!("reset failed images"))
                     .await?;
+                    tx.commit()
+                        .instrument(tracing::info_span!("commit reset failed transaction"))
+                        .await?;
                 }
 
                 static COMPLETE_COUNTER: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -919,6 +899,48 @@ async fn record(
         }
     }
     failure.map_or(Ok(()), Err)
+}
+
+/// Acquire deterministic ascending row locks on parent `posts`, sibling `videos`,
+/// and target `images` before mutating tags or status so concurrent writers cannot
+/// deadlock on Policy v3 `facts_rev` trigger updates (Cycle 3 H9 / Cycle 4 I5).
+async fn lock_images_and_siblings_for_update(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    image_ids: &[i64],
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"SELECT id FROM posts
+           WHERE id IN (SELECT post_id FROM post_images WHERE image_id = ANY($1::BIGINT[]))
+           ORDER BY id FOR NO KEY UPDATE"#,
+    )
+    .bind(image_ids)
+    .execute(&mut **tx)
+    .instrument(tracing::info_span!("lock parent posts"))
+    .await?;
+
+    sqlx::query(
+        r#"SELECT id FROM videos
+           WHERE id IN (
+               SELECT pv.video_id FROM post_videos pv
+               JOIN post_images pi ON pi.post_id = pv.post_id
+               WHERE pi.image_id = ANY($1::BIGINT[])
+           )
+           ORDER BY id FOR NO KEY UPDATE"#,
+    )
+    .bind(image_ids)
+    .execute(&mut **tx)
+    .instrument(tracing::info_span!("lock sibling videos"))
+    .await?;
+
+    sqlx::query(
+        r#"SELECT id FROM images WHERE id = ANY($1::BIGINT[]) ORDER BY id FOR NO KEY UPDATE"#,
+    )
+    .bind(image_ids)
+    .execute(&mut **tx)
+    .instrument(tracing::info_span!("lock target images"))
+    .await?;
+
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1055,6 +1077,7 @@ async fn run_retag_safety(
         }
 
         let mut tx = pool.begin().await?;
+        lock_images_and_siblings_for_update(&mut tx, &batch_ids).await?;
         // Atomically replace all WD-Tagger scores for every retagged image in this batch
         // so stale high scores that now fall below `min_persisted_score` never remain active!
         sqlx::query("DELETE FROM wd_tag_images WHERE image_id = ANY($1::BIGINT[])")

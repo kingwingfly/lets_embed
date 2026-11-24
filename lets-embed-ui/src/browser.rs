@@ -458,6 +458,66 @@ pub fn lock_body_scroll() {
     }
 }
 
+#[cfg(any(test, all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr"))))]
+mod modal_stack {
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        static NEXT_MODAL_ID: Cell<u64> = const { Cell::new(1) };
+        static MODAL_STACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn push() -> u64 {
+        let id = NEXT_MODAL_ID.with(|next| {
+            let cur = next.get();
+            next.set(cur.wrapping_add(1).max(1));
+            cur
+        });
+        MODAL_STACK.with(|stack| stack.borrow_mut().push(id));
+        id
+    }
+
+    pub(super) fn remove(id: u64) {
+        MODAL_STACK.with(|stack| stack.borrow_mut().retain(|&entry| entry != id));
+    }
+
+    pub(super) fn is_top(id: u64) -> bool {
+        MODAL_STACK.with(|stack| stack.borrow().last().copied() == Some(id))
+    }
+}
+
+/// Register a mounted modal dialog on top of the active modal layer stack.
+///
+/// Stacked modals (e.g. `Lightbox` -> `Viewer` -> `ReportDialog`) register bubble-phase
+/// `window` `keydown` listeners in FIFO mount order; checking [`is_top_modal`] ensures only
+/// the topmost modal handles `Escape`, `Tab` focus trapping, and navigation hotkeys
+/// (Cycle 4 I8). Automatically popped on reactive cleanup.
+pub fn push_modal_layer() -> u64 {
+    #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+    {
+        let id = modal_stack::push();
+        on_cleanup(move || modal_stack::remove(id));
+        id
+    }
+    #[cfg(not(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr"))))]
+    {
+        0
+    }
+}
+
+/// Returns `true` when `layer_id` is currently the topmost mounted modal dialog.
+pub fn is_top_modal(layer_id: u64) -> bool {
+    #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+    {
+        modal_stack::is_top(layer_id)
+    }
+    #[cfg(not(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr"))))]
+    {
+        let _ = layer_id;
+        true
+    }
+}
+
 /// True when `target` is inside an editable form field (`input`, `textarea`, `select`, `contenteditable`).
 pub fn is_editable_target(target: Option<web_sys::EventTarget>) -> bool {
     #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
@@ -620,5 +680,37 @@ pub fn read_window_width() -> f64 {
     #[cfg(not(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr"))))]
     {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::modal_stack;
+
+    #[test]
+    fn modal_stack_tracks_topmost_layer_across_nested_and_out_of_order_unmounts() {
+        let lightbox = modal_stack::push();
+        assert!(modal_stack::is_top(lightbox));
+
+        let viewer = modal_stack::push();
+        assert!(!modal_stack::is_top(lightbox));
+        assert!(modal_stack::is_top(viewer));
+
+        let report = modal_stack::push();
+        assert!(!modal_stack::is_top(lightbox));
+        assert!(!modal_stack::is_top(viewer));
+        assert!(modal_stack::is_top(report));
+
+        // Closing middle layer keeps top layer active.
+        modal_stack::remove(viewer);
+        assert!(modal_stack::is_top(report));
+        assert!(!modal_stack::is_top(lightbox));
+
+        // Closing top layer returns control to the underlying lightbox.
+        modal_stack::remove(report);
+        assert!(modal_stack::is_top(lightbox));
+
+        modal_stack::remove(lightbox);
+        assert!(!modal_stack::is_top(lightbox));
     }
 }

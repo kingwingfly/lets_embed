@@ -698,7 +698,15 @@ impl UserAccount {
                 min_created: Option<i64>,
             }
             if let Ok(rows) = db
-                .exec("SELECT MIN(created_at) AS min_created FROM charge_holds", None)
+                .exec(
+                    "SELECT MIN(\
+                        MAX(\
+                            h.created_at,\
+                            COALESCE((SELECT MAX(l.created_at) FROM hold_leases l WHERE l.hold_id = h.hold_id), h.created_at)\
+                        )\
+                     ) AS min_created FROM charge_holds h",
+                    None,
+                )
                 .and_then(|c| c.to_array::<MinRow>())
                 && let Some(min_created) = rows.first().and_then(|r| r.min_created)
             {
@@ -777,8 +785,8 @@ impl UserAccount {
         Ok(db)
     }
 
-    /// Finds an active, unexpired in-flight parent hold that still has at least one live lease
-    /// so concurrent identical requests coalesce via per-participant `hold_leases` (Cycle 3 H1).
+    /// Finds an active in-flight parent hold that still has at least one unexpired lease
+    /// so concurrent identical requests coalesce via per-participant `hold_leases` (Cycle 3 H1 / Cycle 4 I2-I3).
     fn find_in_flight_hold(
         db: &worker::SqlStorage,
         is_guest: bool,
@@ -794,8 +802,8 @@ impl UserAccount {
         let rows: Vec<HoldIdRow> = db
             .exec(
                 "SELECT h.hold_id FROM charge_holds h \
-                 WHERE h.is_guest = ?1 AND h.kind = ?2 AND h.path = ?3 AND h.created_at > ?4 \
-                   AND EXISTS (SELECT 1 FROM hold_leases l WHERE l.hold_id = h.hold_id) \
+                 WHERE h.is_guest = ?1 AND h.kind = ?2 AND h.path = ?3 \
+                   AND EXISTS (SELECT 1 FROM hold_leases l WHERE l.hold_id = h.hold_id AND l.created_at > ?4) \
                  LIMIT 1",
                 vec![guest_flag.into(), kind.into(), path.into(), cutoff.into()],
             )?
@@ -1001,7 +1009,70 @@ impl UserAccount {
         Ok(())
     }
 
-    /// Reclaims and refunds all uncommitted `charge_holds` older than `HOLD_TTL_SECS` (Cycle 2 D-3 / Cycle 3 H4).
+    /// Targeted expiry reclaim for a single `(is_guest, kind, path)` key bypassing the 30s
+    /// `holds_last_purge` throttle, so `eval_free_item` can never observe a stale `free_usage`
+    /// row belonging to an expired uncommitted hold ignored by `find_in_flight_hold` (Cycle 4 I3).
+    async fn reclaim_expired_holds_for_item(
+        &self,
+        db: &worker::SqlStorage,
+        is_guest: bool,
+        kind: &str,
+        path: &str,
+        cutoff: i64,
+    ) -> Result<usize> {
+        let guest_flag: i64 = if is_guest { 1 } else { 0 };
+        db.exec(
+            "DELETE FROM hold_leases WHERE created_at <= ?1 AND hold_id IN (\
+                SELECT hold_id FROM charge_holds \
+                WHERE is_guest = ?2 AND kind = ?3 AND path = ?4 AND created_at <= ?1\
+             )",
+            vec![cutoff.into(), guest_flag.into(), kind.into(), path.into()],
+        )?;
+        #[derive(serde::Deserialize)]
+        struct ExpiredItemHoldRow {
+            hold_id: String,
+            kind: String,
+            source: String,
+            cost: i64,
+            day: i64,
+            path: String,
+            win_start: i64,
+            free_hash_hex: String,
+        }
+        let expired: Vec<ExpiredItemHoldRow> = db
+            .exec(
+                "SELECT h.hold_id, h.kind, h.source, h.cost, h.day, h.path, h.win_start, hex(h.free_hash) AS free_hash_hex \
+                 FROM charge_holds h \
+                 WHERE h.is_guest = ?1 AND h.kind = ?2 AND h.path = ?3 AND h.created_at <= ?4 \
+                   AND NOT EXISTS (SELECT 1 FROM hold_leases l WHERE l.hold_id = h.hold_id)",
+                vec![guest_flag.into(), kind.into(), path.into(), cutoff.into()],
+            )?
+            .to_array()?;
+        let mut reclaimed = 0usize;
+        for row in expired {
+            let free_hash = if row.free_hash_hex.is_empty() {
+                Vec::new()
+            } else {
+                hex::decode(&row.free_hash_hex).unwrap_or_default()
+            };
+            let hold = ChargeHold {
+                kind: row.kind,
+                source: row.source,
+                cost: row.cost,
+                day: row.day,
+                path: row.path,
+                win_start: row.win_start,
+                free_hash,
+            };
+            self.refund_and_delete_hold(db, &row.hold_id, hold, is_guest)
+                .await?;
+            reclaimed += 1;
+        }
+        Ok(reclaimed)
+    }
+
+    /// Reclaims and refunds all uncommitted `charge_holds` older than `HOLD_TTL_SECS` that have
+    /// no remaining live `hold_leases` (Cycle 2 D-3 / Cycle 3 H4 / Cycle 4 I2).
     /// Returns the number of expired holds reclaimed. Updates `holds_last_purge` ONLY after the sweep succeeds.
     async fn reclaim_expired_holds(&self, now: i64, force: bool) -> Result<usize> {
         if !force && now.saturating_sub(self.holds_last_purge.get()) < 30 {
@@ -1009,6 +1080,12 @@ impl UserAccount {
         }
         let db = self.ensure_holds_table()?;
         let cutoff = now.saturating_sub(HOLD_TTL_SECS);
+        // 1. Delete expired leases first so newly attached live leases protect their parent
+        //    hold for their full TTL (Cycle 4 I2).
+        db.exec(
+            "DELETE FROM hold_leases WHERE created_at <= ?1",
+            vec![cutoff.into()],
+        )?;
         #[derive(serde::Deserialize)]
         struct ExpiredHoldRow {
             hold_id: String,
@@ -1021,10 +1098,13 @@ impl UserAccount {
             win_start: i64,
             free_hash_hex: String,
         }
+        // 2. Only reclaim expired parent holds with zero remaining live leases.
         let expired: Vec<ExpiredHoldRow> = db
             .exec(
-                "SELECT hold_id, is_guest, kind, source, cost, day, path, win_start, hex(free_hash) AS free_hash_hex \
-                 FROM charge_holds WHERE created_at <= ?1",
+                "SELECT h.hold_id, h.is_guest, h.kind, h.source, h.cost, h.day, h.path, h.win_start, hex(h.free_hash) AS free_hash_hex \
+                 FROM charge_holds h \
+                 WHERE h.created_at <= ?1 \
+                   AND NOT EXISTS (SELECT 1 FROM hold_leases l WHERE l.hold_id = h.hold_id)",
                 vec![cutoff.into()],
             )?
             .to_array()?;
@@ -1048,10 +1128,6 @@ impl UserAccount {
                 .await?;
             reclaimed += 1;
         }
-        db.exec(
-            "DELETE FROM hold_leases WHERE created_at <= ?1",
-            vec![cutoff.into()],
-        )?;
         self.holds_last_purge.set(now);
         Ok(reclaimed)
     }
@@ -1142,6 +1218,16 @@ impl UserAccount {
         let now = now_secs();
         let _ = self.reclaim_expired_holds(now as i64, false).await;
         if let Some(item) = req.item {
+            let holds_db = self.ensure_holds_table()?;
+            let cutoff = (now as i64).saturating_sub(HOLD_TTL_SECS);
+            self.reclaim_expired_holds_for_item(
+                &holds_db,
+                true,
+                item.kind.name(),
+                &item.path,
+                cutoff,
+            )
+            .await?;
             let limit = policy.item(item.kind).daily_free;
             let in_scope = policy.free_media_in_scope(&item);
             let mut ok = in_scope && self.free_item(&item, limit, now / 86_400, req.head)?;
@@ -1180,6 +1266,16 @@ impl UserAccount {
         }
         let holds_db = self.ensure_holds_table()?;
         let cutoff = (now as i64).saturating_sub(HOLD_TTL_SECS);
+        // Reclaim any expired lease-free hold for this exact item (bypassing the 30s sweep
+        // throttle) so `eval_free_item` never observes an uncommitted `free_usage` row (Cycle 4 I3).
+        self.reclaim_expired_holds_for_item(
+            &holds_db,
+            true,
+            item.kind.name(),
+            &item.path,
+            cutoff,
+        )
+        .await?;
         // Check for an active in-flight guest hold BEFORE `eval_free_item` so concurrent
         // requests for the same path attach their own lease instead of bypassing lease tracking
         // via `FreeOutcome::AlreadyCovered` (Cycle 3 H1).
@@ -1244,20 +1340,20 @@ impl UserAccount {
 
     async fn commit_guest(&self, req: HoldReq) -> Result<Response> {
         let now = now_secs() as i64;
-        let _ = self.reclaim_expired_holds(now, false).await;
         let db = self.ensure_holds_table()?;
-        let Some((parent_hold_id, _)) = Self::resolve_lease_hold_id(&db, &req.hold_id, true)?
-        else {
-            return Response::ok("");
-        };
-        db.exec(
-            "DELETE FROM hold_leases WHERE hold_id = ?1",
-            vec![parent_hold_id.clone().into()],
-        )?;
-        db.exec(
-            "DELETE FROM charge_holds WHERE hold_id = ?1 AND is_guest = 1",
-            vec![parent_hold_id.into()],
-        )?;
+        // Resolve and consume `req.hold_id` BEFORE background expiry reclamation so a
+        // valid commit on the TTL boundary can never self-refund the hold being committed (Cycle 4 I2).
+        if let Some((parent_hold_id, _)) = Self::resolve_lease_hold_id(&db, &req.hold_id, true)? {
+            db.exec(
+                "DELETE FROM hold_leases WHERE hold_id = ?1",
+                vec![parent_hold_id.clone().into()],
+            )?;
+            db.exec(
+                "DELETE FROM charge_holds WHERE hold_id = ?1 AND is_guest = 1",
+                vec![parent_hold_id.into()],
+            )?;
+        }
+        let _ = self.reclaim_expired_holds(now, false).await;
         Response::ok("")
     }
 
@@ -1459,6 +1555,18 @@ impl UserAccount {
             );
         }
 
+        // Reclaim any expired lease-free hold for this exact item (bypassing the 30s sweep
+        // throttle) so `free_item` never observes an uncommitted `free_usage` row (Cycle 4 I3).
+        let holds_db = self.ensure_holds_table()?;
+        self.reclaim_expired_holds_for_item(
+            &holds_db,
+            false,
+            req.kind.name(),
+            &req.path,
+            (now as i64).saturating_sub(HOLD_TTL_SECS),
+        )
+        .await?;
+
         // Evaluate funding; if refused (402), force-reclaim expired holds once and retry
         // before returning 402 so stale holds never cause spurious payment errors (Cycle 3 H4).
         let mut reclaimed_once = false;
@@ -1602,6 +1710,16 @@ impl UserAccount {
         // a refund while a sibling request is still in flight or succeeded (Cycle 3 H1).
         let holds_db = self.ensure_holds_table()?;
         let cutoff = (now as i64).saturating_sub(HOLD_TTL_SECS);
+        // Reclaim any expired lease-free hold for this exact item (bypassing the 30s sweep
+        // throttle) so `eval_free_item` never observes an uncommitted `free_usage` row (Cycle 4 I3).
+        self.reclaim_expired_holds_for_item(
+            &holds_db,
+            false,
+            req.kind.name(),
+            &req.path,
+            cutoff,
+        )
+        .await?;
         if let Some(parent_hold_id) =
             Self::find_in_flight_hold(&holds_db, false, req.kind.name(), &req.path, cutoff)?
         {
@@ -1798,10 +1916,12 @@ impl UserAccount {
 
     async fn commit(&self, req: HoldReq) -> Result<Response> {
         let now = now_secs();
-        let _ = self.reclaim_expired_holds(now as i64, false).await;
         let db = self.ensure_holds_table()?;
+        // Resolve and consume `req.hold_id` BEFORE background expiry reclamation so a
+        // valid commit on the TTL boundary can never self-refund the hold being committed (Cycle 4 I2).
         let Some((parent_hold_id, _)) = Self::resolve_lease_hold_id(&db, &req.hold_id, false)?
         else {
+            let _ = self.reclaim_expired_holds(now as i64, false).await;
             return Response::ok("");
         };
         db.exec(
@@ -1809,6 +1929,7 @@ impl UserAccount {
             vec![parent_hold_id.clone().into()],
         )?;
         let Some(hold) = Self::take_charge_hold(&db, &parent_hold_id, false)? else {
+            let _ = self.reclaim_expired_holds(now as i64, false).await;
             return Response::ok("");
         };
 
@@ -1828,6 +1949,7 @@ impl UserAccount {
             "total_views": total_views,
         }))
         .await?;
+        let _ = self.reclaim_expired_holds(now as i64, false).await;
         Response::ok("")
     }
 
