@@ -203,7 +203,7 @@ function signedLegacySession(principal = wallet, secret = sessionSecret) {
     'base64url'
   );
   const signature = createHmac('sha256', secret).update(payload).digest('base64url');
-  return `ue_session=${payload}.${signature}`;
+  return `__Host-ue_session=${payload}.${signature}`;
 }
 
 function signedSessionV2({ sub = userId, do_key = userDoKey, sid = userSid, secret = sessionSecret } = {}) {
@@ -216,7 +216,7 @@ function signedSessionV2({ sub = userId, do_key = userDoKey, sid = userSid, secr
     .update(Buffer.from('v2.'))
     .update(Buffer.from(payload))
     .digest('base64url');
-  return `ue_session=v2.${payload}.${sig}`;
+  return `__Host-ue_session=v2.${payload}.${sig}`;
 }
 
 function sealPreviewLocator(cap, secret = mediaCapSecret) {
@@ -1077,12 +1077,12 @@ test('Policy v3 gateway enforces HKDF SITE_SECRET, zero implicit admin unlock, f
   assert.equal(revealResp.status, 200);
   assert.equal(revealResp.headers.get('cache-control'), 'private, no-store');
   const guestSetCookie = revealResp.headers.get('set-cookie');
-  assert.match(guestSetCookie, /^le_guest_sid=gs1\./);
+  assert.match(guestSetCookie, /^__Host-le_guest_sid=gs1\./);
   assert.match(guestSetCookie, /HttpOnly/);
   assert.match(guestSetCookie, /SameSite=Lax/);
   assert.match(guestSetCookie, /Secure/);
   const guestCookiePair = guestSetCookie.split(';')[0];
-  const guestClaims = verifyGuestSessionToken(guestCookiePair.slice('le_guest_sid='.length));
+  const guestClaims = verifyGuestSessionToken(guestCookiePair.slice('__Host-le_guest_sid='.length));
   const revealGa = verifyGatewayAssertionV3Header(revealResp.headers.get('x-test-assertion'));
   assert.deepEqual(revealGa.actor, { kind: 'guest_session', gid: guestClaims.gid });
 
@@ -1226,8 +1226,15 @@ test('Policy v3 gateway enforces HKDF SITE_SECRET, zero implicit admin unlock, f
   const userCalls = await getAccountCalls(userDoKey);
   assert.deepEqual(
     userCalls.map((c) => c.op),
-    ['session-context', 'can-charge', 'session-context', 'charge']
+    ['session-context', 'can-charge', 'session-context', 'reserve', 'commit']
   );
+  // Media reserve carries canonical media_path for free_media_folders scope checks (Cycle 2 D-1)
+  assert.equal(userCalls[3].body.path, 'media:image:99');
+  assert.equal(userCalls[3].body.media_path, '/images/2026/01/pic 99.webp');
+
+  // Percent-encoded unreserved paths are rejected before route guards & metering (Cycle 2 D-2)
+  assert.equal((await site('/%69nternal/validate-safety-catalog', { method: 'POST' })).status, 400);
+  assert.equal((await site('/%61pi/search_by_image', { method: 'POST' })).status, 400);
 
   // Preview capability: locked cf.image blur, requires sealed locator (F20), fails closed 502 if transform missing/error, 403 if fixed_blur_enabled=false
   const previewCapClaims = {
@@ -1254,6 +1261,14 @@ test('Policy v3 gateway enforces HKDF SITE_SECRET, zero implicit admin unlock, f
   );
   const previewCap = signMediaCapV3(previewCapClaims);
   assert.ok(!Buffer.from(previewCap.split('.')[1], 'base64url').toString('utf8').includes('blur_42'));
+  // HEAD on /media/preview/* MUST be rejected 405 to prevent unmetered cf.image transforms (Cycle 2 D-7)
+  assert.equal(
+    (await site(`/media/preview/42?cap=${previewCap}`, {
+      method: 'HEAD',
+      headers: { cookie: `${adminViewCookie}; ${guestCookiePair}` },
+    })).status,
+    405
+  );
   const previewOk = await site(`/media/preview/42?cap=${previewCap}&blur=0`, {
     headers: {
       cookie: `${adminViewCookie}; ${guestCookiePair}`,

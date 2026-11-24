@@ -667,13 +667,28 @@ async fn fetch_post_meta(post_id: i64) -> Result<PostMeta, ServerFnError> {
     use search_engine::Engine;
 
     let state = expect_context::<AppState>();
-    let _ctx = RequestSafetyContext::from_leptos_context(&state)?;
+    let ctx = RequestSafetyContext::from_leptos_context(&state)?;
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
-    engine
-        .post_meta(post_id)
-        .await
-        .map_err(|e| ServerFnError::Response(e.to_string()))
+    if ctx.policy.is_enabled() {
+        let has_clear = engine
+            .post_has_any_clear_media(post_id, &ctx.policy, &ctx.caller)
+            .await
+            .map_err(|e| -> ServerFnError {
+                tracing::error!(post_id, "fetch_post_meta safety check failed: {e}");
+                ServerFnError::Response("Failed to load post metadata".to_string())
+            })?;
+        if !has_clear {
+            return Ok(PostMeta {
+                authors: Vec::new(),
+            });
+        }
+    }
+
+    engine.post_meta(post_id).await.map_err(|e| {
+        tracing::error!(post_id, "fetch_post_meta failed: {e}");
+        ServerFnError::Response("Failed to load post metadata".to_string())
+    })
 }
 
 #[cfg(feature = "ssr")]

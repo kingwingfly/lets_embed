@@ -1726,7 +1726,8 @@ fn apply_page_response(resp: SearchResponse, ctx: GalleryLoadCtx) {
 
 #[cfg(feature = "ssr")]
 fn to_server_err(e: impl std::fmt::Display) -> ServerFnError {
-    ServerFnError::Response(e.to_string())
+    tracing::error!("gallery server error: {e}");
+    ServerFnError::Response("Request failed. Please try again.".to_string())
 }
 
 #[cfg(feature = "ssr")]
@@ -1739,7 +1740,8 @@ fn map_search_err(err: anyhow::Error) -> ServerFnError {
             "Seed image is locked under current safety settings".to_string(),
         );
     }
-    ServerFnError::Response(err.to_string())
+    tracing::error!("search server error: {err:#}");
+    ServerFnError::Response("Search failed. Please try again.".to_string())
 }
 
 #[cfg(feature = "ssr")]
@@ -1786,35 +1788,80 @@ async fn hydrate_posts(
     let mut by_id: HashMap<i64, search_engine::PostGalleryCover> =
         covers.into_iter().map(|c| (c.post_id, c)).collect();
 
+    // Withhold post titles whenever safety policy is active and a post has ZERO Clear
+    // media for this caller (mirrors `previews.rs` and `image_details.rs`).
+    let extra_clear_posts = if ctx.policy.is_enabled() {
+        let need_clear_check: Vec<i64> = posts
+            .iter()
+            .filter_map(|post| {
+                let has_clear_cover = by_id.get(&post.id).is_some_and(|c| {
+                    c.cover_image
+                        .as_ref()
+                        .and_then(|im| proj_img_map.get(&im.id))
+                        .is_some_and(ProjectedImage::is_clear)
+                        || c.cover_video
+                            .as_ref()
+                            .and_then(|v| proj_vid_map.get(&v.id))
+                            .is_some_and(ProjectedVideo::is_clear)
+                });
+                (!has_clear_cover).then_some(post.id)
+            })
+            .collect();
+        if need_clear_check.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            engine
+                .posts_with_any_clear_media(&need_clear_check, &ctx.policy, &ctx.caller)
+                .await
+                .map_err(to_server_err)?
+        }
+    } else {
+        std::collections::HashSet::new()
+    };
+
     let mut items = Vec::with_capacity(posts.len());
     for post in posts {
         if let Some(cover) = by_id.remove(&post.id) {
-            let images = cover
+            let images: Vec<ProjectedImage> = cover
                 .cover_image
                 .and_then(|im| proj_img_map.remove(&im.id))
                 .into_iter()
                 .collect();
-            let videos = cover
+            let videos: Vec<ProjectedVideo> = cover
                 .cover_video
                 .and_then(|v| proj_vid_map.remove(&v.id))
                 .into_iter()
                 .collect();
-            items.push(PostItem {
-                id: post.id,
-                title: if post.title.is_empty() {
+            let show_title = !ctx.policy.is_enabled()
+                || images.iter().any(ProjectedImage::is_clear)
+                || videos.iter().any(ProjectedVideo::is_clear)
+                || extra_clear_posts.contains(&post.id);
+            let title = if show_title {
+                if post.title.is_empty() {
                     cover.title
                 } else {
                     post.title
-                },
+                }
+            } else {
+                format!("Restricted Post #{}", post.id)
+            };
+            items.push(PostItem {
+                id: post.id,
+                title,
                 images,
                 videos,
                 image_count: cover.image_count,
                 video_count: cover.video_count,
             });
         } else {
+            let show_title = !ctx.policy.is_enabled() || extra_clear_posts.contains(&post.id);
             items.push(PostItem {
                 id: post.id,
-                title: post.title,
+                title: if show_title {
+                    post.title
+                } else {
+                    format!("Restricted Post #{}", post.id)
+                },
                 images: Vec::new(),
                 videos: Vec::new(),
                 image_count: 0,

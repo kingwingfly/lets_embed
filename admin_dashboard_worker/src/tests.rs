@@ -935,6 +935,10 @@ fn oidc_url_validator_blocks_ssrf_and_accepts_public_https() {
         "https://idp.example.com/oidc?foo=bar",
         "https://idp.example.com/a/../secret",
         "https://idp.example.com/%2e%2e/secret",
+        "https://auth.example.com.",
+        "https://foo.in-addr.arpa/oidc",
+        "https://foo.123/oidc",
+        "https://_bad.example.com/oidc",
     ] {
         assert!(
             validate_oidc_url(bad).is_err(),

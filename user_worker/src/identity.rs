@@ -984,10 +984,10 @@ fn assurance_rank(level: AssuranceLevel) -> u8 {
     }
 }
 
-/// Rotate the caller's session after linking a `purpose == "login"` identity (fixes H8):
-/// revokes the old `active.sid` in `UserAccount` DO and issues a fresh `v2.` session,
-/// upgrading to `Verified18` if the newly linked identity is verified 18+ while never
-/// downgrading an already-verified session.
+/// Rotate the caller's session after linking a `purpose == "login"` identity (fixes H8 / Cycle 2 B-5):
+/// verifies live `session-info`, requires acknowledged DO revocation of the old `active.sid` (503 on
+/// failure), issues a fresh `v2.` session preserving `auth_time` unless freshly verified 18+, and
+/// never misbinds `Verified18`/`strict_age_ok` to a non-OIDC identity on transient DO errors.
 pub async fn rotate_session_on_identity_link(
     st: &AppState,
     cookies: &Cookies,
@@ -997,10 +997,20 @@ pub async fn rotate_session_on_identity_link(
     let cur_info = if let Some(sid) = active.sid.as_deref() {
         let info = do_client::do_session_info(&st.env, &active.do_key, sid)
             .await
-            .ok()
-            .flatten();
-        let _ = do_client::do_session_revoke(&st.env, &active.do_key, sid).await;
-        info
+            .map_err(|e| {
+                worker::console_error!("link session-info failed: {e:?}");
+                api_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "account service unavailable; please retry",
+                )
+            })?;
+        match info {
+            Some(ci) if ci.active => Some(ci),
+            _ => {
+                cookies.add(session::clear_session_cookie());
+                return Err(api_err(StatusCode::UNAUTHORIZED, "session revoked or expired"));
+            }
+        }
     } else {
         None
     };
@@ -1010,46 +1020,56 @@ pub async fn rotate_session_on_identity_link(
         return Err(api_err(StatusCode::UNAUTHORIZED, "account not found"));
     };
 
+    if let Some(sid) = active.sid.as_deref() {
+        do_client::do_session_revoke(&st.env, &active.do_key, sid)
+            .await
+            .map_err(|e| {
+                worker::console_error!("link session-revoke failed: {e:?}");
+                api_err(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "could not rotate session cleanly; please retry",
+                )
+            })?;
+    }
+
     let now = session::now_secs();
     let linked_strict = linked_ident.is_strict_age_verified(now);
-    let (auth_method, identity_key, assurance_level, strict_age_ok) = if linked_strict {
-        (
-            linked_ident.provider_id.as_str().to_string(),
-            linked_ident.identity_key(),
-            AssuranceLevel::Verified18,
-            true,
-        )
-    } else if let Some(ci) = cur_info.filter(|i| i.active) {
-        let best_assurance = if assurance_rank(linked_ident.assurance_level)
-            > assurance_rank(ci.assurance_level)
-        {
-            linked_ident.assurance_level
+    let (auth_method, identity_key, assurance_level, strict_age_ok, preserved_auth_time) =
+        if linked_strict {
+            (
+                linked_ident.provider_id.as_str().to_string(),
+                linked_ident.identity_key(),
+                AssuranceLevel::Verified18,
+                true,
+                None,
+            )
+        } else if let Some(ci) = cur_info {
+            let best_assurance = if assurance_rank(linked_ident.assurance_level)
+                > assurance_rank(ci.assurance_level)
+            {
+                linked_ident.assurance_level
+            } else {
+                ci.assurance_level
+            };
+            (
+                ci.auth_method,
+                ci.identity_key,
+                best_assurance,
+                ci.strict_age_ok && best_assurance == AssuranceLevel::Verified18,
+                Some(ci.created_at),
+            )
         } else {
-            ci.assurance_level
+            // Legacy cutover cookie (`sid: None`) has no `strict_age_ok` OIDC provenance.
+            (
+                linked_ident.provider_id.as_str().to_string(),
+                linked_ident.identity_key(),
+                linked_ident.assurance_level,
+                false,
+                None,
+            )
         };
-        (
-            ci.auth_method,
-            ci.identity_key,
-            best_assurance,
-            ci.strict_age_ok && best_assurance == AssuranceLevel::Verified18,
-        )
-    } else {
-        let best_assurance = if assurance_rank(linked_ident.assurance_level)
-            > assurance_rank(active.ctx.assurance_level)
-        {
-            linked_ident.assurance_level
-        } else {
-            active.ctx.assurance_level
-        };
-        (
-            linked_ident.provider_id.as_str().to_string(),
-            linked_ident.identity_key(),
-            best_assurance,
-            active.ctx.strict_age_ok && best_assurance == AssuranceLevel::Verified18,
-        )
-    };
 
-    issue_v2_session(
+    issue_v2_session_with_auth_time(
         st,
         cookies,
         &account,
@@ -1057,6 +1077,7 @@ pub async fn rotate_session_on_identity_link(
         &identity_key,
         assurance_level,
         strict_age_ok,
+        preserved_auth_time,
     )
     .await?;
     Ok(())
@@ -1082,13 +1103,20 @@ pub async fn unlink_identity(
     }) else {
         // Retryable revocation path (F10): if an earlier unlink deleted the D1 row
         // and then failed to reach `UserAccount` DO, repeating the unlink completes
-        // revoking any lingering active sessions bound to `unlinked_key` instead of 404!
+        // revoking any lingering active sessions bound to `unlinked_key` atomically!
+        let is_oidc_strict = provider_id == AuthProviderId::OidcAgeAssurance.as_str();
         let rev = do_client::do_session_revoke_all(
             &st.env,
             &active.do_key,
             &SessionRevokeAllReq {
                 identity_key: Some(unlinked_key.clone()),
-                strict_only: false,
+                strict_only: is_oidc_strict,
+                revoke_sid: if is_oidc_strict {
+                    active.sid.clone()
+                } else {
+                    None
+                },
+                invalidate_legacy: subject == active.do_key,
             },
         )
         .await
@@ -1099,27 +1127,7 @@ pub async fn unlink_identity(
                 "could not revoke sessions for unlinked identity; please retry",
             )
         })?;
-        let mut revoked_any = rev.revoked > 0;
-        if provider_id == AuthProviderId::OidcAgeAssurance.as_str() {
-            let strict_rev = do_client::do_session_revoke_all(
-                &st.env,
-                &active.do_key,
-                &SessionRevokeAllReq {
-                    identity_key: None,
-                    strict_only: true,
-                },
-            )
-            .await
-            .map_err(|e| {
-                worker::console_error!("unlink retry DO strict revoke failed: {e:?}");
-                api_err(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "could not revoke strict sessions for unlinked identity; please retry",
-                )
-            })?;
-            revoked_any |= strict_rev.revoked > 0;
-        }
-        if revoked_any {
+        if rev.revoked > 0 {
             if let Some(sid) = active.sid.as_deref()
                 && do_client::do_session_info(&st.env, &active.do_key, sid)
                     .await
@@ -1214,19 +1222,41 @@ pub async fn unlink_identity(
         let _ = stmt.run().await;
     }
 
-    // Require acknowledged DO revocation of ALL sessions bound to an unlinked `login` identity (F10).
-    if target.purpose == "login" {
+    let needs_rotation = unlink_requires_strict_revocation(
+        target.assurance_level,
+        &unlinked_key,
+        cur_info.as_ref().map(|i| i.identity_key.as_str()),
+    );
+    let revoke_identity_key = (target.purpose == "login").then(|| unlinked_key.clone());
+    let revoke_strict = needs_rotation && target.assurance_level == AssuranceLevel::Verified18;
+    let revoke_caller_sid = if needs_rotation {
+        active.sid.clone()
+    } else {
+        None
+    };
+    let invalidate_legacy = target.purpose == "login" && subject == active.do_key;
+
+    // Perform ALL required DO session revocations (bound identity, strict 18+, caller's
+    // active sid on rotation, and legacy cutover cookies when unlinking the legacy wallet)
+    // in ONE atomic DO RPC (Cycle 2 B-2 / F10).
+    if revoke_identity_key.is_some()
+        || revoke_strict
+        || revoke_caller_sid.is_some()
+        || invalidate_legacy
+    {
         do_client::do_session_revoke_all(
             &st.env,
             &active.do_key,
             &SessionRevokeAllReq {
-                identity_key: Some(unlinked_key.clone()),
-                strict_only: false,
+                identity_key: revoke_identity_key,
+                strict_only: revoke_strict,
+                revoke_sid: revoke_caller_sid,
+                invalidate_legacy,
             },
         )
         .await
         .map_err(|e| {
-            worker::console_error!("unlink DO revoke_all failed: {e:?}");
+            worker::console_error!("unlink DO atomic revoke failed: {e:?}");
             api_err(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "identity removed, but session revocation failed; retry the unlink to complete revocation",
@@ -1234,35 +1264,10 @@ pub async fn unlink_identity(
         })?;
     }
 
-    let needs_rotation = unlink_requires_strict_revocation(
-        target.assurance_level,
-        &unlinked_key,
-        cur_info.as_ref().map(|i| i.identity_key.as_str()),
-    );
-
     if needs_rotation {
-        // Require acknowledged strict-session revocation if a verified 18+ identity was removed (F10).
-        if target.assurance_level == AssuranceLevel::Verified18 {
-            do_client::do_session_revoke_all(
-                &st.env,
-                &active.do_key,
-                &SessionRevokeAllReq {
-                    identity_key: None,
-                    strict_only: true,
-                },
-            )
-            .await
-            .map_err(|e| {
-                worker::console_error!("unlink DO strict revoke_all failed: {e:?}");
-                api_err(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "identity removed, but strict session revocation failed; retry to complete revocation",
-                )
-            })?;
-        }
-
         // Rotate the caller's session ONLY onto a remaining login identity permitted by live
-        // SitePolicyDO, strictly capped at caller's previous session assurance (F6)!
+        // SitePolicyDO, strictly capped at caller's previous session assurance (F6), and
+        // preserving original `auth_time` so unlinking never refreshes recent-auth (Cycle 2 B-2)!
         let now = session::now_secs();
         let remaining_login: Vec<&IdentityView> = identities
             .iter()
@@ -1278,6 +1283,7 @@ pub async fn unlink_identity(
             Some(ci) => (ci.assurance_level, ci.strict_age_ok),
             None => (active.ctx.assurance_level, active.ctx.strict_age_ok),
         };
+        let preserved_auth_time = cur_info.as_ref().map(|ci| ci.created_at);
 
         let live_policy = crate::policy_do::load_site_policy(&st.env)
             .await
@@ -1298,7 +1304,7 @@ pub async fn unlink_identity(
                 "{}|{}|{}",
                 fallback.provider_id, fallback.issuer, fallback.subject
             );
-            if issue_v2_session(
+            if issue_v2_session_with_auth_time(
                 st,
                 cookies,
                 &account,
@@ -1306,6 +1312,7 @@ pub async fn unlink_identity(
                 &fallback_key,
                 eff_assurance,
                 fallback_strict,
+                preserved_auth_time,
             )
             .await
             .is_err()
@@ -1322,10 +1329,17 @@ pub async fn unlink_identity(
 }
 
 /// Find the user's linked Ethereum wallet address (login OR payment purpose) for ETH/ERC-20 top-ups.
+/// For migrated `users_v2` accounts, `user_identities` is authoritative so unlinked legacy wallets
+/// can NEVER steal another user's deposits (Cycle 2 B-1).
 pub async fn linked_eth_wallet(st: &AppState, user_id: &str) -> worker::Result<Option<String>> {
     #[derive(Deserialize)]
     struct Row {
         subject: String,
+    }
+    #[derive(Deserialize)]
+    struct ExistsRow {
+        #[allow(dead_code)]
+        found: i64,
     }
     let db = st.env.d1(crate::D1_BINDING)?;
     let row = db
@@ -1340,17 +1354,42 @@ pub async fn linked_eth_wallet(st: &AppState, user_id: &str) -> worker::Result<O
     if let Some(r) = row {
         return Ok(Some(r.subject));
     }
+    // Migrated `users_v2` accounts must have an active `user_identities` row.
+    let in_v2 = db
+        .prepare("SELECT 1 AS found FROM users_v2 WHERE id = ?1 LIMIT 1")
+        .bind(&[user_id.into()])?
+        .first::<ExistsRow>(None)
+        .await?
+        .is_some();
+    if in_v2 {
+        return Ok(None);
+    }
     if session::is_eth_address(user_id) {
-        return Ok(Some(user_id.to_string()));
+        let claimed = db
+            .prepare("SELECT 1 AS found FROM user_identities WHERE provider_id = 'siwe' AND subject = ?1 LIMIT 1")
+            .bind(&[user_id.into()])?
+            .first::<ExistsRow>(None)
+            .await?
+            .is_some();
+        if !claimed {
+            return Ok(Some(user_id.to_string()));
+        }
     }
     Ok(None)
 }
 
 /// Find the user's linked Solana wallet address (login OR payment purpose) for SOL/SPL top-ups.
+/// For migrated `users_v2` accounts, `user_identities` is authoritative so unlinked legacy wallets
+/// can NEVER steal another user's deposits (Cycle 2 B-1).
 pub async fn linked_solana_wallet(st: &AppState, user_id: &str) -> worker::Result<Option<String>> {
     #[derive(Deserialize)]
     struct Row {
         subject: String,
+    }
+    #[derive(Deserialize)]
+    struct ExistsRow {
+        #[allow(dead_code)]
+        found: i64,
     }
     let db = st.env.d1(crate::D1_BINDING)?;
     let row = db
@@ -1365,11 +1404,33 @@ pub async fn linked_solana_wallet(st: &AppState, user_id: &str) -> worker::Resul
     if let Some(r) = row {
         return Ok(Some(r.subject));
     }
-    if session::is_sol_principal(user_id) {
-        return Ok(Some(user_id.to_string()));
+    // Migrated `users_v2` accounts must have an active `user_identities` row.
+    let in_v2 = db
+        .prepare("SELECT 1 AS found FROM users_v2 WHERE id = ?1 LIMIT 1")
+        .bind(&[user_id.into()])?
+        .first::<ExistsRow>(None)
+        .await?
+        .is_some();
+    if in_v2 {
+        return Ok(None);
     }
-    // Backwards compatibility with legacy `users.solana_address`
-    crate::solana_link::linked_address(&st.env, user_id).await
+    let legacy_candidate = if session::is_sol_principal(user_id) {
+        Some(user_id.to_string())
+    } else {
+        crate::solana_link::linked_address(&st.env, user_id).await?
+    };
+    if let Some(addr) = legacy_candidate {
+        let claimed = db
+            .prepare("SELECT 1 AS found FROM user_identities WHERE provider_id = 'siws' AND subject = ?1 LIMIT 1")
+            .bind(&[addr.as_str().into()])?
+            .first::<ExistsRow>(None)
+            .await?
+            .is_some();
+        if !claimed {
+            return Ok(Some(addr));
+        }
+    }
+    Ok(None)
 }
 
 fn opt_str_js(v: Option<&str>) -> JsValue {

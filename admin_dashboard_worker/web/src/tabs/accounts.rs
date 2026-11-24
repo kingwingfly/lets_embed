@@ -75,6 +75,7 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
         spawn_local(async move {
             match get_json::<AccountsListResp>(&url).await {
                 Ok(resp) => {
+                    page.set(resp.page.max(1));
                     if let Some(sel) = resp.selected.clone() {
                         selected_account.set(Some(sel));
                     }
@@ -386,12 +387,25 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
 
                 {move || accounts_data.get().map(|data| {
                     let page_size = data.page_size.max(1);
-                    let total_pages = data.total.div_ceil(page_size).max(1);
-                    let cur_page = page.get().min(total_pages);
+                    let effective_total = if data.live_sort_capped && data.live_sort_scan_limit > 0 {
+                        data.total.min(data.live_sort_scan_limit)
+                    } else {
+                        data.total
+                    };
+                    let total_pages = effective_total.div_ceil(page_size).max(1);
+                    let cur_page = data.page.clamp(1, total_pages);
+                    let caption = if data.live_sort_capped {
+                        format!(
+                            "Page {cur_page} of {total_pages} · showing top {} most recently active of {} matching accounts (narrow filters to inspect others)",
+                            effective_total, data.total
+                        )
+                    } else {
+                        format!("Page {cur_page} of {total_pages} · {} matching accounts", data.total)
+                    };
                     view! {
                         <div class="adm-row" style="justify-content: space-between; align-items: center; margin-top: 12px;">
                             <span class="adm-sub">
-                                {format!("Page {cur_page} of {total_pages} · {} matching accounts", data.total)}
+                                {caption}
                             </span>
                             <div class="adm-row" style="gap: 8px;">
                                 <button

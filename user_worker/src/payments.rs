@@ -619,10 +619,19 @@ async fn topup_solana(st: &AppState, deposit: &Deposit<'_>) -> Response {
             .await;
     };
 
-    if spec.feed.is_some()
-        && let Err(response) = verify_ethereum_network(st).await
-    {
-        return response;
+    if spec.feed.is_some() {
+        if !is_feed_tx_within_claim_window(timestamp, crate::session::now_secs()) {
+            return deposit
+                .reject_with_amount(
+                    &st.env,
+                    Some(amount),
+                    "volatile token deposit is older than 24 hours; contact support for historical rate reconciliation",
+                )
+                .await;
+        }
+        if let Err(response) = verify_ethereum_network(st).await {
+            return response;
+        }
     }
     let price = match resolve_price(st, spec).await {
         Ok(p) => p,
@@ -652,6 +661,12 @@ async fn deposit_terms_candidates(
             ))
         }
     }
+}
+
+const MAX_FEED_TX_AGE_SECS: u64 = 24 * 3600;
+
+fn is_feed_tx_within_claim_window(block_timestamp: u64, now: u64) -> bool {
+    now.saturating_sub(block_timestamp) <= MAX_FEED_TX_AGE_SECS
 }
 
 /// Native ETH and ERC-20 share the same sender, receipt, confirmation and block-time checks.
@@ -798,6 +813,18 @@ async fn topup_ethereum(st: &AppState, deposit: &Deposit<'_>) -> Response {
     let Some((policy, amount)) = matched else {
         return deposit.reject(&st.env, first_err).await;
     };
+
+    if spec.feed.is_some()
+        && !is_feed_tx_within_claim_window(timestamp, crate::session::now_secs())
+    {
+        return deposit
+            .reject_with_amount(
+                &st.env,
+                Some(amount),
+                "volatile token deposit is older than 24 hours; contact support for historical rate reconciliation",
+            )
+            .await;
+    }
 
     let price = match resolve_price(st, spec).await {
         Ok(p) => p,

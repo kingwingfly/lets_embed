@@ -343,26 +343,10 @@ pub async fn save_providers(
         .into_response();
     }
 
-    // Phase 1: Commit strictly non-secret provider config via D1 CAS (`pending_do_ack`).
-    loaded.doc.public.enabled_providers = public_configs.clone();
-    let (new_rev, stored_public, digest) =
-        match LoadedSettings::save_d1_cas_pending(&st.env, req.revision, &loaded.doc, editor).await
-        {
-            Ok(Some(res)) => res,
-            Ok(None) => {
-                return conflict(
-                    "Settings were updated concurrently. Reload the dashboard and reapply your changes.",
-                );
-            }
-            Err(e) => {
-                worker::console_error!("save provider config failed: {e:?}");
-                return internal_error();
-            }
-        };
-
-    // Stage write-only encrypted secrets in revision-scoped `provider_secret_versions` at
-    // `policy_rev = new_rev` BEFORE Phase-2 activation so live traffic on the previous active
-    // revision NEVER combines the old endpoint with the new secret (F11)!
+    // Phase 1: Stage write-only encrypted secrets in revision-scoped `provider_secret_versions`
+    // at `policy_rev = target_rev` AND commit `site_settings` inside ONE single atomic D1 batch
+    // transaction BEFORE Phase-2 activation (F11 + Cycle 2 C-1).
+    let target_rev = req.revision.saturating_add(1);
     let db = match st.env.d1(D1_BINDING) {
         Ok(db) => db,
         Err(e) => {
@@ -381,17 +365,10 @@ pub async fn save_providers(
                 .prepare(
                     "INSERT INTO provider_secret_versions \
                        (policy_rev, provider_id, field_name, kid, nonce, ciphertext, deleted, updated_at, updated_by) \
-                     VALUES (?, ?, ?, '', X'', X'', 1, unixepoch(), ?) \
-                     ON CONFLICT(policy_rev, provider_id, field_name) DO UPDATE SET \
-                       kid = '', \
-                       nonce = X'', \
-                       ciphertext = X'', \
-                       deleted = 1, \
-                       updated_at = excluded.updated_at, \
-                       updated_by = excluded.updated_by",
+                     VALUES (?, ?, ?, '', X'', X'', 1, unixepoch(), ?)",
                 )
                 .bind(&[
-                    (new_rev as f64).into(),
+                    (target_rev as f64).into(),
                     provider.into(),
                     field.into(),
                     editor.into(),
@@ -417,17 +394,10 @@ pub async fn save_providers(
                     .prepare(
                         "INSERT INTO provider_secret_versions \
                            (policy_rev, provider_id, field_name, kid, nonce, ciphertext, deleted, updated_at, updated_by) \
-                         VALUES (?, ?, ?, ?, ?, ?, 0, unixepoch(), ?) \
-                         ON CONFLICT(policy_rev, provider_id, field_name) DO UPDATE SET \
-                           kid = excluded.kid, \
-                           nonce = excluded.nonce, \
-                           ciphertext = excluded.ciphertext, \
-                           deleted = 0, \
-                           updated_at = excluded.updated_at, \
-                           updated_by = excluded.updated_by",
+                         VALUES (?, ?, ?, ?, ?, ?, 0, unixepoch(), ?)",
                     )
                     .bind(&[
-                        (new_rev as f64).into(),
+                        (target_rev as f64).into(),
                         provider.into(),
                         field.into(),
                         enc.kid.as_str().into(),
@@ -449,12 +419,27 @@ pub async fn save_providers(
         }
     }
 
-    if !secret_writes.is_empty()
-        && let Err(e) = db.batch(secret_writes).await
+    loaded.doc.public.enabled_providers = public_configs.clone();
+    let (new_rev, stored_public, digest) = match LoadedSettings::save_d1_cas_pending_with_writes(
+        &st.env,
+        req.revision,
+        &loaded.doc,
+        editor,
+        secret_writes,
+    )
+    .await
     {
-        worker::console_error!("write provider_secret_versions batch failed: {e:?}");
-        return internal_error();
-    }
+        Ok(Some(res)) => res,
+        Ok(None) => {
+            return conflict(
+                "Settings were updated concurrently. Reload the dashboard and reapply your changes.",
+            );
+        }
+        Err(e) => {
+            worker::console_error!("atomic save provider config + secrets failed: {e:?}");
+            return internal_error();
+        }
+    };
 
     // Phase 2: Activate on SitePolicyDO ONLY AFTER both D1 CAS and staged secrets succeed.
     match LoadedSettings::activate_saved_revision(&st.env, &stored_public, &digest).await {
@@ -531,6 +516,56 @@ pub async fn rotate_secrets(
             return internal_error();
         }
     };
+
+    // Prune aged superseded/tombstoned historical rows BEFORE re-encrypting so retired keys
+    // and cleared secrets never cause permanent rotation failures or remain in D1 indefinitely (Cycle 2 C-2).
+    #[derive(Deserialize)]
+    struct ActiveRevRow {
+        rev: i64,
+    }
+    let active_rev = match db
+        .prepare(
+            "SELECT COALESCE(MAX(revision), 0) AS rev \
+             FROM site_settings WHERE activation_status = 'active'",
+        )
+        .first::<ActiveRevRow>(None)
+        .await
+    {
+        Ok(r) => r.map_or(0, |row| row.rev.max(0) as u64),
+        Err(e) => {
+            worker::console_error!("query active policy rev for rotation failed: {e:?}");
+            return internal_error();
+        }
+    };
+
+    if let (Ok(prune_ver), Ok(prune_legacy)) = (
+        db.prepare(
+            "DELETE FROM provider_secret_versions \
+             WHERE policy_rev < ( \
+               SELECT MAX(v2.policy_rev) \
+               FROM provider_secret_versions v2 \
+               WHERE v2.provider_id = provider_secret_versions.provider_id \
+                 AND v2.field_name = provider_secret_versions.field_name \
+                 AND v2.policy_rev <= ?1 \
+                 AND v2.updated_at <= unixepoch() - 120 \
+             )",
+        )
+        .bind(&[(active_rev as f64).into()]),
+        db.prepare(
+            "DELETE FROM provider_secrets \
+             WHERE EXISTS ( \
+               SELECT 1 FROM provider_secret_versions v \
+               WHERE v.provider_id = provider_secrets.provider_id \
+                 AND v.field_name = provider_secrets.field_name \
+                 AND v.policy_rev <= ?1 \
+                 AND v.updated_at <= unixepoch() - 120 \
+             )",
+        )
+        .bind(&[(active_rev as f64).into()]),
+    ) && let Err(e) = db.batch(vec![prune_ver, prune_legacy]).await
+    {
+        worker::console_warn!("prune superseded secret rows warning: {e:?}");
+    }
 
     let rows = match db
         .prepare(

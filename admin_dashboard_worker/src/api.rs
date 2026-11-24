@@ -215,6 +215,10 @@ pub struct AccountsListResp {
     pub total: usize,
     pub page: usize,
     pub page_size: usize,
+    #[serde(default)]
+    pub live_sort_capped: bool,
+    #[serde(default)]
+    pub live_sort_scan_limit: usize,
     pub accounts: Vec<AccountEntryResp>,
     pub selected: Option<AccountEntryResp>,
 }

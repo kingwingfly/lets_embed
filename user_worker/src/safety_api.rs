@@ -1276,6 +1276,9 @@ pub async fn identity_unlink(
         Ok(a) => a,
         Err(r) => return r,
     };
+    if let Err(r) = identity::require_recent_auth(&st, &active).await {
+        return r;
+    }
     match identity::unlink_identity(
         &st,
         &cookies,

@@ -752,28 +752,42 @@ async fn record(
                     .instrument(tracing::info_span!("acquire connection"))
                     .await?;
 
-                // each statement is a round trip: skip those with nothing to write
-                if !tag_names.is_empty() {
-                    // tags first, then associations in a separate statement: a concurrent writer
-                    // (another write here, or another node) may insert the same new tag, in which
-                    // case `DO NOTHING` returns no row and a join in the same statement couldn't
-                    // see the winner's row in its snapshot; the next statement's snapshot does
-                    sqlx::query!(
-                        r#"
+                // Wrap tag replacement, embedding persistence, status='completed', and
+                // WD coverage metadata inside a single transaction so partial failures
+                // can never strand images as completed with NULL coverage (Cycle 2 A-5).
+                if !completed_ids.is_empty() {
+                    use sqlx::Connection as _;
+
+                    let mut tx = conn
+                        .begin()
+                        .instrument(tracing::info_span!("begin record transaction"))
+                        .await?;
+
+                    sqlx::query(
+                        r#"DELETE FROM wd_tag_images WHERE image_id = ANY($1::BIGINT[])"#,
+                    )
+                    .bind(&completed_ids)
+                    .execute(&mut *tx)
+                    .instrument(tracing::info_span!("clear stale wd_tag_images"))
+                    .await?;
+
+                    if !tag_names.is_empty() {
+                        sqlx::query!(
+                            r#"
             INSERT INTO wd_tags (name)
             SELECT DISTINCT name FROM unnest($1::TEXT[]) AS _(name)
             WHERE trim(name) != ''
             ORDER BY name
             ON CONFLICT DO NOTHING
         "#,
-                        &tag_names as _
-                    )
-                    .execute(&mut *conn)
-                    .instrument(tracing::info_span!("insert wd_tags"))
-                    .await?;
+                            &tag_names as _
+                        )
+                        .execute(&mut *tx)
+                        .instrument(tracing::info_span!("insert wd_tags"))
+                        .await?;
 
-                    sqlx::query!(
-                        r#"
+                        sqlx::query!(
+                            r#"
             INSERT INTO wd_tag_images (wd_tag_id, image_id, score)
             SELECT wt.id, i.id, i.score
             FROM unnest($1::BIGINT[], $2::TEXT[], $3::REAL[]) AS i(id, name, score)
@@ -781,53 +795,43 @@ async fn record(
             ON CONFLICT (wd_tag_id, image_id) DO UPDATE
             SET score = EXCLUDED.score
         "#,
-                        &wd_ids,
-                        &tag_names as _,
-                        &scores
-                    )
-                    .execute(&mut *conn)
-                    .instrument(tracing::info_span!("upsert wd_tag_images"))
-                    .await?;
-                }
+                            &wd_ids,
+                            &tag_names as _,
+                            &scores
+                        )
+                        .execute(&mut *tx)
+                        .instrument(tracing::info_span!("upsert wd_tag_images"))
+                        .await?;
+                    }
 
-                if !completed_ids.is_empty() {
-                    // embeddings and status in one statement: every `UPDATE images` changes an
-                    // indexed column, so it can't be a HOT update and adds the new row version to
-                    // every index on `images`, both HNSW indexes included
-                    sqlx::query!(
+                    // Embeddings, status='completed', and Policy v3 tag coverage in ONE
+                    // single UPDATE so `images` writes only one row version per batch
+                    // (avoiding double HNSW writes and double facts_rev triggers).
+                    sqlx::query(
                         r#"
             UPDATE images
             SET dinov3_embedding = embeddings.dinov3_embedding,
                 clip_embedding = embeddings.clip_embedding,
-                status = 'completed'::process_status
+                status = 'completed'::process_status,
+                wd_min_persisted_score = $4,
+                wd_vocab_digest = $5
             FROM unnest($1::BIGINT[], $2::halfvec[], $3::halfvec[])
                 AS embeddings(id, dinov3_embedding, clip_embedding)
             WHERE embeddings.id = images.id
         "#,
-                        &completed_ids,
-                        &dino_embeddings as _,
-                        &clip_embeddings as _
-                    )
-                    .execute(&mut *conn)
-                    .instrument(tracing::info_span!("complete images"))
-                    .await?;
-
-                    // Policy v3 tag coverage metadata persisted via runtime query so `.sqlx/`
-                    // offline cache for existing `sqlx::query!` statements remains untouched.
-                    sqlx::query(
-                        r#"
-            UPDATE images
-            SET wd_min_persisted_score = $2,
-                wd_vocab_digest = $3
-            WHERE id = ANY($1::BIGINT[])
-        "#,
                     )
                     .bind(&completed_ids)
+                    .bind(&dino_embeddings)
+                    .bind(&clip_embeddings)
                     .bind(min_persisted_score)
                     .bind(vocab_digest.as_str())
-                    .execute(&mut *conn)
-                    .instrument(tracing::info_span!("record wd coverage"))
+                    .execute(&mut *tx)
+                    .instrument(tracing::info_span!("complete images with wd coverage"))
                     .await?;
+
+                    tx.commit()
+                        .instrument(tracing::info_span!("commit record transaction"))
+                        .await?;
                 }
 
                 if !failed_ids.is_empty() {

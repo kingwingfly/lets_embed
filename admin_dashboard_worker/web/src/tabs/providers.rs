@@ -19,7 +19,7 @@ use crate::{
         SaveProvidersResp, copy_text_to_clipboard, format_ts_utc, get_json, post_json,
         post_json_activatable,
     },
-    drafts::{EditableProvider, use_admin_drafts},
+    drafts::use_admin_drafts,
 };
 
 fn has_oauth_callback(id: AuthProviderId) -> bool {
@@ -322,11 +322,12 @@ pub fn ProvidersTab(
         }
         saving.set(true);
 
+        let age_policy = draft.age_policy.get_untracked();
         let providers: Vec<ProviderUpdateItem> = draft
             .rows
             .get_untracked()
             .iter()
-            .map(EditableProvider::to_update)
+            .map(|row| row.to_update(age_policy))
             .collect();
         let req = SaveProvidersReq {
             revision: draft.revision.get_untracked(),
@@ -651,7 +652,10 @@ pub fn ProvidersTab(
 
                                 {(id == AuthProviderId::Google).then(|| view! {
                                     <ToggleSwitch
-                                        checked=Signal::derive(move || prov.soft_birthday_check.get())
+                                        checked=Signal::derive(move || {
+                                            prov.soft_birthday_check.get()
+                                                && draft.age_policy.get() == AgeVerificationPolicy::SelfAttestation
+                                        })
                                         on_change=Callback::new(move |v| {
                                             prov.soft_birthday_check.set(v);
                                             draft.dirty.set(true);

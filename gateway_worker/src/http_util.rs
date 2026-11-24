@@ -10,8 +10,8 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
 };
 use site_access::{
-    ADMIN_VIEW_COOKIE, ChargeKind, ChargeReq, GUEST_SESSION_COOKIE, STRIPPED_ORIGIN_COOKIES,
-    UPGRADE_PATH, is_privileged_request_header,
+    ADMIN_VIEW_COOKIE, ChargeKind, ChargeReq, GUEST_SESSION_COOKIE, LEGACY_GUEST_SESSION_COOKIE,
+    LEGACY_SESSION_COOKIE, STRIPPED_ORIGIN_COOKIES, UPGRADE_PATH, is_privileged_request_header,
 };
 use worker::{Env, Result};
 
@@ -257,8 +257,38 @@ pub(crate) fn sanitize_origin_cookie(headers: &HeaderMap) -> Option<String> {
     (!kept.is_empty()).then(|| kept.join("; "))
 }
 
+/// Strict single-occurrence cookie extractor: detects duplicate cookie names across
+/// all `Cookie` headers so subdomain cookie tossing cannot silently shadow a host cookie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CookieLookup<'a> {
+    Missing,
+    Single(&'a str),
+    Duplicate,
+}
+
+pub(crate) fn extract_single_cookie<'a>(headers: &'a HeaderMap, target: &str) -> CookieLookup<'a> {
+    let mut found: Option<&'a str> = None;
+    for raw in headers.get_all("cookie").iter().filter_map(|v| v.to_str().ok()) {
+        for pair in raw.split(';').map(str::trim).filter(|c| !c.is_empty()) {
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+            if name.trim() == target {
+                if found.is_some() {
+                    return CookieLookup::Duplicate;
+                }
+                found = Some(value.trim());
+            }
+        }
+    }
+    match found {
+        Some(v) => CookieLookup::Single(v),
+        None => CookieLookup::Missing,
+    }
+}
+
 /// Strips admin, Cloudflare Access, and guest-reveal cookies before forwarding to
-/// `USER_WORKER` while preserving `ue_session` and `__Host-auth_tx`.
+/// `USER_WORKER` while preserving `__Host-ue_session` and `__Host-auth_tx`.
 pub(crate) fn sanitize_user_worker_cookie(headers: &HeaderMap) -> Option<String> {
     let mut kept = Vec::new();
     for raw in headers.get_all("cookie").iter().filter_map(|v| v.to_str().ok()) {
@@ -266,6 +296,8 @@ pub(crate) fn sanitize_user_worker_cookie(headers: &HeaderMap) -> Option<String>
             let name = cookie.split('=').next().unwrap_or("").trim();
             if name != ADMIN_VIEW_COOKIE
                 && name != GUEST_SESSION_COOKIE
+                && name != LEGACY_GUEST_SESSION_COOKIE
+                && name != LEGACY_SESSION_COOKIE
                 && name != "CF_Authorization"
             {
                 kept.push(cookie);
@@ -280,16 +312,21 @@ pub(crate) fn sanitize_user_worker_cookie(headers: &HeaderMap) -> Option<String>
 pub(crate) fn should_strip_api_request_header(name: &str) -> bool {
     is_hop_by_hop(name)
         || name.eq_ignore_ascii_case("cookie")
+        || name.eq_ignore_ascii_case("authorization")
         || name.eq_ignore_ascii_case("x-forwarded-host")
         || name.eq_ignore_ascii_case("x-forwarded-proto")
         || name.eq_ignore_ascii_case("forwarded")
         || name.eq_ignore_ascii_case("cf-ipcountry")
         || name.eq_ignore_ascii_case("x-internal-api-secret")
+        || name.eq_ignore_ascii_case("x-internal-secret")
         || is_privileged_request_header(name)
 }
 
 /// Percent-decode a single RFC 3986 path segment into raw bytes (preserving `+`
-/// literally). Malformed `%` escapes return `None`.
+/// literally). Rejects malformed `%` escapes, lowercase hex digits, double-encoding
+/// (`%25`), control/NUL bytes, path delimiters, and percent-encoded RFC 3986 unreserved
+/// ASCII characters (so proxies normalizing `/%61pi/...` -> `/api/...` can never bypass
+/// gateway route guards or metering).
 pub(crate) fn percent_decode_segment_bytes(seg: &str) -> Option<Vec<u8>> {
     let bytes = seg.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -297,12 +334,29 @@ pub(crate) fn percent_decode_segment_bytes(seg: &str) -> Option<Vec<u8>> {
     while i < bytes.len() {
         match bytes[i] {
             b'%' if i + 2 < bytes.len() => {
-                let hi = (bytes[i + 1] as char).to_digit(16)?;
-                let lo = (bytes[i + 2] as char).to_digit(16)?;
-                out.push((hi * 16 + lo) as u8);
+                let b1 = bytes[i + 1];
+                let b2 = bytes[i + 2];
+                // Require canonical uppercase hex digits (`0-9A-F`).
+                if !(b1.is_ascii_digit() || (b'A'..=b'F').contains(&b1))
+                    || !(b2.is_ascii_digit() || (b'A'..=b'F').contains(&b2))
+                {
+                    return None;
+                }
+                let hi = (b1 as char).to_digit(16)?;
+                let lo = (b2 as char).to_digit(16)?;
+                let decoded = (hi * 16 + lo) as u8;
+                if is_rfc3986_unreserved(decoded)
+                    || decoded <= 0x1f
+                    || decoded == 0x7f
+                    || matches!(decoded, b'/' | b'\\' | b'?' | b'#' | b'%')
+                {
+                    return None;
+                }
+                out.push(decoded);
                 i += 3;
             }
             b'%' => return None,
+            b if b <= 0x1f || b == 0x7f => return None,
             b => {
                 out.push(b);
                 i += 1;
@@ -545,6 +599,7 @@ pub(crate) fn metered_item(
             Ok(Some(ChargeReq {
                 kind: ChargeKind::EmbedSearch,
                 path: format!("search:sim:{}", &sha256_hex(trimmed)[..32]),
+                media_path: None,
             }))
         }
         "/api/search_by_image" => {
@@ -558,6 +613,7 @@ pub(crate) fn metered_item(
             Ok(Some(ChargeReq {
                 kind: ChargeKind::Search,
                 path: format!("search:img:{}", &sha256_hex(&image)[..32]),
+                media_path: None,
             }))
         }
         "/api/search_by_desc" => {
@@ -573,6 +629,7 @@ pub(crate) fn metered_item(
             Ok(Some(ChargeReq {
                 kind: ChargeKind::Description,
                 path: format!("search:desc:{}", &sha256_hex(trimmed)[..32]),
+                media_path: None,
             }))
         }
         "/api/search_advanced" => Ok(None),
@@ -587,6 +644,7 @@ pub(crate) fn metered_item(
             Ok(Some(ChargeReq {
                 kind: ChargeKind::EmbedSearch,
                 path: format!("search:adv_embed:{}", &sha256_hex(&q)[..32]),
+                media_path: None,
             }))
         }
         "/api/search_advanced_clip" => {
@@ -600,6 +658,7 @@ pub(crate) fn metered_item(
             Ok(Some(ChargeReq {
                 kind: ChargeKind::Description,
                 path: format!("search:adv_clip:{}", &sha256_hex(&q)[..32]),
+                media_path: None,
             }))
         }
         "/api/search_advanced_image" => {
@@ -619,6 +678,7 @@ pub(crate) fn metered_item(
                     "search:adv_img:{}",
                     &sha256_hex(&format!("{q}\0{images}"))[..32]
                 ),
+                media_path: None,
             }))
         }
         _ => Ok(None),

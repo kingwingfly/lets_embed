@@ -527,10 +527,10 @@ pub fn SafetyTab(
                                         });
 
                                         let except_err = Signal::derive(move || {
-                                            if !except_open.get() {
+                                            let q = except_draft.with(|d| d.query.clone());
+                                            if q.trim().is_empty() && !except_open.get() {
                                                 return None;
                                             }
-                                            let q = except_draft.with(|d| d.query.clone());
                                             if let Some(local_err) = validate_expr_client(&q, false) {
                                                 return Some(local_err);
                                             }
@@ -789,6 +789,8 @@ pub fn SafetyTab(
                                                                     >
                                                                         {move || if except_open.get() {
                                                                             "− Hide Exclude / Exception (except_expr)"
+                                                                        } else if !except_draft.with(|d| d.query.trim().is_empty()) {
+                                                                            "+ Show Exclude / Exception (except_expr)"
                                                                         } else {
                                                                             "+ Add Exclude / Exception (except_expr)"
                                                                         }}

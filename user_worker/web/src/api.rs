@@ -559,8 +559,20 @@ pub fn sanitize_next(raw: Option<&str>) -> String {
     let Some(s) = raw.map(str::trim) else {
         return "/".to_string();
     };
-    if !s.starts_with('/') || s.starts_with("//") || s.contains('\\') || s.len() > 512 {
+    if !s.starts_with('/')
+        || s.starts_with("//")
+        || s.contains('\\')
+        || s.chars().any(char::is_control)
+        || s.len() > 512
+    {
         return "/".to_string();
+    }
+    let origin = current_origin();
+    if !origin.is_empty() {
+        match web_sys::Url::new_with_base(s, &origin) {
+            Ok(resolved) if resolved.origin() == origin => {}
+            _ => return "/".to_string(),
+        }
     }
     s.to_string()
 }

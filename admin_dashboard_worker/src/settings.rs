@@ -1131,16 +1131,19 @@ impl LoadedSettings {
     }
 
     /// Phase 1 of Two-Phase Activation:
-    /// Atomically commits `doc` at `expected_revision + 1` in D1 via CAS with
-    /// `activation_status = 'pending_do_ack'` BEFORE notifying `SitePolicyDO`.
+    /// Atomically commits `doc` at `expected_revision + 1` in D1 with
+    /// `activation_status = 'pending_do_ack'` alongside any extra revision-scoped
+    /// writes (e.g. `provider_secret_versions`) inside ONE single D1 `batch`
+    /// transaction BEFORE notifying `SitePolicyDO` (Cycle 2 C-1).
     ///
-    /// Returns `Ok(Some((new_rev, stored_public_policy, digest)))` on success,
-    /// or `Ok(None)` on revision conflict (409).
-    pub async fn save_d1_cas_pending(
+    /// Relies on `site_settings.revision INTEGER PRIMARY KEY` so any concurrent
+    /// revision write aborts and rolls back the entire batch cleanly -> `Ok(None)` (409).
+    pub async fn save_d1_cas_pending_with_writes(
         env: &Env,
         expected_revision: u64,
         doc: &SiteSettingsDocument,
         editor: &str,
+        extra_writes: Vec<worker::D1PreparedStatement>,
     ) -> Result<Option<(u64, PublicSitePolicy, String)>> {
         let new_revision = expected_revision.saturating_add(1);
         let mut to_store = doc.clone();
@@ -1152,38 +1155,92 @@ impl LoadedSettings {
         let digest = to_store.public.policy_digest.clone();
 
         let db = env.d1(D1_BINDING)?;
-        let mut writes = Vec::new();
+        let mut writes = Vec::with_capacity(extra_writes.len() + 2);
         if expected_revision == 0 {
             writes.push(
                 db.prepare("UPDATE site_settings SET document=? WHERE revision=0 AND document='{}'")
                     .bind(&[serde_json::to_string(&initial_document(env))?.into()])?,
             );
         }
-        writes.push(
-            db.prepare(
-                "INSERT INTO site_settings (revision, document, updated_at, updated_by, activation_status) \
-                 SELECT revision+1, ?, unixepoch(), ?, 'pending_do_ack' FROM site_settings \
-                 WHERE revision=? AND revision=(SELECT MAX(revision) FROM site_settings)",
-            )
-            .bind(&[
-                serde_json::to_string(&to_store)?.into(),
-                editor.into(),
-                (expected_revision as f64).into(),
-            ])?,
-        );
-        let results = db.batch(writes).await?;
-        let inserted = results
-            .last()
-            .expect("at least one write")
-            .meta()?
-            .and_then(|m| m.changes)
-            == Some(1);
+        if extra_writes.is_empty() {
+            writes.push(
+                db.prepare(
+                    "INSERT INTO site_settings (revision, document, updated_at, updated_by, activation_status) \
+                     SELECT revision+1, ?, unixepoch(), ?, 'pending_do_ack' FROM site_settings \
+                     WHERE revision=? AND revision=(SELECT MAX(revision) FROM site_settings)",
+                )
+                .bind(&[
+                    serde_json::to_string(&to_store)?.into(),
+                    editor.into(),
+                    (expected_revision as f64).into(),
+                ])?,
+            );
+            let results = db.batch(writes).await?;
+            let inserted = results
+                .last()
+                .expect("at least one write")
+                .meta()?
+                .and_then(|m| m.changes)
+                == Some(1);
+            if !inserted {
+                return Ok(None);
+            }
+            return Ok(Some((new_revision, to_store.public, digest)));
+        }
 
-        if !inserted {
+        // Verify expected_revision is the current latest revision BEFORE executing the
+        // atomic PK-enforced batch so future/skipped revision numbers are rejected as 409.
+        #[derive(Deserialize)]
+        struct MaxRevRow {
+            max_rev: Option<i64>,
+        }
+        let max_rev = db
+            .prepare("SELECT MAX(revision) AS max_rev FROM site_settings")
+            .first::<MaxRevRow>(None)
+            .await?
+            .and_then(|r| r.max_rev)
+            .unwrap_or(0)
+            .max(0) as u64;
+        if max_rev != expected_revision {
             return Ok(None);
         }
 
-        Ok(Some((new_revision, to_store.public, digest)))
+        writes.push(
+            db.prepare(
+                "INSERT INTO site_settings (revision, document, updated_at, updated_by, activation_status) \
+                 VALUES (?, ?, unixepoch(), ?, 'pending_do_ack')",
+            )
+            .bind(&[
+                (new_revision as f64).into(),
+                serde_json::to_string(&to_store)?.into(),
+                editor.into(),
+            ])?,
+        );
+        writes.extend(extra_writes);
+
+        match db.batch(writes).await {
+            Ok(_) => Ok(Some((new_revision, to_store.public, digest))),
+            Err(e) => {
+                let msg = format!("{e:?}");
+                if msg.contains("UNIQUE constraint")
+                    || msg.contains("PRIMARY KEY constraint")
+                    || msg.contains("SQLITE_CONSTRAINT")
+                {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    pub async fn save_d1_cas_pending(
+        env: &Env,
+        expected_revision: u64,
+        doc: &SiteSettingsDocument,
+        editor: &str,
+    ) -> Result<Option<(u64, PublicSitePolicy, String)>> {
+        Self::save_d1_cas_pending_with_writes(env, expected_revision, doc, editor, Vec::new()).await
     }
 
     /// Marks a D1 `site_settings` revision as `'active'` ONLY after exact

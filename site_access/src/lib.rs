@@ -41,7 +41,8 @@ pub use tokens::{
     AdminAssertionClaims, BillableMediaKind, GALLERY_SWITCHERS_HEADER, GATEWAY_ASSERTION_AUDIENCE,
     GATEWAY_ASSERTION_DEFAULT_MAX_SKEW, GATEWAY_ASSERTION_HEADER, GATEWAY_ASSERTION_TTL,
     GATEWAY_ASSERTION_VERSION, GUEST_SESSION_COOKIE, GUEST_SESSION_VERSION, GatewayAssertion,
-    GuestSessionToken, LEGACY_APP_COOKIE, LEGACY_TOKEN_COOKIE, LegacySessionClaims,
+    GuestSessionToken, LEGACY_APP_COOKIE, LEGACY_GUEST_SESSION_COOKIE, LEGACY_SESSION_COOKIE,
+    LEGACY_TOKEN_COOKIE, LegacySessionClaims,
     MEDIA_CAP_AUDIENCE, MEDIA_CAP_VERSION, MediaBillingKey, MediaCapKind, MediaCapability,
     POLICY_MIN_REVISION_HEADER, POLICY_REVISION_HEADER, PRIVILEGED_REQUEST_HEADER_PREFIXES,
     PRIVILEGED_REQUEST_HEADERS, SESSION_COOKIE, SESSION_V2_PREFIX, SESSION_V2_VERSION,
@@ -96,6 +97,10 @@ impl ChargeKind {
 pub struct ChargeReq {
     pub path: String,
     pub kind: ChargeKind,
+    /// Canonical gallery media path (`/{images,videos}/{immutable_locator}`) populated
+    /// by `gateway_worker` on `/media/*` requests for `free_media_folders` evaluation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_path: Option<String>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GuestReq {
@@ -151,14 +156,24 @@ pub fn valid_admin_view(secret: &[u8], value: &str, now: u64) -> bool {
         .verify_slice(&sig)
         .is_ok()
 }
+/// Normalizes a client IP address into a stable rate-limit / quota bucket:
+/// - IPv4 (including IPv4-mapped IPv6 `::ffff:a.b.c.d`) -> exact `/32` address string.
+/// - IPv6 -> canonical `/64` network prefix so lower-64 interface-ID rotation cannot bypass quotas.
+pub fn normalize_ip_bucket(ip: std::net::IpAddr) -> String {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+    }
+}
+
 pub fn guest_account(secret: &[u8], ip: std::net::IpAddr) -> String {
-    let digest = mac(
-        secret,
-        b"guest/v1\0",
-        ip.to_canonical().to_string().as_bytes(),
-    )
-    .finalize()
-    .into_bytes();
+    let bucket = normalize_ip_bucket(ip);
+    let digest = mac(secret, b"guest/v1\0", bucket.as_bytes())
+        .finalize()
+        .into_bytes();
     format!("guest:{}", URL_SAFE_NO_PAD.encode(digest))
 }
 
@@ -176,6 +191,30 @@ mod tests {
         let computed = sha256_hex(search_types::canonical_wd_vocab_bytes());
         assert_eq!(computed, search_types::WD_VOCAB_DIGEST);
         assert_eq!(search_types::wd_vocab_count(), 10_861);
+    }
+
+    #[test]
+    fn guest_account_normalizes_ipv6_to_64_and_ipv4_mapped_to_ipv4() {
+        let v4: std::net::IpAddr = "203.0.113.42".parse().unwrap();
+        let v4_mapped: std::net::IpAddr = "::ffff:203.0.113.42".parse().unwrap();
+        assert_eq!(normalize_ip_bucket(v4), "203.0.113.42");
+        assert_eq!(normalize_ip_bucket(v4_mapped), "203.0.113.42");
+        assert_eq!(guest_account(b"secret", v4), guest_account(b"secret", v4_mapped));
+
+        let v6_a: std::net::IpAddr = "2001:db8:abcd:1234::1".parse().unwrap();
+        let v6_b: std::net::IpAddr = "2001:db8:abcd:1234:dead:beef:cafe:9999".parse().unwrap();
+        let v6_other: std::net::IpAddr = "2001:db8:abcd:1235::1".parse().unwrap();
+        assert_eq!(normalize_ip_bucket(v6_a), "2001:db8:abcd:1234::/64");
+        assert_eq!(normalize_ip_bucket(v6_b), "2001:db8:abcd:1234::/64");
+        assert_eq!(guest_account(b"secret", v6_a), guest_account(b"secret", v6_b));
+        assert_ne!(guest_account(b"secret", v6_a), guest_account(b"secret", v6_other));
+
+        let req = MediaBillingKey::image(77).to_charge_req_with_locator("album/pic.webp");
+        assert_eq!(req.path, "media:image:77");
+        assert_eq!(req.media_path.as_deref(), Some("/images/album/pic.webp"));
+        let vreq = MediaBillingKey::video(88).to_charge_req_with_locator("clips/a.mp4");
+        assert_eq!(vreq.path, "media:video:88");
+        assert_eq!(vreq.media_path.as_deref(), Some("/videos/clips/a.mp4"));
     }
 
     #[test]

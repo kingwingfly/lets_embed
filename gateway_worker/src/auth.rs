@@ -213,15 +213,10 @@ pub(crate) fn clear_session_cookie_header() -> String {
     format!("{SESSION_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax")
 }
 
-/// `Set-Cookie` header value for a freshly minted signed `le_guest_sid` cookie.
-pub(crate) fn guest_session_set_cookie_header(signed_token: &str, secure: bool) -> String {
-    if secure {
-        format!(
-            "{GUEST_SESSION_COOKIE}={signed_token}; Path=/; Max-Age={GUEST_SESSION_TTL}; HttpOnly; SameSite=Lax; Secure"
-        )
-    } else {
-        format!(
-            "{GUEST_SESSION_COOKIE}={signed_token}; Path=/; Max-Age={GUEST_SESSION_TTL}; HttpOnly; SameSite=Lax"
-        )
-    }
+/// `Set-Cookie` header value for a freshly minted signed `__Host-le_guest_sid` cookie.
+/// Per RFC 6265bis, `__Host-` cookies MUST always set `Secure`, `Path=/`, and NO `Domain`.
+pub(crate) fn guest_session_set_cookie_header(signed_token: &str) -> String {
+    format!(
+        "{GUEST_SESSION_COOKIE}={signed_token}; Path=/; Max-Age={GUEST_SESSION_TTL}; HttpOnly; SameSite=Lax; Secure"
+    )
 }

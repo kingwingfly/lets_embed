@@ -87,6 +87,8 @@ pub struct DoHandoffPollResp {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DoTransferCreateReq {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
     pub principal: String,
     pub code_hash: String,
     pub token_hash: String,
@@ -107,6 +109,8 @@ pub struct DoTransferClaimResp {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DoTransferRevokeReq {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
     pub principal: String,
 }
 
@@ -952,6 +956,7 @@ pub async fn transfer_create(
         auth_time: Some(orig_auth_time),
     };
     let do_req = DoTransferCreateReq {
+        owner_id: Some(active.user_id.clone()),
         principal: encode_envelope(&envelope),
         code_hash: sha256_hex(&format!("code:{normalized}")),
         token_hash: sha256_hex(&format!("tok:{qr_token}")),
@@ -1149,54 +1154,18 @@ pub async fn transfer_revoke(
         Ok(a) => a,
         Err(r) => return r,
     };
-    let session_info = if let Some(sid) = active.sid.as_deref() {
-        do_client::do_session_info(&st.env, &active.do_key, sid)
-            .await
-            .ok()
-            .flatten()
-    } else {
-        None
-    };
-    let (auth_method, identity_key, auth_time) = match session_info {
-        Some(info) => (info.auth_method, info.identity_key, Some(info.created_at)),
-        None => {
-            let p = if session::is_eth_address(&active.user_id) {
-                "siwe"
-            } else {
-                "siws"
-            };
-            (
-                p.to_string(),
-                format!("{p}|legacy|{}", active.user_id),
-                None,
-            )
-        }
-    };
-    let envelope = StoredPrincipalEnvelope {
-        user_id: active.user_id.clone(),
-        auth_method,
-        identity_key,
-        display_address: auth::display_address(&active.user_id),
-        source_sid: active.sid.clone(),
-        auth_time,
-    };
-    let _ = call_handoff_do(
+    if let Err(r) = call_handoff_do(
         &st,
         "/transfer-revoke",
         &DoTransferRevokeReq {
-            principal: encode_envelope(&envelope),
-        },
-    )
-    .await;
-    // Also clean any legacy raw-principal entry.
-    let _ = call_handoff_do(
-        &st,
-        "/transfer-revoke",
-        &DoTransferRevokeReq {
+            owner_id: Some(active.user_id.clone()),
             principal: active.user_id,
         },
     )
-    .await;
+    .await
+    {
+        return r;
+    }
     StatusCode::OK.into_response()
 }
 

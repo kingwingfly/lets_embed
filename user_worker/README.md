@@ -1,53 +1,49 @@
 # user_worker (`lets-embed-user-worker`)
 
-SIWE (Sign-In with Ethereum) user system for lets_embed, running as the Cloudflare
-Worker `lets-embed-user-worker` (called by `lets-embed-gateway-worker`). Replaces the old apply/approve flow in `gateway_worker`.
+Identity, session, billing, and safety-preference Cloudflare Worker for lets_embed
+(`lets-embed-user-worker`, called via service binding by `lets-embed-gateway-worker`).
 
-- **Auth** supports Ethereum (SIWE) and Solana wallet sign-in. The gateway validates the signed `ue_session` cookie. The dashboard uses a dedicated Cloudflare Access application.
-- **Metering** uses the pricing and free allowances published at `/user/admin`. The gateway asks the account Durable Object to enforce each metered request.
-- **Billing (v2)**: pay-as-you-go points balance + optional subscription plans
+- **Auth & Sessions**: supports Ethereum (SIWE), Solana (SIWS), Google, GitHub, X, Discord, Email OTP, Telegram, and OIDC Age Assurance. Issues revocable `v2` sessions (`__Host-ue_session`, tracked in `UserAccount` DO SQLite) and hosts the `AuthChallengeDO` (single-use nonces, OAuth/OIDC/Telegram transactions, Email OTP) and `SitePolicyDO` (authoritative Policy v3 singleton).
+- **Admin Dashboard**: lives in the separate `lets-embed-admin-dashboard-worker` mounted at `/admin` behind Cloudflare Access (`/user/admin*` is retired and returns `404`).
+- **Metering & Billing (v2)**: pay-as-you-go points balance + optional subscription plans
   (per-window view/search allowances, bought/renewed **from** the balance, **no
   auto-renew** — they lapse to PAYG at period end). Overage falls back to PAYG.
   New users get a free grant.
-- **Top-ups** support ETH, SOL, USDT and USDC. The account page opens the transfer in the customer's wallet and automatically checks the receipt for points.
+- **Top-ups**: support ETH, SOL, USDT and USDC. The account page opens the transfer in the customer's wallet and automatically checks the receipt for points.
 - **Likes**: post/image/video favorites stored in D1, surfaced as like buttons
   on the Leptos details page and a `/user/favorites` page.
-- **Storage**: balance/plan/window/dedupe live only in the Durable Object; D1
-  holds `users` (incl. linked `solana_address`), `payments` (chain-aware) and
-  `likes`. D1 also keeps the published site policy revisions.
+- **Storage**: balance/plan/window/dedupe/sessions/prefs live in Durable Object SQLite; D1
+  holds `users_v2`, `user_identities`, `payments`, `likes`, `site_settings`, and
+  revision-scoped `provider_secret_versions` (AES-256-GCM encrypted).
 
 ## Routes
 
 | Route | Method | What |
 | --- | --- | --- |
-| `/user/login` | GET | wallet login page (`?next=` redirect target) |
+| `/user/login` | GET | sign-in SPA (`?next=` redirect target) |
 | `/user/upgrade` | GET | sign in after reaching a free limit, then open the account top-up form. Signed-in visitors go directly to top-up. |
-| `/user/account` | GET | balance, plan, wallet payments, transfer recovery and payment history |
+| `/user/account` | GET | balance, plan, linked sign-in methods, safety preferences, wallet payments, transfer recovery and payment history |
 | `/user/favorites` | GET | liked posts/images/videos |
-| `/user/api/nonce` | GET | issue a SIWE / SIWS / link nonce (KV, 300s, single-use) |
-| `/user/api/verify` | POST | verify SIWE message + signature, set `ue_session` |
-| `/user/api/verify_solana` | POST | verify SIWS message + ed25519 signature, set `ue_session` |
-| `/user/api/logout` | POST | clear the session cookie |
-| `/user/api/me` | GET | current address + balance / plan / window status |
+| `/user/api/nonce` | GET | issue a purpose-scoped SIWE / SIWS / link nonce (`AuthChallengeDO`, 300s, single-use) |
+| `/user/api/verify` | POST | verify SIWE message + signature, set `__Host-ue_session` |
+| `/user/api/verify_solana` | POST | verify SIWS message + ed25519 signature, set `__Host-ue_session` |
+| `/user/api/logout` | POST | revoke session in DO and clear `__Host-ue_session` |
+| `/user/api/me` | GET | current identity + balance / plan / window status |
 | `/user/api/topup/prepare` | POST | prepare an unsigned mainnet wallet transfer and point estimate for `{account, chain, token, amount}`. Supply the amount as a decimal string in asset units. |
 | `/user/api/topup` | POST | submit a `{chain, token, tx_hash, account?}` top-up for verification + credit |
 | `/user/api/payments` | GET | payment history |
 | `/user/api/subscribe` | POST | buy/renew a plan from the balance (no auto-renew) |
 | `/user/api/unsubscribe` | POST | cancel the active plan and refund prorated unused paid time |
 | `/user/api/rates` | GET | spot USD prices for ETH/SOL (Chainlink feeds) |
-| `/user/api/link_solana` | GET/POST/DELETE | read, link (by signing a challenge), or unlink a Solana wallet for an Ethereum session |
+| `/user/api/link_solana` | GET/POST/DELETE | read, link (by signing a challenge), or unlink a Solana payment wallet |
 | `/user/api/like` | GET/POST/DELETE | check / add / remove a like |
 | `/user/api/likes` | GET | list likes (keyset paginated) |
 | `/user/api/likes/status` | GET | batch check liked status for comma-separated `kind:target_id` pairs |
-| `/user/admin` | GET | admin page (Cloudflare Access protected) |
-| `/user/admin/settings` | POST | publish the visitor, pricing, plan and payment settings |
-| `/user/admin/plan` | POST | grant or revoke a customer subscription |
-| `/user/admin/credit` | POST | admin credit/deduct points |
-| `/user/admin/ban` | POST | admin ban/unban |
+| `/admin/*` | — | Served by `lets-embed-admin-dashboard-worker` behind Cloudflare Access (`/user/admin*` returns `404`) |
 
 ## Points & billing model (v2)
 
-Open **Gallery controls** at `/user/admin` on the gateway hostname. Saving checks the revision shown in the form. Reload and reapply edits if another administrator has already published a change.
+Open the Admin Dashboard at `/admin` on the gateway hostname (protected by Cloudflare Access). Saving checks the revision shown in the form. Reload and reapply edits if another administrator has already published a change.
 
 - **Browsing access** switches between wallet-required and public browsing. To show a public image gallery, select **Public browsing** and set **Image views → Free per day** to a positive number or `-1`.
 - **Free media folders** optionally limits daily free media to selected albums or files. Use decoded gallery paths, one per line, such as `/images/Sample album`. An empty list includes all folders. These rules govern access to media bytes. Search results can still list the full catalog.

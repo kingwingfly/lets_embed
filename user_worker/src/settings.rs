@@ -105,14 +105,18 @@ impl Default for Policy {
     }
 }
 impl Policy {
-    /// Folder rules use decoded, segment-delimited gallery paths. Searches have separate quotas.
+    /// Folder rules use decoded, segment-delimited gallery paths (`/{images,videos}/...`)
+    /// carried on `request.media_path` for Policy v3 `/media/*` requests. Searches have separate quotas.
     pub fn free_media_in_scope(&self, request: &site_access::ChargeReq) -> bool {
         if self.free_media_folders.is_empty()
             || !matches!(request.kind, ChargeKind::Image | ChargeKind::Video)
         {
             return true;
         }
-        let Ok(path) = percent_encoding::percent_decode_str(&request.path).decode_utf8() else {
+        let Some(raw_path) = request.media_path.as_deref() else {
+            return false;
+        };
+        let Ok(path) = percent_encoding::percent_decode_str(raw_path).decode_utf8() else {
             return false;
         };
         if path.contains('\\') || path.split('/').any(|part| matches!(part, "." | "..")) {
@@ -230,16 +234,23 @@ pub struct Published {
 }
 impl Published {
     pub async fn load(env: &Env) -> Result<Self> {
-        let query = env
-            .d1(crate::D1_BINDING)?
-            .prepare("SELECT revision, document FROM site_settings ORDER BY revision DESC LIMIT 1");
+        let query = env.d1(crate::D1_BINDING)?.prepare(
+            "SELECT revision, document FROM site_settings \
+             WHERE activation_status = 'active' \
+             ORDER BY revision DESC LIMIT 1",
+        );
         Self::read(env, query).await
     }
 
     pub async fn at_block(env: &Env, timestamp: u64) -> Result<Policy> {
-        let query = env.d1(crate::D1_BINDING)?.prepare(
-            "SELECT revision, document FROM site_settings WHERE updated_at <= ? ORDER BY revision DESC LIMIT 1"
-        ).bind(&[(timestamp as f64).into()])?;
+        let query = env
+            .d1(crate::D1_BINDING)?
+            .prepare(
+                "SELECT revision, document FROM site_settings \
+                 WHERE activation_status = 'active' AND updated_at <= ? \
+                 ORDER BY revision DESC LIMIT 1",
+            )
+            .bind(&[(timestamp as f64).into()])?;
         Ok(Self::read(env, query).await?.policy)
     }
 
@@ -268,7 +279,8 @@ impl Published {
         let active: Row = db
             .prepare(
                 "SELECT revision, document, updated_at FROM site_settings \
-                 WHERE updated_at <= ? ORDER BY revision DESC LIMIT 1",
+                 WHERE activation_status = 'active' AND updated_at <= ? \
+                 ORDER BY revision DESC LIMIT 1",
             )
             .bind(&[(timestamp as f64).into()])?
             .first(None)
@@ -283,7 +295,8 @@ impl Published {
         let forward: Vec<Row> = db
             .prepare(
                 "SELECT revision, document, updated_at FROM site_settings \
-                 WHERE updated_at > ? AND updated_at <= ? ORDER BY revision ASC LIMIT 5",
+                 WHERE activation_status = 'active' AND updated_at > ? AND updated_at <= ? \
+                 ORDER BY revision ASC LIMIT 5",
             )
             .bind(&[(timestamp as f64).into(), (skew_ceiling as f64).into()])?
             .all()
@@ -304,8 +317,8 @@ impl Published {
             let backward: Vec<Row> = db
                 .prepare(
                     "SELECT revision, document, updated_at FROM site_settings \
-                     WHERE revision < ? AND (updated_at >= ? OR revision = (\
-                         SELECT MAX(revision) FROM site_settings WHERE updated_at < ?\
+                     WHERE activation_status = 'active' AND revision < ? AND (updated_at >= ? OR revision = (\
+                         SELECT MAX(revision) FROM site_settings WHERE activation_status = 'active' AND updated_at < ?\
                      )) ORDER BY revision DESC LIMIT 5",
                 )
                 .bind(&[
@@ -410,15 +423,21 @@ mod tests {
             policy.item(ChargeKind::Description).price,
             config::COST_SEARCH
         );
-        let item = |path: &str| ChargeReq {
-            path: path.into(),
+        let item = |media_path: Option<&str>| ChargeReq {
+            path: "media:image:42".into(),
             kind: ChargeKind::Image,
+            media_path: media_path.map(str::to_string),
         };
-        assert!(policy.free_media_in_scope(&item("/images/example")));
+        assert!(policy.free_media_in_scope(&item(Some("/images/example"))));
+        assert!(policy.free_media_in_scope(&item(None)));
         policy.free_media_folders.push("/images/图库+a b".into());
-        assert!(policy.free_media_in_scope(&item("/images/%E5%9B%BE%E5%BA%93+a%20b/a.webp")));
-        assert!(!policy.free_media_in_scope(&item("/images/图库+a%20bc/a.webp")));
-        assert!(!policy.free_media_in_scope(&item("/videos/a.mp4")));
+        assert!(policy.free_media_in_scope(&item(Some(
+            "/images/%E5%9B%BE%E5%BA%93+a%20b/a.webp"
+        ))));
+        assert!(!policy.free_media_in_scope(&item(Some("/images/图库+a%20bc/a.webp"))));
+        assert!(!policy.free_media_in_scope(&item(Some("/videos/a.mp4"))));
+        // Missing `media_path` MUST fail closed when `free_media_folders` is non-empty (Cycle 2 D-1)
+        assert!(!policy.free_media_in_scope(&item(None)));
     }
 
     #[test]

@@ -27,8 +27,10 @@ type HmacSha256 = Hmac<Sha256>;
 // Shared Cookie & Header Constants
 // ---------------------------------------------------------------------------
 
-pub const SESSION_COOKIE: &str = "ue_session";
-pub const GUEST_SESSION_COOKIE: &str = "le_guest_sid";
+pub const SESSION_COOKIE: &str = "__Host-ue_session";
+pub const GUEST_SESSION_COOKIE: &str = "__Host-le_guest_sid";
+pub const LEGACY_SESSION_COOKIE: &str = "ue_session";
+pub const LEGACY_GUEST_SESSION_COOKIE: &str = "le_guest_sid";
 pub const LEGACY_TOKEN_COOKIE: &str = "gw_token";
 pub const LEGACY_APP_COOKIE: &str = "gw_app";
 pub const AUTH_TX_COOKIE: &str = "__Host-auth_tx";
@@ -86,7 +88,9 @@ pub fn is_privileged_request_header(name: &str) -> bool {
 /// `lets-embed-web` or media origins.
 pub const STRIPPED_ORIGIN_COOKIES: &[&str] = &[
     SESSION_COOKIE,
+    LEGACY_SESSION_COOKIE,
     GUEST_SESSION_COOKIE,
+    LEGACY_GUEST_SESSION_COOKIE,
     crate::ADMIN_VIEW_COOKIE,
     LEGACY_TOKEN_COOKIE,
     LEGACY_APP_COOKIE,
@@ -992,6 +996,22 @@ impl MediaBillingKey {
         ChargeReq {
             path: self.canonical_key(),
             kind: self.charge_kind(),
+            media_path: None,
+        }
+    }
+
+    /// Builds a [`ChargeReq`] carrying both the canonical billing dedupe key
+    /// (`media:{kind}:{id}`) and the verified gallery folder path (`/{images,videos}/{locator}`)
+    /// so `free_media_folders` scope checks work accurately under Policy v3.
+    pub fn to_charge_req_with_locator(self, immutable_locator: &str) -> ChargeReq {
+        let root = match self.kind {
+            BillableMediaKind::Image => "images",
+            BillableMediaKind::Video => "videos",
+        };
+        ChargeReq {
+            path: self.canonical_key(),
+            kind: self.charge_kind(),
+            media_path: Some(format!("/{root}/{immutable_locator}")),
         }
     }
 

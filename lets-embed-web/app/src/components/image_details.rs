@@ -1526,7 +1526,8 @@ async fn fetch_image_details(id: Option<String>) -> Result<ProjectedImageDetails
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
     fn to_err(e: impl std::fmt::Display) -> ServerFnError {
-        ServerFnError::Response(e.to_string())
+        tracing::error!("fetch_image_details failed: {e}");
+        ServerFnError::Response("Failed to load media details".to_string())
     }
 
     let details = engine.image_details(id).await.map_err(to_err)?;
@@ -1584,7 +1585,8 @@ pub async fn list_post_images(post_id: i64) -> Result<Vec<ProjectedImage>, Serve
     use search_engine::Engine;
 
     fn to_err(e: impl std::fmt::Display) -> ServerFnError {
-        ServerFnError::Response(e.to_string())
+        tracing::error!("fetch_image_details failed: {e}");
+        ServerFnError::Response("Failed to load media details".to_string())
     }
 
     let state = expect_context::<AppState>();
@@ -1608,7 +1610,8 @@ pub async fn list_post_videos(post_id: i64) -> Result<Vec<ProjectedVideo>, Serve
     use search_engine::Engine;
 
     fn to_err(e: impl std::fmt::Display) -> ServerFnError {
-        ServerFnError::Response(e.to_string())
+        tracing::error!("fetch_image_details failed: {e}");
+        ServerFnError::Response("Failed to load media details".to_string())
     }
 
     let state = expect_context::<AppState>();

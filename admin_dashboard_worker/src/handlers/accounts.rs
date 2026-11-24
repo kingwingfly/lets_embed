@@ -309,6 +309,14 @@ pub async fn list_accounts(
         "created_desc" => "u.created_at DESC, u.id ASC",
         _ => "u.last_login DESC, u.created_at DESC",
     };
+    let live_sort_capped = needs_live_sort && total > MAX_LIVE_SORT_SCAN;
+    let effective_total = if needs_live_sort {
+        total.min(MAX_LIVE_SORT_SCAN)
+    } else {
+        total
+    };
+    let max_page = effective_total.div_ceil(ACCOUNTS_PAGE_SIZE).max(1);
+    let page = page.clamp(1, max_page);
     let page_offset = page.saturating_sub(1).saturating_mul(ACCOUNTS_PAGE_SIZE);
     let (limit, offset) = if needs_live_sort {
         (MAX_LIVE_SORT_SCAN, 0usize)
@@ -460,6 +468,8 @@ pub async fn list_accounts(
         total,
         page,
         page_size: ACCOUNTS_PAGE_SIZE,
+        live_sort_capped,
+        live_sort_scan_limit: MAX_LIVE_SORT_SCAN,
         accounts,
         selected,
     })

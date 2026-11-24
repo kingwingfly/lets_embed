@@ -209,7 +209,11 @@ async fn main() -> anyhow::Result<()> {
     let addr = leptos_options.site_addr;
     tracing::info!(mode = runtime.mode.as_str(), "listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app.into_make_service()).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -859,15 +863,34 @@ mod tests {
             "private, no-store"
         );
 
-        // 3. `/internal/validate-safety-catalog` accepts valid v3 assertion without DB for empty arrays!
+        // 3a. `/internal/validate-safety-catalog` MUST REJECT user `X-Gateway-Assertion` alone (403, Cycle 2 D-2).
         let valid_anon = signed_assertion(assert_secret, &policy, None, now_secs() + 20);
-        let empty_catalog = app
+        let assertion_only_catalog = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/internal/validate-safety-catalog")
                     .header(GATEWAY_ASSERTION_HEADER, &valid_anon)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"post_tags":[],"authors":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(assertion_only_catalog.status(), StatusCode::FORBIDDEN);
+
+        // 3b. `/internal/validate-safety-catalog` accepts `X-Internal-Api-Secret` without DB for empty arrays!
+        let empty_catalog = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/validate-safety-catalog")
+                    .header(
+                        "x-internal-api-secret",
+                        std::str::from_utf8(internal_secret).unwrap(),
+                    )
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"post_tags":[],"authors":[]}"#))
                     .unwrap(),

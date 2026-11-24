@@ -19,13 +19,14 @@
 
 use std::{
     collections::HashMap,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use app::state::{AppState, CallerContext, DeploymentMode, MediaSigner, RequestSafetyContext};
 use axum::{
-    extract::{Request, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -33,7 +34,7 @@ use axum::{
 use site_access::{
     ActorBinding, GATEWAY_ASSERTION_AUDIENCE, GATEWAY_ASSERTION_DEFAULT_MAX_SKEW,
     GATEWAY_ASSERTION_HEADER, GATEWAY_ASSERTION_TTL, is_privileged_request_header,
-    verify_gateway_assertion,
+    normalize_ip_bucket, verify_gateway_assertion,
 };
 
 /// Maximum distinct subject buckets kept in memory by [`MetadataRateLimiter`].
@@ -218,7 +219,7 @@ fn is_sitemap_path(path: &str) -> bool {
 }
 
 pub(crate) fn is_rate_limited_metadata_route(path: &str) -> bool {
-    matches!(
+    if matches!(
         path,
         "/api/fetch_post_meta"
             | "/api/suggest_search"
@@ -228,7 +229,29 @@ pub(crate) fn is_rate_limited_metadata_route(path: &str) -> bool {
             | "/api/list_post_images"
             | "/api/list_post_videos"
             | "/api/safety/reveal"
-    )
+            | "/api/search_advanced"
+            | "/api/search_query"
+    ) {
+        return true;
+    }
+    // Also cover Leptos hash-suffixed server function endpoints.
+    let Some(name) = path.strip_prefix("/api/") else {
+        return false;
+    };
+    [
+        "search_query",
+        "list_post_images",
+        "list_post_videos",
+        "fetch_image_details",
+    ]
+    .iter()
+    .any(|prefix| {
+        name.strip_prefix(prefix).is_some_and(|suffix| {
+            !suffix.is_empty()
+                && suffix.len() <= 20
+                && suffix.bytes().all(|b| b.is_ascii_digit())
+        })
+    })
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -267,12 +290,54 @@ fn has_valid_internal_secret(headers: &HeaderMap, expected: &[u8]) -> bool {
     false
 }
 
-fn rate_limit_subject(actor: &ActorBinding) -> &str {
+fn extract_client_ip(
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+    trust_cf_ip: bool,
+    trust_proxy: bool,
+) -> Option<IpAddr> {
+    if trust_cf_ip
+        && let Some(raw) = extract_single_header(headers, "cf-connecting-ip")
+        && let Ok(ip) = raw.parse::<IpAddr>()
+    {
+        return Some(ip);
+    }
+    if trust_proxy {
+        for hdr in ["cf-connecting-ip", "x-real-ip"] {
+            if let Some(raw) = extract_single_header(headers, hdr)
+                && let Ok(ip) = raw.parse::<IpAddr>()
+            {
+                return Some(ip);
+            }
+        }
+        if let Some(xff) = extract_single_header(headers, "x-forwarded-for")
+            && let Some(first) = xff.split(',').next().map(str::trim)
+            && let Ok(ip) = first.parse::<IpAddr>()
+        {
+            return Some(ip);
+        }
+    }
+    peer_ip
+}
+
+fn rate_limit_subject_for_request(
+    actor: Option<&ActorBinding>,
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+    trust_cf_ip: bool,
+    trust_proxy: bool,
+) -> String {
     match actor {
-        ActorBinding::User { sub, .. } => sub.as_str(),
-        ActorBinding::LiveAdmin { email } => email.as_str(),
-        ActorBinding::GuestSession { gid } => gid.as_str(),
-        ActorBinding::Anon => "anon",
+        Some(ActorBinding::User { sub, .. }) => format!("u:{sub}"),
+        Some(ActorBinding::LiveAdmin { email }) => format!("a:{email}"),
+        Some(ActorBinding::GuestSession { gid }) => format!("g:{gid}"),
+        Some(ActorBinding::Anon) | None => {
+            if let Some(ip) = extract_client_ip(headers, peer_ip, trust_cf_ip, trust_proxy) {
+                format!("ip:{}", normalize_ip_bucket(ip))
+            } else {
+                "anon".to_string()
+            }
+        }
     }
 }
 
@@ -300,6 +365,10 @@ pub async fn safety_and_auth_middleware(
 ) -> Response {
     let state = &mw.app;
     let path = req.uri().path().to_string();
+    let peer_ip = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
 
     if state.mode == DeploymentMode::Standalone {
         if path.starts_with("/internal/") {
@@ -307,10 +376,12 @@ pub async fn safety_and_auth_middleware(
         }
         // Standalone Mode unconditionally ignores privileged gateway/CF headers.
         strip_privileged_headers(req.headers_mut());
-        if is_rate_limited_metadata_route(&path)
-            && let Err(retry_after) = mw.rate_limiter.check_and_record("anon")
-        {
-            return rate_limited_response(retry_after);
+        if is_rate_limited_metadata_route(&path) {
+            let subject =
+                rate_limit_subject_for_request(None, req.headers(), peer_ip, false, state.trust_proxy);
+            if let Err(retry_after) = mw.rate_limiter.check_and_record(&subject) {
+                return rate_limited_response(retry_after);
+            }
         }
         let ctx = RequestSafetyContext::standalone(
             state.policy_store.current_standalone(),
@@ -333,32 +404,15 @@ pub async fn safety_and_auth_middleware(
 
     let now = unix_now_secs();
 
-    // Managed Mode `/internal/*` endpoints authenticate via EITHER a valid v3
-    // `X-Gateway-Assertion` (without requiring `PolicyStore` sync) OR the
-    // `INTERNAL_API_SECRET` bearer / `X-Internal-Secret` token.
+    // Managed Mode `/internal/*` endpoints require `INTERNAL_API_SECRET` exclusively
+    // (user `X-Gateway-Assertion` alone NEVER unlocks `/internal/*`).
     if path.starts_with("/internal/") {
-        let assertion_ok = state
-            .gateway_assertion_secret
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .and_then(|secret| {
-                let raw = extract_single_header(req.headers(), GATEWAY_ASSERTION_HEADER)?;
-                verify_gateway_assertion(
-                    raw,
-                    secret,
-                    GATEWAY_ASSERTION_AUDIENCE,
-                    now,
-                    GATEWAY_ASSERTION_DEFAULT_MAX_SKEW,
-                )
-                .ok()
-            })
-            .is_some();
         let internal_token_ok = state
             .internal_api_secret
             .as_deref()
             .is_some_and(|secret| has_valid_internal_secret(req.headers(), secret));
 
-        if !assertion_ok && !internal_token_ok {
+        if !internal_token_ok {
             return no_store_error(StatusCode::FORBIDDEN, "Invalid internal credentials");
         }
 
@@ -421,10 +475,16 @@ pub async fn safety_and_auth_middleware(
     // Strip all privileged headers before forwarding to handlers.
     strip_privileged_headers(req.headers_mut());
 
-    // Enforce per-subject + global rate limits on unmetered metadata & reveal routes.
+    // Enforce per-subject + global rate limits on unmetered metadata, search & reveal routes.
     if is_rate_limited_metadata_route(&path) {
-        let subject = rate_limit_subject(&assertion.actor);
-        if let Err(retry_after) = mw.rate_limiter.check_and_record(subject) {
+        let subject = rate_limit_subject_for_request(
+            Some(&assertion.actor),
+            req.headers(),
+            peer_ip,
+            true,
+            false,
+        );
+        if let Err(retry_after) = mw.rate_limiter.check_and_record(&subject) {
             return rate_limited_response(retry_after);
         }
     }
@@ -457,10 +517,12 @@ pub async fn safety_and_auth_middleware(
 
     let mut resp = next.run(req).await;
 
-    let ok = resp.status() == StatusCode::OK;
+    let status = resp.status();
+    let ok = status == StatusCode::OK;
+    let cacheable_status = matches!(status, StatusCode::OK | StatusCode::NOT_MODIFIED);
     let has_set_cookie = resp.headers().contains_key(header::SET_COOKIE);
     let is_pkg = is_safe_pkg_path(&path);
-    let allow_public_cache = ok
+    let allow_public_cache = cacheable_status
         && !has_set_cookie
         && (is_pkg
             || path == "/robots.txt"

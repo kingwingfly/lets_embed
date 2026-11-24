@@ -171,14 +171,7 @@ pub async fn sitemap_root(
         "\"{}\"",
         &site_access::sha256_hex(xml.as_bytes())[..24]
     );
-    if headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|inm| {
-            inm.split(',')
-                .any(|part| part.trim().trim_start_matches("W/") == etag)
-        })
-    {
+    if if_none_match_matches(&headers, &etag) {
         return (
             StatusCode::NOT_MODIFIED,
             [
@@ -200,7 +193,18 @@ pub async fn sitemap_root(
         .into_response()
 }
 
-/// `GET /sitemap/{page}` (e.g. `/sitemap/1.xml`)
+fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|inm| {
+            inm.split(',').any(|part| {
+                let trimmed = part.trim();
+                trimmed == "*" || trimmed.strip_prefix("W/").unwrap_or(trimmed) == etag
+            })
+        })
+}
 pub async fn sitemap_page(
     State(state): State<AppState>,
     ctx_ext: Option<Extension<RequestSafetyContext>>,
@@ -254,14 +258,7 @@ pub async fn sitemap_page(
         "\"{}\"",
         &site_access::sha256_hex(xml.as_bytes())[..24]
     );
-    if headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|inm| {
-            inm.split(',')
-                .any(|part| part.trim().trim_start_matches("W/") == etag)
-        })
-    {
+    if if_none_match_matches(&headers, &etag) {
         return (
             StatusCode::NOT_MODIFIED,
             [
@@ -284,8 +281,22 @@ pub async fn sitemap_page(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_sitemap_page, render_sitemap_index, render_urlset};
+    use super::{if_none_match_matches, parse_sitemap_page, render_sitemap_index, render_urlset};
+    use axum::http::{HeaderMap, header};
     use search_engine::SitemapPostEntry;
+
+    #[test]
+    fn if_none_match_handles_multiple_headers_weak_tags_and_wildcard() {
+        let mut h = HeaderMap::new();
+        h.append(header::IF_NONE_MATCH, "\"other\"".parse().unwrap());
+        h.append(header::IF_NONE_MATCH, "W/\"abc123\", \"def\"".parse().unwrap());
+        assert!(if_none_match_matches(&h, "\"abc123\""));
+        assert!(!if_none_match_matches(&h, "\"zzz\""));
+
+        let mut star = HeaderMap::new();
+        star.insert(header::IF_NONE_MATCH, "*".parse().unwrap());
+        assert!(if_none_match_matches(&star, "\"anything\""));
+    }
 
     #[test]
     fn parses_valid_sitemap_page_filenames_only() {

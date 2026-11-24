@@ -865,19 +865,20 @@ try {
     body: JSON.stringify({ solana_address: solAddress, signature: sig, nonce }),
   });
   const setCookie = loginRes.headers.get('set-cookie') || '';
-  const cookieMatch = setCookie.match(/ue_session=([^;]+)/);
+  const cookieMatch = setCookie.match(/__Host-ue_session=([^;]+)/);
   check(
-    '5a. Real Ed25519 SIWS login issues revocable v2 ue_session cookie',
+    '5a. Real Ed25519 SIWS login issues revocable v2 __Host-ue_session cookie',
     loginRes.ok && Boolean(cookieMatch),
     `status=${loginRes.status}`
   );
 
   if (cookieMatch) {
     await cdp('Network.setCookie', {
-      name: 'ue_session',
+      name: '__Host-ue_session',
       value: cookieMatch[1],
-      domain: ORIGIN_HOSTNAME,
+      url: ORIGIN,
       path: '/',
+      secure: true,
       httpOnly: true,
       sameSite: 'Lax',
     });
@@ -1068,9 +1069,9 @@ try {
     return { clearNow: 0, hasHideBtn: false, firstClearSrc: '' };
   `);
   // F31: Verify guest click-to-reveal ran as an unprivileged GuestSession (NOT LiveAdmin):
-  // `le_guest_sid` cookie was minted AND the revealed `mc3.` capability binds to `guest_session`.
+  // `__Host-le_guest_sid` cookie was minted AND the revealed `mc3.` capability binds to `guest_session`.
   const { cookies: postRevealCookies } = await cdp('Network.getCookies', { urls: [ORIGIN] });
-  const guestCookie = postRevealCookies.find((c) => c.name === 'le_guest_sid');
+  const guestCookie = postRevealCookies.find((c) => c.name === '__Host-le_guest_sid');
   let revealedActorKind = null;
   if (afterReveal.firstClearSrc) {
     const capParam = new URL(afterReveal.firstClearSrc).searchParams.get('cap') || '';

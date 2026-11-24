@@ -50,6 +50,13 @@ pub struct SessionRevokeReq {
 pub struct SessionRevokeAllReq {
     pub identity_key: Option<String>,
     pub strict_only: bool,
+    /// Optional specific caller `sid` to revoke atomically alongside other filters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoke_sid: Option<String>,
+    /// When `true`, also bumps `revoked_all_before` so legacy cutover cookies
+    /// (`sid: None`) are invalidated atomically.
+    #[serde(default)]
+    pub invalidate_legacy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

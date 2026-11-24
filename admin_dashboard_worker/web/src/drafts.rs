@@ -315,14 +315,12 @@ impl EditablePolicyCard {
         let match_expr = self
             .match_draft
             .with_untracked(|d| d.query.trim().to_string());
-        let except_expr = if self.except_open.get_untracked() {
-            let ex = self
-                .except_draft
-                .with_untracked(|d| d.query.trim().to_string());
-            (!ex.is_empty()).then_some(ex)
-        } else {
-            None
-        };
+        // `except_open` controls UI panel visibility ONLY — collapsing the subpanel
+        // must NEVER silently wipe an existing `except_expr` on Publish (Cycle 2 C-4).
+        let ex = self
+            .except_draft
+            .with_untracked(|d| d.query.trim().to_string());
+        let except_expr = (!ex.is_empty()).then_some(ex);
 
         ContentPolicy {
             id: self.id.get_untracked().trim().to_ascii_lowercase(),
@@ -362,10 +360,9 @@ impl EditablePolicyCard {
                 prefix
             }
         };
-        if self.except_open.get()
-            && !self
-                .except_draft
-                .with(|d| d.query.trim().is_empty())
+        if !self
+            .except_draft
+            .with(|d| d.query.trim().is_empty())
         {
             format!("{base} · +except")
         } else {
@@ -669,7 +666,7 @@ impl EditableProvider {
         self.clear_secret.set(false);
     }
 
-    pub fn to_update(&self) -> ProviderUpdateItem {
+    pub fn to_update(&self, age_policy: AgeVerificationPolicy) -> ProviderUpdateItem {
         let opt = |s: String| {
             let t = s.trim().to_string();
             (!t.is_empty()).then_some(t)
@@ -701,11 +698,12 @@ impl EditableProvider {
         };
         ProviderUpdateItem {
             id: self.id,
-            enabled: self.enabled.get_untracked(),
+            enabled: self.enabled.get_untracked() && self.id.is_allowed_under(age_policy),
             display_name,
             issuer,
             public_client_id,
-            soft_birthday_check: self.soft_birthday_check.get_untracked(),
+            soft_birthday_check: self.soft_birthday_check.get_untracked()
+                && age_policy == AgeVerificationPolicy::SelfAttestation,
             secret_value: opt(self.secret_input.get_untracked()),
             clear_secret: self.clear_secret.get_untracked(),
         }
@@ -789,6 +787,14 @@ impl ProvidersDraft {
         self.public_origin.set(resp.public_origin.clone());
         self.rows.with_untracked(|rows| {
             for row in rows {
+                // Keep dirty draft compatible with updated `age_policy` so disabled toggles
+                // can never trap the admin in an unsaveable 400 validation loop (Cycle 2 C-3).
+                if !row.id.is_allowed_under(resp.age_policy) {
+                    row.enabled.set(false);
+                }
+                if resp.age_policy != AgeVerificationPolicy::SelfAttestation {
+                    row.soft_birthday_check.set(false);
+                }
                 if let Some(view) = resp.providers.iter().find(|v| v.config.id == row.id) {
                     row.has_client_secret.set(view.has_client_secret);
                     row.kid.set(view.kid.clone());
