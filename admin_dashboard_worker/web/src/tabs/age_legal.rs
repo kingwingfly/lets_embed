@@ -277,8 +277,8 @@ pub fn AgeLegalTab(
                             draft.noindex_restricted.set(v);
                             draft.dirty.set(true);
                         })
-                        label="`noindex` Restricted Pages"
-                        description="Adds `noindex` robots directive to pages containing blocked adult/restricted items."
+                        label="`noindex` Bypassable Restricted Pages (SFW-Only SEO)"
+                        description="Non-bypassable rules (e.g. Extreme / Gore & Illegal) and unclassified items are always excluded from sitemaps and marked noindex. Enable this to also exclude bypassable restricted pages (e.g. NSFW / Sensitive) from sitemaps and add noindex."
                     />
                 </div>
             </section>

@@ -672,14 +672,14 @@ async fn fetch_post_meta(post_id: i64) -> Result<PostMeta, ServerFnError> {
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
     if ctx.policy.is_enabled() {
-        let has_clear = engine
-            .post_has_any_clear_media(post_id, &ctx.policy, &ctx.caller)
+        let has_displayable = engine
+            .post_has_any_displayable_media(post_id, &ctx.policy, &ctx.caller)
             .await
             .map_err(|e| -> ServerFnError {
                 tracing::error!(post_id, "fetch_post_meta safety check failed: {e}");
                 ServerFnError::Response("Failed to load post metadata".to_string())
             })?;
-        if !has_clear {
+        if !has_displayable {
             return Ok(PostMeta {
                 authors: Vec::new(),
             });

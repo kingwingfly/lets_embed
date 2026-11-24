@@ -53,6 +53,15 @@ impl fmt::Display for MediaKind {
     }
 }
 
+/// Reserved marker appended to [`MaskMetadata::matched_policy_ids`] (or `Blurred`
+/// `matched_policy_ids`) when a restriction has no user self-service unlock path
+/// (e.g. zero-bypass hard block like Extreme / Gore & Illegal, live-admin-only rules,
+/// impossible `require_age_18` while `age_policy == Off`, or pending classification).
+///
+/// Uses a `:` prefix which is disallowed in valid Policy v3 IDs so it can never
+/// collide with an administrator-defined policy slug.
+pub const MASK_NO_UNLOCK_MARKER: &str = "system:no_unlock";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MaskMetadata {
@@ -66,6 +75,18 @@ pub struct MaskMetadata {
     pub requires_login: bool,
     pub requires_age: bool,
     pub requires_terms: bool,
+}
+
+impl MaskMetadata {
+    /// Returns `true` when this placeholder has NO user self-service unlock path
+    /// (hard-blocked / non-bypassable rule, live-admin-only rule, or pending classification).
+    pub fn has_no_unlock_path(&self) -> bool {
+        self.policy_id == "unclassified"
+            || self
+                .matched_policy_ids
+                .iter()
+                .any(|id| id == MASK_NO_UNLOCK_MARKER)
+    }
 }
 
 /// Policy v3 per-asset visibility projection.
@@ -140,6 +161,20 @@ impl MediaVisibility {
 
     pub const fn is_placeholder(&self) -> bool {
         matches!(self, Self::Placeholder { .. })
+    }
+
+    /// Returns `true` when the item is either `Clear` or restricted ONLY by
+    /// user-bypassable policies (so its post title & detail link may stay visible/indexable
+    /// while media bytes and WD tags remain protected). Returns `false` for hard-blocked
+    /// (zero-bypass) policies and unclassified/pending items.
+    pub fn is_bypassable_or_clear(&self) -> bool {
+        match self {
+            Self::Clear { .. } => true,
+            Self::Blurred {
+                matched_policy_ids, ..
+            } => !matched_policy_ids.iter().any(|id| id == MASK_NO_UNLOCK_MARKER),
+            Self::Placeholder { mask, .. } => !mask.has_no_unlock_path(),
+        }
     }
 }
 
@@ -225,6 +260,20 @@ impl ProjectedImage {
 
     pub const fn is_placeholder(&self) -> bool {
         matches!(self, Self::Placeholder { .. })
+    }
+
+    /// Returns `true` when the item is either `Clear` or restricted ONLY by
+    /// user-bypassable policies (so its post title & detail link may stay visible/indexable
+    /// while media bytes and WD tags remain protected). Returns `false` for hard-blocked
+    /// (zero-bypass) policies and unclassified/pending items.
+    pub fn is_bypassable_or_clear(&self) -> bool {
+        match self {
+            Self::Clear { .. } => true,
+            Self::Blurred {
+                matched_policy_ids, ..
+            } => !matched_policy_ids.iter().any(|id| id == MASK_NO_UNLOCK_MARKER),
+            Self::Placeholder { mask, .. } => !mask.has_no_unlock_path(),
+        }
     }
 }
 
@@ -312,6 +361,20 @@ impl ProjectedVideo {
 
     pub const fn is_placeholder(&self) -> bool {
         matches!(self, Self::Placeholder { .. })
+    }
+
+    /// Returns `true` when the item is either `Clear` or restricted ONLY by
+    /// user-bypassable policies (so its post title & detail link may stay visible/indexable
+    /// while media bytes and WD tags remain protected). Returns `false` for hard-blocked
+    /// (zero-bypass) policies and unclassified/pending items.
+    pub fn is_bypassable_or_clear(&self) -> bool {
+        match self {
+            Self::Clear { .. } => true,
+            Self::Blurred {
+                matched_policy_ids, ..
+            } => !matched_policy_ids.iter().any(|id| id == MASK_NO_UNLOCK_MARKER),
+            Self::Placeholder { mask, .. } => !mask.has_no_unlock_path(),
+        }
     }
 }
 
@@ -638,5 +701,42 @@ mod tests {
         assert!(rendered.visibility.is_blurred());
         assert_eq!(rendered.visibility.kind(), MediaKind::Video);
         assert_eq!(rendered.duration, Some(45));
+        assert!(rendered.visibility.is_bypassable_or_clear());
+
+        // Bypassable placeholder (`r18`) is displayable; hard-blocked (`MASK_NO_UNLOCK_MARKER`)
+        // and unclassified placeholders are NOT.
+        assert!(placeholder_img.is_bypassable_or_clear());
+        let hard_blocked = ProjectedImage::Placeholder {
+            id: 100,
+            policy_rev: 5,
+            width: 800,
+            height: 800,
+            mask: MaskMetadata {
+                policy_id: "blood".to_string(),
+                matched_policy_ids: vec!["blood".to_string(), MASK_NO_UNLOCK_MARKER.to_string()],
+                label: "Extreme / Gore & Illegal".to_string(),
+                preset: PlaceholderPreset::Blood,
+                requires_login: false,
+                requires_age: false,
+                requires_terms: false,
+            },
+        };
+        assert!(!hard_blocked.is_bypassable_or_clear());
+        let unclassified = ProjectedImage::Placeholder {
+            id: 101,
+            policy_rev: 5,
+            width: 800,
+            height: 800,
+            mask: MaskMetadata {
+                policy_id: "unclassified".to_string(),
+                matched_policy_ids: vec!["unclassified".to_string()],
+                label: "Pending classification".to_string(),
+                preset: PlaceholderPreset::Custom,
+                requires_login: false,
+                requires_age: false,
+                requires_terms: false,
+            },
+        };
+        assert!(!unclassified.is_bypassable_or_clear());
     }
 }

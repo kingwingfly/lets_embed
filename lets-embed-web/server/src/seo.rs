@@ -1,8 +1,10 @@
 //! Public SEO endpoints: `/robots.txt`, `/sitemap.xml`, and chunked `/sitemap/{page}.xml`.
 //!
 //! - In Managed Mode, canonical origin is ALWAYS the pinned `PUBLIC_URL` (never `Host`/`X-Forwarded-Host`).
-//! - Sitemaps ALWAYS run under the anonymous safe view (`sitemap_post_count_with_policy` /
-//!   `sitemap_post_entries_with_policy`), honoring `policy.legal.noindex_restricted`.
+//! - Sitemaps ALWAYS run under the anonymous view (`sitemap_post_count_with_policy` /
+//!   `sitemap_post_entries_with_policy`): non-bypassable hard-blocked (e.g. Extreme / Gore & Illegal)
+//!   and unclassified covers are ALWAYS excluded when safety is enabled; bypassable covers (e.g.
+//!   NSFW / Sensitive) stay indexed by title unless `policy.legal.noindex_restricted` is enabled.
 
 use std::sync::Arc;
 

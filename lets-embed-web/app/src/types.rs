@@ -11,7 +11,7 @@ use site_access::{AgeGateTrigger, AgeVerificationPolicy};
 
 /// Reserved marker emitted in `MaskMetadata::matched_policy_ids` when a
 /// placeholder restriction has no user self-service unlock path.
-pub const MASK_NO_UNLOCK_MARKER: &str = "system:no_unlock";
+pub use search_types::MASK_NO_UNLOCK_MARKER;
 
 pub const MAX_SEARCH_LIMIT: i64 = 100;
 pub const DEFAULT_SEARCH_LIMIT: i64 = 50;
@@ -345,11 +345,7 @@ pub const fn preset_to_ui(preset: PlaceholderPreset) -> GalleryMaskPreset {
 }
 
 pub fn mask_has_no_unlock_path(mask: &MaskMetadata) -> bool {
-    mask.policy_id == "unclassified"
-        || mask
-            .matched_policy_ids
-            .iter()
-            .any(|id| id == MASK_NO_UNLOCK_MARKER)
+    mask.has_no_unlock_path()
 }
 
 pub fn mask_to_ui(mask: &MaskMetadata) -> GalleryMask {

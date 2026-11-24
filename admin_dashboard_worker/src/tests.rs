@@ -366,8 +366,14 @@ fn admin_assertion_v2_verifies_valid_and_rejects_all_tampered_or_malformed_cases
 fn policy_v3_validation_enforces_codex_invariants_and_wd_vocab() {
     let base = PublicSitePolicy::fresh_bootstrap();
 
-    // Built-in presets validate cleanly & stamp schema_version = 3 + WD_VOCAB_DIGEST
-    let preset_req = sample_safety_req(builtin_safety_presets());
+    // Built-in presets require age verification when `require_age_18` is enabled on R18/Sensitive,
+    // and validate cleanly once AgeVerificationPolicy is enabled.
+    let mut preset_req = sample_safety_req(builtin_safety_presets());
+    assert!(
+        prepare_safety_update(&base, &preset_req, 1).is_err(),
+        "builtin presets require age_policy != Off because r18 & sensitive enable require_age_18"
+    );
+    preset_req.age_policy = AgeVerificationPolicy::SelfAttestation;
     let ok = prepare_safety_update(&base, &preset_req, 1).expect("builtin presets valid");
     assert_eq!(ok.next_policy.schema_version, SITE_POLICY_SCHEMA_VERSION);
     assert_eq!(ok.next_policy.vocab_digest, WD_VOCAB_DIGEST);
@@ -1579,7 +1585,34 @@ fn compact_admin_safety_presets_use_single_tag_in_expr_and_validate_v3() {
         );
     }
     let base = PublicSitePolicy::fresh_bootstrap();
-    let req = sample_safety_req(presets);
+    let mut req = sample_safety_req(presets);
+    req.age_policy = AgeVerificationPolicy::SelfAttestation;
     let prepared = prepare_safety_update(&base, &req, 1).expect("compact presets validate cleanly");
     assert_eq!(prepared.next_policy.policies.len(), 3);
+    let r18 = &prepared.next_policy.policies[0];
+    assert_eq!(r18.id, "r18");
+    assert_eq!(r18.action, PolicyAction::Block);
+    assert!(
+        r18.bypass.include_switcher
+            && !r18.bypass.include_click
+            && r18.bypass.require_gallery_login
+            && r18.bypass.require_age_18
+            && r18.bypass.require_current_terms
+            && r18.bypass.exclude_anonymous
+    );
+    let sens = &prepared.next_policy.policies[1];
+    assert_eq!(sens.id, "sensitive");
+    assert_eq!(sens.action, PolicyAction::Blur);
+    assert!(
+        sens.bypass.include_switcher
+            && sens.bypass.include_click
+            && sens.bypass.require_gallery_login
+            && sens.bypass.require_age_18
+            && sens.bypass.require_current_terms
+            && sens.bypass.exclude_anonymous
+    );
+    let blood = &prepared.next_policy.policies[2];
+    assert_eq!(blood.id, "blood");
+    assert_eq!(blood.action, PolicyAction::Block);
+    assert!(!blood.bypass.has_any_include());
 }

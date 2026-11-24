@@ -2139,8 +2139,13 @@ mod tests {
             },
             ..PublicSitePolicy::default()
         };
-        // Enable require_age_18 on r18 for strict age testing
-        p.policies[0].bypass.require_age_18 = true;
+        // `r18` already enables `require_age_18 = true` in builtin presets; keep
+        // `sensitive` open to anonymous click-to-reveal in this test fixture so
+        // gateway unit tests exercise `le_guest_sid` / `ActorBinding::GuestSession`.
+        p.policies[1].bypass.require_gallery_login = false;
+        p.policies[1].bypass.require_age_18 = false;
+        p.policies[1].bypass.require_current_terms = false;
+        p.policies[1].bypass.exclude_anonymous = false;
         p.refresh_policy_digest();
         p
     }

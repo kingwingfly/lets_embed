@@ -686,7 +686,7 @@ pub fn Results(
                 let cover_video = p.videos.first().cloned();
                 let cover_details_href = cover
                     .as_ref()
-                    .filter(|c| !c.is_placeholder())
+                    .filter(|c| c.is_bypassable_or_clear())
                     .map(|c| format!("/details/{}", c.id()));
                 let nav = use_navigate();
                 let img_count = p.image_count.max(p.images.len());
@@ -899,7 +899,7 @@ pub fn Results(
             }
             Item::Image(im) => {
                 let id = im.id();
-                let is_placeholder = im.is_placeholder();
+                let show_details_link = im.is_bypassable_or_clear();
                 let href = format!("/details/{id}");
                 let click_href = href.clone();
                 let nav = use_navigate();
@@ -1016,7 +1016,7 @@ pub fn Results(
                                             "Report"
                                         </button>
                                     })}
-                                    {(!is_placeholder).then(|| view! {
+                                    {show_details_link.then(|| view! {
                                         <a
                                             href=href
                                             title="Open image details & similar"
@@ -1320,7 +1320,7 @@ pub fn Results(
                                 let aspect = format!("aspect-ratio: {w} / {h}");
                                 let details_href = cover
                                     .as_ref()
-                                    .filter(|c| !c.is_placeholder())
+                                    .filter(|c| c.is_bypassable_or_clear())
                                     .map(|c| format!("/details/{}", c.id()));
                                 let cover_view = match cover {
                                     Some(ProjectedImage::Clear { url, .. }) => {
@@ -1788,30 +1788,32 @@ async fn hydrate_posts(
     let mut by_id: HashMap<i64, search_engine::PostGalleryCover> =
         covers.into_iter().map(|c| (c.post_id, c)).collect();
 
-    // Withhold post titles whenever safety policy is active and a post has ZERO Clear
-    // media for this caller (mirrors `previews.rs` and `image_details.rs`).
-    let extra_clear_posts = if ctx.policy.is_enabled() {
-        let need_clear_check: Vec<i64> = posts
+    // Withhold post titles whenever safety policy is active and a post has ZERO displayable
+    // (Clear or user-bypassable) media — hard-blocked (e.g. Extreme / Gore & Illegal) and
+    // unclassified posts redact to `"Restricted Post #<id>"`, while bypassable posts (e.g.
+    // NSFW / Sensitive) retain their real titles for visitors and search indexing.
+    let extra_displayable_posts = if ctx.policy.is_enabled() {
+        let need_check: Vec<i64> = posts
             .iter()
             .filter_map(|post| {
-                let has_clear_cover = by_id.get(&post.id).is_some_and(|c| {
+                let has_displayable_cover = by_id.get(&post.id).is_some_and(|c| {
                     c.cover_image
                         .as_ref()
                         .and_then(|im| proj_img_map.get(&im.id))
-                        .is_some_and(ProjectedImage::is_clear)
+                        .is_some_and(ProjectedImage::is_bypassable_or_clear)
                         || c.cover_video
                             .as_ref()
                             .and_then(|v| proj_vid_map.get(&v.id))
-                            .is_some_and(ProjectedVideo::is_clear)
+                            .is_some_and(ProjectedVideo::is_bypassable_or_clear)
                 });
-                (!has_clear_cover).then_some(post.id)
+                (!has_displayable_cover).then_some(post.id)
             })
             .collect();
-        if need_clear_check.is_empty() {
+        if need_check.is_empty() {
             std::collections::HashSet::new()
         } else {
             engine
-                .posts_with_any_clear_media(&need_clear_check, &ctx.policy, &ctx.caller)
+                .posts_with_any_displayable_media(&need_check, &ctx.policy, &ctx.caller)
                 .await
                 .map_err(to_server_err)?
         }
@@ -1833,9 +1835,9 @@ async fn hydrate_posts(
                 .into_iter()
                 .collect();
             let show_title = !ctx.policy.is_enabled()
-                || images.iter().any(ProjectedImage::is_clear)
-                || videos.iter().any(ProjectedVideo::is_clear)
-                || extra_clear_posts.contains(&post.id);
+                || images.iter().any(ProjectedImage::is_bypassable_or_clear)
+                || videos.iter().any(ProjectedVideo::is_bypassable_or_clear)
+                || extra_displayable_posts.contains(&post.id);
             let title = if show_title {
                 if post.title.is_empty() {
                     cover.title
@@ -1854,7 +1856,8 @@ async fn hydrate_posts(
                 video_count: cover.video_count,
             });
         } else {
-            let show_title = !ctx.policy.is_enabled() || extra_clear_posts.contains(&post.id);
+            let show_title =
+                !ctx.policy.is_enabled() || extra_displayable_posts.contains(&post.id);
             items.push(PostItem {
                 id: post.id,
                 title: if show_title {

@@ -102,10 +102,7 @@ pub const CLICK_REVEAL_MEDIA_CAP_TTL_SECS: u64 = 900;
 /// placeholder restriction has no user self-service unlock path (e.g. neither
 /// `include_switcher` nor `include_click` is enabled, `require_age_18` is
 /// configured while `age_policy == Off`, or the asset is pending classification).
-///
-/// Uses a `:` prefix which is disallowed in valid Policy v3 IDs so it can never
-/// collide with an administrator-defined policy slug.
-pub const MASK_NO_UNLOCK_MARKER: &str = "system:no_unlock";
+pub use search_types::MASK_NO_UNLOCK_MARKER;
 
 /// Explicit error returned when a similarity search seed (`search_similar` or
 /// `dino:<id>` / `-dino:<id>`) is not Clear for the caller or lacks trusted facts.
@@ -881,7 +878,14 @@ impl CompiledPolicy {
             let can_click_reveal = unsatisfied_blurs
                 .iter()
                 .all(|b| caller.is_click_eligible(&b.policy_ref));
-            let matched_policy_ids = unsatisfied_blurs.iter().map(|p| p.id.clone()).collect();
+            let mut matched_policy_ids: Vec<String> =
+                unsatisfied_blurs.iter().map(|p| p.id.clone()).collect();
+            if !unsatisfied_blurs
+                .iter()
+                .all(|p| policy_has_user_unlock_path(p, &self.policy))
+            {
+                matched_policy_ids.push(MASK_NO_UNLOCK_MARKER.to_string());
+            }
             return MediaOutcome::Blurred {
                 policy_id: primary.id.clone(),
                 matched_policy_ids,
@@ -1209,6 +1213,51 @@ impl CompiledPolicy {
 
         emitted
     }
+
+    /// Push SQL indexability clauses onto `qb` (inside a `WHERE` clause, starting
+    /// with `AND ...`) for anonymous XML sitemaps when `noindex_restricted == false`:
+    /// - Excludes unclassified images when `unclassified_mode == Placeholder`
+    /// - Excludes any image matching (or `Unknown` against) a **non-bypassable** policy
+    ///   (zero user self-service unlock path, e.g. `Extreme / Gore & Illegal` or staff-only rules)
+    /// - Keeps classified images matching only **bypassable** policies (e.g. `NSFW` / `Sensitive`)
+    ///   so their titles and detail pages stay indexable while media bytes remain protected.
+    ///
+    /// Returns `true` if any filter predicate was emitted.
+    pub fn push_indexable_image_sql(
+        &self,
+        qb: &mut QueryBuilder<Postgres>,
+        img_alias: &'static str,
+    ) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        let mut emitted = false;
+        if self.policy.unclassified_mode == UnclassifiedMode::Placeholder {
+            qb.push(" AND ");
+            qb.push(img_alias);
+            qb.push(".status = 'completed'::process_status");
+            emitted = true;
+        }
+
+        let expected_vocab = self.policy.vocab_digest.as_str();
+        for item in &self.policies {
+            let bypassable = policy_has_user_unlock_path(item, &self.policy);
+            if !bypassable {
+                // Non-bypassable policy (zero user unlock path) MUST evaluate strictly to FALSE.
+                qb.push(" AND ");
+                push_policy_strictly_false_sql(qb, item, img_alias, expected_vocab);
+                emitted = true;
+            } else if item.references_wd_tags {
+                // Bypassable WD-tag policy may match (TRUE) or not match (FALSE),
+                // but indeterminate coverage (NULL / Unknown) still fails closed.
+                qb.push(" AND ");
+                push_policy_not_unknown_sql(qb, item, img_alias, expected_vocab);
+                emitted = true;
+            }
+        }
+
+        emitted
+    }
 }
 
 fn push_policy_strictly_false_sql(
@@ -1421,6 +1470,21 @@ impl MediaOutcome {
                 ..
             } if matched_blocks.is_empty() && matched_blurs.is_empty()
         )
+    }
+
+    /// Returns `true` when the media is either `Clear` for the caller or restricted ONLY
+    /// by user-bypassable policies (has a self-service Switcher / Click-to-Reveal unlock path).
+    ///
+    /// Returns `false` for non-bypassable hard blocks (e.g. `Extreme / Gore & Illegal`,
+    /// live-admin-only rules, impossible age gates) and unclassified / `Unknown` items.
+    pub fn is_user_bypassable_or_clear(&self) -> bool {
+        match self {
+            Self::Clear { .. } => true,
+            Self::Blurred {
+                matched_policy_ids, ..
+            } => !matched_policy_ids.iter().any(|id| id == MASK_NO_UNLOCK_MARKER),
+            Self::Placeholder { mask, .. } => !mask.has_no_unlock_path(),
+        }
     }
 }
 
@@ -3193,5 +3257,106 @@ mod tests {
             }
             other => panic!("expected no-unlock Placeholder, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn indexable_metadata_and_sitemap_sql_allow_bypassable_and_block_hard_blocks() {
+        let mut pol = PublicSitePolicy {
+            revision: 1,
+            min_enforce_rev: 1,
+            safety_enabled: true,
+            fixed_blur_enabled: false,
+            age_policy: AgeVerificationPolicy::SelfAttestation,
+            policies: site_access::builtin_safety_presets(),
+            ..PublicSitePolicy::default()
+        };
+        pol.refresh_policy_digest();
+        let compiled = CompiledPolicy::compile(pol.clone()).expect("builtin presets compile");
+        let anon = CallerContext::anonymous();
+
+        // 1. SFW Clear image -> indexable & public-safe clear
+        let sfw = ImageFacts::completed_with_floor(Some(0.30), HashMap::from([("1girl".into(), 0.9)]));
+        let sfw_out = compiled.evaluate_image(&sfw, &anon);
+        assert!(sfw_out.is_public_safe_clear());
+        assert!(sfw_out.is_user_bypassable_or_clear());
+
+        // 2. Bypassable NSFW (`r18`) -> Placeholder, NOT public-safe clear, IS user-bypassable (title indexable!)
+        let nsfw =
+            ImageFacts::completed_with_floor(Some(0.30), HashMap::from([("explicit".into(), 0.9)]));
+        let nsfw_out = compiled.evaluate_image(&nsfw, &anon);
+        assert!(nsfw_out.is_placeholder());
+        assert!(!nsfw_out.is_public_safe_clear());
+        assert!(nsfw_out.is_user_bypassable_or_clear());
+
+        // 3. Bypassable Sensitive (`sensitive`) -> Placeholder when fixed_blur_enabled=false, IS user-bypassable
+        let niche =
+            ImageFacts::completed_with_floor(Some(0.30), HashMap::from([("bdsm".into(), 0.9)]));
+        let niche_out = compiled.evaluate_image(&niche, &anon);
+        assert!(niche_out.is_placeholder());
+        assert!(niche_out.is_user_bypassable_or_clear());
+
+        // 4. Hard-blocked Extreme / Gore (`blood`) -> NOT user-bypassable (NEVER indexable!)
+        let gore =
+            ImageFacts::completed_with_floor(Some(0.30), HashMap::from([("blood".into(), 0.9)]));
+        let gore_out = compiled.evaluate_image(&gore, &anon);
+        assert!(gore_out.is_placeholder());
+        assert!(!gore_out.is_user_bypassable_or_clear());
+
+        // 5. Combined NSFW + Extreme (`explicit` + `blood`) -> NOT user-bypassable!
+        let nsfw_gore = ImageFacts::completed_with_floor(
+            Some(0.30),
+            HashMap::from([("explicit".into(), 0.9), ("guro".into(), 0.9)]),
+        );
+        assert!(!compiled.evaluate_image(&nsfw_gore, &anon).is_user_bypassable_or_clear());
+
+        // 6. Unclassified / pending image -> NOT user-bypassable!
+        let pending = ImageFacts::default();
+        assert!(!compiled.evaluate_image(&pending, &anon).is_user_bypassable_or_clear());
+
+        // 7. Sitemap indexable SQL: strictly FALSE ONLY for non-bypassable (`blood`, 1 rule),
+        //    IS NOT NULL for bypassable WD-tag rules (`r18` & `sensitive`, 2 rules).
+        let mut qb = QueryBuilder::<Postgres>::new("SELECT i.id FROM images i WHERE TRUE");
+        assert!(compiled.push_indexable_image_sql(&mut qb, "i"));
+        let built = qb.build();
+        let sql_str = built.sql();
+        let sql = sql_str.as_str();
+        assert!(sql.contains("i.status = 'completed'::process_status"));
+        assert_eq!(
+            sql.matches(") IS FALSE)").count(),
+            1,
+            "only the 1 non-bypassable policy (blood) must require IS FALSE in indexable sitemap SQL"
+        );
+        assert_eq!(
+            sql.matches(") IS NOT NULL)").count(),
+            2,
+            "the 2 bypassable WD-tag policies (r18, sensitive) must allow TRUE/FALSE and reject only Unknown/NULL"
+        );
+
+        // 8. Non-bypassable Blur rule with fixed_blur_enabled=true marks MASK_NO_UNLOCK_MARKER
+        let mut hard_blur_pol = PublicSitePolicy {
+            revision: 2,
+            min_enforce_rev: 1,
+            safety_enabled: true,
+            fixed_blur_enabled: true,
+            policies: vec![ContentPolicy {
+                id: "hard_blur".into(),
+                grant_generation: 1,
+                enabled: true,
+                priority: 1,
+                name: "Hard Blur".into(),
+                preset: PlaceholderPreset::Blood,
+                match_expr: "tag:blood >= 0.45".into(),
+                except_expr: None,
+                default_tag_min: 0.45,
+                action: PolicyAction::Blur,
+                bypass: PolicyBypass::default(),
+            }],
+            ..PublicSitePolicy::default()
+        };
+        hard_blur_pol.refresh_policy_digest();
+        let hard_blur_compiled = CompiledPolicy::compile(hard_blur_pol).unwrap();
+        let hb_out = hard_blur_compiled.evaluate_image(&gore, &anon);
+        assert!(hb_out.is_blurred());
+        assert!(!hb_out.is_user_bypassable_or_clear());
     }
 }
