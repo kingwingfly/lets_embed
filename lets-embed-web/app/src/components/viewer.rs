@@ -55,6 +55,7 @@ pub fn Viewer(
     let safety = use_context::<SafetyUiState>();
 
     lock_body_scroll();
+    let modal_layer = lets_embed_ui::browser::push_modal_layer();
     push_modal_history(move || index.set(None));
 
     // Immediately wipe media elements and close Viewer on cross-tab safety invalidation.
@@ -101,6 +102,9 @@ pub fn Viewer(
 
     let nav_key = navigate.clone();
     let _ = use_event_listener(window(), ev::keydown, move |e| {
+        if !lets_embed_ui::browser::is_top_modal(modal_layer) {
+            return;
+        }
         if e.alt_key() || e.ctrl_key() || e.meta_key() {
             return;
         }

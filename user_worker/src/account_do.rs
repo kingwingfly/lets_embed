@@ -1606,13 +1606,23 @@ impl UserAccount {
                     cost,
                 )
             };
+            // Force-reclaim expired holds once before falling back to a costlier funding
+            // tier or refusing (402), so expired holds on other items never overcharge
+            // PAYG balance or subscription window quota during the 30s purge throttle (Cycle 5 J4).
+            let should_reclaim = source == ChargeSource::Refuse
+                || (source == ChargeSource::Balance && active && plan_cfg.is_some())
+                || (!included
+                    && cost > 0
+                    && policy.free_media_in_scope(&req)
+                    && rule.daily_free > 0);
+            if !reclaimed_once
+                && should_reclaim
+                && self.reclaim_expired_holds(now as i64, true).await? > 0
+            {
+                reclaimed_once = true;
+                continue;
+            }
             if source == ChargeSource::Refuse {
-                if !reclaimed_once
-                    && self.reclaim_expired_holds(now as i64, true).await? > 0
-                {
-                    reclaimed_once = true;
-                    continue;
-                }
                 let views_remaining = views_remaining(plan_cfg.as_ref(), active, win_views);
                 let searches_remaining = searches_remaining(plan_cfg.as_ref(), active, win_search);
                 let window_reset = window_reset(active, win_start, now);
@@ -1800,13 +1810,23 @@ impl UserAccount {
                     cost,
                 )
             };
+            // Force-reclaim expired holds once before falling back to a costlier funding
+            // tier or refusing (402), so expired holds on other items never overcharge
+            // PAYG balance or subscription window quota during the 30s purge throttle (Cycle 5 J4).
+            let should_reclaim = source == ChargeSource::Refuse
+                || (source == ChargeSource::Balance && active && plan_cfg.is_some())
+                || (!included
+                    && cost > 0
+                    && policy.free_media_in_scope(&req)
+                    && rule.daily_free > 0);
+            if !reclaimed_once
+                && should_reclaim
+                && self.reclaim_expired_holds(now as i64, true).await? > 0
+            {
+                reclaimed_once = true;
+                continue;
+            }
             if source == ChargeSource::Refuse {
-                if !reclaimed_once
-                    && self.reclaim_expired_holds(now as i64, true).await? > 0
-                {
-                    reclaimed_once = true;
-                    continue;
-                }
                 let views_remaining = views_remaining(plan_cfg.as_ref(), active, win_views);
                 let searches_remaining = searches_remaining(plan_cfg.as_ref(), active, win_search);
                 let window_reset = window_reset(active, win_start, now);

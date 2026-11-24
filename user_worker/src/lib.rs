@@ -155,14 +155,20 @@ pub fn verify_internal_api_auth(
     provided.len() == expected.len() && bool::from(provided.as_bytes().ct_eq(expected))
 }
 
-fn cookie_pair_name(pair: &str) -> &str {
-    pair.split_once('=').map_or(pair, |(name, _)| name).trim()
+fn cookie_pair_name(pair: &str) -> Option<&str> {
+    let (name, _) = pair.split_once('=')?;
+    let name = name.trim();
+    (!name.is_empty()).then_some(name)
 }
 
 /// Drops percent-encoded auth-cookie spoofs unconditionally and drops literal
 /// duplicate occurrences of `__Host-ue_session` and `__Host-auth_tx` fail-closed
 /// before `CookieManagerLayer` (`cookie::Cookie::parse_encoded`) percent-decodes
-/// cookie names with last-wins semantics (Cycle 3 H5 / Cycle 4 I1).
+/// cookie names with last-wins semantics (Cycle 3 H5 / Cycle 4 I1 / Cycle 5 J2).
+///
+/// Decodes `Cookie` header bytes via `std::str::from_utf8` (matching `tower-cookies`)
+/// rather than `HeaderValue::to_str()` so non-ASCII UTF-8 bytes in another cookie can
+/// never cause this sanitizer to skip the header.
 pub(crate) fn sanitize_duplicate_auth_cookies(headers: &mut HeaderMap) {
     let mut session_count = 0usize;
     let mut auth_tx_count = 0usize;
@@ -170,10 +176,12 @@ pub(crate) fn sanitize_duplicate_auth_cookies(headers: &mut HeaderMap) {
     for raw in headers
         .get_all(header::COOKIE)
         .iter()
-        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| std::str::from_utf8(v.as_bytes()).ok())
     {
         for pair in raw.split(';').map(str::trim).filter(|c| !c.is_empty()) {
-            let name = cookie_pair_name(pair);
+            let Some(name) = cookie_pair_name(pair) else {
+                continue;
+            };
             let decoded = percent_encoding::percent_decode_str(name)
                 .decode_utf8()
                 .ok();
@@ -202,10 +210,12 @@ pub(crate) fn sanitize_duplicate_auth_cookies(headers: &mut HeaderMap) {
     for raw in headers
         .get_all(header::COOKIE)
         .iter()
-        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| std::str::from_utf8(v.as_bytes()).ok())
     {
         for pair in raw.split(';').map(str::trim).filter(|c| !c.is_empty()) {
-            let name = cookie_pair_name(pair);
+            let Some(name) = cookie_pair_name(pair) else {
+                continue;
+            };
             let decoded = percent_encoding::percent_decode_str(name)
                 .decode_utf8()
                 .ok();
@@ -581,5 +591,30 @@ mod tests {
         );
         sanitize_duplicate_auth_cookies(&mut sole_encoded);
         assert!(sole_encoded.get(header::COOKIE).is_none());
+
+        // Cycle 5 J2: Non-ASCII UTF-8 bytes in another cookie MUST NOT bypass sanitization,
+        // and nameless/valueless tokens without '=' MUST NOT count as duplicate auth cookies.
+        let mut utf8_bypass = HeaderMap::new();
+        utf8_bypass.insert(
+            header::COOKIE,
+            HeaderValue::from_str("pad=é; __Host-ue_session=real; %5F_Host-ue_session=evil")
+                .unwrap(),
+        );
+        sanitize_duplicate_auth_cookies(&mut utf8_bypass);
+        assert_eq!(
+            std::str::from_utf8(utf8_bypass.get(header::COOKIE).unwrap().as_bytes()).unwrap(),
+            "pad=é; __Host-ue_session=real"
+        );
+
+        let mut valueless_dos = HeaderMap::new();
+        valueless_dos.insert(
+            header::COOKIE,
+            HeaderValue::from_static("__Host-ue_session; __Host-ue_session=real"),
+        );
+        sanitize_duplicate_auth_cookies(&mut valueless_dos);
+        assert_eq!(
+            valueless_dos.get(header::COOKIE).unwrap(),
+            "__Host-ue_session; __Host-ue_session=real"
+        );
     }
 }

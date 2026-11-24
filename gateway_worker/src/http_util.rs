@@ -268,7 +268,11 @@ pub(crate) enum CookieLookup<'a> {
 
 pub(crate) fn extract_single_cookie<'a>(headers: &'a HeaderMap, target: &str) -> CookieLookup<'a> {
     let mut found: Option<&'a str> = None;
-    for raw in headers.get_all("cookie").iter().filter_map(|v| v.to_str().ok()) {
+    for raw in headers
+        .get_all("cookie")
+        .iter()
+        .filter_map(|v| std::str::from_utf8(v.as_bytes()).ok())
+    {
         for pair in raw.split(';').map(str::trim).filter(|c| !c.is_empty()) {
             let Some((name, value)) = pair.split_once('=') else {
                 continue;
@@ -329,9 +333,19 @@ pub(crate) fn sanitize_user_worker_cookie(headers: &HeaderMap) -> Option<String>
         CookieLookup::Duplicate
     );
     let mut kept = Vec::new();
-    for raw in headers.get_all("cookie").iter().filter_map(|v| v.to_str().ok()) {
+    for raw in headers
+        .get_all("cookie")
+        .iter()
+        .filter_map(|v| std::str::from_utf8(v.as_bytes()).ok())
+    {
         for cookie in raw.split(';').map(str::trim).filter(|c| !c.is_empty()) {
-            let name = cookie.split('=').next().unwrap_or("").trim();
+            let Some((raw_name, _)) = cookie.split_once('=') else {
+                continue;
+            };
+            let name = raw_name.trim();
+            if name.is_empty() {
+                continue;
+            }
             let decoded = percent_decode_cookie_name(name);
             let is_encoded = decoded != name;
             let is_stripped_sensitive = matches!(

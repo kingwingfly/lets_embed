@@ -23,17 +23,21 @@ pub fn ReportsTab(on_resolved: Callback<()>) -> impl IntoView {
     let busy_id = RwSignal::new(Option::<String>::None);
 
     let load_reports = move || {
-        loading.set(true);
-        let st = status_filter.get_untracked();
+        let Some(st) = status_filter.try_get_untracked() else {
+            return;
+        };
+        let _ = loading.try_set(true);
         let url = format!("/admin/api/reports?status={st}&limit=100");
         spawn_local(async move {
             match get_json::<ReportsListResp>(&url).await {
-                Ok(resp) => data.set(Some(resp)),
+                Ok(resp) => {
+                    let _ = data.try_set(Some(resp));
+                }
                 Err(err) => {
                     toasts.error("Failed to load content reports", Some(err));
                 }
             }
-            loading.set(false);
+            let _ = loading.try_set(false);
         });
     };
 
@@ -71,7 +75,7 @@ pub fn ReportsTab(on_resolved: Callback<()>) -> impl IntoView {
                     toasts.error("Failed to update report status", Some(err));
                 }
             }
-            busy_id.set(None);
+            let _ = busy_id.try_set(None);
         });
     };
 

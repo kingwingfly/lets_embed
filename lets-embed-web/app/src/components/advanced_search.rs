@@ -602,6 +602,7 @@ pub fn AdvancedSearchPanel(
 
     #[cfg(feature = "hydrate")]
     {
+        let modal_layer = lets_embed_ui::browser::push_modal_layer();
         Effect::new(move |_| {
             if let Some(el) = dialog_ref.get() {
                 let _ = el.focus();
@@ -609,6 +610,9 @@ pub fn AdvancedSearchPanel(
         });
 
         let _ = use_event_listener(window(), ev::keydown, move |e: ev::KeyboardEvent| {
+            if !lets_embed_ui::browser::is_top_modal(modal_layer) {
+                return;
+            }
             if e.key() == "Tab" {
                 trap_dialog_tab(&e, dialog_ref.get_untracked());
                 return;

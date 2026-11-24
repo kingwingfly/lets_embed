@@ -159,50 +159,11 @@ pub fn set_document_title(text: &str) {
     }
 }
 
-/// Reference-counted `<body>` scroll lock for stacked modals (`Lightbox` + `Viewer`).
-/// Toggles a dedicated `.modal-open` class so any pre-existing inline `overflow`
-/// style on `<body>` is preserved when the outermost modal closes.
+/// Reference-counted `<body>` scroll lock shared with `lets-embed-ui` modals
+/// (`Lightbox`, `Viewer`, `AdvancedSearchPanel`, `ReportDialog`, `AgeGateModal`)
+/// so closing a stacked UI modal never unlocks scroll underneath an app modal (Cycle 5 J5).
 pub fn lock_body_scroll() {
-    #[cfg(feature = "hydrate")]
-    {
-        use std::cell::Cell;
-
-        thread_local! {
-            static LOCK_COUNT: Cell<usize> = const { Cell::new(0) };
-        }
-
-        fn toggle_class(add: bool) {
-            if let Some(body) = web_sys::window()
-                .and_then(|w| w.document())
-                .and_then(|d| d.body())
-            {
-                let list = body.class_list();
-                let _ = if add {
-                    list.add_1("modal-open")
-                } else {
-                    list.remove_1("modal-open")
-                };
-            }
-        }
-
-        LOCK_COUNT.with(|c| {
-            let n = c.get();
-            if n == 0 {
-                toggle_class(true);
-            }
-            c.set(n + 1);
-        });
-
-        leptos::prelude::on_cleanup(move || {
-            LOCK_COUNT.with(|c| {
-                let next = c.get().saturating_sub(1);
-                c.set(next);
-                if next == 0 {
-                    toggle_class(false);
-                }
-            });
-        });
-    }
+    lets_embed_ui::browser::lock_body_scroll();
 }
 
 /// Push a synthetic same-URL browser history entry while a modal (`Lightbox` or

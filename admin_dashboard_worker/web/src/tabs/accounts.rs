@@ -47,14 +47,29 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
     let busy = RwSignal::new(false);
 
     let load_accounts = move || {
-        loading.set(true);
-        let q = search_q.get_untracked();
-        let pl = plan_filter.get_untracked();
-        let st = status_filter.get_untracked();
-        let pv = provider_filter.get_untracked();
-        let so = sort_by.get_untracked();
-        let pg = page.get_untracked();
-        let sel_id = selected_account.get_untracked().map(|a| a.id);
+        let Some(q) = search_q.try_get_untracked() else {
+            return;
+        };
+        let Some(pl) = plan_filter.try_get_untracked() else {
+            return;
+        };
+        let Some(st) = status_filter.try_get_untracked() else {
+            return;
+        };
+        let Some(pv) = provider_filter.try_get_untracked() else {
+            return;
+        };
+        let Some(so) = sort_by.try_get_untracked() else {
+            return;
+        };
+        let Some(pg) = page.try_get_untracked() else {
+            return;
+        };
+        let sel_id = selected_account
+            .try_get_untracked()
+            .flatten()
+            .map(|a| a.id);
+        let _ = loading.try_set(true);
 
         let mut url = format!(
             "/admin/api/accounts?plan={pl}&status={st}&sort={so}&page={pg}"
@@ -75,26 +90,30 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
         spawn_local(async move {
             match get_json::<AccountsListResp>(&url).await {
                 Ok(resp) => {
-                    page.set(resp.page.max(1));
+                    let _ = page.try_set(resp.page.max(1));
                     if let Some(sel) = resp.selected.clone() {
-                        selected_account.set(Some(sel));
+                        let _ = selected_account.try_set(Some(sel));
                     }
-                    accounts_data.set(Some(resp));
+                    let _ = accounts_data.try_set(Some(resp));
                 }
                 Err(err) => {
                     toasts.error("Failed to load accounts", Some(err));
                 }
             }
-            loading.set(false);
+            let _ = loading.try_set(false);
         });
     };
 
     let load_payments = move || {
-        let st = payments_status.get_untracked();
+        let Some(st) = payments_status.try_get_untracked() else {
+            return;
+        };
         let url = format!("/admin/api/payments?status={st}&limit=50");
         spawn_local(async move {
             match get_json::<PaymentsListResp>(&url).await {
-                Ok(resp) => payments_data.set(Some(resp)),
+                Ok(resp) => {
+                    let _ = payments_data.try_set(Some(resp));
+                }
                 Err(err) => {
                     toasts.error("Failed to load payments", Some(err));
                 }
@@ -133,7 +152,7 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                             resp.balance, resp.applied
                         )),
                     );
-                    credit_reason.set(String::new());
+                    let _ = credit_reason.try_set(String::new());
                     load_accounts();
                     on_mutated.run(());
                 }
@@ -141,7 +160,7 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                     toasts.error("Credit adjustment failed", Some(err));
                 }
             }
-            busy.set(false);
+            let _ = busy.try_set(false);
         });
     };
 
@@ -183,7 +202,7 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                     toasts.error("Plan update failed", Some(err));
                 }
             }
-            busy.set(false);
+            let _ = busy.try_set(false);
         });
     };
 
@@ -217,7 +236,7 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                     toasts.error("Ban status update failed", Some(err));
                 }
             }
-            busy.set(false);
+            let _ = busy.try_set(false);
         });
     };
 

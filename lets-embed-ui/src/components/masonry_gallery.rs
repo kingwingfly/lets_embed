@@ -425,11 +425,14 @@ pub fn MasonryGallery(
         })
     };
 
+    // Memoize emptiness so updating `cards` (e.g. Load more, unlike, spoiler reveal)
+    // does not re-run the outer closure and tear down the entire masonry DOM (Cycle 5 J7).
+    let is_empty = Memo::new(move |_| cards.with(Vec::is_empty));
+
     view! {
         <div node_ref=container_ref class=wrap_cls>
             {move || {
-                let is_empty = cards.with(Vec::is_empty);
-                if is_empty {
+                if is_empty.get() {
                     return empty_message
                         .clone()
                         .map(|msg| view! { <div class="le-gallery-empty">{msg}</div> }.into_any())
@@ -448,7 +451,7 @@ pub fn MasonryGallery(
                         >
                             <For
                                 each=move || cards.get()
-                                key=|c| c.key.clone()
+                                key=|c| (c.key.clone(), std::mem::discriminant(&c.media))
                                 let(card)
                             >
                                 {render_tile_with_opts(card, is_compact)}
@@ -475,7 +478,10 @@ pub fn MasonryGallery(
                                                 all.get(col_idx).cloned().unwrap_or_default()
                                             })
                                         }
-                                        key=|placed| placed.item.key.clone()
+                                        key=|placed| (
+                                            placed.item.key.clone(),
+                                            std::mem::discriminant(&placed.item.media),
+                                        )
                                         let(placed)
                                     >
                                         {render_tile_with_opts(placed.item, is_compact)}

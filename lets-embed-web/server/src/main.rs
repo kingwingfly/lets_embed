@@ -399,6 +399,7 @@ mod tests {
         // 3. With explicit `--trust-proxy`, Standalone honors `X-Forwarded-Host`.
         let mut trust_state = state;
         trust_state.trust_proxy = true;
+        let trust_state_for_api = trust_state.clone();
         let trust_app = test_router(trust_state, None);
         let robots_proxy = trust_app
             .oneshot(
@@ -420,6 +421,24 @@ mod tests {
         )
         .unwrap();
         assert!(robots_proxy_txt.contains("Sitemap: https://proxy.example.com/sitemap.xml"));
+
+        // 4. Cycle 5 J1: `POST /api/*` sent with `Accept: text/html` + `Referer` MUST NOT
+        //    trigger `leptos_axum` 302 Found redirect rewriting (returns 200 OK, no Location).
+        let post_api = build_app_router(trust_state_for_api, None, Vec::new(), test_leptos_opts())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/site_config")
+                    .header("accept", "text/html,application/xhtml+xml")
+                    .header("referer", "https://evil.example/")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_api.status(), StatusCode::OK);
+        assert!(post_api.headers().get("location").is_none());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

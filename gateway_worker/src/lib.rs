@@ -782,19 +782,32 @@ fn build_service_headers(
 
 fn build_api_headers(
     uri: &Uri,
+    worker_method: &worker::Method,
     headers: &HeaderMap,
     cfg: &GatewayConfig,
     signed_assertion: &str,
 ) -> Vec<(String, String)> {
+    let is_api_post =
+        *worker_method == worker::Method::Post && uri.path().starts_with("/api/");
     let mut out = Vec::new();
     for (k, v) in headers {
         let name = k.as_str();
         if should_strip_api_request_header(name) {
             continue;
         }
+        // Prevent `leptos_axum` HTML-form redirect rewriting (`Accept: text/html` + `Referer` ->
+        // `302 Found` with full JSON body) on `POST /api/*` server functions (Cycle 5 J1).
+        if is_api_post
+            && (name.eq_ignore_ascii_case("accept") || name.eq_ignore_ascii_case("referer"))
+        {
+            continue;
+        }
         if let Ok(val) = v.to_str() {
             out.push((name.to_string(), val.to_string()));
         }
+    }
+    if is_api_post {
+        out.push(("accept".to_string(), "application/json".to_string()));
     }
     if let Some(host) = request_host(uri, headers) {
         let proto = if is_https_request(uri) {
@@ -922,8 +935,8 @@ async fn proxy_to_api(
     };
     let req = UpstreamFetchReq {
         url: target_url,
+        headers: build_api_headers(uri, &worker_method, headers, cfg, signed_assertion),
         method: worker_method,
-        headers: build_api_headers(uri, headers, cfg, signed_assertion),
         body,
         no_cache: !allow_public_cache,
         preview_blur: None,
@@ -1893,7 +1906,7 @@ async fn handle_gateway_request(
 
         let resp = match reserve_res {
             Ok((200, hold_id)) => {
-                let response = proxy_to_api(
+                let mut response = proxy_to_api(
                     backend,
                     cfg,
                     &uri,
@@ -1904,6 +1917,13 @@ async fn handle_gateway_request(
                     false,
                 )
                 .await;
+                // Never forward an upstream 3xx response (and its body) alongside a
+                // released/refunded billing hold on metered search routes (Cycle 5 J1).
+                if response.status().is_redirection() {
+                    response = private_no_store(
+                        (StatusCode::BAD_GATEWAY, "Upstream redirect rejected").into_response(),
+                    );
+                }
                 if let Some(hold_id) = hold_id {
                     let op = match (guest, response.status().is_success()) {
                         (false, true) => "commit",
@@ -4399,5 +4419,77 @@ mod tests {
             http_util::sanitize_user_worker_cookie(&dup).as_deref(),
             Some("__Host-auth_tx=ok")
         );
+
+        // Cycle 5 J2: Non-ASCII UTF-8 bytes in another cookie MUST NOT bypass sanitization,
+        // and nameless tokens without '=' are dropped cleanly rather than causing false drops.
+        let mut utf8_and_valueless = HeaderMap::new();
+        utf8_and_valueless.insert(
+            "cookie",
+            axum::http::HeaderValue::from_str(
+                "pad=é; __Host-ue_session; __Host-ue_session=real; %5F_Host-ue_session=evil",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            http_util::sanitize_user_worker_cookie(&utf8_and_valueless).as_deref(),
+            Some("pad=é; __Host-ue_session=real")
+        );
+    }
+
+    #[test]
+    fn metered_post_normalizes_accept_strips_referer_and_rejects_upstream_3xx_body() {
+        let policy = sample_safety_policy();
+        let cfg = test_cfg();
+
+        // 1. Metered POST /api/search_by_desc with `Accept: text/html` + `Referer`
+        //    must strip `referer` and force `accept: application/json` upstream so
+        //    `leptos_axum` never rewrites 200 -> 302 (Cycle 5 J1).
+        let backend_ok = MockBackend::with_policy(policy.clone());
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("host", "gallery.test".parse().unwrap());
+        hdrs.insert("origin", "https://gallery.test".parse().unwrap());
+        hdrs.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        hdrs.insert(
+            "content-type",
+            "application/x-www-form-urlencoded".parse().unwrap(),
+        );
+        hdrs.insert("accept", "text/html,application/xhtml+xml".parse().unwrap());
+        hdrs.insert("referer", "https://gallery.test/".parse().unwrap());
+        let ok_resp = dispatch(
+            &backend_ok,
+            &cfg,
+            Method::POST,
+            "/api/search_by_desc",
+            hdrs.clone(),
+            Bytes::from_static(b"q=sunset&limit=10&offset=0"),
+        );
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+        {
+            let up = backend_ok.upstream_calls.borrow();
+            assert_eq!(up.len(), 1);
+            assert_eq!(
+                header_value(&up[0].headers, "accept"),
+                Some("application/json")
+            );
+            assert_eq!(header_value(&up[0].headers, "referer"), None);
+        }
+
+        // 2. If upstream still unexpectedly returns 302 Found with a body on a metered
+        //    search POST, gateway MUST reject with 502 Bad Gateway (never leaking body
+        //    while releasing/refunding the hold).
+        let mut backend_302 = MockBackend::with_policy(policy);
+        backend_302.upstream_status = StatusCode::FOUND;
+        let resp_302 = dispatch(
+            &backend_302,
+            &cfg,
+            Method::POST,
+            "/api/search_by_desc",
+            hdrs,
+            Bytes::from_static(b"q=sunset&limit=10&offset=0"),
+        );
+        assert_eq!(resp_302.status(), StatusCode::BAD_GATEWAY);
+        let calls = backend_302.account_calls.borrow();
+        assert!(calls.iter().any(|c| c.operation == "reserve-guest"));
+        assert!(calls.iter().any(|c| c.operation == "release-guest"));
     }
 }

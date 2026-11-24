@@ -369,6 +369,16 @@ pub async fn safety_and_auth_middleware(
 ) -> Response {
     let state = &mw.app;
     let path = req.uri().path().to_string();
+    // Prevent `leptos_axum::handle_server_fns_inner` from rewriting `200 OK` JSON
+    // responses into `302 Found` (`Location: <Referer>`) with an intact response body
+    // when a client sends `Accept: text/html` + `Referer` on `POST /api/*` (Cycle 5 J1).
+    if req.method() == axum::http::Method::POST && path.starts_with("/api/") {
+        req.headers_mut().remove(header::REFERER);
+        req.headers_mut().insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/json"),
+        );
+    }
     let peer_ip = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
