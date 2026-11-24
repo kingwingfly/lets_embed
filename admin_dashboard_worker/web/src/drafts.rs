@@ -650,6 +650,25 @@ impl EditableProvider {
         }
     }
 
+    /// Updates all reactive signals IN PLACE from `v` (including resetting write-only
+    /// secret inputs) so `<For key=|p| p.id.as_str()>` controls never become detached
+    /// from the serialized draft rows after Save or Discard (F27).
+    pub fn update_from_view(&self, v: &ProviderView) {
+        self.has_client_secret.set(v.has_client_secret);
+        self.kid.set(v.kid.clone());
+        self.updated_at.set(v.updated_at);
+        self.updated_by.set(v.updated_by.clone());
+        self.enabled.set(v.config.enabled);
+        self.display_name
+            .set(v.config.display_name.clone().unwrap_or_default());
+        self.issuer.set(v.config.issuer.clone().unwrap_or_default());
+        self.public_client_id
+            .set(v.config.public_client_id.clone().unwrap_or_default());
+        self.soft_birthday_check.set(v.config.soft_birthday_check);
+        self.secret_input.set(String::new());
+        self.clear_secret.set(false);
+    }
+
     pub fn to_update(&self) -> ProviderUpdateItem {
         let opt = |s: String| {
             let t = s.trim().to_string();
@@ -730,15 +749,32 @@ impl ProvidersDraft {
         self.current_kid.set(resp.current_kid.clone());
         self.has_prev_key.set(resp.has_prev_key);
         self.public_origin.set(resp.public_origin.clone());
-        let built = self.owner.with_value(|root| {
-            root.with(|| {
-                resp.providers
+        let updated_in_place = self.rows.with_untracked(|existing| {
+            if existing.len() == resp.providers.len()
+                && existing
                     .iter()
-                    .map(EditableProvider::from_view)
-                    .collect()
-            })
+                    .zip(resp.providers.iter())
+                    .all(|(r, v)| r.id == v.config.id)
+            {
+                for (row, view) in existing.iter().zip(resp.providers.iter()) {
+                    row.update_from_view(view);
+                }
+                true
+            } else {
+                false
+            }
         });
-        self.rows.set(built);
+        if !updated_in_place {
+            let built = self.owner.with_value(|root| {
+                root.with(|| {
+                    resp.providers
+                        .iter()
+                        .map(EditableProvider::from_view)
+                        .collect()
+                })
+            });
+            self.rows.set(built);
+        }
         self.loaded.set(true);
     }
 

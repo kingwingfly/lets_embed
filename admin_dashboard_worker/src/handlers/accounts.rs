@@ -36,7 +36,8 @@ use crate::{
 };
 
 const ACCOUNTS_PAGE_SIZE: usize = 25;
-const MAX_LIVE_DO_FETCH: usize = 30;
+const MAX_LIVE_SORT_SCAN: usize = 250;
+const LIVE_DO_BATCH_CHUNK: usize = 25;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct AccountsQuery {
@@ -308,13 +309,11 @@ pub async fn list_accounts(
         "created_desc" => "u.created_at DESC, u.id ASC",
         _ => "u.last_login DESC, u.created_at DESC",
     };
+    let page_offset = page.saturating_sub(1).saturating_mul(ACCOUNTS_PAGE_SIZE);
     let (limit, offset) = if needs_live_sort {
-        (MAX_LIVE_DO_FETCH, 0usize)
+        (MAX_LIVE_SORT_SCAN, 0usize)
     } else {
-        (
-            ACCOUNTS_PAGE_SIZE,
-            page.saturating_sub(1).saturating_mul(ACCOUNTS_PAGE_SIZE),
-        )
+        (ACCOUNTS_PAGE_SIZE, page_offset)
     };
 
     let list_sql = format!(
@@ -346,7 +345,63 @@ pub async fn list_accounts(
         }
     };
 
-    let user_ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+    // Fetch live `UserAccount` DO statuses in bounded concurrent chunks so live sorting
+    // (`credits_desc`, `credits_asc`, `views_desc`) covers matching candidates cleanly before
+    // paginating to the requested page (F30).
+    let mut statuses = Vec::with_capacity(rows.len());
+    for chunk in rows.chunks(LIVE_DO_BATCH_CHUNK) {
+        let status_futs = chunk.iter().map(|r| {
+            let env = &st.env;
+            let do_key = r.account_do_key.as_str();
+            async move {
+                match do_client::user_status(env, do_key).await {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        worker::console_error!("do status failed for account key: {e:?}");
+                        None
+                    }
+                }
+            }
+        });
+        statuses.extend(join_all(status_futs).await);
+    }
+
+    let mut paired: Vec<_> = rows.into_iter().zip(statuses).collect();
+
+    match sort {
+        "credits_desc" => paired.sort_by(|(ra, sa), (rb, sb)| {
+            sb.as_ref()
+                .map_or(i64::MIN, |s| s.balance)
+                .cmp(&sa.as_ref().map_or(i64::MIN, |s| s.balance))
+                .then_with(|| rb.last_login.cmp(&ra.last_login))
+                .then_with(|| ra.id.cmp(&rb.id))
+        }),
+        "credits_asc" => paired.sort_by(|(ra, sa), (rb, sb)| {
+            sa.as_ref()
+                .map_or(i64::MAX, |s| s.balance)
+                .cmp(&sb.as_ref().map_or(i64::MAX, |s| s.balance))
+                .then_with(|| rb.last_login.cmp(&ra.last_login))
+                .then_with(|| ra.id.cmp(&rb.id))
+        }),
+        "views_desc" => paired.sort_by(|(ra, sa), (rb, sb)| {
+            sb.as_ref()
+                .map_or(-1, |s| s.total_views)
+                .cmp(&sa.as_ref().map_or(-1, |s| s.total_views))
+                .then_with(|| rb.last_login.cmp(&ra.last_login))
+                .then_with(|| ra.id.cmp(&rb.id))
+        }),
+        _ => {}
+    }
+
+    if needs_live_sort {
+        paired = paired
+            .into_iter()
+            .skip(page_offset)
+            .take(ACCOUNTS_PAGE_SIZE)
+            .collect();
+    }
+
+    let user_ids: Vec<String> = paired.iter().map(|(r, _)| r.id.clone()).collect();
     let mut identities_map = match load_identities_for_users(&st.env, &user_ids).await {
         Ok(m) => m,
         Err(e) => {
@@ -355,24 +410,8 @@ pub async fn list_accounts(
         }
     };
 
-    let status_futs = rows.iter().map(|r| {
-        let env = &st.env;
-        let do_key = r.account_do_key.as_str();
-        async move {
-            match do_client::user_status(env, do_key).await {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    worker::console_error!("do status failed for account key: {e:?}");
-                    None
-                }
-            }
-        }
-    });
-    let statuses = join_all(status_futs).await;
-
-    let mut accounts: Vec<AccountEntryResp> = rows
+    let accounts: Vec<AccountEntryResp> = paired
         .into_iter()
-        .zip(statuses)
         .map(|(r, live_status)| {
             let identities = identities_map.remove(&r.id).unwrap_or_default();
             let live_plan = live_status
@@ -405,31 +444,6 @@ pub async fn list_accounts(
             }
         })
         .collect();
-
-    match sort {
-        "credits_desc" => accounts.sort_by(|a, b| {
-            b.live_status
-                .as_ref()
-                .map_or(i64::MIN, |s| s.balance)
-                .cmp(&a.live_status.as_ref().map_or(i64::MIN, |s| s.balance))
-                .then_with(|| b.last_login.cmp(&a.last_login))
-        }),
-        "credits_asc" => accounts.sort_by(|a, b| {
-            a.live_status
-                .as_ref()
-                .map_or(i64::MAX, |s| s.balance)
-                .cmp(&b.live_status.as_ref().map_or(i64::MAX, |s| s.balance))
-                .then_with(|| b.last_login.cmp(&a.last_login))
-        }),
-        "views_desc" => accounts.sort_by(|a, b| {
-            b.live_status
-                .as_ref()
-                .map_or(-1, |s| s.total_views)
-                .cmp(&a.live_status.as_ref().map_or(-1, |s| s.total_views))
-                .then_with(|| b.last_login.cmp(&a.last_login))
-        }),
-        _ => {}
-    }
 
     let selected = if let Some(target_id) = q.user_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         if let Some(found) = accounts.iter().find(|a| a.id == target_id) {

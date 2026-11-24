@@ -1662,6 +1662,7 @@ impl UserAccount {
             return Response::error("banned", 403);
         }
         let now = now_secs();
+        let effective_created_at = req.auth_time.map_or(now, |t| t.min(now));
         let db = self.ensure_session_tables(now as i64)?;
         let strict_flag: i64 =
             if req.strict_age_ok && req.assurance_level == AssuranceLevel::Verified18 {
@@ -1679,14 +1680,14 @@ impl UserAccount {
                 req.identity_key.into(),
                 assurance_to_str(req.assurance_level).into(),
                 strict_flag.into(),
-                (now as i64).into(),
+                (effective_created_at as i64).into(),
                 (req.expires_at as i64).into(),
             ],
         )?;
         json(
             &SessionIssueResp {
                 sid: req.sid,
-                created_at: now,
+                created_at: effective_created_at,
                 expires_at: req.expires_at,
             },
             200,

@@ -356,19 +356,33 @@ pub fn decrypt_secret(
     Err(SecretError::DecryptFailed)
 }
 
-/// Load a provider secret from D1 `provider_secrets` (decrypting via the
-/// `SITE_SECRET` / `PROVIDER_SECRETS_KEY` keyring and validating AAD).
+/// Load a provider secret matching `active_policy_rev`:
+/// 1. Consults `provider_secret_versions` for the latest row with `policy_rev <= active_policy_rev`
+///    (so staged/unactivated secrets at `policy_rev > active_policy_rev` are NEVER used with
+///    the previous active endpoint!).
+/// 2. If a versioned row is marked `deleted != 0`, treats the D1 secret as cleared and falls
+///    through to `fallback_env_vars`.
+/// 3. If no versioned row exists yet at `policy_rev <= active_policy_rev`, falls back to the
+///    legacy unversioned `provider_secrets` table, then `fallback_env_vars`.
 ///
-/// If a row exists in D1 and decryption fails, this FAILS CLOSED (`Err`) and
-/// NEVER silently falls back to env vars. Only when no D1 row exists does it
-/// consult `fallback_env_vars` (`wrangler secret`).
+/// If an encrypted row exists and decryption fails, this FAILS CLOSED (`Err`) and
+/// NEVER silently falls back to env vars.
 pub async fn load_provider_secret(
     env: &Env,
     deployment_id: &str,
+    active_policy_rev: u64,
     provider_id: &str,
     field_name: &str,
     fallback_env_vars: &[&str],
 ) -> Result<Option<SecretString>, SecretError> {
+    #[derive(Deserialize)]
+    struct VersionedRow {
+        kid: String,
+        nonce_hex: String,
+        ciphertext_hex: String,
+        deleted: i64,
+    }
+
     #[derive(Deserialize)]
     struct Row {
         kid: String,
@@ -380,34 +394,73 @@ pub async fn load_provider_secret(
         .d1(crate::D1_BINDING)
         .map_err(|e| SecretError::DatabaseError(e.to_string()))?;
 
-    let row = db
+    let ver_row = db
         .prepare(
-            "SELECT kid, hex(nonce) AS nonce_hex, hex(ciphertext) AS ciphertext_hex \
-             FROM provider_secrets WHERE provider_id = ?1 AND field_name = ?2",
+            "SELECT kid, hex(nonce) AS nonce_hex, hex(ciphertext) AS ciphertext_hex, deleted \
+             FROM provider_secret_versions \
+             WHERE provider_id = ?1 AND field_name = ?2 AND policy_rev <= ?3 \
+             ORDER BY policy_rev DESC LIMIT 1",
         )
-        .bind(&[provider_id.into(), field_name.into()])
+        .bind(&[
+            provider_id.into(),
+            field_name.into(),
+            (active_policy_rev as f64).into(),
+        ])
         .map_err(|e| SecretError::DatabaseError(e.to_string()))?
-        .first::<Row>(None)
+        .first::<VersionedRow>(None)
         .await
         .map_err(|e| SecretError::DatabaseError(e.to_string()))?;
 
-    if let Some(row) = row {
-        let nonce = hex::decode(&row.nonce_hex).map_err(|_| SecretError::InvalidNonceLength)?;
-        let ciphertext =
-            hex::decode(&row.ciphertext_hex).map_err(|_| SecretError::DecryptFailed)?;
-        let ring = KeyRing::from_env(env)?;
-        let secret = decrypt_secret(
-            &ring,
-            deployment_id,
-            provider_id,
-            field_name,
-            &EncryptedSecret {
-                kid: row.kid,
-                nonce,
-                ciphertext,
-            },
-        )?;
-        return Ok(Some(secret));
+    if let Some(row) = ver_row {
+        if row.deleted == 0 {
+            let nonce = hex::decode(&row.nonce_hex).map_err(|_| SecretError::InvalidNonceLength)?;
+            let ciphertext =
+                hex::decode(&row.ciphertext_hex).map_err(|_| SecretError::DecryptFailed)?;
+            let ring = KeyRing::from_env(env)?;
+            let secret = decrypt_secret(
+                &ring,
+                deployment_id,
+                provider_id,
+                field_name,
+                &EncryptedSecret {
+                    kid: row.kid,
+                    nonce,
+                    ciphertext,
+                },
+            )?;
+            return Ok(Some(secret));
+        }
+        // Explicitly cleared at or before `active_policy_rev`: skip legacy table, allow env fallback.
+    } else {
+        let row = db
+            .prepare(
+                "SELECT kid, hex(nonce) AS nonce_hex, hex(ciphertext) AS ciphertext_hex \
+                 FROM provider_secrets WHERE provider_id = ?1 AND field_name = ?2",
+            )
+            .bind(&[provider_id.into(), field_name.into()])
+            .map_err(|e| SecretError::DatabaseError(e.to_string()))?
+            .first::<Row>(None)
+            .await
+            .map_err(|e| SecretError::DatabaseError(e.to_string()))?;
+
+        if let Some(row) = row {
+            let nonce = hex::decode(&row.nonce_hex).map_err(|_| SecretError::InvalidNonceLength)?;
+            let ciphertext =
+                hex::decode(&row.ciphertext_hex).map_err(|_| SecretError::DecryptFailed)?;
+            let ring = KeyRing::from_env(env)?;
+            let secret = decrypt_secret(
+                &ring,
+                deployment_id,
+                provider_id,
+                field_name,
+                &EncryptedSecret {
+                    kid: row.kid,
+                    nonce,
+                    ciphertext,
+                },
+            )?;
+            return Ok(Some(secret));
+        }
     }
 
     for &var_name in fallback_env_vars {

@@ -228,14 +228,28 @@
     const tx = JSON.parse(txJson);
     await provider.request({ method: "eth_requestAccounts" });
     if (tx.chainId) {
+      const expectedChain = parseInt(String(tx.chainId), 16);
       try {
         await provider.request({
           method: "wallet_switchEthereumChain",
           params: [{ chainId: tx.chainId }],
         });
-      } catch (_) {}
+      } catch (err) {
+        const detail = err && err.message ? err.message : String(err);
+        throw new Error(
+          `Wallet refused to switch to required Ethereum network (${tx.chainId}): ${detail}`
+        );
+      }
+      const activeChainHex = await provider.request({ method: "eth_chainId" });
+      const activeChain = parseInt(String(activeChainHex), 16);
+      if (!Number.isFinite(activeChain) || activeChain !== expectedChain) {
+        throw new Error(
+          `Wallet is on chain ${activeChainHex}, but this payment requires ${tx.chainId}. Switch networks in your wallet and retry.`
+        );
+      }
     }
     const params = { from: tx.from, to: tx.to, value: tx.value || "0x0" };
+    if (tx.chainId) params.chainId = tx.chainId;
     if (tx.data) params.data = tx.data;
     const hash = await provider.request({
       method: "eth_sendTransaction",

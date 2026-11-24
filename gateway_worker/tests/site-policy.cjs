@@ -219,7 +219,52 @@ function signedSessionV2({ sub = userId, do_key = userDoKey, sid = userSid, secr
   return `ue_session=v2.${payload}.${sig}`;
 }
 
+function sealPreviewLocator(cap, secret = mediaCapSecret) {
+  const plain = Buffer.from(cap.immutable_locator, 'utf8');
+  const actorBytes = Buffer.from(JSON.stringify(cap.actor_binding), 'utf8');
+  const assetBuf = Buffer.alloc(8);
+  assetBuf.writeBigInt64BE(BigInt(cap.asset_id));
+  const factsBuf = Buffer.alloc(8);
+  factsBuf.writeBigUInt64BE(BigInt(cap.facts_rev));
+  const policyBuf = Buffer.alloc(8);
+  policyBuf.writeBigUInt64BE(BigInt(cap.policy_rev));
+  const expBuf = Buffer.alloc(8);
+  expBuf.writeBigUInt64BE(BigInt(cap.exp));
+  const out = Buffer.alloc(plain.length);
+  let counter = 0;
+  for (let off = 0; off < plain.length; off += 32) {
+    const ctrBuf = Buffer.alloc(4);
+    ctrBuf.writeUInt32BE(counter++);
+    const block = createHmac('sha256', secret)
+      .update(Buffer.from('media-cap-preview-locator/v3\0'))
+      .update(assetBuf)
+      .update(factsBuf)
+      .update(policyBuf)
+      .update(expBuf)
+      .update(actorBytes)
+      .update(ctrBuf)
+      .digest();
+    const n = Math.min(32, plain.length - off);
+    for (let i = 0; i < n; i++) out[off + i] = plain[off + i] ^ block[i];
+  }
+  return `enc1.${out.toString('base64url')}`;
+}
+
 function signMediaCapV3(cap, secret = mediaCapSecret) {
+  const wireCap =
+    cap.kind === 'preview' && !String(cap.immutable_locator || '').startsWith('enc1.')
+      ? { ...cap, immutable_locator: sealPreviewLocator(cap, secret) }
+      : cap;
+  const payload = Buffer.from(JSON.stringify(wireCap)).toString('base64url');
+  const sig = createHmac('sha256', secret)
+    .update(Buffer.from('media-cap/v3\0'))
+    .update(Buffer.from('mc3.'))
+    .update(Buffer.from(payload))
+    .digest('base64url');
+  return `mc3.${payload}.${sig}`;
+}
+
+function signRawMediaCapV3(cap, secret = mediaCapSecret) {
   const payload = Buffer.from(JSON.stringify(cap)).toString('base64url');
   const sig = createHmac('sha256', secret)
     .update(Buffer.from('media-cap/v3\0'))
@@ -1184,8 +1229,8 @@ test('Policy v3 gateway enforces HKDF SITE_SECRET, zero implicit admin unlock, f
     ['session-context', 'can-charge', 'session-context', 'charge']
   );
 
-  // Preview capability: locked cf.image blur, fails closed 502 if transform missing/error, 403 if fixed_blur_enabled=false
-  const previewCap = signMediaCapV3({
+  // Preview capability: locked cf.image blur, requires sealed locator (F20), fails closed 502 if transform missing/error, 403 if fixed_blur_enabled=false
+  const previewCapClaims = {
     v: 3,
     aud: 'lets-embed-media',
     kind: 'preview',
@@ -1198,7 +1243,17 @@ test('Policy v3 gateway enforces HKDF SITE_SECRET, zero implicit admin unlock, f
     matched_blurs: [{ id: 'sensitive', grant_generation: 1 }],
     revealed_refs: [],
     exp: now + 300,
-  });
+  };
+  // Unsealed plaintext preview locator MUST be rejected with 403
+  const unsealedPreviewCap = signRawMediaCapV3(previewCapClaims);
+  assert.equal(
+    (await site(`/media/preview/42?cap=${unsealedPreviewCap}`, {
+      headers: { cookie: `${adminViewCookie}; ${guestCookiePair}` },
+    })).status,
+    403
+  );
+  const previewCap = signMediaCapV3(previewCapClaims);
+  assert.ok(!Buffer.from(previewCap.split('.')[1], 'base64url').toString('utf8').includes('blur_42'));
   const previewOk = await site(`/media/preview/42?cap=${previewCap}&blur=0`, {
     headers: {
       cookie: `${adminViewCookie}; ${guestCookiePair}`,
@@ -1208,6 +1263,7 @@ test('Policy v3 gateway enforces HKDF SITE_SECRET, zero implicit admin unlock, f
     },
   });
   assert.equal(previewOk.status, 200);
+  assert.equal(previewOk.headers.get('x-test-upstream'), `${imageUpstream}/2026/01/blur_42.webp`);
   const previewCf = JSON.parse(previewOk.headers.get('x-test-cf'));
   assert.deepEqual(previewCf.image, { blur: 80, width: 360, quality: 30, format: 'webp' });
 

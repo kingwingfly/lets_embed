@@ -27,6 +27,10 @@ pub struct SessionIssueReq {
     pub assurance_level: AssuranceLevel,
     pub strict_age_ok: bool,
     pub expires_at: u64,
+    /// Optional preserved original authentication timestamp (e.g. for cross-device
+    /// transfers so claiming a transfer never refreshes `created_at` / recent-auth checks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_time: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

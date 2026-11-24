@@ -67,6 +67,12 @@ pub fn default_safety_tag_set() -> HashSet<String> {
         .collect()
 }
 
+/// Canonical lowercase hex SHA-256 digest of the ordered WD-Tagger v3
+/// `selected_tags.csv` manifest (`"{index}:{G|C|R}:{name}"` joined by `'\n'`).
+/// Guards against silently pairing inference logits with a reordered or altered CSV.
+pub const WD_ORDERED_MANIFEST_DIGEST: &str =
+    "833a2120d0b02f720cf317ce4d831fb175292c9255bc04390829356face6aa46";
+
 /// Computes the canonical lowercase hex SHA-256 digest of a WD-Tagger vocabulary:
 /// unique tag names sorted in ASCII byte order and joined with `'\n'` (no trailing newline).
 pub fn compute_vocab_digest(tags: &[Tag]) -> String {
@@ -79,6 +85,43 @@ pub fn compute_vocab_digest(tags: &[Tag]) -> String {
     names.dedup();
     let joined = names.join("\n");
     sha256_hex(joined.as_bytes())
+}
+
+/// Computes the order- and category-sensitive SHA-256 digest over `(index, type, name)`
+/// so a reordered or miscategorized `selected_tags.csv` cannot pass validation.
+pub fn compute_ordered_manifest_digest(tags: &[Tag]) -> String {
+    use std::fmt::Write as _;
+    let mut buf = String::with_capacity(tags.len() * 24);
+    for (idx, tag) in tags.iter().enumerate() {
+        if idx > 0 {
+            buf.push('\n');
+        }
+        let cat = match tag.r#type {
+            TagType::Character => 'C',
+            TagType::Rating => 'R',
+            TagType::General => 'G',
+        };
+        let _ = write!(buf, "{idx}:{cat}:{}", tag.name);
+    }
+    sha256_hex(buf.as_bytes())
+}
+
+/// Verifies that `tags` has exact length [`OUT_DIM`] and exact positional `(index, category, name)`
+/// alignment matching [`WD_ORDERED_MANIFEST_DIGEST`].
+pub fn verify_ordered_manifest(tags: &[Tag]) -> anyhow::Result<()> {
+    if tags.len() != OUT_DIM {
+        bail!(
+            "WD-Tagger CSV has {} tags, expected exact OUT_DIM={OUT_DIM}",
+            tags.len()
+        );
+    }
+    let actual = compute_ordered_manifest_digest(tags);
+    if actual != WD_ORDERED_MANIFEST_DIGEST {
+        bail!(
+            "WD-Tagger CSV positional/category manifest digest mismatch: got {actual}, expected {WD_ORDERED_MANIFEST_DIGEST} (CSV may be reordered or from a different model)"
+        );
+    }
+    Ok(())
 }
 
 /// Pure-Rust FIPS 180-4 SHA-256 returning lowercase hex (keeps `wd_tagger` free of extra crates).
@@ -221,11 +264,7 @@ pub fn tags(csv_path: impl AsRef<Path>) -> anyhow::Result<Vec<Tag>> {
     let file = std::fs::File::open(csv_path)?;
     let tags = parse_tags_csv(BufReader::new(file))?;
 
-    assert_eq!(
-        OUT_DIM,
-        tags.len(),
-        "there should be as many tags as wd-tagger OUT_DIM"
-    );
+    verify_ordered_manifest(&tags)?;
 
     Ok(tags)
 }
@@ -265,9 +304,7 @@ pub fn infer_tag_with_safety<'a>(
     character_threshold: f32,
     always_keep_tags: Option<&HashSet<String>>,
 ) -> anyhow::Result<Vec<Vec<(&'a Tag, f32)>>> {
-    if tags.len() != OUT_DIM {
-        bail!("invalid tags number")
-    }
+    verify_ordered_manifest(tags)?;
     let batch_size = batch_input.len();
     let pixel_values = batch_input.into_iter().flatten().collect::<Vec<_>>();
 
@@ -312,9 +349,7 @@ pub fn infer_tag_with_coverage<'a>(
     min_persisted_score: f32,
     always_keep_tags: Option<&HashSet<String>>,
 ) -> anyhow::Result<Vec<Vec<(&'a Tag, f32)>>> {
-    if tags.len() != OUT_DIM {
-        bail!("invalid tags number")
-    }
+    verify_ordered_manifest(tags)?;
     if !min_persisted_score.is_finite() || min_persisted_score <= 0.0 || min_persisted_score > 1.0 {
         bail!("min_persisted_score must be finite and in (0.0, 1.0]")
     }
@@ -691,5 +726,49 @@ tag_id,name,category,count
         let mut reversed = tags;
         reversed.reverse();
         assert_eq!(compute_vocab_digest(&reversed), WD_VOCAB_DIGEST);
+    }
+
+    #[test]
+    fn ordered_manifest_digest_rejects_reordered_or_miscategorized_tags() {
+        let mut sample = vec![
+            Tag {
+                r#type: TagType::Rating,
+                name: "general".into(),
+            },
+            Tag {
+                r#type: TagType::Rating,
+                name: "explicit".into(),
+            },
+            Tag {
+                r#type: TagType::General,
+                name: "1girl".into(),
+            },
+        ];
+        let base_vocab = compute_vocab_digest(&sample);
+        let base_ordered = compute_ordered_manifest_digest(&sample);
+
+        // Swapping two entries preserves the set digest, but MUST change the ordered digest!
+        sample.swap(0, 1);
+        assert_eq!(compute_vocab_digest(&sample), base_vocab);
+        assert_ne!(compute_ordered_manifest_digest(&sample), base_ordered);
+        sample.swap(0, 1);
+
+        // Changing a tag's category preserves the name set, but MUST change the ordered digest!
+        sample[1].r#type = TagType::General;
+        assert_eq!(compute_vocab_digest(&sample), base_vocab);
+        assert_ne!(compute_ordered_manifest_digest(&sample), base_ordered);
+
+        // If the local model CSV exists in the workspace, verify it passes `verify_ordered_manifest`
+        // and that swapping two rows fails immediately.
+        let model_csv = Path::new("../models/wd-eva02-large-tagger-v3/selected_tags.csv");
+        if model_csv.exists() {
+            let mut loaded = tags(model_csv).expect("model CSV must match ordered manifest");
+            assert_eq!(loaded.len(), OUT_DIM);
+            loaded.swap(0, 3);
+            assert!(
+                verify_ordered_manifest(&loaded).is_err(),
+                "reordered CSV must fail ordered manifest verification"
+            );
+        }
     }
 }

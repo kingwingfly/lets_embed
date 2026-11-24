@@ -23,8 +23,12 @@ use subtle::ConstantTimeEq;
 use tower_cookies::Cookies;
 
 use crate::{
-    AppState, auth, challenge_do, identity, policy_do, providers::sanitize_next_url, secrets,
-    session, types::ApiError,
+    AppState, auth,
+    challenge_do::{self, OAuthTxConsumeReq, OAuthTxStartReq},
+    identity, policy_do,
+    providers::{ip_rate_key, random_b64url, sanitize_next_url, sha256_hex},
+    secrets, session,
+    types::ApiError,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -32,6 +36,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub const TELEGRAM_MAX_AGE_SECS: u64 = 300;
 pub const TELEGRAM_MAX_FUTURE_SKEW_SECS: u64 = 60;
 pub const TELEGRAM_REPLAY_TTL_PADDING_SECS: u64 = 360;
+const TELEGRAM_TX_TTL_SECS: u64 = 600;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelegramAuthPayload {
@@ -189,6 +194,7 @@ pub async fn verify(
     let bot_token = match secrets::load_provider_secret(
         &st.env,
         &st.deployment_id,
+        policy.revision,
         AuthProviderId::Telegram.as_str(),
         "bot_token",
         &["TELEGRAM_BOT_TOKEN"],
@@ -310,6 +316,122 @@ pub async fn verify(
     .into_response()
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TelegramStartReq {
+    #[serde(default)]
+    pub next: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TelegramStartResp {
+    auth_url: String,
+}
+
+/// Begin a browser-bound Telegram Login Widget transaction (`POST /user/auth/telegram/start`).
+/// Mints a single-use `state` + `__Host-auth_tx` cookie stored in `AuthChallengeDO` so
+/// third-party Telegram callback links cannot silently switch another visitor's session (F13).
+#[worker::send]
+pub async fn start(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    cookies: Cookies,
+    Json(req): Json<TelegramStartReq>,
+) -> Response {
+    if let Err(r) = auth::require_same_origin(&st, &headers) {
+        return r;
+    }
+
+    let policy = match policy_do::load_site_policy(&st.env).await {
+        Ok(env) => env.policy,
+        Err(e) => {
+            worker::console_error!("telegram start: policy load failed: {e:?}");
+            return auth::internal_error();
+        }
+    };
+    if let Err(msg) =
+        identity::check_login_provider_eligibility(&policy, AuthProviderId::Telegram, None)
+    {
+        return auth::api_error(StatusCode::FORBIDDEN, msg);
+    }
+
+    let ip_bucket = format!("telegram:{}", ip_rate_key(&headers, &st.session_v2_secret));
+    match challenge_do::hit_rate_limit(&st.env, &ip_bucket, 600, 40).await {
+        Ok(rl) if !rl.allowed => {
+            return auth::api_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many sign-in attempts; retry later",
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            worker::console_error!("telegram start rate limit DO failed: {e:?}");
+            return auth::internal_error();
+        }
+    }
+
+    let tx_id = match random_b64url(16) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let tx_cookie_secret = match random_b64url(24) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let state = match random_b64url(24) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let next_url = sanitize_next_url(req.next.as_deref());
+    let redirect_uri = format!("{}/user/auth/telegram/callback", st.public_origin());
+    let now = session::now_secs();
+
+    match challenge_do::start_oauth_tx(
+        &st.env,
+        &OAuthTxStartReq {
+            tx_id: tx_id.clone(),
+            tx_cookie_hash: sha256_hex(&tx_cookie_secret),
+            provider_id: AuthProviderId::Telegram.as_str().to_string(),
+            action: "login".to_string(),
+            initiator_user_id: None,
+            redirect_uri,
+            state: state.clone(),
+            pkce_verifier: String::new(),
+            nonce: String::new(),
+            next_url,
+            expires_at: now + TELEGRAM_TX_TTL_SECS,
+            ip_bucket: None,
+        },
+    )
+    .await
+    {
+        Ok((200, _)) => {}
+        Ok((429, msg)) => return auth::api_error(StatusCode::TOO_MANY_REQUESTS, msg),
+        Ok((code, msg)) => {
+            worker::console_error!("telegram start DO status {code}: {msg}");
+            return auth::internal_error();
+        }
+        Err(e) => {
+            worker::console_error!("telegram start DO failed: {e:?}");
+            return auth::internal_error();
+        }
+    }
+
+    cookies.add(session::make_auth_tx_cookie(
+        format!("{tx_id}.{tx_cookie_secret}"),
+        TELEGRAM_TX_TTL_SECS as i64,
+    ));
+
+    let auth_url = format!(
+        "/user/auth/telegram/callback?state={}",
+        urlencoding::encode(&state)
+    );
+    (
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(TelegramStartResp { auth_url }),
+    )
+        .into_response()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelegramCallbackQuery {
     pub id: i64,
@@ -323,6 +445,8 @@ pub struct TelegramCallbackQuery {
     pub photo_url: Option<String>,
     pub auth_date: u64,
     pub hash: String,
+    #[serde(default)]
+    pub state: Option<String>,
     #[serde(default)]
     pub next: Option<String>,
 }
@@ -343,16 +467,57 @@ fn telegram_error_redirect(msg: &str) -> Response {
     redirect_no_store(&format!("/user/login?error={encoded}"))
 }
 
-/// CSP-safe Telegram Login Widget redirect callback (`data-auth-url="/user/auth/telegram/callback?next=..."`).
+/// CSP-safe Telegram Login Widget redirect callback (`data-auth-url="/user/auth/telegram/callback?state=..."`).
 ///
-/// Avoids Telegram's `eval()`-based `data-onauth` handler so strict `SPA_CSP` stays intact
-/// without `'unsafe-eval'`.
+/// Requires a matching browser-bound `__Host-auth_tx` cookie + single-use `state` minted
+/// by `POST /user/auth/telegram/start` so unsolicited callback links cannot silently switch
+/// a visitor into another user's account (F13).
 #[worker::send]
 pub async fn callback(
     State(st): State<AppState>,
     cookies: Cookies,
     Query(q): Query<TelegramCallbackQuery>,
 ) -> Response {
+    // Always clear `__Host-auth_tx` immediately regardless of outcome.
+    let raw_tx_cookie = cookies
+        .get(session::AUTH_TX_COOKIE)
+        .map(|c| c.value().to_string());
+    cookies.add(session::clear_auth_tx_cookie());
+
+    let (Some(state), Some(tx_cookie)) = (
+        q.state.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        raw_tx_cookie.as_deref(),
+    ) else {
+        return telegram_error_redirect(
+            "Missing or expired Telegram sign-in session. Please try again.",
+        );
+    };
+    let Some((tx_id, tx_cookie_secret)) = tx_cookie.split_once('.') else {
+        return telegram_error_redirect("Invalid Telegram sign-in session cookie.");
+    };
+
+    let tx = match challenge_do::consume_oauth_tx(
+        &st.env,
+        &OAuthTxConsumeReq {
+            tx_id: tx_id.to_string(),
+            tx_cookie_hash: sha256_hex(tx_cookie_secret),
+            state: state.to_string(),
+        },
+    )
+    .await
+    {
+        Ok(Some(tx)) if tx.provider_id == AuthProviderId::Telegram.as_str() => tx,
+        Ok(_) => {
+            return telegram_error_redirect(
+                "Telegram sign-in session expired or did not originate from this browser.",
+            );
+        }
+        Err(e) => {
+            worker::console_error!("telegram callback tx consume DO failed: {e:?}");
+            return telegram_error_redirect("Telegram verification failed.");
+        }
+    };
+
     let policy = match policy_do::load_site_policy(&st.env).await {
         Ok(env) => env.policy,
         Err(e) => {
@@ -370,6 +535,7 @@ pub async fn callback(
     let bot_token = match secrets::load_provider_secret(
         &st.env,
         &st.deployment_id,
+        policy.revision,
         AuthProviderId::Telegram.as_str(),
         "bot_token",
         &["TELEGRAM_BOT_TOKEN"],
@@ -453,7 +619,11 @@ pub async fn callback(
         return telegram_error_redirect("Could not create session.");
     }
 
-    let dest = sanitize_next_url(q.next.as_deref());
+    let dest = sanitize_next_url(
+        Some(tx.next_url.as_str())
+            .filter(|s| !s.is_empty())
+            .or(q.next.as_deref()),
+    );
     redirect_no_store(&dest)
 }
 

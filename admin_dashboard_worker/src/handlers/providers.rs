@@ -50,6 +50,16 @@ struct SecretMetaRow {
 }
 
 #[derive(Deserialize)]
+struct VersionedSecretMetaRow {
+    provider_id: String,
+    field_name: String,
+    kid: String,
+    deleted: i64,
+    updated_at: i64,
+    updated_by: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct SecretRotateRow {
     provider_id: String,
     field_name: String,
@@ -58,11 +68,25 @@ struct SecretRotateRow {
     ciphertext_hex: String,
 }
 
+#[derive(Deserialize)]
+struct VersionedSecretRotateRow {
+    policy_rev: i64,
+    provider_id: String,
+    field_name: String,
+    kid: String,
+    nonce_hex: String,
+    ciphertext_hex: String,
+}
+
+/// Load effective masked secret metadata up to `up_to_rev`: overlays versioned rows
+/// from `provider_secret_versions` (`policy_rev <= up_to_rev`, ordered ascending so
+/// the newest version wins) on top of legacy `provider_secrets` (F11).
 async fn load_secret_metadata(
     env: &worker::Env,
+    up_to_rev: u64,
 ) -> worker::Result<HashMap<(String, String), SecretMetaRow>> {
     let db = env.d1(D1_BINDING)?;
-    let rows = db
+    let legacy_rows = db
         .prepare(
             "SELECT provider_id, field_name, kid, updated_at, updated_by \
              FROM provider_secrets",
@@ -70,9 +94,38 @@ async fn load_secret_metadata(
         .all()
         .await?
         .results::<SecretMetaRow>()?;
-    let mut map = HashMap::with_capacity(rows.len());
-    for row in rows {
+    let mut map = HashMap::with_capacity(legacy_rows.len());
+    for row in legacy_rows {
         map.insert((row.provider_id.clone(), row.field_name.clone()), row);
+    }
+
+    let ver_rows = db
+        .prepare(
+            "SELECT provider_id, field_name, kid, deleted, updated_at, updated_by \
+             FROM provider_secret_versions \
+             WHERE policy_rev <= ?1 \
+             ORDER BY policy_rev ASC",
+        )
+        .bind(&[(up_to_rev as f64).into()])?
+        .all()
+        .await?
+        .results::<VersionedSecretMetaRow>()?;
+    for row in ver_rows {
+        let key = (row.provider_id.clone(), row.field_name.clone());
+        if row.deleted != 0 {
+            map.remove(&key);
+        } else {
+            map.insert(
+                key,
+                SecretMetaRow {
+                    provider_id: row.provider_id,
+                    field_name: row.field_name,
+                    kid: row.kid,
+                    updated_at: row.updated_at,
+                    updated_by: row.updated_by,
+                },
+            );
+        }
     }
     Ok(map)
 }
@@ -82,6 +135,10 @@ fn build_provider_views(
     configured: &[AuthProviderPublicConfig],
     secret_meta: &HashMap<(String, String), SecretMetaRow>,
 ) -> Vec<ProviderView> {
+    // Match runtime effective defaults (F28): when `enabled_providers` is empty and
+    // `age_policy != StrictProviderVerified18`, SIWE and SIWS are active by default in `user_worker`.
+    let empty_defaults_wallets = configured.is_empty()
+        && age_policy != site_access::AgeVerificationPolicy::StrictProviderVerified18;
     AuthProviderId::ALL
         .iter()
         .map(|&id| {
@@ -91,7 +148,8 @@ fn build_provider_views(
                 .cloned()
                 .unwrap_or(AuthProviderPublicConfig {
                     id,
-                    enabled: false,
+                    enabled: empty_defaults_wallets
+                        && matches!(id, AuthProviderId::Siwe | AuthProviderId::Siws),
                     display_name: None,
                     issuer: None,
                     public_client_id: None,
@@ -132,7 +190,7 @@ pub async fn get_providers(
         }
     };
 
-    let secret_meta = match load_secret_metadata(&st.env).await {
+    let secret_meta = match load_secret_metadata(&st.env, loaded.revision).await {
         Ok(m) => m,
         Err(e) => {
             worker::console_error!("load provider_secrets metadata failed: {e:?}");
@@ -252,11 +310,12 @@ pub async fn save_providers(
     }
 
     if are_providers_unchanged(
+        age_policy,
         &loaded.doc.public.enabled_providers,
         &public_configs,
         !pending_ops.is_empty(),
     ) {
-        let secret_meta = match load_secret_metadata(&st.env).await {
+        let secret_meta = match load_secret_metadata(&st.env, loaded.revision).await {
             Ok(m) => m,
             Err(e) => {
                 worker::console_error!("load provider_secrets metadata failed: {e:?}");
@@ -301,7 +360,9 @@ pub async fn save_providers(
             }
         };
 
-    // Persist any submitted write-only secrets ONLY in encrypted `provider_secrets` table.
+    // Stage write-only encrypted secrets in revision-scoped `provider_secret_versions` at
+    // `policy_rev = new_rev` BEFORE Phase-2 activation so live traffic on the previous active
+    // revision NEVER combines the old endpoint with the new secret (F11)!
     let db = match st.env.d1(D1_BINDING) {
         Ok(db) => db,
         Err(e) => {
@@ -317,15 +378,30 @@ pub async fn save_providers(
     for op in pending_ops {
         match op {
             PendingSecretOp::Delete { provider, field } => match db
-                .prepare("DELETE FROM provider_secrets WHERE provider_id = ? AND field_name = ?")
-                .bind(&[provider.into(), field.into()])
-            {
+                .prepare(
+                    "INSERT INTO provider_secret_versions \
+                       (policy_rev, provider_id, field_name, kid, nonce, ciphertext, deleted, updated_at, updated_by) \
+                     VALUES (?, ?, ?, '', X'', X'', 1, unixepoch(), ?) \
+                     ON CONFLICT(policy_rev, provider_id, field_name) DO UPDATE SET \
+                       kid = '', \
+                       nonce = X'', \
+                       ciphertext = X'', \
+                       deleted = 1, \
+                       updated_at = excluded.updated_at, \
+                       updated_by = excluded.updated_by",
+                )
+                .bind(&[
+                    (new_rev as f64).into(),
+                    provider.into(),
+                    field.into(),
+                    editor.into(),
+                ]) {
                 Ok(stmt) => {
                     secret_writes.push(stmt);
                     cleared_secret_count += 1;
                 }
                 Err(e) => {
-                    worker::console_error!("bind delete provider_secret failed: {e:?}");
+                    worker::console_error!("bind delete provider_secret_versions failed: {e:?}");
                     return internal_error();
                 }
             },
@@ -339,17 +415,19 @@ pub async fn save_providers(
 
                 match db
                     .prepare(
-                        "INSERT INTO provider_secrets \
-                           (provider_id, field_name, kid, nonce, ciphertext, updated_at, updated_by) \
-                         VALUES (?, ?, ?, ?, ?, unixepoch(), ?) \
-                         ON CONFLICT(provider_id, field_name) DO UPDATE SET \
+                        "INSERT INTO provider_secret_versions \
+                           (policy_rev, provider_id, field_name, kid, nonce, ciphertext, deleted, updated_at, updated_by) \
+                         VALUES (?, ?, ?, ?, ?, ?, 0, unixepoch(), ?) \
+                         ON CONFLICT(policy_rev, provider_id, field_name) DO UPDATE SET \
                            kid = excluded.kid, \
                            nonce = excluded.nonce, \
                            ciphertext = excluded.ciphertext, \
+                           deleted = 0, \
                            updated_at = excluded.updated_at, \
                            updated_by = excluded.updated_by",
                     )
                     .bind(&[
+                        (new_rev as f64).into(),
                         provider.into(),
                         field.into(),
                         enc.kid.as_str().into(),
@@ -363,7 +441,7 @@ pub async fn save_providers(
                         updated_secret_count += 1;
                     }
                     Err(e) => {
-                        worker::console_error!("bind upsert provider_secret failed: {e:?}");
+                        worker::console_error!("bind upsert provider_secret_versions failed: {e:?}");
                         return internal_error();
                     }
                 }
@@ -374,11 +452,11 @@ pub async fn save_providers(
     if !secret_writes.is_empty()
         && let Err(e) = db.batch(secret_writes).await
     {
-        worker::console_error!("write provider_secrets batch failed: {e:?}");
+        worker::console_error!("write provider_secret_versions batch failed: {e:?}");
         return internal_error();
     }
 
-    // Phase 2: Activate on SitePolicyDO ONLY AFTER both D1 CAS and `provider_secrets` succeed.
+    // Phase 2: Activate on SitePolicyDO ONLY AFTER both D1 CAS and staged secrets succeed.
     match LoadedSettings::activate_saved_revision(&st.env, &stored_public, &digest).await {
         Ok(ActivationOutcome::Active {
             ack,
@@ -389,7 +467,7 @@ pub async fn save_providers(
                 ack.revision
             );
 
-            let secret_meta = match load_secret_metadata(&st.env).await {
+            let secret_meta = match load_secret_metadata(&st.env, ack.revision).await {
                 Ok(m) => m,
                 Err(e) => {
                     worker::console_error!("reload provider_secrets metadata failed: {e:?}");
@@ -470,8 +548,24 @@ pub async fn rotate_secrets(
         }
     };
 
+    let versioned_rows = match db
+        .prepare(
+            "SELECT policy_rev, provider_id, field_name, kid, hex(nonce) AS nonce_hex, hex(ciphertext) AS ciphertext_hex \
+             FROM provider_secret_versions WHERE deleted = 0",
+        )
+        .all()
+        .await
+        .and_then(|r| r.results::<VersionedSecretRotateRow>())
+    {
+        Ok(r) => r,
+        Err(e) => {
+            worker::console_error!("query provider_secret_versions for rotation failed: {e:?}");
+            return internal_error();
+        }
+    };
+
     let current_kid = st.keyring.current.kid().to_string();
-    let total_rows = rows.len();
+    let total_rows = rows.len() + versioned_rows.len();
     let mut rotated = 0usize;
     let mut skipped_current = 0usize;
     let mut failed = 0usize;
@@ -553,6 +647,88 @@ pub async fn rotate_secrets(
             },
             Err(e) => {
                 worker::console_error!("bind rotate update failed: {e:?}");
+                failed += 1;
+            }
+        }
+    }
+
+    for row in versioned_rows {
+        if row.kid == current_kid {
+            skipped_current += 1;
+            continue;
+        }
+        let (Ok(old_nonce), Ok(old_ct)) = (
+            hex::decode(&row.nonce_hex),
+            hex::decode(&row.ciphertext_hex),
+        ) else {
+            worker::console_error!(
+                "corrupt hex blob in provider_secret_versions for rev={}/{}/{}",
+                row.policy_rev,
+                row.provider_id,
+                row.field_name
+            );
+            failed += 1;
+            continue;
+        };
+        let reenc = match st.keyring.reencrypt(
+            &st.deployment_id,
+            &row.provider_id,
+            &row.field_name,
+            &row.kid,
+            &old_nonce,
+            &old_ct,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                worker::console_error!(
+                    "re-encrypt failed for versioned rev={}/{}/{} (kid={}): {e}",
+                    row.policy_rev,
+                    row.provider_id,
+                    row.field_name,
+                    row.kid
+                );
+                failed += 1;
+                continue;
+            }
+        };
+        let nonce_val: JsValue = js_sys::Uint8Array::from(&reenc.nonce[..]).into();
+        let ct_val: JsValue = js_sys::Uint8Array::from(reenc.ciphertext.as_slice()).into();
+        let res = db
+            .prepare(
+                "UPDATE provider_secret_versions \
+                 SET kid = ?, nonce = ?, ciphertext = ?, updated_at = unixepoch(), updated_by = ? \
+                 WHERE policy_rev = ? AND provider_id = ? AND field_name = ? AND kid = ?",
+            )
+            .bind(&[
+                reenc.kid.as_str().into(),
+                nonce_val,
+                ct_val,
+                editor.into(),
+                (row.policy_rev as f64).into(),
+                row.provider_id.as_str().into(),
+                row.field_name.as_str().into(),
+                row.kid.as_str().into(),
+            ]);
+        match res {
+            Ok(stmt) => match stmt.run().await {
+                Ok(out) if out.meta().ok().flatten().and_then(|m| m.changes) == Some(1) => {
+                    rotated += 1;
+                }
+                Ok(_) => {
+                    skipped_current += 1;
+                }
+                Err(e) => {
+                    worker::console_error!(
+                        "persist rotated versioned secret failed for rev={}/{}/{}: {e:?}",
+                        row.policy_rev,
+                        row.provider_id,
+                        row.field_name
+                    );
+                    failed += 1;
+                }
+            },
+            Err(e) => {
+                worker::console_error!("bind rotate versioned update failed: {e:?}");
                 failed += 1;
             }
         }

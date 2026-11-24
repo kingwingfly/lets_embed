@@ -293,6 +293,7 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                         prop:value=move || sort_by.get()
                         on:change=move |ev| {
                             sort_by.set(event_target_value(&ev));
+                            page.set(1);
                             load_accounts();
                         }
                     >
@@ -382,6 +383,47 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                         </tbody>
                     </table>
                 </div>
+
+                {move || accounts_data.get().map(|data| {
+                    let page_size = data.page_size.max(1);
+                    let total_pages = data.total.div_ceil(page_size).max(1);
+                    let cur_page = page.get().min(total_pages);
+                    view! {
+                        <div class="adm-row" style="justify-content: space-between; align-items: center; margin-top: 12px;">
+                            <span class="adm-sub">
+                                {format!("Page {cur_page} of {total_pages} · {} matching accounts", data.total)}
+                            </span>
+                            <div class="adm-row" style="gap: 8px;">
+                                <button
+                                    type="button"
+                                    class="adm-btn adm-btn--sm"
+                                    disabled={move || loading.get() || cur_page <= 1}
+                                    on:click=move |_| {
+                                        if cur_page > 1 {
+                                            page.set(cur_page - 1);
+                                            load_accounts();
+                                        }
+                                    }
+                                >
+                                    "Previous"
+                                </button>
+                                <button
+                                    type="button"
+                                    class="adm-btn adm-btn--sm"
+                                    disabled={move || loading.get() || cur_page >= total_pages}
+                                    on:click=move |_| {
+                                        if cur_page < total_pages {
+                                            page.set(cur_page + 1);
+                                            load_accounts();
+                                        }
+                                    }
+                                >
+                                    "Next"
+                                </button>
+                            </div>
+                        </div>
+                    }
+                })}
             </section>
 
             // Selected Account Inspector

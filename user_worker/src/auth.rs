@@ -2,11 +2,11 @@
 
 use axum::{
     Json,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use site_access::{
     AssuranceLevel, AuthProviderId, AuthProviderPublicConfig, PolicyRef, PublicSitePolicy,
 };
@@ -94,11 +94,36 @@ pub(crate) fn require_same_origin(st: &AppState, headers: &HeaderMap) -> Result<
     Ok(())
 }
 
-/// Issue a single-use wallet nonce atomically in `AuthChallengeDO` (eliminates KV race H12).
+pub(crate) const NONCE_PURPOSE_LOGIN: &str = "wallet_login";
+pub(crate) const NONCE_PURPOSE_LINK_PAYMENT: &str = "wallet_link_payment";
+pub(crate) const NONCE_PURPOSE_LINK_LOGIN: &str = "wallet_link_login";
+
+#[derive(Debug, Default, Deserialize)]
+pub struct NonceQuery {
+    #[serde(default)]
+    pub purpose: Option<String>,
+}
+
+fn resolve_nonce_purpose(raw: Option<&str>) -> Option<&'static str> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        None | Some("login") => Some(NONCE_PURPOSE_LOGIN),
+        Some("link_payment") => Some(NONCE_PURPOSE_LINK_PAYMENT),
+        Some("link_login") => Some(NONCE_PURPOSE_LINK_LOGIN),
+        _ => None,
+    }
+}
+
+/// Issue a single-use purpose-scoped wallet nonce atomically in `AuthChallengeDO` (F7, H12).
 #[worker::send]
-pub async fn nonce(State(st): State<AppState>) -> Response {
+pub async fn nonce(State(st): State<AppState>, Query(q): Query<NonceQuery>) -> Response {
+    let Some(purpose) = resolve_nonce_purpose(q.purpose.as_deref()) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid nonce purpose (expected login, link_payment, or link_login)",
+        );
+    };
     let nonce = uuid::Uuid::new_v4().simple().to_string();
-    if let Err(e) = challenge_do::issue_nonce(&st.env, &nonce, "wallet", config::NONCE_TTL_SECS).await
+    if let Err(e) = challenge_do::issue_nonce(&st.env, &nonce, purpose, config::NONCE_TTL_SECS).await
     {
         worker::console_error!("AuthChallengeDO nonce issue failed: {e:?}");
         return internal_error();
@@ -142,14 +167,13 @@ pub(crate) async fn verify_siwe_and_ensure_user(
         return Err(api_error(StatusCode::UNAUTHORIZED, "chain id mismatch"));
     }
     if msg.uri.contains("/user/login/approve")
-        || msg
-            .statement
-            .as_deref()
-            .is_some_and(|s| s.starts_with("Approve sign-in for another browser"))
+        || msg.statement.as_deref().is_some_and(|s| {
+            s.starts_with("Approve sign-in for another browser") || s.starts_with("Link ")
+        })
     {
         return Err(api_error(
             StatusCode::UNAUTHORIZED,
-            "handoff approval signature cannot be used for direct sign-in",
+            "handoff or wallet-link signature cannot be used for direct sign-in",
         ));
     }
 
@@ -178,8 +202,8 @@ pub(crate) async fn verify_siwe_and_ensure_user(
         }
     }
 
-    // Atomic single-use nonce consumption in `AuthChallengeDO`!
-    match challenge_do::consume_nonce(&st.env, &msg.nonce, "wallet").await {
+    // Atomic single-use nonce consumption scoped strictly to direct wallet login (F7)!
+    match challenge_do::consume_nonce(&st.env, &msg.nonce, NONCE_PURPOSE_LOGIN).await {
         Ok(true) => {}
         Ok(false) => {
             return Err(api_error(
@@ -244,7 +268,7 @@ pub(crate) async fn verify_siws_and_ensure_user(
         return Err(api_error(StatusCode::BAD_REQUEST, "invalid solana address"));
     }
 
-    match challenge_do::consume_nonce(&st.env, &req.nonce, "wallet").await {
+    match challenge_do::consume_nonce(&st.env, &req.nonce, NONCE_PURPOSE_LOGIN).await {
         Ok(true) => {}
         Ok(false) => {
             return Err(api_error(
@@ -357,14 +381,19 @@ pub async fn logout(State(st): State<AppState>, headers: HeaderMap, cookies: Coo
     if let Err(r) = require_same_origin(&st, &headers) {
         return r;
     }
-    // Revoke active `sid` in `UserAccount` DO immediately (H8).
+    // Require acknowledged `sid` revocation in `UserAccount` DO before returning 200 (F10).
     if let Some(verified) = session::verify_cookie_session(
         &cookies,
         &st.session_v2_secret,
         st.legacy_jwt_secret.as_deref().map(Vec::as_slice),
     ) && let Some(sid) = verified.sid()
+        && let Err(e) = do_client::do_session_revoke(&st.env, verified.do_key(), sid).await
     {
-        let _ = do_client::do_session_revoke(&st.env, verified.do_key(), sid).await;
+        worker::console_error!("logout DO session revoke failed: {e:?}");
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "could not revoke session; please try signing out again",
+        );
     }
     cookies.add(session::clear_session_cookie());
     StatusCode::OK.into_response()

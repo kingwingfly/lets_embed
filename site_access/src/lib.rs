@@ -676,6 +676,72 @@ mod tests {
             &policy,
             Some(7)
         ));
+
+        // Preview capabilities MUST seal `immutable_locator` so original filename NEVER appears
+        // in decoded base64url payload, while `verify_media_capability` decrypts it cleanly (F20).
+        let secret_filename_preview = MediaCapability {
+            kind: MediaCapKind::Preview,
+            immutable_locator: "2026/01/very_sensitive_original_title_42.webp".into(),
+            matched_blocks: vec![],
+            matched_blurs: vec![PolicyRef::new("sensitive", 1)],
+            revealed_refs: vec![],
+            ..preview_cap
+        };
+        let preview_tok = sign_media_capability(&secret_filename_preview, secret).expect("sign preview");
+        let payload_b64 = preview_tok
+            .strip_prefix("mc3.")
+            .unwrap()
+            .split_once('.')
+            .unwrap()
+            .0;
+        let payload_raw = URL_SAFE_NO_PAD.decode(payload_b64).unwrap();
+        let payload_str = String::from_utf8(payload_raw).unwrap();
+        assert!(
+            !payload_str.contains("very_sensitive_original_title_42"),
+            "preview mc3 payload must never disclose original filename: {payload_str}"
+        );
+        assert!(
+            payload_str.contains("\"enc1."),
+            "preview mc3 payload must carry sealed enc1 locator"
+        );
+        let unsealed = verify_media_capability(
+            &preview_tok,
+            secret,
+            MEDIA_CAP_AUDIENCE,
+            MediaCapKind::Preview,
+            42,
+            4500,
+            policy.min_enforce_rev,
+            policy.revision,
+        )
+        .expect("sealed preview cap verifies and decrypts");
+        assert_eq!(unsealed, secret_filename_preview);
+
+        // An unsealed Preview capability signed directly with raw JSON must be rejected!
+        let raw_preview_payload =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&secret_filename_preview).unwrap());
+        let mut raw_mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+        raw_mac.update(b"media-cap/v3\0");
+        raw_mac.update(b"mc3.");
+        raw_mac.update(raw_preview_payload.as_bytes());
+        let forged_unsealed = format!(
+            "mc3.{raw_preview_payload}.{}",
+            URL_SAFE_NO_PAD.encode(raw_mac.finalize().into_bytes())
+        );
+        assert!(
+            verify_media_capability(
+                &forged_unsealed,
+                secret,
+                MEDIA_CAP_AUDIENCE,
+                MediaCapKind::Preview,
+                42,
+                4500,
+                policy.min_enforce_rev,
+                policy.revision,
+            )
+            .is_err(),
+            "unsealed Preview locator must be rejected"
+        );
     }
 
     #[test]

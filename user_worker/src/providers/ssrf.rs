@@ -68,34 +68,15 @@ const FORBIDDEN_HOST_SUFFIXES: &[&str] = &[
     ".intranet",
 ];
 
-/// Multi-tenant or two-label public suffixes that MUST NOT be treated as a
-/// shared organization parent domain when pinning discovery endpoints.
-const NON_SHARED_PARENT_SUFFIXES: &[&str] = &[
-    "co.uk",
-    "org.uk",
-    "gov.uk",
-    "ac.uk",
-    "com.au",
-    "net.au",
-    "org.au",
-    "co.jp",
-    "ne.jp",
-    "or.jp",
-    "com.cn",
-    "com.br",
-    "co.nz",
-    "workers.dev",
-    "pages.dev",
-    "amazonaws.com",
-    "cloudfront.net",
-    "appspot.com",
-    "azurewebsites.net",
-    "herokuapp.com",
-    "googleapis.com",
-    "github.io",
-    "netlify.app",
-    "vercel.app",
-];
+/// Parses an optional comma/whitespace-separated allowlist of extra HTTPS hostnames
+/// permitted for OIDC discovery endpoints (e.g., from `OIDC_AGE_ALLOWED_ENDPOINT_HOSTS`).
+pub fn parse_allowed_endpoint_hosts(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split([',', ' ', '\n', '\r', '\t'])
+        .map(|s| s.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|s| !s.is_empty() && s.contains('.'))
+        .collect()
+}
 
 /// Validate a URL for OIDC Discovery / JWKS / Token / UserInfo / Authorization.
 pub fn validate_oidc_url(raw: &str) -> Result<Url, SsrfError> {
@@ -204,12 +185,22 @@ fn is_numeric_ip_label(lbl: &str) -> bool {
 }
 
 /// Checks whether `endpoint_url` has an approved origin pinned to `issuer_url`.
-/// Allows exact host match, subdomains of `issuer_host`, or sibling subdomains
-/// under the same non-public-suffix parent domain (e.g. `id.vendor.com` + `api.vendor.com`).
-/// For Google's built-in OIDC issuer (`accounts.google.com`), explicitly pins only
-/// Google's official OIDC hosts (`oauth2.googleapis.com`, `www.googleapis.com`,
-/// `openidconnect.googleapis.com`).
-pub fn is_endpoint_origin_pinned(issuer_url: &Url, endpoint_url: &Url) -> bool {
+///
+/// Strictly allows ONLY:
+/// 1. Exact host match (`ep == iss`),
+/// 2. Strict subdomain of the issuer (`*.{iss}`),
+/// 3. Google's exact official OIDC hosts (`oauth2.googleapis.com`, `www.googleapis.com`,
+///    `openidconnect.googleapis.com`) ONLY when `iss == "accounts.google.com"`, or
+/// 4. An explicit operator-configured host in `extra_allowed_hosts`
+///    (from `OIDC_AGE_ALLOWED_ENDPOINT_HOSTS`).
+///
+/// NEVER guesses sibling domains by comparing the last 2 labels (which fails on
+/// multi-label public suffixes like `co.za`, `com.sg`, `auth0.com`, etc.).
+pub fn is_endpoint_origin_pinned(
+    issuer_url: &Url,
+    endpoint_url: &Url,
+    extra_allowed_hosts: &[String],
+) -> bool {
     if issuer_url.scheme() != "https" || endpoint_url.scheme() != "https" {
         return false;
     }
@@ -224,8 +215,7 @@ pub fn is_endpoint_origin_pinned(issuer_url: &Url, endpoint_url: &Url) -> bool {
         return true;
     }
     // Google's real OIDC discovery (`https://accounts.google.com`) publishes endpoints
-    // on these exact `googleapis.com` hosts. Pin them explicitly ONLY for Google while
-    // keeping `googleapis.com` in `NON_SHARED_PARENT_SUFFIXES` for all other issuers.
+    // on these exact `googleapis.com` hosts. Pin them explicitly ONLY for Google.
     if iss == "accounts.google.com"
         && matches!(
             ep.as_str(),
@@ -234,28 +224,16 @@ pub fn is_endpoint_origin_pinned(issuer_url: &Url, endpoint_url: &Url) -> bool {
     {
         return true;
     }
-    // Endpoint is a subdomain of issuer (e.g. issuer = yoti.com, ep = api.yoti.com)
+    // Endpoint is a strict subdomain of issuer (e.g. issuer = yoti.com, ep = api.yoti.com)
     if ep.ends_with(&format!(".{iss}")) {
         return true;
     }
-    // Sibling subdomains sharing the same registrable 2-label parent domain,
-    // excluding public/multi-tenant suffixes.
-    let iss_parts: Vec<&str> = iss.split('.').collect();
-    let ep_parts: Vec<&str> = ep.split('.').collect();
-    if iss_parts.len() >= 2 && ep_parts.len() >= 2 {
-        let iss_parent = format!(
-            "{}.{}",
-            iss_parts[iss_parts.len() - 2],
-            iss_parts[iss_parts.len() - 1]
-        );
-        let ep_parent = format!(
-            "{}.{}",
-            ep_parts[ep_parts.len() - 2],
-            ep_parts[ep_parts.len() - 1]
-        );
-        if iss_parent == ep_parent && !NON_SHARED_PARENT_SUFFIXES.contains(&iss_parent.as_str()) {
-            return true;
-        }
+    // Explicit operator allowlist (e.g. `OIDC_AGE_ALLOWED_ENDPOINT_HOSTS`)
+    if extra_allowed_hosts
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(&ep))
+    {
+        return true;
     }
     false
 }
@@ -293,6 +271,16 @@ pub fn validate_discovery_document(
     configured_issuer: &str,
     doc: &OidcDiscoveryDoc,
 ) -> Result<ValidatedOidcEndpoints, SsrfError> {
+    validate_discovery_document_with_allowed_hosts(configured_issuer, doc, &[])
+}
+
+/// Same as [`validate_discovery_document`] with an optional explicit allowlist
+/// of additional trusted endpoint hostnames.
+pub fn validate_discovery_document_with_allowed_hosts(
+    configured_issuer: &str,
+    doc: &OidcDiscoveryDoc,
+    extra_allowed_hosts: &[String],
+) -> Result<ValidatedOidcEndpoints, SsrfError> {
     let issuer_url = validate_oidc_url(configured_issuer)?;
     if doc.issuer.trim() != configured_issuer.trim() {
         return Err(SsrfError::IssuerMismatch);
@@ -301,9 +289,9 @@ pub fn validate_discovery_document(
     let auth_url = validate_oidc_url(&doc.authorization_endpoint)?;
     let token_url = validate_oidc_url(&doc.token_endpoint)?;
     let jwks_url = validate_oidc_url(&doc.jwks_uri)?;
-    if !is_endpoint_origin_pinned(&issuer_url, &auth_url)
-        || !is_endpoint_origin_pinned(&issuer_url, &token_url)
-        || !is_endpoint_origin_pinned(&issuer_url, &jwks_url)
+    if !is_endpoint_origin_pinned(&issuer_url, &auth_url, extra_allowed_hosts)
+        || !is_endpoint_origin_pinned(&issuer_url, &token_url, extra_allowed_hosts)
+        || !is_endpoint_origin_pinned(&issuer_url, &jwks_url, extra_allowed_hosts)
     {
         return Err(SsrfError::EndpointOriginNotPinned);
     }
@@ -311,7 +299,7 @@ pub fn validate_discovery_document(
     let userinfo_endpoint = match doc.userinfo_endpoint.as_deref() {
         Some(raw) if !raw.trim().is_empty() => {
             let ui_url = validate_oidc_url(raw)?;
-            if !is_endpoint_origin_pinned(&issuer_url, &ui_url) {
+            if !is_endpoint_origin_pinned(&issuer_url, &ui_url, extra_allowed_hosts) {
                 return Err(SsrfError::EndpointOriginNotPinned);
             }
             Some(ui_url.to_string())
@@ -422,14 +410,51 @@ mod tests {
     #[test]
     fn discovery_validation_enforces_exact_issuer_and_origin_pinning() {
         let configured = "https://id.vendor.example";
+        // Exact host + strict subdomains of the issuer are accepted by default.
         let good = OidcDiscoveryDoc {
             issuer: configured.into(),
             authorization_endpoint: "https://id.vendor.example/oauth/authorize".into(),
-            token_endpoint: "https://api.vendor.example/oauth/token".into(),
-            jwks_uri: "https://keys.vendor.example/.well-known/jwks.json".into(),
-            userinfo_endpoint: Some("https://api.vendor.example/userinfo".into()),
+            token_endpoint: "https://api.id.vendor.example/oauth/token".into(),
+            jwks_uri: "https://keys.id.vendor.example/.well-known/jwks.json".into(),
+            userinfo_endpoint: Some("https://id.vendor.example/userinfo".into()),
         };
         assert!(validate_discovery_document(configured, &good).is_ok());
+
+        // Unpinned sibling host (e.g. `api.vendor.example` for `id.vendor.example`) MUST be
+        // rejected unless explicitly allowlisted by the operator (F16)!
+        let sibling_doc = OidcDiscoveryDoc {
+            token_endpoint: "https://api.vendor.example/oauth/token".into(),
+            ..good.clone()
+        };
+        assert_eq!(
+            validate_discovery_document(configured, &sibling_doc).unwrap_err(),
+            SsrfError::EndpointOriginNotPinned
+        );
+        let allow = parse_allowed_endpoint_hosts(Some("api.vendor.example"));
+        assert!(
+            validate_discovery_document_with_allowed_hosts(configured, &sibling_doc, &allow)
+                .is_ok()
+        );
+
+        // Two-label public suffix registrants (e.g. `co.za`, `auth0.com`) MUST NEVER match siblings!
+        for (iss, evil_tok) in [
+            ("https://legit.co.za", "https://attacker.co.za/token"),
+            ("https://tenant-a.auth0.com", "https://attacker.auth0.com/token"),
+            ("https://good-idp.workers.dev", "https://evil-idp.workers.dev/token"),
+        ] {
+            let doc = OidcDiscoveryDoc {
+                issuer: iss.into(),
+                authorization_endpoint: format!("{iss}/authorize"),
+                token_endpoint: evil_tok.into(),
+                jwks_uri: format!("{iss}/jwks.json"),
+                userinfo_endpoint: None,
+            };
+            assert_eq!(
+                validate_discovery_document(iss, &doc).unwrap_err(),
+                SsrfError::EndpointOriginNotPinned,
+                "sibling under shared suffix must be rejected: {iss} -> {evil_tok}"
+            );
+        }
 
         // Issuer mismatch rejected
         let wrong_iss = OidcDiscoveryDoc {
@@ -444,24 +469,10 @@ mod tests {
         // Off-origin jwks_uri rejected
         let evil_jwks = OidcDiscoveryDoc {
             jwks_uri: "https://attacker.evil.org/jwks.json".into(),
-            ..good.clone()
+            ..good
         };
         assert_eq!(
             validate_discovery_document(configured, &evil_jwks).unwrap_err(),
-            SsrfError::EndpointOriginNotPinned
-        );
-
-        // Multi-tenant suffix (workers.dev) MUST NOT allow sibling tenants!
-        let mt_issuer = "https://good-idp.workers.dev";
-        let mt_doc = OidcDiscoveryDoc {
-            issuer: mt_issuer.into(),
-            authorization_endpoint: "https://good-idp.workers.dev/authorize".into(),
-            token_endpoint: "https://evil-idp.workers.dev/token".into(),
-            jwks_uri: "https://good-idp.workers.dev/jwks.json".into(),
-            userinfo_endpoint: None,
-        };
-        assert_eq!(
-            validate_discovery_document(mt_issuer, &mt_doc).unwrap_err(),
             SsrfError::EndpointOriginNotPinned
         );
 

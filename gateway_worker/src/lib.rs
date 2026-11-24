@@ -1388,6 +1388,9 @@ async fn handle_media_route(
                     resp.headers_mut().remove("set-cookie");
                     private_no_store(resp)
                 }
+            } else if resp.status() == StatusCode::NOT_MODIFIED {
+                resp.headers_mut().remove("set-cookie");
+                private_no_store(resp)
             } else if resp.status().is_redirection() {
                 private_no_store(
                     (StatusCode::BAD_GATEWAY, "Upstream redirect rejected").into_response(),
@@ -4195,5 +4198,52 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn clear_media_passes_through_304_not_modified_and_still_rejects_302_redirect() {
+        let policy = sample_safety_policy();
+        let cfg = test_cfg();
+        let cap = MediaCapability {
+            v: MEDIA_CAP_VERSION,
+            aud: MEDIA_CAP_AUDIENCE.into(),
+            kind: MediaCapKind::Image,
+            asset_id: 99,
+            immutable_locator: "2026/01/pic_99.webp".into(),
+            facts_rev: 7,
+            policy_rev: policy.revision,
+            actor_binding: ActorBinding::Anon,
+            matched_blocks: vec![],
+            matched_blurs: vec![],
+            revealed_refs: vec![],
+            exp: TEST_NOW + 300,
+        };
+        let cap_tok = sign_media_capability(&cap, &cfg.media_cap_secret).unwrap();
+
+        let mut backend_304 = MockBackend::with_policy(policy.clone());
+        backend_304.upstream_status = StatusCode::NOT_MODIFIED;
+        let mut cond_hdrs = HeaderMap::new();
+        cond_hdrs.insert("if-none-match", "\"etag-99\"".parse().unwrap());
+        let resp_304 = dispatch(
+            &backend_304,
+            &cfg,
+            Method::GET,
+            &format!("/media/image/99?cap={cap_tok}"),
+            cond_hdrs.clone(),
+            Bytes::new(),
+        );
+        assert_eq!(resp_304.status(), StatusCode::NOT_MODIFIED);
+
+        let mut backend_302 = MockBackend::with_policy(policy);
+        backend_302.upstream_status = StatusCode::FOUND;
+        let resp_302 = dispatch(
+            &backend_302,
+            &cfg,
+            Method::GET,
+            &format!("/media/image/99?cap={cap_tok}"),
+            cond_hdrs,
+            Bytes::new(),
+        );
+        assert_eq!(resp_302.status(), StatusCode::BAD_GATEWAY);
     }
 }

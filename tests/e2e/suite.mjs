@@ -1055,26 +1055,47 @@ try {
   const afterReveal = await evalJs(`
     const deadline = Date.now() + 20000;
     while (Date.now() < deadline) {
-      const clearNow = [...document.querySelectorAll('img')].filter(i => i.src.includes('/media/image/') && i.complete && i.naturalWidth > 0).length;
-      if (clearNow > 0) {
+      const clearImg = [...document.querySelectorAll('img')].find(i => i.src.includes('/media/image/') && i.complete && i.naturalWidth > 0);
+      if (clearImg) {
+        const clearNow = [...document.querySelectorAll('img')].filter(i => i.src.includes('/media/image/') && i.complete && i.naturalWidth > 0).length;
         const hasHideBtn = [...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Hide');
-        return { clearNow, hasHideBtn };
+        return { clearNow, hasHideBtn, firstClearSrc: clearImg.src };
       }
       const btn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('Click to reveal'));
       if (btn) btn.click();
       await new Promise(r => setTimeout(r, 400));
     }
-    return { clearNow: 0, hasHideBtn: false };
+    return { clearNow: 0, hasHideBtn: false, firstClearSrc: '' };
   `);
+  // F31: Verify guest click-to-reveal ran as an unprivileged GuestSession (NOT LiveAdmin):
+  // `le_guest_sid` cookie was minted AND the revealed `mc3.` capability binds to `guest_session`.
+  const { cookies: postRevealCookies } = await cdp('Network.getCookies', { urls: [ORIGIN] });
+  const guestCookie = postRevealCookies.find((c) => c.name === 'le_guest_sid');
+  let revealedActorKind = null;
+  if (afterReveal.firstClearSrc) {
+    const capParam = new URL(afterReveal.firstClearSrc).searchParams.get('cap') || '';
+    const capParts = capParam.startsWith('mc3.') ? capParam.slice(4).split('.') : [];
+    if (capParts[0]) {
+      const capPayload = JSON.parse(Buffer.from(capParts[0], 'base64url').toString('utf8'));
+      revealedActorKind = capPayload?.actor_binding?.kind || null;
+    }
+  }
   await screenshot('e2e_blur_click_after.png');
   check(
-    '5h. Blur + Fixed Server Preview hides clear URL until click -> POST /api/safety/reveal loads clear image + Hide',
+    '5h. Blur + Fixed Server Preview hides clear URL until click -> guest POST /api/safety/reveal mints GuestSession cap + loads clear image',
     beforeReveal.spoilers > 0 &&
       beforeReveal.clearBefore === 0 &&
       beforeReveal.hasRevealBtn &&
       afterReveal.clearNow > 0 &&
-      afterReveal.hasHideBtn,
-    JSON.stringify({ beforeReveal, afterReveal })
+      afterReveal.hasHideBtn &&
+      Boolean(guestCookie?.value) &&
+      revealedActorKind === 'guest_session',
+    JSON.stringify({
+      beforeReveal,
+      afterReveal,
+      hasGuestCookie: Boolean(guestCookie?.value),
+      revealedActorKind,
+    })
   );
 
   check(

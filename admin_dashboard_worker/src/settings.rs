@@ -690,6 +690,29 @@ pub fn validate_provider_updates(
                 .transpose()?
         };
 
+        // When enabled, OAuth/OIDC providers MUST have a non-empty Client ID and Telegram
+        // MUST have a non-empty bot username so the dashboard cannot publish a broken provider (F29).
+        if item.enabled && public_client_id.is_none() {
+            match item.id {
+                AuthProviderId::Google
+                | AuthProviderId::GitHub
+                | AuthProviderId::X
+                | AuthProviderId::Discord
+                | AuthProviderId::OidcAgeAssurance => {
+                    return Err(format!(
+                        "Provider '{}' requires a non-empty Client ID when enabled",
+                        item.id.as_str()
+                    ));
+                }
+                AuthProviderId::Telegram => {
+                    return Err(
+                        "Provider 'telegram' requires a non-empty bot username when enabled".into(),
+                    );
+                }
+                AuthProviderId::EmailOtp | AuthProviderId::Siwe | AuthProviderId::Siws => {}
+            }
+        }
+
         // Only `OidcAgeAssurance` (required OIDC discovery issuer) and `EmailOtp`
         // (optional HTTP mail API endpoint) use `issuer`. Standard OAuth providers
         // (`Google`, `GitHub`, `X`, `Discord`) use fixed official endpoints.
@@ -871,11 +894,15 @@ pub fn is_public_policy_unchanged(prev: &PublicSitePolicy, next: &PublicSitePoli
 }
 
 /// Expands and normalizes a slice of [`AuthProviderPublicConfig`] into canonical
-/// order across all [`AuthProviderId::ALL`] entries so fresh/sparse stored lists
-/// compare equal to full default-disabled submissions from the admin UI.
+/// order across all [`AuthProviderId::ALL`] entries, matching runtime effective
+/// defaults (on a fresh empty list with `age_policy != StrictProviderVerified18`,
+/// `siwe` and `siws` default to `enabled: true` so explicitly disabling them persists, F28).
 pub fn canonical_provider_configs(
+    age_policy: AgeVerificationPolicy,
     configured: &[AuthProviderPublicConfig],
 ) -> Vec<AuthProviderPublicConfig> {
+    let empty_defaults_wallets =
+        configured.is_empty() && age_policy != AgeVerificationPolicy::StrictProviderVerified18;
     let mut out: Vec<AuthProviderPublicConfig> = AuthProviderId::ALL
         .iter()
         .map(|&id| {
@@ -925,7 +952,8 @@ pub fn canonical_provider_configs(
                 },
                 None => AuthProviderPublicConfig {
                     id,
-                    enabled: false,
+                    enabled: empty_defaults_wallets
+                        && matches!(id, AuthProviderId::Siwe | AuthProviderId::Siws),
                     display_name: None,
                     issuer: None,
                     public_client_id: None,
@@ -939,13 +967,16 @@ pub fn canonical_provider_configs(
 }
 
 /// Returns `true` when incoming provider public configs are canonically identical
-/// to stored configs AND no secret upserts or deletions were submitted.
+/// to effective stored configs AND no secret upserts or deletions were submitted.
 pub fn are_providers_unchanged(
+    age_policy: AgeVerificationPolicy,
     prev: &[AuthProviderPublicConfig],
     next: &[AuthProviderPublicConfig],
     has_secret_mutations: bool,
 ) -> bool {
-    !has_secret_mutations && canonical_provider_configs(prev) == canonical_provider_configs(next)
+    !has_secret_mutations
+        && canonical_provider_configs(age_policy, prev)
+            == canonical_provider_configs(age_policy, next)
 }
 
 // ---------------------------------------------------------------------------

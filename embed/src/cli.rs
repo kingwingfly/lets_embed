@@ -1009,7 +1009,14 @@ async fn run_retag_safety(
             }
         }
 
-        let mut conn = pool.acquire().await?;
+        let mut tx = pool.begin().await?;
+        // Atomically replace all WD-Tagger scores for every retagged image in this batch
+        // so stale high scores that now fall below `min_persisted_score` never remain active!
+        sqlx::query("DELETE FROM wd_tag_images WHERE image_id = ANY($1::BIGINT[])")
+            .bind(&batch_ids)
+            .execute(&mut *tx)
+            .await?;
+
         if !tag_names.is_empty() {
             sqlx::query(
                 r#"
@@ -1021,7 +1028,7 @@ async fn run_retag_safety(
                 "#,
             )
             .bind(&tag_names)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
 
             sqlx::query(
@@ -1037,7 +1044,7 @@ async fn run_retag_safety(
             .bind(&wd_ids)
             .bind(&tag_names)
             .bind(&scores)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
         }
 
@@ -1052,8 +1059,10 @@ async fn run_retag_safety(
         .bind(&batch_ids)
         .bind(params.min_persisted_score)
         .bind(params.vocab_digest.as_str())
-        .execute(&mut *conn)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         processed += batch_ids.len() as u64;
         tracing::info!(

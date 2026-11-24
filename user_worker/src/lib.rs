@@ -243,6 +243,7 @@ async fn router(env: Env, _ctx: Context) -> Result<Router> {
         // Pluggable Multi-Provider Auth (OAuth2, OIDC Age Assurance, Email OTP, Telegram)
         .route("/user/auth/email/start", post(providers::email::start))
         .route("/user/auth/email/verify", post(providers::email::verify))
+        .route("/user/auth/telegram/start", post(providers::telegram::start))
         .route("/user/auth/telegram/verify", post(providers::telegram::verify))
         .route(
             "/user/auth/telegram/callback",

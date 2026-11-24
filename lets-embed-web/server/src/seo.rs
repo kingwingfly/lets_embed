@@ -167,10 +167,33 @@ pub async fn sitemap_root(
         render_sitemap_index(&origin, pages)
     };
 
+    let etag = format!(
+        "\"{}\"",
+        &site_access::sha256_hex(xml.as_bytes())[..24]
+    );
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|inm| {
+            inm.split(',')
+                .any(|part| part.trim().trim_start_matches("W/") == etag)
+        })
+    {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, "public, max-age=0, must-revalidate".to_string()),
+            ],
+        )
+            .into_response();
+    }
+
     (
         [
-            (header::CONTENT_TYPE, "application/xml; charset=utf-8"),
-            (header::CACHE_CONTROL, "public, max-age=3600"),
+            (header::CONTENT_TYPE, "application/xml; charset=utf-8".to_string()),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, "public, max-age=0, must-revalidate".to_string()),
         ],
         xml,
     )
@@ -227,10 +250,32 @@ pub async fn sitemap_page(
         }
     };
     let xml = render_urlset(&origin, page == 1, &entries);
+    let etag = format!(
+        "\"{}\"",
+        &site_access::sha256_hex(xml.as_bytes())[..24]
+    );
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|inm| {
+            inm.split(',')
+                .any(|part| part.trim().trim_start_matches("W/") == etag)
+        })
+    {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, "public, max-age=0, must-revalidate".to_string()),
+            ],
+        )
+            .into_response();
+    }
     (
         [
-            (header::CONTENT_TYPE, "application/xml; charset=utf-8"),
-            (header::CACHE_CONTROL, "public, max-age=3600"),
+            (header::CONTENT_TYPE, "application/xml; charset=utf-8".to_string()),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, "public, max-age=0, must-revalidate".to_string()),
         ],
         xml,
     )

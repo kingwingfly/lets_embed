@@ -575,9 +575,12 @@ pub fn AccountPage() -> impl IntoView {
         let Some(b) = boot.get_untracked() else {
             return;
         };
+        let Some(m) = me.get_untracked() else {
+            return;
+        };
         busy.set(true);
         spawn_local(async move {
-            let nonce = match api::get_json::<NonceResp>("/user/api/nonce").await {
+            let nonce = match api::get_json::<NonceResp>("/user/api/nonce?purpose=link_payment").await {
                 Ok(n) => n.nonce,
                 Err(e) => {
                     toasts.error("Could not link Ethereum wallet", Some(e.display()));
@@ -585,12 +588,16 @@ pub fn AccountPage() -> impl IntoView {
                     return;
                 }
             };
+            let statement = format!(
+                "Link Ethereum wallet for payment to account {}.",
+                m.user_id
+            );
             match wallet::connect_and_sign_siwe(
                 "",
                 &b.siwe_domain,
                 b.chain_id,
                 &nonce,
-                "Link Ethereum wallet for crypto payments.",
+                &statement,
                 None,
             )
             .await
@@ -635,7 +642,7 @@ pub fn AccountPage() -> impl IntoView {
         };
         busy.set(true);
         spawn_local(async move {
-            let nonce = match api::get_json::<NonceResp>("/user/api/nonce").await {
+            let nonce = match api::get_json::<NonceResp>("/user/api/nonce?purpose=link_payment").await {
                 Ok(n) => n.nonce,
                 Err(e) => {
                     toasts.error("Could not link Solana wallet", Some(e.display()));
@@ -643,7 +650,10 @@ pub fn AccountPage() -> impl IntoView {
                     return;
                 }
             };
-            let challenge = format!("Link Solana wallet to {}\nNonce: {}", m.user_id, nonce);
+            let challenge = format!(
+                "Link Solana wallet for payment to {}\nNonce: {}",
+                m.user_id, nonce
+            );
             match wallet::connect_and_sign_sol_message("", &challenge).await {
                 Ok(sig) => {
                     match api::post_json_empty(

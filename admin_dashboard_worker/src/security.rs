@@ -466,7 +466,16 @@ pub fn validate_oidc_url(raw: &str) -> Result<String, String> {
         return Err("OIDC URL path contains invalid traversal segments".into());
     }
 
-    Ok(parsed.as_str().trim_end_matches('/').to_string())
+    // Preserve an explicit trailing slash (e.g. `https://idp.example.com/tenant/` or
+    // `https://auth.example.com/`) because OIDC discovery compares `doc.issuer` by exact
+    // byte equality; strip ONLY the synthetic root `/` that `Url::parse` appends when the
+    // input had no path and no trailing slash (F17).
+    let normalized = parsed.as_str();
+    if !trimmed.ends_with('/') && parsed.path() == "/" {
+        Ok(normalized.trim_end_matches('/').to_string())
+    } else {
+        Ok(normalized.to_string())
+    }
 }
 
 fn is_disallowed_internal_host(host: &str) -> bool {

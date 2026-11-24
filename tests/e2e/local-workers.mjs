@@ -159,47 +159,61 @@ const MF_PERSIST_DIR =
   process.env.MF_PERSIST_DIR ||
   fs.mkdtempSync(path.join(MF_PERSIST_BASE, 'mf-dev-'));
 
+const gatewaySharedConfig = {
+  outboundService,
+  bindings: {
+    SITE_SECRET,
+    CF_ACCESS_AUD: 'local-admin',
+    ADMIN_ALLOWED_EMAILS: 'admin@localhost',
+    CF_ACCESS_CLIENT_ID: 'local-dev-client',
+    CF_ACCESS_CLIENT_SECRET: 'local-dev-secret',
+    API_UPSTREAM: 'https://api.local.test',
+    IMAGE_UPSTREAM: 'https://image.local.test',
+    VIDEO_UPSTREAM: 'https://video.local.test',
+  },
+  serviceBindings: {
+    USER_WORKER: 'lets-embed-user-worker',
+    ADMIN_DASHBOARD_WORKER: {
+      name: 'lets-embed-admin-dashboard-worker',
+      props: { gallery_admin: true },
+    },
+  },
+  durableObjects: {
+    USER_ACCOUNT: {
+      className: 'UserAccount',
+      scriptName: 'lets-embed-user-worker',
+      useSQLite: true,
+    },
+    SITE_POLICY: {
+      className: 'SitePolicyDO',
+      scriptName: 'lets-embed-user-worker',
+      useSQLite: true,
+    },
+  },
+};
+
 const mf = new Miniflare({
   ...convertV4MiniflareOptions({
     cf: false,
     host: HOST,
     port: PORT,
     workers: [
+      // Match production Cloudflare Access scoping (F31): ONLY `/admin` and `/admin/*`
+      // receive a Cloudflare Access identity (`admin@localhost`); all public gallery,
+      // `/user/*`, `/media/*`, and `/api/safety/reveal` routes run unprivileged so guest
+      // sessions (`le_guest_sid`) and metering are exercised faithfully!
       {
         ...builtWorker('gateway_worker'),
+        ...gatewaySharedConfig,
+        name: 'lets-embed-gateway-admin',
+        routes: ['*/admin', '*/admin/*'],
+        access: { aud: 'local-admin', identity: { email: 'admin@localhost' } },
+      },
+      {
+        ...builtWorker('gateway_worker'),
+        ...gatewaySharedConfig,
         name: 'lets-embed-gateway-worker',
         routes: ['*/*'],
-        access: { aud: 'local-admin', identity: { email: 'admin@localhost' } },
-        outboundService,
-        bindings: {
-          SITE_SECRET,
-          CF_ACCESS_AUD: 'local-admin',
-          ADMIN_ALLOWED_EMAILS: 'admin@localhost',
-          CF_ACCESS_CLIENT_ID: 'local-dev-client',
-          CF_ACCESS_CLIENT_SECRET: 'local-dev-secret',
-          API_UPSTREAM: 'https://api.local.test',
-          IMAGE_UPSTREAM: 'https://image.local.test',
-          VIDEO_UPSTREAM: 'https://video.local.test',
-        },
-        serviceBindings: {
-          USER_WORKER: 'lets-embed-user-worker',
-          ADMIN_DASHBOARD_WORKER: {
-            name: 'lets-embed-admin-dashboard-worker',
-            props: { gallery_admin: true },
-          },
-        },
-        durableObjects: {
-          USER_ACCOUNT: {
-            className: 'UserAccount',
-            scriptName: 'lets-embed-user-worker',
-            useSQLite: true,
-          },
-          SITE_POLICY: {
-            className: 'SitePolicyDO',
-            scriptName: 'lets-embed-user-worker',
-            useSQLite: true,
-          },
-        },
       },
       {
         ...builtWorker('user_worker'),
@@ -273,6 +287,7 @@ for (const file of [
   '0002_site_settings.sql',
   '0003_identities_safety.sql',
   '0004_policy_v3.sql',
+  '0005_versioned_provider_secrets.sql',
 ]) {
   const sql = fs
     .readFileSync(path.join(ROOT, 'user_worker/migrations', file), 'utf8')
@@ -299,11 +314,7 @@ const overview = await overviewResp.json();
 const access = {
   ...overview.access,
   login_required: false,
-  image: { ...overview.access.image, free_per_day: -1 },
-  video: { ...overview.access.video, free_per_day: -1 },
-  desc_search: { ...overview.access.desc_search, free_per_day: -1 },
-  image_search: { ...overview.access.image_search, free_per_day: -1 },
-  similar_search: { ...overview.access.similar_search, free_per_day: -1 },
+  items: (overview.access.items || []).map((item) => ({ ...item, daily_free: -1 })),
 };
 const saveResp = await mf.dispatchFetch(`${origin}/admin/api/settings/access`, {
   method: 'POST',

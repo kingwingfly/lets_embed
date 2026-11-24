@@ -900,9 +900,18 @@ fn strict_18_rejects_non_age_capable_providers_and_auto_disables_on_upgrade() {
 
 #[test]
 fn oidc_url_validator_blocks_ssrf_and_accepts_public_https() {
+    // Explicit trailing slash MUST be preserved for exact OIDC issuer equality (F17).
     assert_eq!(
         validate_oidc_url("https://idp.example.com/realms/age/").unwrap(),
+        "https://idp.example.com/realms/age/"
+    );
+    assert_eq!(
+        validate_oidc_url("https://idp.example.com/realms/age").unwrap(),
         "https://idp.example.com/realms/age"
+    );
+    assert_eq!(
+        validate_oidc_url("https://auth.yoti.com/").unwrap(),
+        "https://auth.yoti.com/"
     );
     assert_eq!(
         validate_oidc_url("https://auth.yoti.com:443").unwrap(),
@@ -1020,8 +1029,38 @@ fn validate_provider_updates_strips_unused_fields_and_normalizes_telegram_handle
 
     let oidc = by_id(AuthProviderId::OidcAgeAssurance);
     assert_eq!(oidc.display_name.as_deref(), Some("Verify 18+ with Yoti"));
-    assert_eq!(oidc.issuer.as_deref(), Some("https://auth.yoti.com"));
+    assert_eq!(oidc.issuer.as_deref(), Some("https://auth.yoti.com/"));
     assert_eq!(oidc.public_client_id.as_deref(), Some("yoti-cid"));
+
+    // F29: Enabling OAuth/OIDC or Telegram without a Client ID / Bot Username MUST be rejected!
+    for required_cid_provider in [
+        AuthProviderId::Google,
+        AuthProviderId::GitHub,
+        AuthProviderId::X,
+        AuthProviderId::Discord,
+        AuthProviderId::OidcAgeAssurance,
+        AuthProviderId::Telegram,
+    ] {
+        let bad = ProviderUpdateItem {
+            id: required_cid_provider,
+            enabled: true,
+            display_name: None,
+            issuer: if required_cid_provider == AuthProviderId::OidcAgeAssurance {
+                Some("https://auth.yoti.com".into())
+            } else {
+                None
+            },
+            public_client_id: Some("   ".into()),
+            soft_birthday_check: false,
+            secret_value: None,
+            clear_secret: false,
+        };
+        assert!(
+            validate_provider_updates(AgeVerificationPolicy::SelfAttestation, &[bad]).is_err(),
+            "enabling {:?} with blank public_client_id must fail validation (F29)",
+            required_cid_provider
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1368,7 +1407,9 @@ fn no_op_saves_do_not_bump_revision_for_access_safety_and_providers() {
     ));
 
     // --- C. Auth Providers ---
-    // Fresh bootstrap (`enabled_providers = []`) vs all 9 default-disabled rows from UI => unchanged!
+    // Fresh bootstrap (`enabled_providers = []`, AgeVerificationPolicy::Off) enables SIWE & SIWS
+    // at runtime (F28): submitting those effective defaults is a no-op, while explicitly
+    // disabling all 9 providers MUST NOT be treated as unchanged so disabling wallets persists!
     let all_disabled_items: Vec<ProviderUpdateItem> = AuthProviderId::ALL
         .iter()
         .map(|&id| ProviderUpdateItem {
@@ -1386,27 +1427,76 @@ fn no_op_saves_do_not_bump_revision_for_access_safety_and_providers() {
         validate_provider_updates(AgeVerificationPolicy::Off, &all_disabled_items)
             .expect("valid default disabled providers");
     assert!(
-        are_providers_unchanged(&[], &validated_disabled, false),
-        "submitting default disabled providers against empty bootstrap must be a no-op"
+        !are_providers_unchanged(AgeVerificationPolicy::Off, &[], &validated_disabled, false),
+        "explicitly disabling SIWE/SIWS against empty Off bootstrap must persist (F28)"
+    );
+    assert!(
+        !are_providers_unchanged(
+            AgeVerificationPolicy::SelfAttestation,
+            &[],
+            &validated_disabled,
+            false
+        ),
+        "explicitly disabling SIWE/SIWS against empty SelfAttestation bootstrap must persist (F28)"
+    );
+    assert!(
+        are_providers_unchanged(
+            AgeVerificationPolicy::StrictProviderVerified18,
+            &[],
+            &validated_disabled,
+            false
+        ),
+        "under StrictProviderVerified18, empty bootstrap has all disabled so all-disabled is a no-op"
+    );
+
+    let mut default_wallets_items = all_disabled_items.clone();
+    for p in &mut default_wallets_items {
+        if matches!(p.id, AuthProviderId::Siwe | AuthProviderId::Siws) {
+            p.enabled = true;
+        }
+    }
+    let validated_default_wallets =
+        validate_provider_updates(AgeVerificationPolicy::Off, &default_wallets_items)
+            .expect("valid default wallets");
+    assert!(
+        are_providers_unchanged(
+            AgeVerificationPolicy::Off,
+            &[],
+            &validated_default_wallets,
+            false
+        ),
+        "submitting effective runtime defaults (SIWE+SIWS enabled) against empty Off bootstrap is a no-op"
     );
 
     // Same public config WITH a secret update or clear MUST NOT be treated as unchanged.
     assert!(
-        !are_providers_unchanged(&[], &validated_disabled, true),
+        !are_providers_unchanged(
+            AgeVerificationPolicy::Off,
+            &[],
+            &validated_default_wallets,
+            true
+        ),
         "secret update/deletion must bypass no-op short-circuit"
     );
 
-    // Enabling a provider MUST NOT be treated as unchanged.
+    // Enabling a provider (with required client ID, F29) MUST NOT be treated as unchanged.
     let mut enable_google = all_disabled_items.clone();
-    enable_google
+    let g = enable_google
         .iter_mut()
         .find(|p| p.id == AuthProviderId::Google)
-        .unwrap()
-        .enabled = true;
+        .unwrap();
+    g.enabled = true;
+    g.public_client_id = Some("google-client-id".into());
     let validated_google = validate_provider_updates(AgeVerificationPolicy::Off, &enable_google)
         .expect("valid google enable");
-    assert!(!are_providers_unchanged(&[], &validated_google, false));
+    assert!(!are_providers_unchanged(
+        AgeVerificationPolicy::Off,
+        &[],
+        &validated_google,
+        false
+    ));
     assert!(are_providers_unchanged(
+        AgeVerificationPolicy::Off,
         &validated_google,
         &validated_google,
         false

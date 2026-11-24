@@ -21,6 +21,71 @@ use site_access::{
 };
 use sqlx::{Executor as _, PgPool, Postgres, QueryBuilder, Row as _};
 
+/// Computes an order-independent, non-zero 53-bit `u64` fingerprint of an image's
+/// own `facts_rev` and EVERY attached parent post's `(post_id, post_facts_rev)`.
+///
+/// Unlike `MAX(...)`, bumping ANY lower-revision parent or attaching/detaching a parent
+/// ALWAYS changes the resulting `facts_rev`, immediately invalidating stale capabilities.
+pub fn compute_image_facts_rev(image_own_rev: u64, parent_post_revs: &[(i64, u64)]) -> u64 {
+    let mut pairs: Vec<(i64, u64)> = parent_post_revs
+        .iter()
+        .map(|&(pid, rev)| (pid, rev.max(1)))
+        .collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    let mut buf = Vec::with_capacity(24 + pairs.len() * 16);
+    buf.extend_from_slice(b"img-facts-rev/v1\0");
+    buf.extend_from_slice(&image_own_rev.max(1).to_be_bytes());
+    for (pid, rev) in pairs {
+        buf.extend_from_slice(&pid.to_be_bytes());
+        buf.extend_from_slice(&rev.to_be_bytes());
+    }
+    digest_to_safe_u64(&buf)
+}
+
+/// Computes an order-independent, non-zero 53-bit `u64` fingerprint of a video's
+/// own `facts_rev`, every parent post's `(post_id, post_facts_rev)`, and every
+/// sibling image's `(post_id, image_id, image_own_facts_rev)`.
+pub fn compute_video_facts_rev(
+    video_own_rev: u64,
+    parent_post_revs: &[(i64, u64)],
+    sibling_image_revs: &[(i64, i64, u64)],
+) -> u64 {
+    let mut posts: Vec<(i64, u64)> = parent_post_revs
+        .iter()
+        .map(|&(pid, rev)| (pid, rev.max(1)))
+        .collect();
+    posts.sort_unstable();
+    posts.dedup();
+    let mut siblings: Vec<(i64, i64, u64)> = sibling_image_revs
+        .iter()
+        .map(|&(pid, iid, rev)| (pid, iid, rev.max(1)))
+        .collect();
+    siblings.sort_unstable();
+    siblings.dedup();
+    let mut buf = Vec::with_capacity(32 + posts.len() * 16 + siblings.len() * 24);
+    buf.extend_from_slice(b"vid-facts-rev/v1\0");
+    buf.extend_from_slice(&video_own_rev.max(1).to_be_bytes());
+    buf.extend_from_slice(&(posts.len() as u64).to_be_bytes());
+    for (pid, rev) in posts {
+        buf.extend_from_slice(&pid.to_be_bytes());
+        buf.extend_from_slice(&rev.to_be_bytes());
+    }
+    buf.extend_from_slice(&(siblings.len() as u64).to_be_bytes());
+    for (pid, iid, rev) in siblings {
+        buf.extend_from_slice(&pid.to_be_bytes());
+        buf.extend_from_slice(&iid.to_be_bytes());
+        buf.extend_from_slice(&rev.to_be_bytes());
+    }
+    digest_to_safe_u64(&buf)
+}
+
+fn digest_to_safe_u64(data: &[u8]) -> u64 {
+    let hex = site_access::sha256_hex(data);
+    let raw = u64::from_str_radix(&hex[..16], 16).unwrap_or(1);
+    (raw & 0x001f_ffff_ffff_ffff).max(1)
+}
+
 /// Public/anonymous capability TTL (1 hour — bounded 1..6h for SEO/crawlers,
 /// immediately invalidated by `min_enforce_rev` or `facts_rev` changes).
 pub const PUBLIC_MEDIA_CAP_TTL_SECS: u64 = 3600;
@@ -441,9 +506,13 @@ impl CompiledPolicy {
         }
     }
 
-    /// True when safety enforcement is turned on AND at least one enabled policy exists.
+    /// True when safety enforcement is active — either because at least one rule
+    /// is enabled OR because global `unclassified_mode == UnclassifiedMode::Placeholder`
+    /// restricts unclassified media while the master safety switch is on.
     pub fn is_enabled(&self) -> bool {
-        self.policy.safety_enabled && !self.policies.is_empty()
+        self.policy.safety_enabled
+            && (!self.policies.is_empty()
+                || self.policy.unclassified_mode == UnclassifiedMode::Placeholder)
     }
 
     /// Pure deterministic Policy v3 compiler (zero DB queries, zero tag-ID cache).
@@ -545,12 +614,23 @@ impl CompiledPolicy {
     /// Evaluate ALL enabled Policy v3 restrictions for a single image across EVERY
     /// parent post context independently and return the strictest [`MediaOutcome`].
     pub fn evaluate_image(&self, facts: &ImageFacts, caller: &CallerContext) -> MediaOutcome {
-        let facts_rev = facts.facts_rev.max(1);
+        let parent_pairs: Vec<(i64, u64)> = facts
+            .parent_posts
+            .iter()
+            .map(|p| (p.post_id, p.facts_rev))
+            .collect();
+        let facts_rev = if facts.exists {
+            compute_image_facts_rev(facts.image_own_facts_rev, &parent_pairs)
+        } else {
+            facts.facts_rev.max(1)
+        };
+        let canonical_name = facts.canonical_name.clone();
         if !self.is_enabled() {
             return MediaOutcome::Clear {
                 matched_blocks: Vec::new(),
                 matched_blurs: Vec::new(),
                 facts_rev,
+                canonical_name,
             };
         }
 
@@ -592,7 +672,7 @@ impl CompiledPolicy {
             }
         }
 
-        self.finalize_outcome(agg, facts_rev, caller)
+        self.finalize_outcome(agg, facts_rev, canonical_name, caller)
     }
 
     /// Evaluate a video across EVERY parent post and EVERY sibling image independently,
@@ -603,22 +683,37 @@ impl CompiledPolicy {
         video_facts_rev: u64,
         caller: &CallerContext,
     ) -> MediaOutcome {
-        // Match `lookup_facts_rev(MediaKind::Video)` exactly:
-        // GREATEST(v.facts_rev, MAX(p.facts_rev), MAX(si.facts_rev)) — never rolling in
-        // unrelated posts that happen to share a sibling image!
-        let mut authoritative_rev = video_facts_rev.max(1);
+        self.evaluate_video_posts_with_name(posts, video_facts_rev, None, caller)
+    }
+
+    pub fn evaluate_video_posts_with_name(
+        &self,
+        posts: &[ParentPostFacts],
+        video_facts_rev: u64,
+        canonical_name: Option<String>,
+        caller: &CallerContext,
+    ) -> MediaOutcome {
+        // Match `lookup_facts_rev(MediaKind::Video)` exactly via deterministic fingerprint
+        // of video own rev, all parent post revs, and all sibling image own revs!
+        let parent_revs: Vec<(i64, u64)> = posts
+            .iter()
+            .map(|p| (p.post_id, p.post_facts_rev))
+            .collect();
+        let mut sibling_revs: Vec<(i64, i64, u64)> = Vec::new();
         for post in posts {
-            authoritative_rev = authoritative_rev.max(post.post_facts_rev);
             for img in &post.images {
-                authoritative_rev = authoritative_rev.max(img.image_own_facts_rev.max(1));
+                sibling_revs.push((post.post_id, img.image_id, img.image_own_facts_rev));
             }
         }
+        let authoritative_rev =
+            compute_video_facts_rev(video_facts_rev, &parent_revs, &sibling_revs);
 
         if !self.is_enabled() {
             return MediaOutcome::Clear {
                 matched_blocks: Vec::new(),
                 matched_blurs: Vec::new(),
                 facts_rev: authoritative_rev,
+                canonical_name,
             };
         }
 
@@ -680,7 +775,7 @@ impl CompiledPolicy {
             }
         }
 
-        self.finalize_outcome(agg, authoritative_rev, caller)
+        self.finalize_outcome(agg, authoritative_rev, canonical_name, caller)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -717,6 +812,7 @@ impl CompiledPolicy {
         &self,
         agg: EvalAccumulator<'_>,
         facts_rev: u64,
+        canonical_name: Option<String>,
         caller: &CallerContext,
     ) -> MediaOutcome {
         let mut matched_blocks: Vec<&CompiledPolicyItem> = agg.blocks.into_values().collect();
@@ -795,6 +891,7 @@ impl CompiledPolicy {
                 matched_blocks: matched_block_refs,
                 matched_blurs: matched_blur_refs,
                 facts_rev,
+                canonical_name,
             };
         }
 
@@ -803,6 +900,7 @@ impl CompiledPolicy {
             matched_blocks: matched_block_refs,
             matched_blurs: matched_blur_refs,
             facts_rev,
+            canonical_name,
         }
     }
 
@@ -833,47 +931,51 @@ impl CompiledPolicy {
                 matched_blocks,
                 matched_blurs,
                 facts_rev,
-            } => match signer {
-                MediaSigner::Standalone => ProjectedImage::Clear {
-                    id: image.id,
-                    url: format!("/images/{}.webp", encode_url_path(&image.name)),
-                    name: Some(image.name.clone()),
-                    width: image.width,
-                    height: image.height,
-                },
-                MediaSigner::Managed { secret, now_secs } => {
-                    let locator = format!("{}.webp", image.name.trim_start_matches('/'));
-                    match mint_cap_url_v3(
-                        secret,
-                        *now_secs,
-                        policy_rev,
-                        facts_rev,
-                        MediaCapKind::Image,
-                        image.id,
-                        locator,
-                        &matched_blocks,
-                        &matched_blurs,
-                        &[],
-                        caller,
-                        None,
-                    ) {
-                        Ok((url, _exp)) => ProjectedImage::Clear {
-                            id: image.id,
-                            url,
-                            name: None,
-                            width: image.width,
-                            height: image.height,
-                        },
-                        Err(mask) => ProjectedImage::Placeholder {
-                            id: image.id,
+                canonical_name,
+            } => {
+                let effective_name = canonical_name.as_deref().unwrap_or(&image.name);
+                match signer {
+                    MediaSigner::Standalone => ProjectedImage::Clear {
+                        id: image.id,
+                        url: format!("/images/{}.webp", encode_url_path(effective_name)),
+                        name: Some(effective_name.to_string()),
+                        width: image.width,
+                        height: image.height,
+                    },
+                    MediaSigner::Managed { secret, now_secs } => {
+                        let locator = format!("{}.webp", effective_name.trim_start_matches('/'));
+                        match mint_cap_url_v3(
+                            secret,
+                            *now_secs,
                             policy_rev,
-                            width: image.width,
-                            height: image.height,
-                            mask,
-                        },
+                            facts_rev,
+                            MediaCapKind::Image,
+                            image.id,
+                            locator,
+                            &matched_blocks,
+                            &matched_blurs,
+                            &[],
+                            caller,
+                            None,
+                        ) {
+                            Ok((url, _exp)) => ProjectedImage::Clear {
+                                id: image.id,
+                                url,
+                                name: None,
+                                width: image.width,
+                                height: image.height,
+                            },
+                            Err(mask) => ProjectedImage::Placeholder {
+                                id: image.id,
+                                policy_rev,
+                                width: image.width,
+                                height: image.height,
+                                mask,
+                            },
+                        }
                     }
                 }
-            },
+            }
             MediaOutcome::Blurred {
                 policy_id,
                 matched_policy_ids,
@@ -883,6 +985,7 @@ impl CompiledPolicy {
                 matched_blocks,
                 matched_blurs,
                 facts_rev,
+                canonical_name,
             } => {
                 if !self.policy.fixed_blur_enabled {
                     return ProjectedImage::Placeholder {
@@ -901,6 +1004,7 @@ impl CompiledPolicy {
                         },
                     };
                 }
+                let effective_name = canonical_name.as_deref().unwrap_or(&image.name);
                 let preview_url = match signer {
                     // Never emit clear `/images/...` bytes as preview_url!
                     MediaSigner::Standalone => None,
@@ -910,7 +1014,7 @@ impl CompiledPolicy {
                             // Card still renders frosted blur overlay + Click-to-Reveal (which upgrades to GuestSession).
                             None
                         } else {
-                            let locator = format!("{}.webp", image.name.trim_start_matches('/'));
+                            let locator = format!("{}.webp", effective_name.trim_start_matches('/'));
                             match mint_cap_url_v3(
                                 secret,
                                 *now_secs,
@@ -1010,50 +1114,54 @@ impl CompiledPolicy {
                 matched_blocks,
                 matched_blurs,
                 facts_rev,
-            } => match signer {
-                MediaSigner::Standalone => ProjectedVideo::Clear {
-                    id: video.id,
-                    url: format!("/videos/{}", encode_url_path(&video.name)),
-                    name: Some(video.name.clone()),
-                    width: video.width,
-                    height: video.height,
-                    duration: video.duration,
-                },
-                MediaSigner::Managed { secret, now_secs } => {
-                    let locator = video.name.trim_start_matches('/').to_string();
-                    match mint_cap_url_v3(
-                        secret,
-                        *now_secs,
-                        policy_rev,
-                        facts_rev,
-                        MediaCapKind::Video,
-                        video.id,
-                        locator,
-                        &matched_blocks,
-                        &matched_blurs,
-                        &[],
-                        caller,
-                        None,
-                    ) {
-                        Ok((url, _exp)) => ProjectedVideo::Clear {
-                            id: video.id,
-                            url,
-                            name: None,
-                            width: video.width,
-                            height: video.height,
-                            duration: video.duration,
-                        },
-                        Err(mask) => ProjectedVideo::Placeholder {
-                            id: video.id,
+                canonical_name,
+            } => {
+                let effective_name = canonical_name.as_deref().unwrap_or(&video.name);
+                match signer {
+                    MediaSigner::Standalone => ProjectedVideo::Clear {
+                        id: video.id,
+                        url: format!("/videos/{}", encode_url_path(effective_name)),
+                        name: Some(effective_name.to_string()),
+                        width: video.width,
+                        height: video.height,
+                        duration: video.duration,
+                    },
+                    MediaSigner::Managed { secret, now_secs } => {
+                        let locator = effective_name.trim_start_matches('/').to_string();
+                        match mint_cap_url_v3(
+                            secret,
+                            *now_secs,
                             policy_rev,
-                            width: video.width,
-                            height: video.height,
-                            duration: video.duration,
-                            mask,
-                        },
+                            facts_rev,
+                            MediaCapKind::Video,
+                            video.id,
+                            locator,
+                            &matched_blocks,
+                            &matched_blurs,
+                            &[],
+                            caller,
+                            None,
+                        ) {
+                            Ok((url, _exp)) => ProjectedVideo::Clear {
+                                id: video.id,
+                                url,
+                                name: None,
+                                width: video.width,
+                                height: video.height,
+                                duration: video.duration,
+                            },
+                            Err(mask) => ProjectedVideo::Placeholder {
+                                id: video.id,
+                                policy_rev,
+                                width: video.width,
+                                height: video.height,
+                                duration: video.duration,
+                                mask,
+                            },
+                        }
                     }
                 }
-            },
+            }
         }
     }
 
@@ -1189,15 +1297,18 @@ pub struct ImageParentPostFacts {
 /// Exact DB metadata facts for evaluating Policy v3 on an image in a single snapshot.
 #[derive(Debug, Clone)]
 pub struct ImageFacts {
+    pub image_id: i64,
     pub exists: bool,
     pub is_completed: bool,
+    /// Canonical `images.name` captured in the same `REPEATABLE READ` snapshot as `facts_rev`.
+    pub canonical_name: Option<String>,
     pub wd_min_persisted_score: Option<f32>,
     /// Canonical WD-Tagger v3 vocabulary digest stamped on `images.wd_vocab_digest`.
     /// Must equal `policy.vocab_digest` for absent WD tags to evaluate `False` instead of `Unknown`.
     pub wd_vocab_digest: Option<String>,
-    /// Image row's own `images.facts_rev` (used by `evaluate_video_posts` to match `lookup_facts_rev(Video)`).
+    /// Image row's own `images.facts_rev` (used by `compute_image_facts_rev` and `compute_video_facts_rev`).
     pub image_own_facts_rev: u64,
-    /// Authoritative image `facts_rev = GREATEST(i.facts_rev, COALESCE(MAX(p.facts_rev), 1))`.
+    /// Authoritative image `facts_rev` fingerprint covering `image_own_facts_rev` and all parent posts.
     pub facts_rev: u64,
     /// Canonical `wd_tags.name -> score` pairs present on this image.
     pub wd_tag_scores: HashMap<String, f32>,
@@ -1208,8 +1319,10 @@ pub struct ImageFacts {
 impl Default for ImageFacts {
     fn default() -> Self {
         Self {
+            image_id: 0,
             exists: false,
             is_completed: false,
+            canonical_name: None,
             wd_min_persisted_score: None,
             wd_vocab_digest: None,
             image_own_facts_rev: 1,
@@ -1227,12 +1340,14 @@ impl ImageFacts {
         wd_tag_scores: HashMap<String, f32>,
     ) -> Self {
         Self {
+            image_id: 0,
             exists: true,
             is_completed: true,
+            canonical_name: None,
             wd_min_persisted_score: min_persisted_score,
             wd_vocab_digest: Some(search_types::wd_vocab::WD_VOCAB_DIGEST.to_string()),
             image_own_facts_rev: 1,
-            facts_rev: 1,
+            facts_rev: compute_image_facts_rev(1, &[]),
             wd_tag_scores,
             parent_posts: Vec::new(),
         }
@@ -1257,6 +1372,7 @@ pub enum MediaOutcome {
         matched_blocks: Vec<PolicyRef>,
         matched_blurs: Vec<PolicyRef>,
         facts_rev: u64,
+        canonical_name: Option<String>,
     },
     Blurred {
         policy_id: String,
@@ -1267,6 +1383,7 @@ pub enum MediaOutcome {
         matched_blocks: Vec<PolicyRef>,
         matched_blurs: Vec<PolicyRef>,
         facts_rev: u64,
+        canonical_name: Option<String>,
     },
     Placeholder {
         mask: MaskMetadata,
@@ -1682,6 +1799,7 @@ pub(crate) async fn load_image_facts_in_tx(
     let img_rows = sqlx::query(
         r#"
         SELECT id,
+               name::TEXT AS canonical_name,
                (status = 'completed'::process_status) AS is_completed,
                wd_min_persisted_score,
                wd_vocab_digest,
@@ -1697,6 +1815,7 @@ pub(crate) async fn load_image_facts_in_tx(
     let mut map: HashMap<i64, ImageFacts> = HashMap::with_capacity(img_rows.len());
     for row in img_rows {
         let id: i64 = row.try_get("id")?;
+        let canonical_name: String = row.try_get("canonical_name")?;
         let is_completed: bool = row.try_get("is_completed")?;
         let wd_min_persisted_score: Option<f32> = row.try_get("wd_min_persisted_score")?;
         let wd_vocab_digest: Option<String> = row.try_get("wd_vocab_digest")?;
@@ -1705,12 +1824,14 @@ pub(crate) async fn load_image_facts_in_tx(
         map.insert(
             id,
             ImageFacts {
+                image_id: id,
                 exists: true,
                 is_completed,
+                canonical_name: Some(canonical_name),
                 wd_min_persisted_score,
                 wd_vocab_digest,
                 image_own_facts_rev: own_rev,
-                facts_rev: own_rev,
+                facts_rev: compute_image_facts_rev(own_rev, &[]),
                 wd_tag_scores: HashMap::new(),
                 parent_posts: Vec::new(),
             },
@@ -1721,7 +1842,7 @@ pub(crate) async fn load_image_facts_in_tx(
         return Ok(map);
     }
 
-    // Load parent posts (always needed for authoritative `facts_rev = GREATEST(i.facts_rev, MAX(p.facts_rev))`).
+    // Load parent posts (always needed for authoritative dependency-fingerprint `facts_rev`).
     let parent_rows = sqlx::query(
         r#"
         SELECT pi.image_id, p.id AS post_id, p.facts_rev
@@ -1741,15 +1862,23 @@ pub(crate) async fn load_image_facts_in_tx(
         let post_id: i64 = row.try_get("post_id")?;
         let post_rev: i64 = row.try_get("facts_rev")?;
         let rev_u64 = post_rev.max(1) as u64;
-        if let Some(entry) = map.get_mut(&image_id) {
-            entry.facts_rev = entry.facts_rev.max(rev_u64);
-        }
         image_post_pairs
             .entry(image_id)
             .or_default()
             .push((post_id, rev_u64));
         all_post_ids.insert(post_id);
     }
+
+    for (&image_id, entry) in &mut map {
+        let pairs = image_post_pairs
+            .get(&image_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        entry.facts_rev = compute_image_facts_rev(entry.image_own_facts_rev, pairs);
+    }
+
+    let mut post_tags_map: HashMap<i64, HashSet<String>> = HashMap::new();
+    let mut post_authors_map: HashMap<i64, HashSet<String>> = HashMap::new();
 
     if policy.is_enabled() {
         if !policy.referenced_wd_tags.is_empty() {
@@ -1778,8 +1907,6 @@ pub(crate) async fn load_image_facts_in_tx(
         }
 
         let post_ids_vec: Vec<i64> = all_post_ids.into_iter().collect();
-        let mut post_tags_map: HashMap<i64, HashSet<String>> = HashMap::new();
-        let mut post_authors_map: HashMap<i64, HashSet<String>> = HashMap::new();
 
         if !post_ids_vec.is_empty() && !policy.referenced_post_tags.is_empty() {
             let pt_rows = sqlx::query(
@@ -1822,17 +1949,19 @@ pub(crate) async fn load_image_facts_in_tx(
                 post_authors_map.entry(post_id).or_default().insert(name);
             }
         }
+    }
 
-        for (image_id, pairs) in image_post_pairs {
-            if let Some(entry) = map.get_mut(&image_id) {
-                for (post_id, post_rev) in pairs {
-                    entry.parent_posts.push(ImageParentPostFacts {
-                        post_id,
-                        post_tags: post_tags_map.get(&post_id).cloned().unwrap_or_default(),
-                        authors: post_authors_map.get(&post_id).cloned().unwrap_or_default(),
-                        facts_rev: post_rev,
-                    });
-                }
+    // Always attach parent post IDs + revs so `evaluate_image` reproduces the exact same
+    // `compute_image_facts_rev` fingerprint as `lookup_facts_rev` even when safety is off.
+    for (image_id, pairs) in image_post_pairs {
+        if let Some(entry) = map.get_mut(&image_id) {
+            for (post_id, post_rev) in pairs {
+                entry.parent_posts.push(ImageParentPostFacts {
+                    post_id,
+                    post_tags: post_tags_map.get(&post_id).cloned().unwrap_or_default(),
+                    authors: post_authors_map.get(&post_id).cloned().unwrap_or_default(),
+                    facts_rev: post_rev,
+                });
             }
         }
     }
@@ -1870,7 +1999,7 @@ pub(crate) async fn evaluate_videos_in_tx(
 
     let vid_rows = sqlx::query(
         r#"
-        SELECT id, facts_rev
+        SELECT id, name::TEXT AS canonical_name, facts_rev
         FROM videos
         WHERE id = ANY($1::BIGINT[])
         "#,
@@ -1879,11 +2008,12 @@ pub(crate) async fn evaluate_videos_in_tx(
     .fetch_all(&mut **tx)
     .await?;
 
-    let mut video_revs: HashMap<i64, u64> = HashMap::with_capacity(vid_rows.len());
+    let mut video_meta: HashMap<i64, (u64, String)> = HashMap::with_capacity(vid_rows.len());
     for row in vid_rows {
         let id: i64 = row.try_get("id")?;
+        let canonical_name: String = row.try_get("canonical_name")?;
         let rev: i64 = row.try_get("facts_rev")?;
-        video_revs.insert(id, rev.max(1) as u64);
+        video_meta.insert(id, (rev.max(1) as u64, canonical_name));
     }
 
     let pv_rows = sqlx::query(
@@ -1986,8 +2116,8 @@ pub(crate) async fn evaluate_videos_in_tx(
     };
 
     for &vid in video_ids {
-        let base_rev = match video_revs.get(&vid).copied() {
-            Some(r) => r,
+        let (base_rev, canonical_name) = match video_meta.get(&vid) {
+            Some((r, name)) => (*r, Some(name.clone())),
             None => {
                 if policy.is_enabled() {
                     out.insert(
@@ -2004,6 +2134,7 @@ pub(crate) async fn evaluate_videos_in_tx(
                             matched_blocks: Vec::new(),
                             matched_blurs: Vec::new(),
                             facts_rev: 1,
+                            canonical_name: None,
                         },
                     );
                 }
@@ -2032,7 +2163,8 @@ pub(crate) async fn evaluate_videos_in_tx(
             }
         }
 
-        let outcome = policy.evaluate_video_posts(&parent_posts, base_rev, caller);
+        let outcome =
+            policy.evaluate_video_posts_with_name(&parent_posts, base_rev, canonical_name, caller);
         out.insert(vid, outcome);
     }
 
@@ -2040,6 +2172,11 @@ pub(crate) async fn evaluate_videos_in_tx(
 }
 
 /// Authoritative single-snapshot `facts_rev` lookup backing `GET /internal/facts-rev/{kind}/{id}`.
+///
+/// Uses [`compute_image_facts_rev`] / [`compute_video_facts_rev`] over ALL dependency
+/// `(id, rev)` pairs inside a single `REPEATABLE READ` snapshot so mutating ANY parent
+/// post or sibling image (even one with a lower revision than another parent) ALWAYS
+/// changes the fingerprint.
 pub async fn lookup_facts_rev(
     pool: &PgPool,
     kind: MediaKind,
@@ -2049,52 +2186,90 @@ pub async fn lookup_facts_rev(
         return Ok(None);
     }
     let mut tx = begin_repeatable_read_tx(pool).await?;
-    let row = match kind {
+    let rev = match kind {
         MediaKind::Image => {
-            sqlx::query(
+            let own_row = sqlx::query("SELECT facts_rev FROM images WHERE id = $1")
+                .bind(asset_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let Some(own_row) = own_row else {
+                tx.commit().await?;
+                return Ok(None);
+            };
+            let own_rev = own_row.try_get::<i64, _>("facts_rev")?.max(1) as u64;
+            let parent_rows = sqlx::query(
                 r#"
-                SELECT GREATEST(i.facts_rev, COALESCE(MAX(p.facts_rev), 1))::BIGINT AS facts_rev
-                FROM images i
-                LEFT JOIN post_images pi ON pi.image_id = i.id
-                LEFT JOIN posts p ON p.id = pi.post_id
-                WHERE i.id = $1
-                GROUP BY i.id, i.facts_rev
+                SELECT p.id AS post_id, p.facts_rev
+                FROM post_images pi
+                JOIN posts p ON p.id = pi.post_id
+                WHERE pi.image_id = $1
                 "#,
             )
             .bind(asset_id)
-            .fetch_optional(&mut *tx)
-            .await?
+            .fetch_all(&mut *tx)
+            .await?;
+            let mut parents = Vec::with_capacity(parent_rows.len());
+            for r in parent_rows {
+                let pid: i64 = r.try_get("post_id")?;
+                let prev: i64 = r.try_get("facts_rev")?;
+                parents.push((pid, prev.max(1) as u64));
+            }
+            compute_image_facts_rev(own_rev, &parents)
         }
         MediaKind::Video => {
-            sqlx::query(
+            let own_row = sqlx::query("SELECT facts_rev FROM videos WHERE id = $1")
+                .bind(asset_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let Some(own_row) = own_row else {
+                tx.commit().await?;
+                return Ok(None);
+            };
+            let own_rev = own_row.try_get::<i64, _>("facts_rev")?.max(1) as u64;
+            let parent_rows = sqlx::query(
                 r#"
-                SELECT GREATEST(
-                    v.facts_rev,
-                    COALESCE(MAX(p.facts_rev), 1),
-                    COALESCE(MAX(si.facts_rev), 1)
-                )::BIGINT AS facts_rev
-                FROM videos v
-                LEFT JOIN post_videos pv ON pv.video_id = v.id
-                LEFT JOIN posts p ON p.id = pv.post_id
-                LEFT JOIN post_images pi ON pi.post_id = p.id
-                LEFT JOIN images si ON si.id = pi.image_id
-                WHERE v.id = $1
-                GROUP BY v.id, v.facts_rev
+                SELECT p.id AS post_id, p.facts_rev
+                FROM post_videos pv
+                JOIN posts p ON p.id = pv.post_id
+                WHERE pv.video_id = $1
                 "#,
             )
             .bind(asset_id)
-            .fetch_optional(&mut *tx)
-            .await?
+            .fetch_all(&mut *tx)
+            .await?;
+            let mut parents = Vec::with_capacity(parent_rows.len());
+            let mut post_ids = Vec::with_capacity(parent_rows.len());
+            for r in parent_rows {
+                let pid: i64 = r.try_get("post_id")?;
+                let prev: i64 = r.try_get("facts_rev")?;
+                parents.push((pid, prev.max(1) as u64));
+                post_ids.push(pid);
+            }
+            let mut siblings = Vec::new();
+            if !post_ids.is_empty() {
+                let sib_rows = sqlx::query(
+                    r#"
+                    SELECT pi.post_id, si.id AS image_id, si.facts_rev
+                    FROM post_images pi
+                    JOIN images si ON si.id = pi.image_id
+                    WHERE pi.post_id = ANY($1::BIGINT[])
+                    "#,
+                )
+                .bind(&post_ids)
+                .fetch_all(&mut *tx)
+                .await?;
+                for r in sib_rows {
+                    let pid: i64 = r.try_get("post_id")?;
+                    let iid: i64 = r.try_get("image_id")?;
+                    let srev: i64 = r.try_get("facts_rev")?;
+                    siblings.push((pid, iid, srev.max(1) as u64));
+                }
+            }
+            compute_video_facts_rev(own_rev, &parents, &siblings)
         }
     };
     tx.commit().await?;
-    match row {
-        Some(r) => {
-            let rev: i64 = r.try_get("facts_rev")?;
-            Ok(Some(rev.max(1) as u64))
-        }
-        None => Ok(None),
-    }
+    Ok(Some(rev))
 }
 
 /// Exact catalog validation backing `POST /internal/validate-safety-catalog`.
@@ -2222,6 +2397,7 @@ pub async fn evaluate_single_asset_for_reveal(
             matched_blocks,
             matched_blurs,
             facts_rev,
+            ..
         } => Ok(RevealCheckResult::Allowed {
             immutable_locator,
             facts_rev,
@@ -2407,12 +2583,14 @@ mod tests {
 
         // 1. Legacy image with wd_min_persisted_score == None and missing `explicit` row -> Unknown -> Placeholder!
         let legacy_uncovered = ImageFacts {
+            image_id: 1,
             exists: true,
             is_completed: true,
+            canonical_name: None,
             wd_min_persisted_score: None,
             wd_vocab_digest: Some(search_types::wd_vocab::WD_VOCAB_DIGEST.to_string()),
             image_own_facts_rev: 3,
-            facts_rev: 3,
+            facts_rev: compute_image_facts_rev(3, &[]),
             wd_tag_scores: HashMap::new(),
             parent_posts: Vec::new(),
         };
@@ -2420,12 +2598,14 @@ mod tests {
 
         // 1b. Image with wd_min_persisted_score <= threshold BUT mismatched/NULL wd_vocab_digest -> Unknown -> Placeholder (fail-closed H1)!
         let stale_vocab_img = ImageFacts {
+            image_id: 2,
             exists: true,
             is_completed: true,
+            canonical_name: None,
             wd_min_persisted_score: Some(0.05),
             wd_vocab_digest: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
             image_own_facts_rev: 3,
-            facts_rev: 3,
+            facts_rev: compute_image_facts_rev(3, &[]),
             wd_tag_scores: HashMap::new(),
             parent_posts: Vec::new(),
         };
@@ -2477,12 +2657,14 @@ mod tests {
         let cont_compiled = CompiledPolicy::compile(cont_pol).unwrap();
 
         let pending_safe_author = ImageFacts {
+            image_id: 3,
             exists: true,
             is_completed: false,
+            canonical_name: None,
             wd_min_persisted_score: None,
             wd_vocab_digest: None,
             image_own_facts_rev: 2,
-            facts_rev: 2,
+            facts_rev: compute_image_facts_rev(2, &[(1, 2)]),
             wd_tag_scores: HashMap::new(),
             parent_posts: vec![ImageParentPostFacts {
                 post_id: 1,
@@ -2512,12 +2694,14 @@ mod tests {
 
         // Image attached ONLY to exempt parent -> Clear (except_expr = post_tag:exempt_r18 clears r18)
         let exempt_only = ImageFacts {
+            image_id: 10,
             exists: true,
             is_completed: true,
+            canonical_name: None,
             wd_min_persisted_score: Some(0.05),
             wd_vocab_digest: Some(search_types::wd_vocab::WD_VOCAB_DIGEST.to_string()),
             image_own_facts_rev: 9,
-            facts_rev: 9,
+            facts_rev: compute_image_facts_rev(9, &[(100, 9)]),
             wd_tag_scores: HashMap::from([("nude".into(), 0.90)]),
             parent_posts: vec![ImageParentPostFacts {
                 post_id: 100,
@@ -2559,8 +2743,10 @@ mod tests {
         // Sibling image has own facts_rev = 15, while another unrelated post bumped its effective facts_rev to 99.
         // Video MUST aggregate `image_own_facts_rev = 15` (matching `lookup_facts_rev(Video)`), NOT 99!
         let blur_img = ImageFacts {
+            image_id: 42,
             exists: true,
             is_completed: true,
+            canonical_name: None,
             wd_min_persisted_score: Some(0.05),
             wd_vocab_digest: Some(search_types::wd_vocab::WD_VOCAB_DIGEST.to_string()),
             image_own_facts_rev: 15,
@@ -2576,7 +2762,8 @@ mod tests {
             authors: HashSet::new(),
         };
 
-        // Video MUST become Blurred (NEVER Clear!), inheriting authoritative facts_rev = 15!
+        let expected_rev = compute_video_facts_rev(4, &[(10, 11)], &[(10, 42, 15)]);
+        // Video MUST become Blurred (NEVER Clear!), inheriting authoritative fingerprint `facts_rev`!
         let outcome = compiled.evaluate_video_posts(&[post], 4, &guest_click);
         assert_eq!(
             outcome,
@@ -2588,7 +2775,8 @@ mod tests {
                 can_click_reveal: true,
                 matched_blocks: vec![],
                 matched_blurs: vec![PolicyRef::new("sensitive", 3)],
-                facts_rev: 15,
+                facts_rev: expected_rev,
+                canonical_name: None,
             }
         );
 
@@ -2678,9 +2866,177 @@ mod tests {
                     7,
                 )
                 .expect("preview cap v3 verifies");
-                assert_eq!(verified.facts_rev, 1);
+                assert_eq!(verified.facts_rev, compute_image_facts_rev(1, &[]));
                 assert!(verified.revealed_refs.is_empty());
                 assert_eq!(verified.matched_blurs, vec![PolicyRef::new("sensitive", 3)]);
+            }
+            other => panic!("expected Blurred with preview_url, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn f1_facts_rev_fingerprint_changes_when_lower_rev_parent_or_sibling_mutates() {
+        let rev_before = compute_image_facts_rev(10, &[(1, 100), (2, 5)]);
+        let rev_after_parent2 = compute_image_facts_rev(10, &[(1, 100), (2, 6)]);
+        assert_ne!(
+            rev_before, rev_after_parent2,
+            "mutating a lower-rev parent MUST change image facts_rev even when another parent is at rev 100"
+        );
+        // Order-independent across parent pairs
+        assert_eq!(rev_before, compute_image_facts_rev(10, &[(2, 5), (1, 100)]));
+
+        let vid_before = compute_video_facts_rev(4, &[(1, 100), (2, 5)], &[(1, 50, 90), (2, 51, 3)]);
+        let vid_after_sibling =
+            compute_video_facts_rev(4, &[(1, 100), (2, 5)], &[(1, 50, 90), (2, 51, 4)]);
+        assert_ne!(
+            vid_before, vid_after_sibling,
+            "mutating a lower-rev sibling image MUST change video facts_rev"
+        );
+    }
+
+    #[test]
+    fn f4_empty_rules_still_enforces_global_unclassified_placeholder() {
+        let mut pol = PublicSitePolicy {
+            revision: 4,
+            min_enforce_rev: 1,
+            safety_enabled: true,
+            unclassified_mode: UnclassifiedMode::Placeholder,
+            policies: vec![],
+            ..PublicSitePolicy::default()
+        };
+        pol.refresh_policy_digest();
+        let compiled = CompiledPolicy::compile(pol).unwrap();
+        assert!(
+            compiled.is_enabled(),
+            "safety_enabled + UnclassifiedMode::Placeholder must stay enabled even with 0 rules"
+        );
+
+        let anon = CallerContext::anonymous();
+        let pending = ImageFacts {
+            image_id: 9,
+            exists: true,
+            is_completed: false,
+            canonical_name: None,
+            wd_min_persisted_score: None,
+            wd_vocab_digest: None,
+            image_own_facts_rev: 1,
+            facts_rev: compute_image_facts_rev(1, &[]),
+            wd_tag_scores: HashMap::new(),
+            parent_posts: Vec::new(),
+        };
+        assert!(compiled.evaluate_image(&pending, &anon).is_placeholder());
+
+        let completed = ImageFacts::completed_with_floor(Some(0.05), HashMap::new());
+        assert!(compiled.evaluate_image(&completed, &anon).is_clear());
+
+        let mut qb = QueryBuilder::<Postgres>::new("SELECT i.id FROM images i WHERE TRUE");
+        assert!(compiled.push_caller_allowed_image_sql(&mut qb, &anon, "i"));
+        let built = qb.build();
+        assert!(built.sql().as_str().contains("status = 'completed'"));
+    }
+
+    fn decode_b64url_test(input: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut buf: u32 = 0;
+        let mut bits: u8 = 0;
+        for b in input.bytes() {
+            let val = match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a' + 26,
+                b'0'..=b'9' => b - b'0' + 52,
+                b'-' => 62,
+                b'_' => 63,
+                _ => continue,
+            };
+            buf = (buf << 6) | u32::from(val);
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buf >> bits) as u8);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn f19_and_f20_snapshot_canonical_name_overrides_stale_image_name_and_preview_hides_filename() {
+        let compiled = CompiledPolicy::compile(sample_policy_v3()).unwrap();
+        let user = CallerContext {
+            actor: ActorBinding::User {
+                sub: "usr-9".into(),
+                sid: "sid-9".into(),
+            },
+            direct_grants: HashSet::new(),
+            click_eligible: HashSet::from([PolicyRef::new("sensitive", 3)]),
+            is_billing_waived: false,
+            age_verified: false,
+            terms_accepted: false,
+        };
+        let secret = Arc::new(b"media-secret-v3-0123456789abcdef".to_vec());
+        let signer = MediaSigner::Managed {
+            secret: secret.clone(),
+            now_secs: 3000,
+        };
+        let stale_img = Image {
+            id: 77,
+            name: "2026/01/old_stale_name".into(),
+            width: 800,
+            height: 600,
+        };
+
+        // Clear image uses canonical_name from REPEATABLE READ snapshot rather than stale Image.name.
+        let mut facts = ImageFacts::completed_with_floor(Some(0.05), HashMap::new());
+        facts.canonical_name = Some("2026/01/renamed_canonical".into());
+        let clear_outcome = compiled.evaluate_image(&facts, &user);
+        let clear_proj = compiled.project_image(&stale_img, clear_outcome, &user, &signer);
+        match clear_proj {
+            ProjectedImage::Clear { ref url, .. } => {
+                let tok = url.split("cap=").nth(1).unwrap();
+                let verified = verify_media_capability(
+                    tok,
+                    &secret,
+                    MEDIA_CAP_AUDIENCE,
+                    MediaCapKind::Image,
+                    77,
+                    3010,
+                    5,
+                    7,
+                )
+                .unwrap();
+                assert_eq!(verified.immutable_locator, "2026/01/renamed_canonical.webp");
+            }
+            other => panic!("expected Clear, got {other:?}"),
+        }
+
+        // Blurred preview capability uses canonical_name AND seals it in the wire token (F20).
+        let mut blur_facts = ImageFacts::completed_with_floor(
+            Some(0.05),
+            HashMap::from([("lingerie".into(), 0.90)]),
+        );
+        blur_facts.canonical_name = Some("2026/01/secret_blurred_title".into());
+        let blur_outcome = compiled.evaluate_image(&blur_facts, &user);
+        let blur_proj = compiled.project_image(&stale_img, blur_outcome, &user, &signer);
+        match blur_proj {
+            ProjectedImage::Blurred {
+                preview_url: Some(ref p),
+                ..
+            } => {
+                let tok = p.split("cap=").nth(1).unwrap();
+                let payload_b64 = tok.strip_prefix("mc3.").unwrap().split_once('.').unwrap().0;
+                let decoded = String::from_utf8(decode_b64url_test(payload_b64)).unwrap();
+                assert!(!decoded.contains("secret_blurred_title"));
+                let verified = verify_media_capability(
+                    tok,
+                    &secret,
+                    MEDIA_CAP_AUDIENCE,
+                    MediaCapKind::Preview,
+                    77,
+                    3010,
+                    5,
+                    7,
+                )
+                .unwrap();
+                assert_eq!(verified.immutable_locator, "2026/01/secret_blurred_title.webp");
             }
             other => panic!("expected Blurred with preview_url, got {other:?}"),
         }

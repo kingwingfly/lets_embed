@@ -406,6 +406,7 @@ pub async fn callback(
     let client_secret = match secrets::load_provider_secret(
         &st.env,
         &st.deployment_id,
+        policy.revision,
         provider.as_str(),
         "client_secret",
         fallback_secret_env_name(provider),

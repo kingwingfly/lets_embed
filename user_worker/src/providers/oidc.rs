@@ -24,7 +24,8 @@ use worker::{Env, Method};
 use crate::challenge_do::{self, JwksCachePutReq};
 use crate::providers::ssrf::{
     OidcDiscoveryDoc, SsrfError, ValidatedOidcEndpoints, discovery_url_for_issuer,
-    fetch_https_no_redirect, validate_discovery_document,
+    fetch_https_no_redirect, parse_allowed_endpoint_hosts,
+    validate_discovery_document_with_allowed_hosts,
 };
 
 const MAX_CLOCK_SKEW_SECS: u64 = 60;
@@ -144,13 +145,23 @@ pub async fn load_oidc_material(
     configured_issuer: &str,
     force_refresh: bool,
 ) -> Result<OidcProviderMaterial, OidcError> {
+    let extra_allowed_hosts = parse_allowed_endpoint_hosts(
+        env.var("OIDC_AGE_ALLOWED_ENDPOINT_HOSTS")
+            .ok()
+            .map(|v| v.to_string())
+            .as_deref(),
+    );
     if !force_refresh
         && let Ok(Some(cached)) = challenge_do::get_cached_jwks(env, configured_issuer).await
         && let (Ok(doc), Ok(jwks)) = (
             serde_json::from_str::<OidcDiscoveryDoc>(&cached.discovery_json),
             serde_json::from_str::<JwkSet>(&cached.jwks_json),
         )
-        && let Ok(endpoints) = validate_discovery_document(configured_issuer, &doc)
+        && let Ok(endpoints) = validate_discovery_document_with_allowed_hosts(
+            configured_issuer,
+            &doc,
+            &extra_allowed_hosts,
+        )
     {
         return Ok(OidcProviderMaterial { endpoints, jwks });
     }
@@ -169,7 +180,11 @@ pub async fn load_oidc_material(
         .map_err(|e| OidcError::Ssrf(SsrfError::FetchFailed(e.to_string())))?;
     let doc: OidcDiscoveryDoc = serde_json::from_str(&discovery_json)
         .map_err(|_| OidcError::InvalidClaims("malformed OIDC discovery document"))?;
-    let endpoints = validate_discovery_document(configured_issuer, &doc)?;
+    let endpoints = validate_discovery_document_with_allowed_hosts(
+        configured_issuer,
+        &doc,
+        &extra_allowed_hosts,
+    )?;
 
     let mut jwks_resp = fetch_https_no_redirect(
         &endpoints.jwks_uri,
@@ -628,32 +643,54 @@ pub fn validate_oidc_claims(
 // Strict Verified-18+ Claim Extraction (OidcAgeAssurance ONLY)
 // ---------------------------------------------------------------------------
 
+/// Generic authentication methods (`amr`) that prove login authentication ONLY —
+/// NOT age or identity verification.
+const GENERIC_AUTH_AMR: &[&str] = &[
+    "pwd", "otp", "sms", "mfa", "kba", "swk", "hwk", "user", "pop", "pin", "fpt", "geo", "mca",
+    "rba", "sc", "tel", "wia",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgeClaimOutcome {
+    Adult(&'static str),
+    Minor(&'static str),
+    Absent,
+}
+
 /// Evaluate verified 18+ claims from a vetted Age-Assurance OIDC provider.
 ///
 /// Requires:
 /// 1. If `required_acr` is configured, token `acr` MUST match.
 /// 2. If `required_amr` is configured, token `amr` MUST contain it.
-/// 3. Explicit 18+ proof:
-///    - OIDC4IDA `verified_claims.claims.{age_over_18 == true | age_equal_or_over."18" == true | birthdate >= 18}`
-///      (requiring non-empty `verified_claims.verification.trust_framework`), OR
-///    - Top-level `age_over_18 == true` / `age_equal_or_over."18" == true` / `birthdate >= 18`
-///      accompanied by non-empty `acr` or `amr` assurance provenance!
+/// 3. Explicit negative age claims (`age_over_18: false`, `age_equal_or_over."18": false`,
+///    or an under-18 `birthdate`) inside `verified_claims` OR top-level ALWAYS fail closed
+///    immediately with NO fallback (F5).
+/// 4. Explicit 18+ proof:
+///    - Path 1 (preferred): OIDC4IDA `verified_claims.claims.{age_over_18 == true | age_equal_or_over."18" == true | birthdate >= 18}`
+///      requiring non-empty `verified_claims.verification.trust_framework`, OR
+///    - Path 2: Top-level `age_over_18 == true` / `age_equal_or_over."18" == true` with
+///      operator-configured `required_acr`/`required_amr`, explicit `acr`, or non-generic age-assurance `amr`;
+///      top-level `birthdate >= 18` is ONLY accepted when the operator explicitly configured
+///      `required_acr` or `required_amr` (never accepted on bare generic `amr` like `["pwd"]`).
 pub fn evaluate_verified_18_claims(
     token: &VerifiedIdToken,
     required_acr: Option<&str>,
     required_amr: Option<&str>,
     now_epoch_secs: u64,
 ) -> Result<VerifiedAgeResult, OidcError> {
-    if let Some(req_acr) = required_acr.map(str::trim).filter(|s| !s.is_empty())
-        && token.acr.as_deref() != Some(req_acr)
+    let req_acr = required_acr.map(str::trim).filter(|s| !s.is_empty());
+    let req_amr = required_amr.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(expected_acr) = req_acr
+        && token.acr.as_deref() != Some(expected_acr)
     {
         return Err(OidcError::AgeNotVerified("acr assurance level mismatch"));
     }
-    if let Some(req_amr) = required_amr.map(str::trim).filter(|s| !s.is_empty())
-        && !token.amr.iter().any(|m| m == req_amr)
+    if let Some(expected_amr) = req_amr
+        && !token.amr.iter().any(|m| m == expected_amr)
     {
         return Err(OidcError::AgeNotVerified("required amr method missing"));
     }
+    let has_configured_policy_requirement = req_acr.is_some() || req_amr.is_some();
 
     // Path 1: OIDC for Identity Assurance (`verified_claims`)
     if let Some(vc) = token.raw_claims.get("verified_claims") {
@@ -662,55 +699,116 @@ pub fn evaluate_verified_18_claims(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        if let Some(tf) = trust_framework
-            && let Some(vc_claims) = vc.get("claims")
-            && let Some(method) = check_age_18_claim_object(vc_claims, now_epoch_secs)
-        {
-            return Ok(VerifiedAgeResult {
-                verified_18: true,
-                method: format!("oidc_ida:{tf}:{method}"),
-            });
+        if let Some(vc_claims) = vc.get("claims") {
+            match check_age_18_claim_object(vc_claims, now_epoch_secs) {
+                AgeClaimOutcome::Minor(_) => {
+                    // Explicit verified-negative result ALWAYS takes precedence — NO fallback!
+                    return Err(OidcError::AgeNotVerified(
+                        "verified_claims explicitly indicates user is under 18",
+                    ));
+                }
+                AgeClaimOutcome::Adult(method) => {
+                    if let Some(tf) = trust_framework {
+                        return Ok(VerifiedAgeResult {
+                            verified_18: true,
+                            method: format!("oidc_ida:{tf}:{method}"),
+                        });
+                    }
+                }
+                AgeClaimOutcome::Absent => {}
+            }
         }
     }
 
-    // Path 2: Top-level verified claims on a vetted age-assurance OIDC issuer with acr/amr provenance
-    let has_provenance = token.acr.is_some() || !token.amr.is_empty();
-    if has_provenance && let Some(method) = check_age_18_claim_object(&token.raw_claims, now_epoch_secs)
-    {
-        let prov = token
-            .acr
-            .as_deref()
-            .or_else(|| token.amr.first().map(String::as_str))
-            .unwrap_or("oidc");
-        return Ok(VerifiedAgeResult {
-            verified_18: true,
-            method: format!("oidc:{prov}:{method}"),
-        });
+    // Path 2: Top-level claims on a vetted age-assurance OIDC issuer
+    match check_age_18_claim_object(&token.raw_claims, now_epoch_secs) {
+        AgeClaimOutcome::Minor(_) => Err(OidcError::AgeNotVerified(
+            "top-level age claims explicitly indicate user is under 18",
+        )),
+        AgeClaimOutcome::Adult("birthdate") => {
+            // Generic profile `birthdate` MUST NOT qualify as strict Verified18 unless the
+            // operator explicitly pinned `required_acr` or `required_amr` for the issuer!
+            if !has_configured_policy_requirement {
+                return Err(OidcError::AgeNotVerified(
+                    "top-level birthdate requires verified_claims or operator-configured required_acr/required_amr",
+                ));
+            }
+            let prov = req_acr
+                .or(req_amr)
+                .or(token.acr.as_deref())
+                .unwrap_or("oidc");
+            Ok(VerifiedAgeResult {
+                verified_18: true,
+                method: format!("oidc:{prov}:birthdate"),
+            })
+        }
+        AgeClaimOutcome::Adult(method) => {
+            let has_non_generic_amr = token.amr.iter().any(|m| {
+                let low = m.trim().to_ascii_lowercase();
+                !low.is_empty() && !GENERIC_AUTH_AMR.contains(&low.as_str())
+            });
+            let has_provenance =
+                has_configured_policy_requirement || token.acr.is_some() || has_non_generic_amr;
+            if !has_provenance {
+                return Err(OidcError::AgeNotVerified(
+                    "age_over_18 claim requires verified_claims, acr, or non-generic age-assurance amr",
+                ));
+            }
+            let prov = req_acr
+                .or(req_amr)
+                .or(token.acr.as_deref())
+                .or_else(|| {
+                    token
+                        .amr
+                        .iter()
+                        .find(|m| !GENERIC_AUTH_AMR.contains(&m.trim().to_ascii_lowercase().as_str()))
+                        .map(String::as_str)
+                })
+                .unwrap_or("oidc");
+            Ok(VerifiedAgeResult {
+                verified_18: true,
+                method: format!("oidc:{prov}:{method}"),
+            })
+        }
+        AgeClaimOutcome::Absent => Err(OidcError::AgeNotVerified(
+            "missing verified age_over_18 or verified birthdate (>= 18) with assurance provenance",
+        )),
     }
-
-    Err(OidcError::AgeNotVerified(
-        "missing verified age_over_18 or verified birthdate (>= 18) with assurance provenance",
-    ))
 }
 
-fn check_age_18_claim_object(obj: &Value, now_epoch_secs: u64) -> Option<&'static str> {
-    if obj.get("age_over_18").and_then(Value::as_bool) == Some(true) {
-        return Some("age_over_18");
+fn check_age_18_claim_object(obj: &Value, now_epoch_secs: u64) -> AgeClaimOutcome {
+    let mut positive: Option<&'static str> = None;
+
+    if let Some(over) = obj.get("age_over_18").and_then(Value::as_bool) {
+        if !over {
+            return AgeClaimOutcome::Minor("age_over_18");
+        }
+        positive.get_or_insert("age_over_18");
     }
-    if obj
+    if let Some(eq_over) = obj
         .get("age_equal_or_over")
         .and_then(|m| m.get("18"))
         .and_then(Value::as_bool)
-        == Some(true)
     {
-        return Some("age_equal_or_over_18");
+        if !eq_over {
+            return AgeClaimOutcome::Minor("age_equal_or_over_18");
+        }
+        positive.get_or_insert("age_equal_or_over_18");
     }
-    if let Some(dob) = obj.get("birthdate").and_then(Value::as_str)
-        && is_dob_at_least_18(dob, now_epoch_secs) == Some(true)
-    {
-        return Some("birthdate");
+    if let Some(dob) = obj.get("birthdate").and_then(Value::as_str) {
+        match is_dob_at_least_18(dob, now_epoch_secs) {
+            Some(false) => return AgeClaimOutcome::Minor("birthdate"),
+            Some(true) => {
+                positive.get_or_insert("birthdate");
+            }
+            None => {}
+        }
     }
-    None
+
+    match positive {
+        Some(m) => AgeClaimOutcome::Adult(m),
+        None => AgeClaimOutcome::Absent,
+    }
 }
 
 /// Convert Unix epoch seconds to UTC `(year, month, day)` using Howard Hinnant's algorithm.
@@ -876,8 +974,65 @@ mod tests {
             acr: None,
             amr: vec![],
             raw_claims: serde_json::json!({ "age_over_18": true }),
-            ..verified
+            ..verified.clone()
         };
         assert!(evaluate_verified_18_claims(&unverified, None, None, NOW).is_err());
+
+        // F5: Explicit verified-negative inside `verified_claims` MUST fail even if top-level
+        // claims carry an adult birthdate or `age_over_18: true` + acr/amr!
+        let verified_minor_with_adult_top_level = VerifiedIdToken {
+            acr: Some("eidas-high".into()),
+            amr: vec!["idv".into()],
+            raw_claims: serde_json::json!({
+                "age_over_18": true,
+                "birthdate": "1990-01-01",
+                "verified_claims": {
+                    "verification": { "trust_framework": "uk_tfida" },
+                    "claims": { "age_over_18": false }
+                }
+            }),
+            ..verified.clone()
+        };
+        assert!(
+            evaluate_verified_18_claims(
+                &verified_minor_with_adult_top_level,
+                Some("eidas-high"),
+                Some("idv"),
+                NOW
+            )
+            .is_err(),
+            "verified_claims age_over_18=false must take precedence over top-level adult claims"
+        );
+
+        // F5: Top-level birthdate with generic password `amr: ["pwd"]` and no operator-configured
+        // required_acr/required_amr MUST NOT qualify as Verified18!
+        let pwd_birthdate = VerifiedIdToken {
+            acr: None,
+            amr: vec!["pwd".into()],
+            raw_claims: serde_json::json!({ "birthdate": "1990-01-01" }),
+            ..verified.clone()
+        };
+        assert!(evaluate_verified_18_claims(&pwd_birthdate, None, None, NOW).is_err());
+
+        // Top-level `age_over_18: true` with ONLY generic `amr: ["pwd"]` also rejected without
+        // explicit operator requirement or `acr`.
+        let pwd_age_claim = VerifiedIdToken {
+            acr: None,
+            amr: vec!["pwd".into()],
+            raw_claims: serde_json::json!({ "age_over_18": true }),
+            ..verified.clone()
+        };
+        assert!(evaluate_verified_18_claims(&pwd_age_claim, None, None, NOW).is_err());
+
+        // Top-level `birthdate >= 18` succeeds ONLY when operator explicitly configured required_acr/amr.
+        let configured_dob = VerifiedIdToken {
+            acr: Some("eidas-high".into()),
+            amr: vec!["idv".into()],
+            raw_claims: serde_json::json!({ "birthdate": "1990-01-01" }),
+            ..verified
+        };
+        assert!(
+            evaluate_verified_18_claims(&configured_dob, Some("eidas-high"), None, NOW).is_ok()
+        );
     }
 }
