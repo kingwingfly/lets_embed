@@ -743,6 +743,18 @@ pub fn validate_provider_updates(
             None
         };
 
+        if item.clear_secret
+            && item
+                .secret_value
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+        {
+            return Err(format!(
+                "Provider '{}' cannot both set secret_value and clear_secret in the same request",
+                item.id.as_str()
+            ));
+        }
+
         if let Some(secret) = item.secret_value.as_deref() {
             if !secret.is_empty() && secret_field_for_provider(item.id).is_none() {
                 return Err(format!(

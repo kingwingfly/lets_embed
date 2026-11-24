@@ -696,6 +696,7 @@ impl EditableProvider {
         } else {
             opt(self.public_client_id.get_untracked())
         };
+        let clear_secret = self.clear_secret.get_untracked();
         ProviderUpdateItem {
             id: self.id,
             enabled: self.enabled.get_untracked() && self.id.is_allowed_under(age_policy),
@@ -704,8 +705,10 @@ impl EditableProvider {
             public_client_id,
             soft_birthday_check: self.soft_birthday_check.get_untracked()
                 && age_policy == AgeVerificationPolicy::SelfAttestation,
-            secret_value: opt(self.secret_input.get_untracked()),
-            clear_secret: self.clear_secret.get_untracked(),
+            secret_value: (!clear_secret)
+                .then(|| opt(self.secret_input.get_untracked()))
+                .flatten(),
+            clear_secret,
         }
     }
 }

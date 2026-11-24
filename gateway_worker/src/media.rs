@@ -232,8 +232,6 @@ pub(crate) fn is_allowed_media_request_header(kind: MediaCapKind, name: &str) ->
             | "if-none-match"
             | "if-modified-since"
             | "if-range"
-            | "if-match"
-            | "if-unmodified-since"
             | "accept"
             | "accept-encoding"
             | "user-agent"

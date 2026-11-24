@@ -713,6 +713,9 @@ pub fn ProvidersTab(
                                                     checked=Signal::derive(move || prov.clear_secret.get())
                                                     on_change=Callback::new(move |v| {
                                                         prov.clear_secret.set(v);
+                                                        if v {
+                                                            prov.secret_input.set(String::new());
+                                                        }
                                                         draft.dirty.set(true);
                                                     })
                                                     label="Delete stored secret on save"

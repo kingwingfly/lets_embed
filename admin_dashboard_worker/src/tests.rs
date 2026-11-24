@@ -1065,6 +1065,38 @@ fn validate_provider_updates_strips_unused_fields_and_normalizes_telegram_handle
             required_cid_provider
         );
     }
+
+    // Cycle 3 H11: Reject contradictory clear_secret: true + non-empty secret_value
+    let contradictory = ProviderUpdateItem {
+        id: AuthProviderId::Google,
+        enabled: true,
+        display_name: None,
+        issuer: None,
+        public_client_id: Some("google-client-id".into()),
+        soft_birthday_check: false,
+        secret_value: Some("new-secret".into()),
+        clear_secret: true,
+    };
+    assert!(
+        validate_provider_updates(AgeVerificationPolicy::SelfAttestation, &[contradictory])
+            .is_err(),
+        "clear_secret=true combined with non-empty secret_value must fail validation (H11)"
+    );
+    let clear_with_blank = ProviderUpdateItem {
+        id: AuthProviderId::Google,
+        enabled: true,
+        display_name: None,
+        issuer: None,
+        public_client_id: Some("google-client-id".into()),
+        soft_birthday_check: false,
+        secret_value: Some("   ".into()),
+        clear_secret: true,
+    };
+    assert!(
+        validate_provider_updates(AgeVerificationPolicy::SelfAttestation, &[clear_with_blank])
+            .is_ok(),
+        "clear_secret=true with whitespace-only secret_value should succeed"
+    );
 }
 
 // ---------------------------------------------------------------------------

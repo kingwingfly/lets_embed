@@ -1559,7 +1559,9 @@ async fn forward_gallery_request(
     )
     .await;
 
-    if let Some(cookie_hdr) = minted_guest_cookie {
+    if let Some(cookie_hdr) = minted_guest_cookie
+        && resp.status().is_success()
+    {
         resp.headers_mut().append(
             "set-cookie",
             cookie_hdr.parse().expect("ASCII le_guest_sid Set-Cookie"),

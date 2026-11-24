@@ -82,6 +82,9 @@ fn redirect_no_store(location: &str) -> Response {
 }
 
 /// Sanitize a relative static asset path under `/user/assets/{*path}`.
+/// Enforces an explicit non-HTML static extension allowlist so `index.html` can
+/// NEVER be served via `/user/assets/index.html` without CSP / `X-Frame-Options`
+/// / `Referrer-Policy` headers (Cycle 3 H6).
 pub fn sanitize_asset_path(raw: &str) -> Option<String> {
     let trimmed = raw.trim_start_matches('/');
     if trimmed.is_empty()
@@ -99,6 +102,15 @@ pub fn sanitize_asset_path(raw: &str) -> Option<String> {
         if seg.is_empty() || seg == "." || seg == ".." {
             return None;
         }
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let allowed_ext = [
+        ".js", ".mjs", ".wasm", ".css", ".svg", ".png", ".ico", ".webp", ".woff2",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext));
+    if !allowed_ext {
+        return None;
     }
     Some(trimmed.to_string())
 }
@@ -272,6 +284,10 @@ mod tests {
             "pkg\\foo.js",
             "pkg/a?b=1",
             "pkg/a\0.js",
+            "index.html",
+            "/index.html",
+            "foo/bar.htm",
+            "INDEX.HTML",
         ] {
             assert!(sanitize_asset_path(bad).is_none(), "expected rejection for {bad}");
         }

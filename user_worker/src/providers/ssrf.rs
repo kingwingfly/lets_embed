@@ -66,6 +66,9 @@ const FORBIDDEN_HOST_SUFFIXES: &[&str] = &[
     ".lan",
     ".corp",
     ".intranet",
+    ".private",
+    ".test",
+    ".invalid",
 ];
 
 /// Parses an optional comma/whitespace-separated allowlist of extra HTTPS hostnames
@@ -394,6 +397,9 @@ mod tests {
             "https://metadata.google.internal/computeMetadata/v1/",
             "https://printer.local/jwks",
             "https://service.home.arpa/jwks",
+            "https://relay.private/emails",
+            "https://idp.test/token",
+            "https://auth.invalid/jwks",
             "https://intranet/",
             "Https://auth.example.org/a/../secret",
             "HTTPS://auth.example.org/a/%2e%2e/secret",

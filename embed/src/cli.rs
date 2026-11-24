@@ -721,6 +721,12 @@ async fn record(
         let vocab_digest = Arc::clone(&vocab_digest);
         writes.spawn(
             async move {
+                // Deduplicate by image_id (keeping the latest result per id) so a reclaimed
+                // duplicate in the same batch cannot trigger Postgres error 21000 on ON CONFLICT.
+                let mut deduped: std::collections::BTreeMap<i64, _> = std::collections::BTreeMap::new();
+                for (id, opt_out) in res {
+                    deduped.insert(id, opt_out);
+                }
                 let mut wd_ids = vec![];
                 let mut tag_names = vec![];
                 let mut scores = vec![];
@@ -728,7 +734,7 @@ async fn record(
                 let mut clip_embeddings = vec![];
                 let mut dino_embeddings = vec![];
                 let mut failed_ids = vec![];
-                for (id, opt_out) in res {
+                for (id, opt_out) in deduped {
                     match opt_out {
                         Some((tags, clip_embedding, dino_embedding)) => {
                             for (tag, score) in tags {
@@ -755,6 +761,9 @@ async fn record(
                 // Wrap tag replacement, embedding persistence, status='completed', and
                 // WD coverage metadata inside a single transaction so partial failures
                 // can never strand images as completed with NULL coverage (Cycle 2 A-5).
+                // Acquire deterministic ascending row locks on parent posts, sibling videos,
+                // and images before mutating so concurrent writers cannot deadlock on
+                // Policy v3 facts_rev trigger updates (Cycle 3 P2-2).
                 if !completed_ids.is_empty() {
                     use sqlx::Connection as _;
 
@@ -762,6 +771,38 @@ async fn record(
                         .begin()
                         .instrument(tracing::info_span!("begin record transaction"))
                         .await?;
+
+                    sqlx::query(
+                        r#"SELECT id FROM posts
+                           WHERE id IN (SELECT post_id FROM post_images WHERE image_id = ANY($1::BIGINT[]))
+                           ORDER BY id FOR NO KEY UPDATE"#,
+                    )
+                    .bind(&completed_ids)
+                    .execute(&mut *tx)
+                    .instrument(tracing::info_span!("lock parent posts"))
+                    .await?;
+
+                    sqlx::query(
+                        r#"SELECT id FROM videos
+                           WHERE id IN (
+                               SELECT pv.video_id FROM post_videos pv
+                               JOIN post_images pi ON pi.post_id = pv.post_id
+                               WHERE pi.image_id = ANY($1::BIGINT[])
+                           )
+                           ORDER BY id FOR NO KEY UPDATE"#,
+                    )
+                    .bind(&completed_ids)
+                    .execute(&mut *tx)
+                    .instrument(tracing::info_span!("lock sibling videos"))
+                    .await?;
+
+                    sqlx::query(
+                        r#"SELECT id FROM images WHERE id = ANY($1::BIGINT[]) ORDER BY id FOR NO KEY UPDATE"#,
+                    )
+                    .bind(&completed_ids)
+                    .execute(&mut *tx)
+                    .instrument(tracing::info_span!("lock target images"))
+                    .await?;
 
                     sqlx::query(
                         r#"DELETE FROM wd_tag_images WHERE image_id = ANY($1::BIGINT[])"#,

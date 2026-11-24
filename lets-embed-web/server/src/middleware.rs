@@ -310,9 +310,13 @@ fn extract_client_ip(
                 return Some(ip);
             }
         }
-        if let Some(xff) = extract_single_header(headers, "x-forwarded-for")
-            && let Some(first) = xff.split(',').next().map(str::trim)
-            && let Ok(ip) = first.parse::<IpAddr>()
+        if let Some(xff) = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .next_back()
+            .and_then(|v| v.to_str().ok())
+            && let Some(last) = xff.rsplit(',').next().map(str::trim)
+            && let Ok(ip) = last.parse::<IpAddr>()
         {
             return Some(ip);
         }
@@ -330,7 +334,15 @@ fn rate_limit_subject_for_request(
     match actor {
         Some(ActorBinding::User { sub, .. }) => format!("u:{sub}"),
         Some(ActorBinding::LiveAdmin { email }) => format!("a:{email}"),
-        Some(ActorBinding::GuestSession { gid }) => format!("g:{gid}"),
+        // Key GuestSession on normalized client IP first so cookie-less `/api/safety/reveal`
+        // minting cannot rotate `gid` buckets to bypass per-IP rate limits (Cycle 3 P1-2).
+        Some(ActorBinding::GuestSession { gid }) => {
+            if let Some(ip) = extract_client_ip(headers, peer_ip, trust_cf_ip, trust_proxy) {
+                format!("ip:{}", normalize_ip_bucket(ip))
+            } else {
+                format!("g:{gid}")
+            }
+        }
         Some(ActorBinding::Anon) | None => {
             if let Some(ip) = extract_client_ip(headers, peer_ip, trust_cf_ip, trust_proxy) {
                 format!("ip:{}", normalize_ip_bucket(ip))

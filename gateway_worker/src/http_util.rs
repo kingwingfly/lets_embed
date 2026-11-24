@@ -288,8 +288,18 @@ pub(crate) fn extract_single_cookie<'a>(headers: &'a HeaderMap, target: &str) ->
 }
 
 /// Strips admin, Cloudflare Access, and guest-reveal cookies before forwarding to
-/// `USER_WORKER` while preserving `__Host-ue_session` and `__Host-auth_tx`.
+/// `USER_WORKER` while preserving single-occurrence `__Host-ue_session` and `__Host-auth_tx`.
+/// Duplicate occurrences of auth cookies are dropped fail-closed to prevent parser
+/// differentials against `tower-cookies` last-wins behavior (Cycle 3 H5).
 pub(crate) fn sanitize_user_worker_cookie(headers: &HeaderMap) -> Option<String> {
+    let dup_session = matches!(
+        extract_single_cookie(headers, site_access::SESSION_COOKIE),
+        CookieLookup::Duplicate
+    );
+    let dup_auth_tx = matches!(
+        extract_single_cookie(headers, site_access::AUTH_TX_COOKIE),
+        CookieLookup::Duplicate
+    );
     let mut kept = Vec::new();
     for raw in headers.get_all("cookie").iter().filter_map(|v| v.to_str().ok()) {
         for cookie in raw.split(';').map(str::trim).filter(|c| !c.is_empty()) {
@@ -299,6 +309,8 @@ pub(crate) fn sanitize_user_worker_cookie(headers: &HeaderMap) -> Option<String>
                 && name != LEGACY_GUEST_SESSION_COOKIE
                 && name != LEGACY_SESSION_COOKIE
                 && name != "CF_Authorization"
+                && !(dup_session && name == site_access::SESSION_COOKIE)
+                && !(dup_auth_tx && name == site_access::AUTH_TX_COOKIE)
             {
                 kept.push(cookie);
             }
@@ -570,6 +582,43 @@ pub(crate) fn require_form_urlencoded(headers: &HeaderMap) -> std::result::Resul
     }
 }
 
+/// Defense-in-depth validation of optional pagination/threshold search params so
+/// malformed query parameters fail `400` at the edge before reserving a billing hold.
+fn validate_optional_search_params(body: &Bytes) -> std::result::Result<(), MeterError> {
+    let s = std::str::from_utf8(body).map_err(|_| MeterError::BadRequest)?;
+    for pair in s.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair.split_once('=').ok_or(MeterError::BadRequest)?;
+        let key = percent_decode(k).ok_or(MeterError::BadRequest)?;
+        if matches!(key.as_str(), "limit" | "offset" | "min_similarity") {
+            let val = percent_decode(v).ok_or(MeterError::BadRequest)?;
+            let trimmed = val.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match key.as_str() {
+                "limit" | "offset" => {
+                    if trimmed.parse::<i64>().is_err() {
+                        return Err(MeterError::BadRequest);
+                    }
+                }
+                "min_similarity" => {
+                    let Ok(f) = trimmed.parse::<f32>() else {
+                        return Err(MeterError::BadRequest);
+                    };
+                    if !f.is_finite() || !(0.0..=1.0).contains(&f) {
+                        return Err(MeterError::BadRequest);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Computes the metered search [`ChargeReq`] for `POST` search routes.
 ///
 /// Media billing is handled exclusively by the capability-gated `/media/*`
@@ -590,6 +639,7 @@ pub(crate) fn metered_item(
                 return Err(MeterError::PayloadTooLarge);
             }
             require_form_urlencoded(headers)?;
+            validate_optional_search_params(body)?;
             let q = form_field(body, "q").ok_or(MeterError::BadRequest)?;
             let trimmed = q.trim();
             let id: i64 = trimmed.parse().map_err(|_| MeterError::BadRequest)?;
@@ -607,6 +657,7 @@ pub(crate) fn metered_item(
                 return Err(MeterError::PayloadTooLarge);
             }
             require_form_urlencoded(headers)?;
+            validate_optional_search_params(body)?;
             let image = form_field(body, "image")
                 .filter(|s| !s.trim().is_empty())
                 .ok_or(MeterError::BadRequest)?;
@@ -621,6 +672,7 @@ pub(crate) fn metered_item(
                 return Err(MeterError::PayloadTooLarge);
             }
             require_form_urlencoded(headers)?;
+            validate_optional_search_params(body)?;
             let q = form_field(body, "q").ok_or(MeterError::BadRequest)?;
             let trimmed = q.trim();
             if trimmed.is_empty() || q.len() > 2000 {
@@ -638,6 +690,7 @@ pub(crate) fn metered_item(
                 return Err(MeterError::PayloadTooLarge);
             }
             require_form_urlencoded(headers)?;
+            validate_optional_search_params(body)?;
             let q = form_field(body, "q")
                 .filter(|s| !s.trim().is_empty())
                 .ok_or(MeterError::BadRequest)?;
@@ -652,6 +705,7 @@ pub(crate) fn metered_item(
                 return Err(MeterError::PayloadTooLarge);
             }
             require_form_urlencoded(headers)?;
+            validate_optional_search_params(body)?;
             let q = form_field(body, "q")
                 .filter(|s| !s.trim().is_empty())
                 .ok_or(MeterError::BadRequest)?;
@@ -666,6 +720,7 @@ pub(crate) fn metered_item(
                 return Err(MeterError::PayloadTooLarge);
             }
             require_form_urlencoded(headers)?;
+            validate_optional_search_params(body)?;
             let q = form_field(body, "q")
                 .filter(|s| !s.trim().is_empty())
                 .ok_or(MeterError::BadRequest)?;
