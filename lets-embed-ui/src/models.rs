@@ -1016,7 +1016,7 @@ impl PresetTemplate {
                 description: "Childlike, TS/femboy/futa, elderly, moderate-to-heavy SM/BDSM, and niche fetish themes.".to_string(),
                 default_mode: RuleMode::SpoilerBlur,
                 preset: GalleryMaskPreset::Sensitive,
-                requires_age: false,
+                requires_age: true,
                 query: search_types::PRESET_SENSITIVE_QUERY.to_string(),
             },
             Self {

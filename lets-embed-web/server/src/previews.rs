@@ -185,34 +185,34 @@ pub async fn like_previews_post(
         proj_videos.into_iter().map(|v| (v.id(), v)).collect();
     let post_map: HashMap<i64, _> = raw_posts.into_iter().map(|p| (p.post_id, p)).collect();
 
-    // Only query full post media clearance for posts whose projected cover is NOT already clear.
-    let need_clear_check: Vec<i64> = post_ids
+    // Only query full post media displayability for posts whose projected cover is hard-blocked / unclassified.
+    let need_displayable_check: Vec<i64> = post_ids
         .iter()
         .copied()
         .filter(|pid| {
             let Some(p) = post_map.get(pid) else {
                 return false;
             };
-            let cover_clear = p
+            let cover_displayable = p
                 .cover_image
                 .as_ref()
                 .and_then(|c| proj_img_map.get(&c.id))
-                .is_some_and(|im| im.is_clear())
+                .is_some_and(ProjectedImage::is_bypassable_or_clear)
                 || p.cover_video
                     .as_ref()
                     .and_then(|v| proj_vid_map.get(&v.id))
-                    .is_some_and(|v| v.is_clear());
-            !cover_clear
+                    .is_some_and(ProjectedVideo::is_bypassable_or_clear);
+            !cover_displayable
         })
         .collect();
-    let extra_clear_posts = if need_clear_check.is_empty() {
+    let extra_displayable_posts = if need_displayable_check.is_empty() {
         HashSet::new()
     } else {
         engine
-            .posts_with_any_clear_media(&need_clear_check, &ctx.policy, &ctx.caller)
+            .posts_with_any_displayable_media(&need_displayable_check, &ctx.policy, &ctx.caller)
             .await
             .map_err(|e| {
-                tracing::error!("like_previews_post post clearance check failed: {e}");
+                tracing::error!("like_previews_post post displayability check failed: {e}");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?
     };
@@ -229,10 +229,10 @@ pub async fn like_previews_post(
                 .cover_video
                 .as_ref()
                 .and_then(|v| proj_vid_map.get(&v.id));
-            let has_clear = cover_img.is_some_and(|im| im.is_clear())
-                || cover_vid.is_some_and(|v| v.is_clear())
-                || extra_clear_posts.contains(&pid);
-            let safe_title = if has_clear {
+            let has_displayable = cover_img.is_some_and(ProjectedImage::is_bypassable_or_clear)
+                || cover_vid.is_some_and(ProjectedVideo::is_bypassable_or_clear)
+                || extra_displayable_posts.contains(&pid);
+            let safe_title = if has_displayable {
                 p.title.clone()
             } else {
                 format!("Restricted Post #{pid}")
@@ -316,9 +316,9 @@ pub async fn post_images(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let has_any_clear =
-        images.iter().any(|i| i.is_clear()) || videos.iter().any(|v| v.is_clear());
-    let (safe_title, safe_authors) = if has_any_clear {
+    let has_any_displayable = images.iter().any(ProjectedImage::is_bypassable_or_clear)
+        || videos.iter().any(ProjectedVideo::is_bypassable_or_clear);
+    let (safe_title, safe_authors) = if has_any_displayable {
         (
             title,
             meta.authors.into_iter().map(|a| a.name).collect(),
@@ -664,33 +664,33 @@ pub async fn like_previews(
         proj_videos.into_iter().map(|v| (v.id(), v)).collect();
     let post_map: HashMap<i64, _> = posts.into_iter().map(|p| (p.post_id, p)).collect();
 
-    let need_clear_check: Vec<i64> = post_ids
+    let need_displayable_check: Vec<i64> = post_ids
         .iter()
         .copied()
         .filter(|pid| {
             let Some(p) = post_map.get(pid) else {
                 return false;
             };
-            let cover_clear = p
+            let cover_displayable = p
                 .cover_image
                 .as_ref()
                 .and_then(|c| proj_img_map.get(&c.id))
-                .is_some_and(|im| im.is_clear())
+                .is_some_and(ProjectedImage::is_bypassable_or_clear)
                 || p.cover_video
                     .as_ref()
                     .and_then(|v| proj_vid_map.get(&v.id))
-                    .is_some_and(|v| v.is_clear());
-            !cover_clear
+                    .is_some_and(ProjectedVideo::is_bypassable_or_clear);
+            !cover_displayable
         })
         .collect();
-    let extra_clear_posts = if need_clear_check.is_empty() {
+    let extra_displayable_posts = if need_displayable_check.is_empty() {
         HashSet::new()
     } else {
         engine
-            .posts_with_any_clear_media(&need_clear_check, &ctx.policy, &ctx.caller)
+            .posts_with_any_displayable_media(&need_displayable_check, &ctx.policy, &ctx.caller)
             .await
             .map_err(|e| {
-                tracing::error!("like_previews post clearance check failed: {e}");
+                tracing::error!("like_previews post displayability check failed: {e}");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?
     };
@@ -708,10 +708,10 @@ pub async fn like_previews(
                 let p = post_map.get(&id)?;
                 let cover_img = p.cover_image.as_ref().and_then(|c| proj_img_map.get(&c.id));
                 let cover_vid = p.cover_video.as_ref().and_then(|v| proj_vid_map.get(&v.id));
-                let has_clear = cover_img.is_some_and(|im| im.is_clear())
-                    || cover_vid.is_some_and(|v| v.is_clear())
-                    || extra_clear_posts.contains(&id);
-                let title = if has_clear {
+                let has_displayable = cover_img.is_some_and(ProjectedImage::is_bypassable_or_clear)
+                    || cover_vid.is_some_and(ProjectedVideo::is_bypassable_or_clear)
+                    || extra_displayable_posts.contains(&id);
+                let title = if has_displayable {
                     (!p.title.trim().is_empty()).then(|| p.title.clone())
                 } else {
                     Some(format!("Restricted Post #{id}"))

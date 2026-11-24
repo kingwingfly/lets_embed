@@ -771,7 +771,7 @@ pub fn builtin_safety_presets() -> Vec<ContentPolicy> {
                 include_click: false,
                 include_live_admin: false,
                 require_gallery_login: true,
-                require_age_18: false,
+                require_age_18: true,
                 require_current_terms: true,
                 exclude_anonymous: true,
                 exclude_countries: Vec::new(),
@@ -792,10 +792,10 @@ pub fn builtin_safety_presets() -> Vec<ContentPolicy> {
                 include_switcher: true,
                 include_click: true,
                 include_live_admin: false,
-                require_gallery_login: false,
-                require_age_18: false,
-                require_current_terms: false,
-                exclude_anonymous: false,
+                require_gallery_login: true,
+                require_age_18: true,
+                require_current_terms: true,
+                exclude_anonymous: true,
                 exclude_countries: Vec::new(),
             },
         },
@@ -1490,11 +1490,12 @@ mod tests {
             revision: 1,
             min_enforce_rev: 1,
             safety_enabled: true,
+            age_policy: AgeVerificationPolicy::SelfAttestation,
             policies: builtin_safety_presets(),
             ..PublicSitePolicy::default()
         };
         p.refresh_policy_digest();
-        let info = validate_policy_set(&p).expect("builtin presets valid");
+        let info = validate_policy_set(&p).expect("builtin presets valid with SelfAttestation");
         assert_eq!(p.policies.len(), 3);
         assert_eq!(
             info.total_terms,
@@ -1502,6 +1503,24 @@ mod tests {
                 + search_types::PRESET_SENSITIVE_TAGS.len()
                 + search_types::PRESET_EXTREME_TAGS.len()
         );
+        // Preset 1 (r18): Block + Switcher + Login + 18+ + Terms + Exclude Anonymous
+        assert_eq!(p.policies[0].action, PolicyAction::Block);
+        assert!(p.policies[0].bypass.include_switcher);
+        assert!(!p.policies[0].bypass.include_click);
+        assert!(p.policies[0].bypass.require_gallery_login);
+        assert!(p.policies[0].bypass.require_age_18);
+        assert!(p.policies[0].bypass.require_current_terms);
+        assert!(p.policies[0].bypass.exclude_anonymous);
+        // Preset 2 (sensitive): Blur + Switcher + Click + Login + 18+ + Terms + Exclude Anonymous
+        assert_eq!(p.policies[1].action, PolicyAction::Blur);
+        assert!(p.policies[1].bypass.include_switcher);
+        assert!(p.policies[1].bypass.include_click);
+        assert!(p.policies[1].bypass.require_gallery_login);
+        assert!(p.policies[1].bypass.require_age_18);
+        assert!(p.policies[1].bypass.require_current_terms);
+        assert!(p.policies[1].bypass.exclude_anonymous);
+        // Preset 3 (blood): hard Block (zero bypass)
+        assert_eq!(p.policies[2].action, PolicyAction::Block);
         assert!(
             !p.policies[2].bypass.has_any_include(),
             "Extreme / Gore & Illegal preset must default to hard block (zero bypass)"

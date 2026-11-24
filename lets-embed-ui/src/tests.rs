@@ -1577,6 +1577,9 @@ fn query_builder_in_and_not_in_parse_format_presets_and_validation() {
     // Built-in Safety Presets: exactly 3 presets, each collapsing to 1 compact WD Tag IN [...] >= 0.45 row
     let builtins = PresetTemplate::builtins();
     assert_eq!(builtins.len(), 3);
+    assert!(builtins[0].requires_age && builtins[0].default_mode == crate::RuleMode::Switcher);
+    assert!(builtins[1].requires_age && builtins[1].default_mode == crate::RuleMode::SpoilerBlur);
+    assert!(!builtins[2].requires_age && builtins[2].default_mode == crate::RuleMode::Switcher);
     for preset_id in ["r18", "sensitive", "blood"] {
         let tpl = builtins
             .iter()

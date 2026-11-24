@@ -4,9 +4,9 @@ pub mod safety;
 pub mod wd_vocab;
 
 pub use projection::{
-    MaskMetadata, MediaKind, MediaVisibility, PlaceholderPreset, ProjectedImage, ProjectedVideo,
-    RenderedMedia, RenderedPost, RevealRequest, RevealResponse, SafetyProjection,
-    SimilarityThresholdError, clamp_min_similarity, validate_min_similarity,
+    MASK_NO_UNLOCK_MARKER, MaskMetadata, MediaKind, MediaVisibility, PlaceholderPreset,
+    ProjectedImage, ProjectedVideo, RenderedMedia, RenderedPost, RevealRequest, RevealResponse,
+    SafetyProjection, SimilarityThresholdError, clamp_min_similarity, validate_min_similarity,
 };
 pub use query::{
     ClipClause, DinoClause, ThresholdError, UploadClause, VectorClause, VectorTarget,

@@ -557,6 +557,7 @@ pub fn SafetyTab(
                                                     include_switcher.set(true);
                                                     include_click.set(false);
                                                     require_login.set(true);
+                                                    require_age.set(true);
                                                     require_terms.set(true);
                                                     exclude_anon.set(true);
                                                 }
@@ -564,15 +565,17 @@ pub fn SafetyTab(
                                                     action_sig.set(PolicyAction::Blur);
                                                     include_switcher.set(true);
                                                     include_click.set(true);
-                                                    require_login.set(false);
-                                                    require_terms.set(false);
-                                                    exclude_anon.set(false);
+                                                    require_login.set(true);
+                                                    require_age.set(true);
+                                                    require_terms.set(true);
+                                                    exclude_anon.set(true);
                                                 }
                                                 GalleryMaskPreset::Blood => {
                                                     action_sig.set(PolicyAction::Block);
                                                     include_switcher.set(false);
                                                     include_click.set(false);
                                                     require_login.set(false);
+                                                    require_age.set(false);
                                                     require_terms.set(false);
                                                     exclude_anon.set(false);
                                                 }

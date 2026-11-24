@@ -1544,21 +1544,15 @@ async fn fetch_image_details(id: Option<String>) -> Result<ProjectedImageDetails
         .project_image(&details.image, outcome.clone(), &ctx.caller, &ctx.signer);
     let is_clear = projected.is_clear();
     let public_safe_clear = is_clear && outcome.is_public_safe_clear();
-    let noindex = !public_safe_clear && ctx.policy.policy.legal.noindex_restricted;
-
-    // Withhold post title & authors whenever the viewed image is restricted AND
-    // the parent post has ZERO eligible clear items for this caller (prevents
-    // leaking restricted post titles/authors in JSON, HTML, <title>, and Open Graph).
-    let show_post_meta = if is_clear {
-        true
-    } else if let Some(ref p) = details.post {
-        engine
-            .post_has_any_clear_media(p.id, &ctx.policy, &ctx.caller)
-            .await
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    let is_indexable_metadata = outcome.is_user_bypassable_or_clear();
+    // Non-bypassable restrictions (e.g. Extreme / Gore & Illegal, staff-only, or
+    // pending unclassified) are ALWAYS `noindex, nofollow` with title/authors withheld.
+    // Bypassable restrictions (e.g. NSFW / Sensitive with Switcher or Click-to-Reveal)
+    // keep post title & authors visible and indexable unless `noindex_restricted` is ON,
+    // while still withholding media URLs, `og:image`, and WD tags until unlocked.
+    let noindex =
+        !is_indexable_metadata || (!public_safe_clear && ctx.policy.policy.legal.noindex_restricted);
+    let show_post_meta = is_indexable_metadata;
 
     Ok(ProjectedImageDetails {
         image: projected,

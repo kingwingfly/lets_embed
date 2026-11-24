@@ -552,7 +552,7 @@ try {
     const clipboardText = await navigator.clipboard.readText();
     const copyToast = (document.querySelector('.le-toast-host')?.innerText || '').trim();
 
-    // Save Geo-Blocking policy to verify backend validation accepts the 49-country preset
+    // Save Geo-Blocking policy to verify backend validation accepts the 77-country preset
     const saveGeoBtn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('Save Geo-Blocking'));
     if (!saveGeoBtn) throw new Error('Save Geo-Blocking button not found');
     saveGeoBtn.click();
@@ -576,10 +576,10 @@ try {
   `);
   await screenshot('e2e_admin_geo_waf.png');
   check(
-    '3c. Dedicated Geo-Blocking & Similarity tabs + R-18 preset (49), live WAF rule (+XX/+T1), 1-click Copy & Save',
+    '3c. Dedicated Geo-Blocking & Similarity tabs + R-18 preset (77), live WAF rule (+XX/+T1), 1-click Copy & Save',
     geoWafCheck.simOnly &&
       geoWafCheck.geoOnly &&
-      geoWafCheck.codeCount === 49 &&
+      geoWafCheck.codeCount === 77 &&
       geoWafCheck.hasAdminExempt &&
       geoWafCheck.hasXX &&
       geoWafCheck.hasT1 &&
@@ -662,7 +662,7 @@ try {
     setVal(rawInput, 'tag:maid >= 0.45');
     await new Promise(r => setTimeout(r, 180));
 
-    // Smoke-test per-rule Exclude Countries "+ R-18 Prohibited (49)" quick-fill + Clear
+    // Smoke-test per-rule Exclude Countries "+ R-18 Prohibited (77)" quick-fill + Clear
     const ruleGeoBtn = [...maidCard.querySelectorAll('button')].find(b => b.textContent.includes('+ R-18 Prohibited'));
     if (!ruleGeoBtn) throw new Error('Per-rule R-18 geo preset button not found');
     ruleGeoBtn.click();
@@ -711,7 +711,7 @@ try {
       safetySetup.rawExprs.length >= 3 &&
       safetySetup.rawExprs.every((e) => e.includes('tag IN (')) &&
       safetySetup.foldedCount >= 3 &&
-      safetySetup.ruleGeoCount === 49 &&
+      safetySetup.ruleGeoCount === 77 &&
       safetySetup.customInitiallyEnabled === true &&
       safetySetup.hasAgeWarnLink,
     JSON.stringify(safetySetup)

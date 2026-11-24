@@ -476,6 +476,101 @@ impl Engine {
         Ok(clear_posts)
     }
 
+    /// Returns the subset of `post_ids` that have at least one image or video
+    /// evaluating to `Clear` OR restricted only by user-bypassable policies
+    /// (`outcome.is_user_bypassable_or_clear()`). Used to keep post titles & authors
+    /// visible/indexable on bypassable posts (e.g. NSFW / Sensitive) while withholding
+    /// metadata on hard-blocked (e.g. Extreme / Gore & Illegal) and unclassified posts.
+    pub async fn posts_with_any_displayable_media(
+        &self,
+        post_ids: &[i64],
+        policy: &CompiledPolicy,
+        caller: &CallerContext,
+    ) -> anyhow::Result<std::collections::HashSet<i64>> {
+        if post_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        if !policy.is_enabled() {
+            return Ok(post_ids.iter().copied().collect());
+        }
+        let mut displayable_posts: std::collections::HashSet<i64> =
+            std::collections::HashSet::new();
+
+        let pi_rows = sqlx::query(
+            "SELECT post_id, image_id FROM post_images WHERE post_id = ANY($1::BIGINT[])",
+        )
+        .bind(post_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        if !pi_rows.is_empty() {
+            let mut img_to_posts: std::collections::HashMap<i64, Vec<i64>> =
+                std::collections::HashMap::new();
+            for row in pi_rows {
+                let pid: i64 = row.try_get("post_id")?;
+                let iid: i64 = row.try_get("image_id")?;
+                img_to_posts.entry(iid).or_default().push(pid);
+            }
+            let img_ids: Vec<i64> = img_to_posts.keys().copied().collect();
+            let outcomes = self.evaluate_images(&img_ids, policy, caller).await?;
+            for (iid, outcome) in outcomes {
+                if outcome.is_user_bypassable_or_clear()
+                    && let Some(pids) = img_to_posts.get(&iid)
+                {
+                    displayable_posts.extend(pids.iter().copied());
+                }
+            }
+        }
+
+        let remaining: Vec<i64> = post_ids
+            .iter()
+            .copied()
+            .filter(|pid| !displayable_posts.contains(pid))
+            .collect();
+        if !remaining.is_empty() {
+            let pv_rows = sqlx::query(
+                "SELECT post_id, video_id FROM post_videos WHERE post_id = ANY($1::BIGINT[])",
+            )
+            .bind(&remaining)
+            .fetch_all(&self.pool)
+            .await?;
+            if !pv_rows.is_empty() {
+                let mut vid_to_posts: std::collections::HashMap<i64, Vec<i64>> =
+                    std::collections::HashMap::new();
+                for row in pv_rows {
+                    let pid: i64 = row.try_get("post_id")?;
+                    let vid: i64 = row.try_get("video_id")?;
+                    vid_to_posts.entry(vid).or_default().push(pid);
+                }
+                let vid_ids: Vec<i64> = vid_to_posts.keys().copied().collect();
+                let outcomes =
+                    safety::evaluate_videos_batch(&self.pool, &vid_ids, policy, caller).await?;
+                for (vid, outcome) in outcomes {
+                    if outcome.is_user_bypassable_or_clear()
+                        && let Some(pids) = vid_to_posts.get(&vid)
+                    {
+                        displayable_posts.extend(pids.iter().copied());
+                    }
+                }
+            }
+        }
+
+        Ok(displayable_posts)
+    }
+
+    /// Returns `true` iff `post_id` has at least one image or video evaluating to
+    /// `Clear` or a user-bypassable restriction (`outcome.is_user_bypassable_or_clear()`).
+    pub async fn post_has_any_displayable_media(
+        &self,
+        post_id: i64,
+        policy: &CompiledPolicy,
+        caller: &CallerContext,
+    ) -> anyhow::Result<bool> {
+        let displayable = self
+            .posts_with_any_displayable_media(&[post_id], policy, caller)
+            .await?;
+        Ok(displayable.contains(&post_id))
+    }
+
     /// Returns `true` iff `post_id` has at least one image or video that evaluates
     /// strictly `Clear` for `(policy, caller)`. Used to withhold post title & authors
     /// on fully restricted posts (detail pages, SEO/Open Graph, album responses).
@@ -2268,20 +2363,28 @@ impl Engine {
         Ok(count)
     }
 
-    /// Count distinct posts eligible for anonymous sitemap indexing, honoring
-    /// `policy.legal.noindex_restricted` when safety rules are enabled.
+    /// Count distinct posts eligible for anonymous sitemap indexing:
+    /// - When safety is disabled: all posts with at least one image.
+    /// - When `noindex_restricted` is ON: strictly public-safe `Clear` covers only.
+    /// - When `noindex_restricted` is OFF: SFW `Clear` + bypassable restricted covers
+    ///   (e.g. NSFW / Sensitive), while ALWAYS excluding non-bypassable hard-blocked
+    ///   covers (e.g. Extreme / Gore & Illegal) and unclassified/pending covers.
     pub async fn sitemap_post_count_with_policy(
         &self,
         policy: &CompiledPolicy,
     ) -> anyhow::Result<i64> {
-        if !(policy.is_enabled() && policy.policy.legal.noindex_restricted) {
+        if !policy.is_enabled() {
             return self.sitemap_post_count().await;
         }
-        let anon = CallerContext::anonymous();
         let mut qb = QueryBuilder::<Postgres>::new(
             "WITH covers AS (SELECT DISTINCT ON (pi.post_id) pi.post_id, pi.image_id FROM post_images pi ORDER BY pi.post_id, pi.image_id ASC) SELECT COUNT(*)::BIGINT FROM covers c JOIN images i ON i.id = c.image_id WHERE TRUE",
         );
-        policy.push_caller_allowed_image_sql(&mut qb, &anon, "i");
+        if policy.policy.legal.noindex_restricted {
+            let anon = CallerContext::anonymous();
+            policy.push_caller_allowed_image_sql(&mut qb, &anon, "i");
+        } else {
+            policy.push_indexable_image_sql(&mut qb, "i");
+        }
         let row = qb.build().fetch_one(&self.pool).await?;
         let count: i64 = row.try_get(0)?;
         Ok(count)
@@ -2330,8 +2433,11 @@ impl Engine {
         Ok(out)
     }
 
-    /// Return a page of canonical post cover image IDs strictly under the anonymous safe view,
-    /// omitting restricted covers when `policy.legal.noindex_restricted` is enabled.
+    /// Return a page of canonical post cover image IDs strictly under the anonymous SEO view:
+    /// - Always omits non-bypassable hard-blocked covers (e.g. Extreme / Gore & Illegal)
+    ///   and pending unclassified covers whenever safety is enabled.
+    /// - Also omits bypassable restricted covers (e.g. NSFW / Sensitive) when
+    ///   `policy.legal.noindex_restricted` is enabled.
     pub async fn sitemap_post_entries_with_policy(
         &self,
         policy: &CompiledPolicy,
@@ -2341,14 +2447,18 @@ impl Engine {
         if limit <= 0 || offset < 0 {
             return Ok(Vec::new());
         }
-        if !(policy.is_enabled() && policy.policy.legal.noindex_restricted) {
+        if !policy.is_enabled() {
             return self.sitemap_post_entries(limit, offset).await;
         }
-        let anon = CallerContext::anonymous();
         let mut qb = QueryBuilder::<Postgres>::new(
             "WITH covers AS (SELECT DISTINCT ON (pi.post_id) pi.post_id, pi.image_id FROM post_images pi ORDER BY pi.post_id, pi.image_id ASC) SELECT c.image_id AS cover_id, to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS lastmod FROM covers c JOIN posts p ON p.id = c.post_id JOIN images i ON i.id = c.image_id WHERE TRUE",
         );
-        policy.push_caller_allowed_image_sql(&mut qb, &anon, "i");
+        if policy.policy.legal.noindex_restricted {
+            let anon = CallerContext::anonymous();
+            policy.push_caller_allowed_image_sql(&mut qb, &anon, "i");
+        } else {
+            policy.push_indexable_image_sql(&mut qb, "i");
+        }
         qb.push(" ORDER BY p.id DESC LIMIT ");
         qb.push_bind(limit);
         qb.push(" OFFSET ");
