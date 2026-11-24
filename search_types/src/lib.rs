@@ -18,8 +18,10 @@ pub use safety::{
     validate_policy_expr_pair, validate_wd_tags_in_expr,
 };
 pub use wd_vocab::{
-    BUILTIN_SAFETY_PRESET_TAGS, WD_VOCAB_COUNT, WD_VOCAB_DIGEST, canonical_wd_vocab_bytes,
-    is_canonical_wd_tag, wd_vocab_count, wd_vocab_tags,
+    BUILTIN_SAFETY_PRESET_TAGS, PRESET_EXTREME_QUERY, PRESET_EXTREME_TAGS, PRESET_R18_QUERY,
+    PRESET_R18_TAGS, PRESET_SENSITIVE_QUERY, PRESET_SENSITIVE_TAGS, WD_VOCAB_COUNT,
+    WD_VOCAB_DIGEST, canonical_wd_vocab_bytes, is_canonical_wd_tag, wd_vocab_count,
+    wd_vocab_tags,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

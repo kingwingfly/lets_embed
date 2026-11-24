@@ -11,7 +11,8 @@ use std::{
 };
 
 use search_types::{
-    BUILTIN_SAFETY_PRESET_TAGS, WD_VOCAB_DIGEST,
+    BUILTIN_SAFETY_PRESET_TAGS, PRESET_EXTREME_QUERY, PRESET_R18_QUERY, PRESET_SENSITIVE_QUERY,
+    WD_VOCAB_DIGEST,
     query::{validate_threshold_hundredths_f32, validate_threshold_range},
     safety::{
         MAX_POLICIES_PER_SET, MAX_TERMS_PER_POLICY, MAX_TOTAL_TERMS_PER_SET,
@@ -353,15 +354,20 @@ impl SimilarityDefaults {
 }
 
 /// Curated ISO-3166 alpha-2 preset of countries with nationwide legal
-/// prohibitions or blocks on online adult / R-18 content.
+/// prohibitions or state blocks on distributing/hosting online adult / R-18 content.
 ///
+/// Covers MENA (20), Asia/Central Asia & Caucasus (28), Eastern Europe/CIS with
+/// statutory distribution bans (3), Sub-Saharan Africa with explicit anti-obscenity /
+/// anti-pornography distribution laws (21), and Americas/Oceania (5) — 77 codes total.
 /// Operators should review and customize this list with legal counsel for their
-/// specific jurisdiction and content profile. Always sorted & deduplicated.
+/// specific jurisdiction and content profile. Always strictly sorted & deduplicated.
 pub const R18_PROHIBITED_COUNTRIES: &[&str] = &[
-    "AE", "AF", "BD", "BH", "BN", "BT", "BY", "CN", "CU", "DZ", "EG", "ER", "ET", "ID", "IN",
-    "IQ", "IR", "JO", "KH", "KP", "KR", "KW", "LA", "LK", "LY", "MA", "MM", "MV", "MY", "NP",
-    "OM", "PK", "PS", "QA", "SA", "SD", "SG", "SO", "SY", "TH", "TM", "TN", "TR", "TZ", "UA",
-    "UG", "UZ", "VN", "YE",
+    "AE", "AF", "AZ", "BD", "BH", "BI", "BN", "BT", "BY", "CD", "CM", "CN", "CU", "DJ", "DZ",
+    "EG", "ER", "ET", "FJ", "GH", "GM", "ID", "IN", "IQ", "IR", "JO", "KE", "KG", "KH", "KM",
+    "KP", "KR", "KW", "KZ", "LA", "LB", "LK", "LY", "MA", "MM", "MR", "MV", "MW", "MY", "NG",
+    "NP", "OM", "PG", "PH", "PK", "PS", "QA", "RU", "RW", "SA", "SD", "SG", "SN", "SO", "SS",
+    "SY", "TD", "TH", "TJ", "TM", "TN", "TO", "TR", "TZ", "UA", "UG", "UZ", "VN", "WS", "YE",
+    "ZM", "ZW",
 ];
 
 /// Merges existing ISO-3166 alpha-2 codes with additional preset codes into a
@@ -743,7 +749,10 @@ pub fn decode_active_policy_v3(raw_json: &str) -> Result<PublicSitePolicy, Polic
 }
 
 /// Built-in Policy v3 preset templates verified against the bundled 10,861-name
-/// WD-Tagger v3 vocabulary.
+/// WD-Tagger v3 vocabulary:
+/// 1. `r18` — NSFW / Adult & Explicit (sexual, nudity, exposure, explicit content)
+/// 2. `sensitive` — Sensitive / Niche Themes (childlike, TS/femboy/futa, elderly, SM/BDSM, niche fetishes)
+/// 3. `blood` — Extreme / Gore & Illegal (bloody, gore, kill, severe violence, self-harm, illegal — hard blocked)
 pub fn builtin_safety_presets() -> Vec<ContentPolicy> {
     vec![
         ContentPolicy {
@@ -751,9 +760,9 @@ pub fn builtin_safety_presets() -> Vec<ContentPolicy> {
             grant_generation: 1,
             enabled: true,
             priority: 10,
-            name: "NSFW / Explicit".to_string(),
+            name: "NSFW / Adult & Explicit".to_string(),
             preset: PlaceholderPreset::R18,
-            match_expr: "tag:explicit OR tag:nude OR tag:nipples OR tag:pussy OR tag:penis OR tag:sex OR tag:uncensored OR tag:censored OR tag:topless OR tag:bottomless".to_string(),
+            match_expr: PRESET_R18_QUERY.to_string(),
             except_expr: None,
             default_tag_min: DEFAULT_POLICY_TAG_MIN,
             action: PolicyAction::Block,
@@ -773,9 +782,9 @@ pub fn builtin_safety_presets() -> Vec<ContentPolicy> {
             grant_generation: 1,
             enabled: true,
             priority: 20,
-            name: "Suggestive / Ecchi".to_string(),
+            name: "Sensitive / Niche Themes".to_string(),
             preset: PlaceholderPreset::Sensitive,
-            match_expr: "tag:questionable OR tag:sensitive OR tag:lingerie OR tag:bikini OR tag:underwear OR tag:panties OR tag:cleavage OR tag:bdsm".to_string(),
+            match_expr: PRESET_SENSITIVE_QUERY.to_string(),
             except_expr: None,
             default_tag_min: DEFAULT_POLICY_TAG_MIN,
             action: PolicyAction::Blur,
@@ -794,15 +803,15 @@ pub fn builtin_safety_presets() -> Vec<ContentPolicy> {
             id: "blood".to_string(),
             grant_generation: 1,
             enabled: true,
-            priority: 30,
-            name: "Blood / Gore".to_string(),
+            priority: 5,
+            name: "Extreme / Gore & Illegal".to_string(),
             preset: PlaceholderPreset::Blood,
-            match_expr: "tag:blood".to_string(),
+            match_expr: PRESET_EXTREME_QUERY.to_string(),
             except_expr: None,
             default_tag_min: DEFAULT_POLICY_TAG_MIN,
             action: PolicyAction::Block,
             bypass: PolicyBypass {
-                include_switcher: true,
+                include_switcher: false,
                 include_click: false,
                 include_live_admin: false,
                 require_gallery_login: false,
@@ -1486,7 +1495,17 @@ mod tests {
         };
         p.refresh_policy_digest();
         let info = validate_policy_set(&p).expect("builtin presets valid");
-        assert_eq!(info.total_terms, 19);
+        assert_eq!(p.policies.len(), 3);
+        assert_eq!(
+            info.total_terms,
+            search_types::PRESET_R18_TAGS.len()
+                + search_types::PRESET_SENSITIVE_TAGS.len()
+                + search_types::PRESET_EXTREME_TAGS.len()
+        );
+        assert!(
+            !p.policies[2].bypass.has_any_include(),
+            "Extreme / Gore & Illegal preset must default to hard block (zero bypass)"
+        );
 
         // 1. Block + include_click MUST be rejected
         let mut bad_click = p.clone();

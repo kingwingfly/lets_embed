@@ -171,11 +171,11 @@ pub fn ImageDetails() -> impl IntoView {
     let params = use_params_map();
     let id_sig: Signal<Option<String>> = Memo::new(move |_| params.with(|p| p.get("id"))).into();
     view! {
-        <div class="w-full min-h-full flex flex-col pt-2 sm:pt-3">
+        <div class="web-details-page w-full min-h-full flex flex-col pt-2 sm:pt-3">
             <For each=move || params.with(|p| p.get("id")) key=String::clone let(id)>
                 <ImageDetailPage id />
             </For>
-            <div class="w-full px-3 md:px-4 pb-4 mt-2">
+            <div class="web-details-similar-section w-full px-3 md:px-4 pb-4 mt-2">
                 <Results embedded=true default_similar_id=id_sig heading="Similar \u{1f49e}" />
             </div>
         </div>
@@ -217,7 +217,7 @@ fn PostAlbumMasonry(
     view! {
         <div
             node_ref=container_ref
-            class="flex-[2] min-w-0 max-h-[40vh] overflow-y-auto md:max-h-none md:min-h-0 p-0.5 pr-1.5"
+            class="web-details-album-masonry flex-[2] min-w-0 max-h-[40vh] overflow-y-auto md:max-h-none md:min-h-0 p-0.5 pr-1.5"
         >
             <div class="flex items-start gap-2 w-full">
                 <For
@@ -1049,40 +1049,40 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                 <Meta property="og:image:width" content=image_width.to_string()/>
                 <Meta property="og:image:height" content=image_height.to_string()/>
             })}
-            <div class="flex flex-col md:flex-row w-full gap-3 md:gap-4 p-3 md:p-4 md:h-[72vh]">
+            <div class="web-details-layout flex flex-col md:flex-row w-full gap-3 md:gap-4 p-3 md:p-4 md:h-[72vh]">
                 <div
                     node_ref=container_ref
-                    class="relative w-full h-[45vh] md:h-full md:flex-1 md:min-w-0 shrink-0
+                    class="web-details-hero-stage relative w-full h-[45vh] md:h-full md:flex-1 md:min-w-0 shrink-0
                             flex items-center justify-center bg-sky-100/70 ring-1 ring-sky-200 rounded-2xl overflow-hidden"
                 >
                     {hero_stage}
                 </div>
 
-                <div class="w-full md:w-96 lg:w-[28rem] xl:w-[32rem] md:shrink-0
+                <div class="web-details-sidebar w-full md:w-96 lg:w-[28rem] xl:w-[32rem] md:shrink-0
                             md:h-full flex flex-col gap-3 md:min-h-0">
                     {
                         post.map(|p| view! {
                             <button
                                 type="button"
                                 prop:disabled=move || !album_ready()
-                                class="w-full flex items-center justify-between gap-2 text-left text-sky-800
+                                class="web-details-post-btn w-full flex items-center justify-between gap-2 text-left text-sky-800
                                        text-lg md:text-xl font-bold shrink-0 px-3 py-2 md:py-3
                                        bg-white/80 ring-1 ring-sky-200 shadow-sm shadow-sky-200/50
                                        rounded-2xl cursor-pointer hover:bg-white disabled:opacity-75 disabled:cursor-wait transition-colors"
                                 title="Open full post album"
                                 on:click=move |_| open_lightbox()
                             >
-                                <h1 class="line-clamp-2 min-w-0 m-0 text-inherit font-inherit">{ p.title }</h1>
-                                <span class="shrink-0 text-xs font-semibold px-2.5 py-1 rounded-full bg-sky-100 text-sky-700 whitespace-nowrap">
+                                <h1 class="web-details-post-title line-clamp-2 min-w-0 m-0 text-inherit font-inherit">{ p.title }</h1>
+                                <span class="web-details-album-badge shrink-0 text-xs font-semibold px-2.5 py-1 rounded-full bg-sky-100 text-sky-700 whitespace-nowrap">
                                     {album_badge}
                                 </span>
                             </button>
                         })
                     }
 
-                    <div class="shrink-0 flex flex-col gap-2 px-3 py-2.5
+                    <div class="web-details-actions-card shrink-0 flex flex-col gap-2 px-3 py-2.5
                                 bg-white/75 ring-1 ring-sky-100 rounded-2xl">
-                        <div class="flex items-center justify-center flex-wrap gap-2">
+                        <div class="web-details-action-row flex items-center justify-center flex-wrap gap-2">
                             <LikeButton kind="image" target_id=image_id show_label=true />
                             {
                                 post_like_id.map(|post_id| view! {
@@ -1092,7 +1092,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                             <a
                                 href="/user/favorites"
                                 rel="external"
-                                class="inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm font-medium
+                                class="web-details-favorites-link inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm font-medium
                                        text-sky-700 bg-sky-50 ring-1 ring-sky-200 hover:bg-sky-100 transition-colors"
                             >
                                 "\u{2605} Favorites"
@@ -1101,7 +1101,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                 <button
                                     type="button"
                                     title="Report content"
-                                    class="inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm font-medium
+                                    class="web-details-report-btn inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm font-medium
                                            text-rose-700 bg-rose-50 ring-1 ring-rose-200 hover:bg-rose-100 transition-colors cursor-pointer"
                                     on:click=move |_| {
                                         s.open_report(
@@ -1115,11 +1115,11 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                 </button>
                             })}
                         </div>
-                        <div class="flex items-center justify-center flex-wrap gap-1.5 text-xs text-slate-500">
+                        <div class="web-details-meta-strip flex items-center justify-center flex-wrap gap-1.5 text-xs text-slate-500">
                             <button
                                 type="button"
                                 title="Copy image ID (for DINO search)"
-                                class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100
+                                class="web-details-copy-id-btn inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100
                                        hover:bg-sky-100 hover:text-sky-700 text-slate-600 font-mono transition-colors cursor-pointer"
                                 on:click=on_copy_id
                             >
@@ -1130,7 +1130,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                 }}
                             </button>
                             {(image_width > 0 && image_height > 0).then(|| view! {
-                                <span class="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 tabular-nums">
+                                <span class="web-details-dims px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 tabular-nums">
                                     {format!("{image_width} × {image_height}")}
                                 </span>
                             })}
@@ -1139,7 +1139,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                                     href=orig_href
                                     target="_blank"
                                     rel="noopener noreferrer"
-                                    class="px-2 py-0.5 rounded-full bg-slate-100 hover:bg-sky-100 hover:text-sky-700
+                                    class="web-details-original-link px-2 py-0.5 rounded-full bg-slate-100 hover:bg-sky-100 hover:text-sky-700
                                            text-slate-600 font-medium transition-colors"
                                 >
                                     "Original \u{2197}"
@@ -1148,7 +1148,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                         </div>
                     </div>
 
-                    <div class="min-h-0 shrink flex flex-col gap-1.5 p-2.5 bg-white/75 ring-1 ring-sky-100 rounded-2xl">
+                    <div class="web-details-tags-card min-h-0 shrink flex flex-col gap-1.5 p-2.5 bg-white/75 ring-1 ring-sky-100 rounded-2xl">
                         {(tag_count > 0).then(|| view! {
                             <div class="flex items-center justify-between gap-2 px-0.5 text-[11px] text-sky-600/80">
                                 <span>

@@ -626,9 +626,9 @@ try {
     };
     clickBtn('+ NSFW');
     await new Promise(r => setTimeout(r, 180));
-    clickBtn('+ Suggestive / Ecchi');
+    clickBtn('+ Sensitive / Niche');
     await new Promise(r => setTimeout(r, 180));
-    clickBtn('+ Blood / Violence');
+    clickBtn('+ Extreme / Illegal');
     await new Promise(r => setTimeout(r, 220));
 
     const masterSwitch = document.querySelector('[role="switch"]');

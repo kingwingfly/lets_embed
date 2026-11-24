@@ -200,9 +200,9 @@ pub fn BlurredMediaCard(
     let alt_stored = StoredValue::new(effective_alt);
 
     let root_cls = if compact {
-        "le-spoiler le-spoiler--compact w-full relative overflow-hidden"
+        "web-blurred-card le-spoiler le-spoiler--compact w-full relative overflow-hidden"
     } else {
-        "le-spoiler w-full relative overflow-hidden"
+        "web-blurred-card le-spoiler w-full relative overflow-hidden"
     };
 
     view! {
@@ -216,7 +216,7 @@ pub fn BlurredMediaCard(
                                 view! {
                                     <button
                                         type="button"
-                                        class="block w-full h-full p-0 border-0 bg-transparent cursor-zoom-in focus-visible:outline-2 focus-visible:outline-sky-400"
+                                        class="web-blurred-card-open-btn block w-full h-full p-0 border-0 bg-transparent cursor-zoom-in focus-visible:outline-2 focus-visible:outline-sky-400"
                                         on:click=move |ev: ev::MouseEvent| {
                                             ev.stop_propagation();
                                             open_cb.run(());
@@ -229,7 +229,7 @@ pub fn BlurredMediaCard(
                                             height=h
                                             alt=alt_text
                                             src=clear_src
-                                            class="block w-full h-full object-cover select-none"
+                                            class="web-blurred-card-clear-img block w-full h-full object-cover select-none"
                                         />
                                     </button>
                                 }
@@ -243,18 +243,18 @@ pub fn BlurredMediaCard(
                                         height=h
                                         alt=alt_text
                                         src=clear_src
-                                        class="block w-full h-full object-cover select-none"
+                                        class="web-blurred-card-clear-img block w-full h-full object-cover select-none"
                                     />
                                 }
                                 .into_any()
                             };
                             view! {
-                                <div class="relative w-full h-full">
+                                <div class="web-blurred-card-revealed relative w-full h-full">
                                     {img_view}
                                     <button
                                         type="button"
                                         title="Re-hide blurred media"
-                                        class="absolute bottom-2 left-2 z-10 px-2.5 py-0.5 rounded-full text-[11px] font-semibold
+                                        class="web-blurred-card-hide-btn absolute bottom-2 left-2 z-10 px-2.5 py-0.5 rounded-full text-[11px] font-semibold
                                                bg-slate-900/75 hover:bg-slate-900 text-white backdrop-blur-xs ring-1 ring-white/20
                                                transition-colors cursor-pointer"
                                         on:click=move |ev: ev::MouseEvent| {
@@ -270,11 +270,11 @@ pub fn BlurredMediaCard(
                         }
                         MediaKind::Video => view! {
                             <div
-                                class="relative w-full h-full bg-black"
+                                class="web-blurred-card-revealed web-blurred-card-revealed--video relative w-full h-full bg-black"
                                 on:click=|ev: ev::MouseEvent| ev.stop_propagation()
                             >
                                 <video
-                                    class="w-full h-full block bg-black object-contain select-none"
+                                    class="web-blurred-card-video w-full h-full block bg-black object-contain select-none"
                                     controls
                                     playsinline
                                     preload="metadata"
@@ -283,7 +283,7 @@ pub fn BlurredMediaCard(
                                 <button
                                     type="button"
                                     title="Re-hide blurred video"
-                                    class="absolute bottom-2 left-2 z-10 px-2.5 py-0.5 rounded-full text-[11px] font-semibold
+                                    class="web-blurred-card-hide-btn absolute bottom-2 left-2 z-10 px-2.5 py-0.5 rounded-full text-[11px] font-semibold
                                            bg-slate-900/80 hover:bg-slate-900 text-white backdrop-blur-xs ring-1 ring-white/20
                                            transition-colors cursor-pointer"
                                     on:click=move |ev: ev::MouseEvent| {
@@ -303,25 +303,25 @@ pub fn BlurredMediaCard(
                     let alt_text = alt_stored.get_value();
                     let preset_slug = ui_preset.as_str();
                     view! {
-                        <div class="relative w-full h-full flex items-center justify-center bg-gradient-to-br from-slate-800 via-slate-900 to-sky-950 select-none">
+                        <div class="web-blurred-card-cover relative w-full h-full flex items-center justify-center bg-gradient-to-br from-slate-800 via-slate-900 to-sky-950 select-none">
                             {preview.filter(|u| !u.is_empty()).map(|purl| view! {
                                 <img
                                     loading="lazy"
                                     decoding="async"
                                     src=purl
                                     alt=alt_text
-                                    class="absolute inset-0 w-full h-full object-cover scale-105 opacity-90 pointer-events-none"
+                                    class="web-blurred-card-preview-img absolute inset-0 w-full h-full object-cover scale-105 opacity-90 pointer-events-none"
                                 />
                             })}
-                            <div class="absolute inset-0 bg-slate-950/45 backdrop-blur-sm pointer-events-none" />
-                            <div class="relative z-10 flex flex-col items-center justify-center text-center gap-1.5 px-3 py-2 max-w-[92%]">
+                            <div class="web-blurred-card-scrim absolute inset-0 bg-slate-950/45 backdrop-blur-sm pointer-events-none" />
+                            <div class="web-blurred-card-overlay relative z-10 flex flex-col items-center justify-center text-center gap-1.5 px-3 py-2 max-w-[92%]">
                                 <span class=format!(
-                                    "inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wide \
+                                    "web-blurred-card-badge inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wide \
                                      bg-white/15 text-sky-100 ring-1 ring-white/25 backdrop-blur-xs le-blurred-badge--{preset_slug}"
                                 )>
                                     {badge_text}
                                 </span>
-                                <span class="text-xs sm:text-sm font-semibold text-white drop-shadow-xs line-clamp-2">
+                                <span class="web-blurred-card-label text-xs sm:text-sm font-semibold text-white drop-shadow-xs line-clamp-2">
                                     {lbl}
                                 </span>
                                 {if can_click_reveal {
@@ -329,7 +329,7 @@ pub fn BlurredMediaCard(
                                         <button
                                             type="button"
                                             prop:disabled=move || revealing.get()
-                                            class="mt-1 inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-semibold
+                                            class="web-blurred-card-reveal-btn mt-1 inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-semibold
                                                    bg-white/95 hover:bg-white text-slate-900 shadow-md shadow-black/30
                                                    active:scale-95 disabled:opacity-65 disabled:cursor-wait transition-all cursor-pointer"
                                             on:click=on_reveal_click
@@ -349,7 +349,7 @@ pub fn BlurredMediaCard(
                                         <a
                                             href="/user/account"
                                             rel="external"
-                                            class="mt-1 inline-flex items-center gap-1 px-3 py-1 rounded-full text-[11px] font-semibold
+                                            class="web-blurred-card-settings-link mt-1 inline-flex items-center gap-1 px-3 py-1 rounded-full text-[11px] font-semibold
                                                    bg-white/15 hover:bg-white/25 text-white ring-1 ring-white/30 backdrop-blur-xs
                                                    transition-colors"
                                             on:click=|ev: ev::MouseEvent| ev.stop_propagation()

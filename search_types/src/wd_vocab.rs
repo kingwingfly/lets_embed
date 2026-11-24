@@ -17,7 +17,123 @@ pub const WD_VOCAB_COUNT: usize = 10_861;
 pub const WD_VOCAB_DIGEST: &str =
     "760e0e0b36eff91fe713495c20e3f0ecf49cd958b8033b3c454c97f3abfd339c";
 
-/// The 20 canonical WD-Tagger tags referenced by built-in safety presets and
+/// Built-in Preset 1 (NSFW / Adult & Explicit): sexual, explicit, nudity, and adult exposure tags.
+/// Strictly verified against the bundled 10,861-name WD-Tagger v3 vocabulary (25 tags <= 32 cap).
+pub const PRESET_R18_TAGS: &[&str] = &[
+    "explicit",
+    "questionable",
+    "nude",
+    "topless",
+    "bottomless",
+    "breasts_out",
+    "nipples",
+    "pussy",
+    "penis",
+    "anus",
+    "testicles",
+    "pubic_hair",
+    "erection",
+    "sex",
+    "vaginal",
+    "anal",
+    "oral",
+    "fellatio",
+    "paizuri",
+    "cum",
+    "masturbation",
+    "uncensored",
+    "censored",
+    "mosaic_censoring",
+    "bar_censor",
+];
+
+/// Built-in Preset 2 (Sensitive / Niche Themes): childlike/underage-style, femboy/TS/futanari,
+/// elderly/ugly-bastard, moderate-to-heavy SM/BDSM, and niche fetish themes not everyone wants to see.
+/// Strictly verified against the bundled 10,861-name WD-Tagger v3 vocabulary (30 tags <= 32 cap).
+pub const PRESET_SENSITIVE_TAGS: &[&str] = &[
+    // Childlike / underage-looking
+    "loli",
+    "shota",
+    "child",
+    // Femboy / TS / Futanari / gender-bending
+    "otoko_no_ko",
+    "futanari",
+    "crossdressing",
+    "genderswap",
+    // Elderly / ugly-bastard
+    "old_man",
+    "old_woman",
+    "ugly_man",
+    "fat_man",
+    // Moderate-to-heavy SM / BDSM
+    "bdsm",
+    "bondage",
+    "shibari",
+    "gagged",
+    "ball_gag",
+    "whip",
+    "hogtie",
+    "nipple_clamps",
+    "slave",
+    // Niche / sensitive fetish themes
+    "tentacles",
+    "furry",
+    "pregnant",
+    "lactation",
+    "inflation",
+    "vore",
+    "peeing",
+    "diaper",
+    "hypnosis",
+    "mind_control",
+];
+
+/// Built-in Preset 3 (Extreme / Gore, Violence & Illegal): bloody, gore, killing, severe violence,
+/// self-harm, non-consensual, and illegal/unacceptable content intended to be hard-blocked.
+/// Strictly verified against the bundled 10,861-name WD-Tagger v3 vocabulary (27 tags <= 32 cap).
+pub const PRESET_EXTREME_TAGS: &[&str] = &[
+    // Bloody / gore / death / dismemberment
+    "blood",
+    "blood_splatter",
+    "pool_of_blood",
+    "bleeding",
+    "guro",
+    "ryona",
+    "corpse",
+    "death",
+    "decapitation",
+    "severed_head",
+    "severed_limb",
+    "impaled",
+    "stab",
+    // Severe violence / torture / self-harm
+    "torture",
+    "strangling",
+    "suicide",
+    "self-harm",
+    "noose",
+    "abuse",
+    // Illegal / non-consensual / extremism
+    "rape",
+    "imminent_rape",
+    "after_rape",
+    "bestiality",
+    "child_on_child",
+    "molestation",
+    "drugged",
+    "swastika",
+];
+
+/// Compact single-row Policy v3 selector expression for Preset 1 (`NSFW / Adult & Explicit`).
+pub const PRESET_R18_QUERY: &str = "tag IN (explicit, questionable, nude, topless, bottomless, breasts_out, nipples, pussy, penis, anus, testicles, pubic_hair, erection, sex, vaginal, anal, oral, fellatio, paizuri, cum, masturbation, uncensored, censored, mosaic_censoring, bar_censor) >= 0.45";
+
+/// Compact single-row Policy v3 selector expression for Preset 2 (`Sensitive / Niche Themes`).
+pub const PRESET_SENSITIVE_QUERY: &str = "tag IN (loli, shota, child, otoko_no_ko, futanari, crossdressing, genderswap, old_man, old_woman, ugly_man, fat_man, bdsm, bondage, shibari, gagged, ball_gag, whip, hogtie, nipple_clamps, slave, tentacles, furry, pregnant, lactation, inflation, vore, peeing, diaper, hypnosis, mind_control) >= 0.45";
+
+/// Compact single-row Policy v3 selector expression for Preset 3 (`Extreme / Gore & Illegal`).
+pub const PRESET_EXTREME_QUERY: &str = "tag IN (blood, blood_splatter, pool_of_blood, bleeding, guro, ryona, corpse, death, decapitation, severed_head, severed_limb, impaled, stab, torture, strangling, suicide, self-harm, noose, abuse, rape, imminent_rape, after_rape, bestiality, child_on_child, molestation, drugged, swastika) >= 0.45";
+
+/// All 84 canonical WD-Tagger tags referenced by the 3 built-in safety presets and
 /// category-9 rating persistence.
 pub const BUILTIN_SAFETY_PRESET_TAGS: &[&str] = &[
     // Category 9 ratings
@@ -25,25 +141,89 @@ pub const BUILTIN_SAFETY_PRESET_TAGS: &[&str] = &[
     "sensitive",
     "questionable",
     "explicit",
-    // R-18 / Explicit preset
+    // Preset 1: NSFW / Adult & Explicit (excluding explicit/questionable already listed)
     "nude",
+    "topless",
+    "bottomless",
+    "breasts_out",
     "nipples",
     "pussy",
     "penis",
+    "anus",
+    "testicles",
+    "pubic_hair",
+    "erection",
     "sex",
+    "vaginal",
+    "anal",
+    "oral",
+    "fellatio",
+    "paizuri",
+    "cum",
+    "masturbation",
     "uncensored",
     "censored",
-    "topless",
-    "bottomless",
-    // Suggestive / Ecchi preset
-    "lingerie",
-    "bikini",
-    "underwear",
-    "panties",
-    "cleavage",
+    "mosaic_censoring",
+    "bar_censor",
+    // Preset 2: Sensitive / Niche Themes
+    "loli",
+    "shota",
+    "child",
+    "otoko_no_ko",
+    "futanari",
+    "crossdressing",
+    "genderswap",
+    "old_man",
+    "old_woman",
+    "ugly_man",
+    "fat_man",
     "bdsm",
-    // Blood / Violence preset
+    "bondage",
+    "shibari",
+    "gagged",
+    "ball_gag",
+    "whip",
+    "hogtie",
+    "nipple_clamps",
+    "slave",
+    "tentacles",
+    "furry",
+    "pregnant",
+    "lactation",
+    "inflation",
+    "vore",
+    "peeing",
+    "diaper",
+    "hypnosis",
+    "mind_control",
+    // Preset 3: Extreme / Gore & Illegal
     "blood",
+    "blood_splatter",
+    "pool_of_blood",
+    "bleeding",
+    "guro",
+    "ryona",
+    "corpse",
+    "death",
+    "decapitation",
+    "severed_head",
+    "severed_limb",
+    "impaled",
+    "stab",
+    "torture",
+    "strangling",
+    "suicide",
+    "self-harm",
+    "noose",
+    "abuse",
+    "rape",
+    "imminent_rape",
+    "after_rape",
+    "bestiality",
+    "child_on_child",
+    "molestation",
+    "drugged",
+    "swastika",
 ];
 
 /// Returns the canonical `\n`-joined UTF-8 bytes over which [`WD_VOCAB_DIGEST`]
@@ -242,8 +422,54 @@ mod tests {
     }
 
     #[test]
-    fn all_20_builtin_safety_preset_tags_and_every_vocab_tag_resolve_true() {
-        assert_eq!(BUILTIN_SAFETY_PRESET_TAGS.len(), 20);
+    fn all_builtin_safety_preset_tags_and_every_vocab_tag_resolve_true() {
+        use std::collections::HashSet;
+
+        assert_eq!(PRESET_R18_TAGS.len(), 25);
+        assert_eq!(PRESET_SENSITIVE_TAGS.len(), 30);
+        assert_eq!(PRESET_EXTREME_TAGS.len(), 27);
+        assert!(PRESET_R18_TAGS.len() <= crate::safety::MAX_TERMS_PER_POLICY);
+        assert!(PRESET_SENSITIVE_TAGS.len() <= crate::safety::MAX_TERMS_PER_POLICY);
+        assert!(PRESET_EXTREME_TAGS.len() <= crate::safety::MAX_TERMS_PER_POLICY);
+        assert!(
+            PRESET_R18_TAGS.len() + PRESET_SENSITIVE_TAGS.len() + PRESET_EXTREME_TAGS.len()
+                <= crate::safety::MAX_TOTAL_TERMS_PER_SET
+        );
+
+        assert_eq!(
+            PRESET_R18_QUERY,
+            format!("tag IN ({}) >= 0.45", PRESET_R18_TAGS.join(", "))
+        );
+        assert_eq!(
+            PRESET_SENSITIVE_QUERY,
+            format!("tag IN ({}) >= 0.45", PRESET_SENSITIVE_TAGS.join(", "))
+        );
+        assert_eq!(
+            PRESET_EXTREME_QUERY,
+            format!("tag IN ({}) >= 0.45", PRESET_EXTREME_TAGS.join(", "))
+        );
+
+        // Zero overlap between the 3 presets and exact union with BUILTIN_SAFETY_PRESET_TAGS
+        let r18_set: HashSet<&str> = PRESET_R18_TAGS.iter().copied().collect();
+        let sens_set: HashSet<&str> = PRESET_SENSITIVE_TAGS.iter().copied().collect();
+        let ext_set: HashSet<&str> = PRESET_EXTREME_TAGS.iter().copied().collect();
+        assert_eq!(r18_set.len(), PRESET_R18_TAGS.len());
+        assert_eq!(sens_set.len(), PRESET_SENSITIVE_TAGS.len());
+        assert_eq!(ext_set.len(), PRESET_EXTREME_TAGS.len());
+        assert!(r18_set.is_disjoint(&sens_set));
+        assert!(r18_set.is_disjoint(&ext_set));
+        assert!(sens_set.is_disjoint(&ext_set));
+
+        let mut expected_union: HashSet<&str> =
+            ["general", "sensitive", "questionable", "explicit"].into_iter().collect();
+        expected_union.extend(&r18_set);
+        expected_union.extend(&sens_set);
+        expected_union.extend(&ext_set);
+        let actual_union: HashSet<&str> = BUILTIN_SAFETY_PRESET_TAGS.iter().copied().collect();
+        assert_eq!(actual_union.len(), BUILTIN_SAFETY_PRESET_TAGS.len());
+        assert_eq!(actual_union, expected_union);
+        assert_eq!(BUILTIN_SAFETY_PRESET_TAGS.len(), 84);
+
         for &preset_tag in BUILTIN_SAFETY_PRESET_TAGS {
             assert!(
                 is_canonical_wd_tag(preset_tag),

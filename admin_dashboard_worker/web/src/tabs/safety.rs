@@ -471,7 +471,7 @@ pub fn SafetyTab(
                     if is_empty {
                         view! {
                             <div class="adm-empty-card">
-                                "No content policies configured yet. Click a WD-Tagger preset button above (+ NSFW, + Suggestive / Ecchi, + Blood / Violence) or + Custom Policy to create one."
+                                "No content policies configured yet. Click a WD-Tagger preset button above (+ NSFW / Explicit, + Sensitive / Niche, + Extreme / Illegal) or + Custom Policy to create one."
                             </div>
                         }.into_any()
                     } else {
@@ -506,7 +506,9 @@ pub fn SafetyTab(
                                         let exclude_anon = card.exclude_anonymous;
                                         let exclude_countries_text = card.exclude_countries_text;
                                         let card_for_selector = card.clone();
+                                        let card_for_selector_title = card.clone();
                                         let card_for_bypass = card.clone();
+                                        let card_for_bypass_title = card.clone();
 
                                         let threshold_defaults = Signal::derive(move || QueryThresholdDefaults {
                                             tag_min_score: Some(default_tag_min.get()),
@@ -549,15 +551,41 @@ pub fn SafetyTab(
                                             {
                                                 name_sig.set(tpl.label.clone());
                                             }
-                                            match tpl.default_mode {
-                                                UiRuleMode::SpoilerBlur => {
-                                                    action_sig.set(PolicyAction::Blur);
-                                                    include_click.set(true);
-                                                }
-                                                UiRuleMode::Switcher => {
+                                            match tpl.preset {
+                                                GalleryMaskPreset::R18 => {
                                                     action_sig.set(PolicyAction::Block);
+                                                    include_switcher.set(true);
                                                     include_click.set(false);
+                                                    require_login.set(true);
+                                                    require_terms.set(true);
+                                                    exclude_anon.set(true);
                                                 }
+                                                GalleryMaskPreset::Sensitive => {
+                                                    action_sig.set(PolicyAction::Blur);
+                                                    include_switcher.set(true);
+                                                    include_click.set(true);
+                                                    require_login.set(false);
+                                                    require_terms.set(false);
+                                                    exclude_anon.set(false);
+                                                }
+                                                GalleryMaskPreset::Blood => {
+                                                    action_sig.set(PolicyAction::Block);
+                                                    include_switcher.set(false);
+                                                    include_click.set(false);
+                                                    require_login.set(false);
+                                                    require_terms.set(false);
+                                                    exclude_anon.set(false);
+                                                }
+                                                GalleryMaskPreset::Custom => match tpl.default_mode {
+                                                    UiRuleMode::SpoilerBlur => {
+                                                        action_sig.set(PolicyAction::Blur);
+                                                        include_click.set(true);
+                                                    }
+                                                    UiRuleMode::Switcher => {
+                                                        action_sig.set(PolicyAction::Block);
+                                                        include_click.set(false);
+                                                    }
+                                                },
                                             }
                                             draft.dirty.set(true);
                                         });
@@ -615,10 +643,16 @@ pub fn SafetyTab(
                                                                 PolicyAction::Blur => "Blur",
                                                             }}
                                                         </span>
-                                                        <span class="adm-policy-selector-summary adm-mono">
+                                                        <span
+                                                            class="adm-policy-selector-summary adm-mono"
+                                                            title=move || card_for_selector_title.selector_summary()
+                                                        >
                                                             {move || card_for_selector.selector_summary()}
                                                         </span>
-                                                        <span class="adm-policy-bypass-summary">
+                                                        <span
+                                                            class="adm-policy-bypass-summary"
+                                                            title=move || card_for_bypass_title.bypass_summary()
+                                                        >
                                                             {move || card_for_bypass.bypass_summary()}
                                                         </span>
                                                     </button>
@@ -728,9 +762,9 @@ pub fn SafetyTab(
                                                                         draft.dirty.set(true);
                                                                     }
                                                                 >
-                                                                    <option value="r18">"R-18 (Yellow 18+ badge)"</option>
-                                                                    <option value="sensitive">"Sensitive (Purple Eye-off)"</option>
-                                                                    <option value="blood">"Blood / Violence (Red Warning)"</option>
+                                                                    <option value="r18">"R-18 / NSFW (Yellow 18+ badge)"</option>
+                                                                    <option value="sensitive">"Sensitive / Niche (Purple Eye-off)"</option>
+                                                                    <option value="blood">"Extreme / Gore & Illegal (Red Warning)"</option>
                                                                     <option value="custom">"Custom Shield"</option>
                                                                 </select>
                                                             </label>

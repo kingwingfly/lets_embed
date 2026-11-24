@@ -681,30 +681,30 @@ pub fn SearchBar() -> impl IntoView {
 
     let bar_row_cls = move || {
         if is_home() {
-            "flex flex-wrap xl:flex-nowrap w-full items-center gap-x-1.5 sm:gap-x-2 gap-y-1.5 sm:gap-y-2 py-2 sm:py-2.5 px-2.5 sm:px-3.5"
+            "web-nav-row flex flex-wrap xl:flex-nowrap w-full items-center gap-x-1.5 sm:gap-x-2 gap-y-1.5 sm:gap-y-2 py-2 sm:py-2.5 px-2.5 sm:px-3.5"
         } else {
-            "flex flex-wrap lg:flex-nowrap w-full items-center gap-x-1.5 sm:gap-x-2 gap-y-1.5 sm:gap-y-2 py-2 sm:py-2.5 px-2.5 sm:px-3.5"
+            "web-nav-row flex flex-wrap lg:flex-nowrap w-full items-center gap-x-1.5 sm:gap-x-2 gap-y-1.5 sm:gap-y-2 py-2 sm:py-2.5 px-2.5 sm:px-3.5"
         }
     };
     let account_slot_cls = move || {
         if is_home() {
-            "order-2 md:order-3 xl:order-5 ml-auto md:ml-0 shrink-0"
+            "web-nav-account-slot order-2 md:order-3 xl:order-5 ml-auto md:ml-0 shrink-0"
         } else {
-            "order-2 md:order-3 lg:order-5 ml-auto md:ml-0 shrink-0"
+            "web-nav-account-slot order-2 md:order-3 lg:order-5 ml-auto md:ml-0 shrink-0"
         }
     };
     let row_break_cls = move || {
         if is_home() {
-            "hidden md:block xl:hidden basis-full h-0 -my-1 order-4"
+            "web-nav-row-break hidden md:block xl:hidden basis-full h-0 -my-1 order-4"
         } else {
-            "hidden md:block lg:hidden basis-full h-0 -my-1 order-4"
+            "web-nav-row-break hidden md:block lg:hidden basis-full h-0 -my-1 order-4"
         }
     };
     let actions_slot_cls = move || {
         if is_home() {
-            "md:order-6 xl:order-3 ml-auto xl:ml-0 flex items-center gap-1 sm:gap-2 shrink-0"
+            "web-nav-actions-slot md:order-6 xl:order-3 ml-auto xl:ml-0 flex items-center gap-1 sm:gap-2 shrink-0"
         } else {
-            "md:order-6 lg:order-3 ml-auto lg:ml-0 flex items-center gap-1 sm:gap-2 shrink-0"
+            "web-nav-actions-slot md:order-6 lg:order-3 ml-auto lg:ml-0 flex items-center gap-1 sm:gap-2 shrink-0"
         }
     };
 
@@ -716,17 +716,17 @@ pub fn SearchBar() -> impl IntoView {
     let nav_clear = navigate;
 
     view! {
-        <header class="sticky top-2 sm:top-3 z-40 w-full px-2 sm:px-3.5 mt-2 sm:mt-3 pointer-events-none">
+        <header class="web-site-header sticky top-2 sm:top-3 z-40 w-full px-2 sm:px-3.5 mt-2 sm:mt-3 pointer-events-none">
             <div
                 node_ref=header_card_ref
-                class="floating-nav-card pointer-events-auto relative flex flex-col w-full max-w-[1640px] mx-auto"
+                class="web-nav-card floating-nav-card pointer-events-auto relative flex flex-col w-full max-w-[1640px] mx-auto"
             >
                 <div class=bar_row_cls>
                     // Brand logo
                     <a
                         href="/"
                         on:click=move |_| adv_open.set(false)
-                        class="order-1 font-display text-lg sm:text-2xl font-bold text-left shrink-0 whitespace-nowrap
+                        class="web-brand-link order-1 font-display text-lg sm:text-2xl font-bold text-left shrink-0 whitespace-nowrap
                             bg-gradient-to-r from-sky-500 via-blue-500 to-cyan-400 bg-clip-text text-transparent
                             drop-shadow-sm hover:scale-105 transition-transform"
                     >
@@ -735,10 +735,10 @@ pub fn SearchBar() -> impl IntoView {
 
                     // Unified Web-of-Science pill search form (Posts only: Title & Author, Title, Author)
                     <form
-                        class="order-3 md:order-2 flex w-full md:w-auto md:flex-1 min-w-0 items-center"
+                        class="web-search-form order-3 md:order-2 flex w-full md:w-auto md:flex-1 min-w-0 items-center"
                         on:submit=submit
                     >
-                        <div class="relative flex flex-1 min-w-0 items-center bg-white border border-sky-200 rounded-full
+                        <div class="web-search-pill relative flex flex-1 min-w-0 items-center bg-white border border-sky-200 rounded-full
                                     shadow-xs shadow-sky-100/80 focus-within:border-sky-400 focus-within:ring-2
                                     focus-within:ring-sky-200/80 transition">
                             // Custom themed field dropdown (floats cleanly below rounded pill)
@@ -770,7 +770,7 @@ pub fn SearchBar() -> impl IntoView {
                             />
 
                             // Spacious input + inline clear button
-                            <div class="relative flex-1 min-w-0 flex items-center">
+                            <div class="web-search-input-wrap relative flex-1 min-w-0 flex items-center">
                                 <input
                                     role="combobox"
                                     aria-label="Search posts"
@@ -782,7 +782,7 @@ pub fn SearchBar() -> impl IntoView {
                                             .then(|| active_idx.get().map(|i| format!("search-opt-{i}")))
                                             .flatten()
                                     }
-                                    class="w-full min-w-0 bg-transparent py-2 pl-3 pr-8 text-sm sm:text-[15px] outline-none
+                                    class="web-search-input w-full min-w-0 bg-transparent py-2 pl-3 pr-8 text-sm sm:text-[15px] outline-none
                                            text-slate-700 placeholder:text-sky-400/75"
                                     autocomplete="off"
                                     placeholder=move || match field_mode.get() {
@@ -863,7 +863,7 @@ pub fn SearchBar() -> impl IntoView {
                                         type="button"
                                         aria-label="Clear search"
                                         title="Clear"
-                                        class="absolute right-1.5 top-1/2 -translate-y-1/2 w-6 h-6 rounded-full
+                                        class="web-search-clear-btn absolute right-1.5 top-1/2 -translate-y-1/2 w-6 h-6 rounded-full
                                                flex items-center justify-center text-sky-400 hover:text-sky-700
                                                hover:bg-sky-100 transition-colors cursor-pointer"
                                         on:mousedown=|ev| ev.prevent_default()
@@ -881,7 +881,7 @@ pub fn SearchBar() -> impl IntoView {
                             // Primary Search button inside right edge of WoS pill
                             <button
                                 type="submit"
-                                class="shrink-0 m-0.5 bg-gradient-to-r from-sky-400 to-blue-500 text-white text-xs sm:text-sm font-medium
+                                class="web-search-submit-btn shrink-0 m-0.5 bg-gradient-to-r from-sky-400 to-blue-500 text-white text-xs sm:text-sm font-medium
                                        rounded-full py-1.5 sm:py-2 px-3.5 sm:px-4 shadow-sm shadow-sky-300/60
                                        hover:from-sky-500 hover:to-blue-600 active:scale-95 transition-all cursor-pointer"
                             >
@@ -900,7 +900,7 @@ pub fn SearchBar() -> impl IntoView {
                                             id="search-suggestions"
                                             role="listbox"
                                             on:mousedown=|ev| ev.prevent_default()
-                                            class="absolute left-0 right-0 top-full mt-2 z-50 max-h-72 overflow-y-auto overscroll-contain
+                                            class="web-search-suggestions absolute left-0 right-0 top-full mt-2 z-50 max-h-72 overflow-y-auto overscroll-contain
                                                    rounded-2xl bg-white/95 backdrop-blur-md ring-1 ring-sky-200/90
                                                    shadow-xl shadow-sky-200/60 p-1.5 flex flex-col gap-0.5"
                                         >
@@ -926,9 +926,9 @@ pub fn SearchBar() -> impl IntoView {
                                                         role="option"
                                                         aria-selected=move || (active_idx.get() == Some(i)).to_string()
                                                         class=move || if active_idx.get() == Some(i) {
-                                                            "w-full text-left px-3 py-2 rounded-xl flex flex-col gap-0.5 bg-sky-100/90 text-sky-900 cursor-pointer transition-colors"
+                                                            "web-search-suggestion-item is-active w-full text-left px-3 py-2 rounded-xl flex flex-col gap-0.5 bg-sky-100/90 text-sky-900 cursor-pointer transition-colors"
                                                         } else {
-                                                            "w-full text-left px-3 py-2 rounded-xl flex flex-col gap-0.5 hover:bg-sky-50 text-slate-700 cursor-pointer transition-colors"
+                                                            "web-search-suggestion-item w-full text-left px-3 py-2 rounded-xl flex flex-col gap-0.5 hover:bg-sky-50 text-slate-700 cursor-pointer transition-colors"
                                                         }
                                                         on:mousedown=|ev| ev.prevent_default()
                                                         on:mouseenter=move |_| active_idx.set(Some(i))
@@ -967,9 +967,9 @@ pub fn SearchBar() -> impl IntoView {
 
                     // Balanced toolbar row on mobile (<md): Density left, View Mode (Random) + Advanced right.
                     // Unwraps via `md:contents` on tablet/desktop to participate directly in the flex order.
-                    <div class="order-4 w-full flex items-center justify-between gap-1.5 min-w-0 md:contents">
+                    <div class="web-nav-toolbar-row order-4 w-full flex items-center justify-between gap-1.5 min-w-0 md:contents">
                         {move || is_home().then(|| view! {
-                            <div class="md:order-5 xl:order-4 shrink-0">
+                            <div class="web-nav-density-slot md:order-5 xl:order-4 shrink-0">
                                 <DensityPicker density=density persist=true />
                             </div>
                         })}
@@ -982,21 +982,21 @@ pub fn SearchBar() -> impl IntoView {
                                 let roll_posts = go_random_posts.clone();
                                 let roll_images = go_random_images.clone();
                                 let posts_cls = if cur_target == "posts" {
-                                    "px-2 sm:px-2.5 py-1 rounded-full text-[11px] sm:text-xs font-semibold bg-sky-500 text-white shadow-xs transition-all cursor-pointer"
+                                    "web-random-posts-btn is-active px-2 sm:px-2.5 py-1 rounded-full text-[11px] sm:text-xs font-semibold bg-sky-500 text-white shadow-xs transition-all cursor-pointer"
                                 } else {
-                                    "px-2 sm:px-2.5 py-1 rounded-full text-[11px] sm:text-xs font-medium text-sky-700 hover:bg-sky-200/70 transition-all cursor-pointer"
+                                    "web-random-posts-btn px-2 sm:px-2.5 py-1 rounded-full text-[11px] sm:text-xs font-medium text-sky-700 hover:bg-sky-200/70 transition-all cursor-pointer"
                                 };
                                 let images_cls = if cur_target == "images" {
-                                    "px-2 sm:px-2.5 py-1 rounded-full text-[11px] sm:text-xs font-semibold bg-sky-500 text-white shadow-xs transition-all cursor-pointer"
+                                    "web-random-images-btn is-active px-2 sm:px-2.5 py-1 rounded-full text-[11px] sm:text-xs font-semibold bg-sky-500 text-white shadow-xs transition-all cursor-pointer"
                                 } else {
-                                    "px-2 sm:px-2.5 py-1 rounded-full text-[11px] sm:text-xs font-medium text-sky-700 hover:bg-sky-200/70 transition-all cursor-pointer"
+                                    "web-random-images-btn px-2 sm:px-2.5 py-1 rounded-full text-[11px] sm:text-xs font-medium text-sky-700 hover:bg-sky-200/70 transition-all cursor-pointer"
                                 };
                                 view! {
-                                    <div class="inline-flex items-center gap-0.5 p-0.5 rounded-full bg-sky-100/90 ring-1 ring-sky-200/90">
+                                    <div class="web-random-group inline-flex items-center gap-0.5 p-0.5 rounded-full bg-sky-100/90 ring-1 ring-sky-200/90">
                                         <button
                                             type="button"
                                             title="Re-roll random shuffle"
-                                            class="inline-flex items-center gap-1 px-1.5 sm:px-2.5 py-1 rounded-full text-xs font-semibold
+                                            class="web-random-reroll-btn inline-flex items-center gap-1 px-1.5 sm:px-2.5 py-1 rounded-full text-xs font-semibold
                                                    text-sky-700 hover:bg-white/80 transition-colors cursor-pointer whitespace-nowrap"
                                             on:click=move |_| reroll(cur_target)
                                         >
@@ -1027,7 +1027,7 @@ pub fn SearchBar() -> impl IntoView {
                                     <button
                                         type="button"
                                         title="Roll random posts"
-                                        class="inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1.5 sm:py-2 rounded-full text-xs sm:text-sm
+                                        class="web-random-btn inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1.5 sm:py-2 rounded-full text-xs sm:text-sm
                                                font-medium text-sky-700 bg-sky-50 hover:bg-sky-100 ring-1 ring-sky-200/90
                                                active:scale-95 transition-all cursor-pointer whitespace-nowrap"
                                         on:click=move |_| roll("posts")
@@ -1045,11 +1045,11 @@ pub fn SearchBar() -> impl IntoView {
                                 title="Open Advanced Query Builder (Tag, Author, Title, CLIP, Visual)"
                                 class=move || {
                                     if adv_open.get() || has_active_advanced() {
-                                        "relative inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1.5 sm:py-2 rounded-full text-[11.5px] sm:text-sm \
+                                        "web-advanced-btn is-active relative inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1.5 sm:py-2 rounded-full text-[11.5px] sm:text-sm \
                                          font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 ring-1 ring-indigo-300 \
                                          shadow-xs shadow-indigo-200/50 active:scale-95 transition-all cursor-pointer whitespace-nowrap"
                                     } else {
-                                        "relative inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1.5 sm:py-2 rounded-full text-[11.5px] sm:text-sm \
+                                        "web-advanced-btn relative inline-flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1.5 sm:py-2 rounded-full text-[11.5px] sm:text-sm \
                                          font-medium text-slate-700 bg-white hover:bg-sky-50 hover:text-sky-700 ring-1 ring-sky-200 \
                                          active:scale-95 transition-all cursor-pointer whitespace-nowrap"
                                     }
@@ -1104,28 +1104,28 @@ pub fn SearchBar() -> impl IntoView {
                             let query_title = summary.query_text.clone();
                             let query_display = summary.query_text;
                             view! {
-                                <div class="w-full bg-gradient-to-r from-sky-50/90 via-indigo-50/70 to-sky-50/90 border-t border-sky-200/70 rounded-b-[19px]">
-                                    <div class="px-3 sm:px-4 py-1.5 flex items-center gap-2 min-w-0">
+                                <div class="web-query-summary-strip w-full bg-gradient-to-r from-sky-50/90 via-indigo-50/70 to-sky-50/90 border-t border-sky-200/70 rounded-b-[19px]">
+                                    <div class="web-query-summary-row px-3 sm:px-4 py-1.5 flex items-center gap-2 min-w-0">
                                         <span class=format!(
-                                            "shrink-0 px-2 py-0.5 rounded-full text-[11px] font-semibold ring-1 whitespace-nowrap {kind_cls}"
+                                            "web-query-summary-kind shrink-0 px-2 py-0.5 rounded-full text-[11px] font-semibold ring-1 whitespace-nowrap {kind_cls}"
                                         )>
                                             {kind_label}
                                         </span>
                                         {summary.meta_badge.map(|b| view! {
-                                            <span class="shrink-0 px-2 py-0.5 rounded-full text-[11px] font-medium bg-white/85 text-slate-600 ring-1 ring-slate-200 whitespace-nowrap">
+                                            <span class="web-query-summary-meta shrink-0 px-2 py-0.5 rounded-full text-[11px] font-medium bg-white/85 text-slate-600 ring-1 ring-slate-200 whitespace-nowrap">
                                                 {b}
                                             </span>
                                         })}
                                         <code
                                             title=query_title
-                                            class="flex-1 min-w-0 truncate text-xs sm:text-[13px] font-mono text-slate-700 bg-white/75
+                                            class="web-query-summary-code flex-1 min-w-0 truncate text-xs sm:text-[13px] font-mono text-slate-700 bg-white/75
                                                    px-2.5 py-0.5 rounded-lg ring-1 ring-sky-200/60"
                                         >
                                             {query_display}
                                         </code>
                                         <button
                                             type="button"
-                                            class="shrink-0 px-2.5 py-1 rounded-full text-xs font-semibold text-indigo-700
+                                            class="web-query-summary-edit-btn shrink-0 px-2.5 py-1 rounded-full text-xs font-semibold text-indigo-700
                                                    bg-white hover:bg-indigo-50 ring-1 ring-indigo-200 transition-colors cursor-pointer whitespace-nowrap"
                                             on:click=move |_| adv_open.set(true)
                                         >
@@ -1133,7 +1133,7 @@ pub fn SearchBar() -> impl IntoView {
                                         </button>
                                         <button
                                             type="button"
-                                            class="shrink-0 px-2.5 py-1 rounded-full text-xs font-medium text-slate-600
+                                            class="web-query-summary-clear-btn shrink-0 px-2.5 py-1 rounded-full text-xs font-medium text-slate-600
                                                    hover:text-rose-600 hover:bg-rose-50 ring-1 ring-slate-200/80
                                                    transition-colors cursor-pointer whitespace-nowrap"
                                             on:click=move |_| {
@@ -1181,8 +1181,8 @@ pub fn SearchBar() -> impl IntoView {
             let html = safety.notice_banner_html.get()?;
             let dismiss_key = safety.notice_banner_key.get();
             Some(view! {
-                <div class="w-full px-2 sm:px-3.5 mt-2">
-                    <div class="max-w-[1640px] mx-auto">
+                <div class="web-notice-banner-slot w-full px-2 sm:px-3.5 mt-2">
+                    <div class="web-notice-banner-inner max-w-[1640px] mx-auto">
                         {if dismiss_key.is_empty() {
                             view! {
                                 <NoticeBanner

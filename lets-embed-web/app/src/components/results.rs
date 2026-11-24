@@ -1048,7 +1048,7 @@ pub fn Results(
             let is_locked = lower.contains("locked") || lower.contains("403");
             if is_locked {
                 return view! {
-                    <div class="w-full max-w-md mx-auto my-6 px-5 py-4 rounded-2xl bg-sky-50/90 ring-1 ring-sky-200
+                    <div class="web-results-locked w-full max-w-md mx-auto my-6 px-5 py-4 rounded-2xl bg-sky-50/90 ring-1 ring-sky-200
                                 text-center text-slate-600 shadow-sm flex flex-col items-center gap-2">
                         <p class="text-sm font-medium text-sky-800">
                             "Visual similarity is unavailable while this item is locked under your current safety settings."
@@ -1065,7 +1065,7 @@ pub fn Results(
                     || lower.contains("/user/upgrade"));
             if is_allowance {
                 return view! {
-                    <div class="w-full max-w-md mx-auto my-6 px-5 py-4 rounded-2xl bg-sky-50/90 ring-1 ring-sky-200
+                    <div class="web-results-allowance w-full max-w-md mx-auto my-6 px-5 py-4 rounded-2xl bg-sky-50/90 ring-1 ring-sky-200
                                 text-center text-slate-600 shadow-sm flex flex-col items-center gap-2.5">
                         <p class="text-sm font-medium text-sky-800">
                             "Sign in or upgrade to explore visually similar images."
@@ -1073,7 +1073,7 @@ pub fn Results(
                         <a
                             href="/user/upgrade"
                             rel="external"
-                            class="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-full text-sm font-medium
+                            class="web-results-upgrade-btn inline-flex items-center gap-1.5 px-4 py-1.5 rounded-full text-sm font-medium
                                    bg-gradient-to-r from-sky-400 to-blue-500 text-white shadow-sm
                                    hover:from-sky-500 hover:to-blue-600 transition-all"
                         >
@@ -1084,12 +1084,12 @@ pub fn Results(
                 .into_any();
             }
             view! {
-                <div class="w-full max-w-md mx-auto my-4 px-5 py-4 rounded-2xl bg-rose-50/90 ring-1 ring-rose-200
+                <div class="web-results-error w-full max-w-md mx-auto my-4 px-5 py-4 rounded-2xl bg-rose-50/90 ring-1 ring-rose-200
                             text-center text-rose-600 shadow-sm flex flex-col items-center gap-2.5">
                     <p class="text-sm font-medium break-words">{format!("Error: {e}")}</p>
                     <button
                         type="button"
-                        class="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-full text-sm font-medium
+                        class="web-results-retry-btn inline-flex items-center gap-1.5 px-4 py-1.5 rounded-full text-sm font-medium
                                bg-white text-rose-600 ring-1 ring-rose-300 hover:bg-rose-100/70
                                active:scale-95 transition-all cursor-pointer"
                         on:click=move |_| {
@@ -1108,7 +1108,7 @@ pub fn Results(
     let loading_view = move || {
         loading.get().then(|| {
             view! {
-                <div class="w-full text-sky-500 p-4 text-center animate-pulse">"Loading\u{2026} \u{1f4ab}"</div>
+                <div class="web-results-loading w-full text-sky-500 p-4 text-center animate-pulse">"Loading\u{2026} \u{1f4ab}"</div>
             }
         })
     };
@@ -1213,17 +1213,17 @@ pub fn Results(
             };
 
             view! {
-                <div class="w-full max-w-md mx-auto my-10 p-6 rounded-2xl bg-white/80 ring-1 ring-sky-200
+                <div class="web-results-empty w-full max-w-md mx-auto my-10 p-6 rounded-2xl bg-white/80 ring-1 ring-sky-200
                             text-center text-slate-600 shadow-sm shadow-sky-200/40">
                     <div class="text-2xl mb-1">"\u{1F50D}"</div>
                     <p class="font-semibold text-sky-800">{heading}</p>
                     <p class="text-sm text-slate-500 mt-1">{hint}</p>
                     {(tag_cta_href.is_some() || clip_cta_href.is_some()).then(|| view! {
-                        <div class="flex flex-wrap items-center justify-center gap-2 mt-4">
+                        <div class="web-results-empty-actions flex flex-wrap items-center justify-center gap-2 mt-4">
                             {tag_cta_href.map(|href| view! {
                                 <a
                                     href=href
-                                    class="inline-flex items-center gap-1 px-4 py-1.5 rounded-full text-sm font-medium
+                                    class="web-results-cta-tag inline-flex items-center gap-1 px-4 py-1.5 rounded-full text-sm font-medium
                                            bg-sky-100 text-sky-700 ring-1 ring-sky-200
                                            hover:bg-sky-200/80 transition-all"
                                 >
@@ -1233,7 +1233,7 @@ pub fn Results(
                             {clip_cta_href.map(|href| view! {
                                 <a
                                     href=href
-                                    class="inline-flex items-center gap-1 px-4 py-1.5 rounded-full text-sm font-medium
+                                    class="web-results-cta-clip inline-flex items-center gap-1 px-4 py-1.5 rounded-full text-sm font-medium
                                            bg-gradient-to-r from-sky-400 to-blue-500 text-white shadow-sm
                                            hover:from-sky-500 hover:to-blue-600 transition-all"
                                 >
@@ -1254,7 +1254,7 @@ pub fn Results(
             && columns.with(|cs| cs.iter().any(|c| !c.items.is_empty())))
         .then(|| {
             view! {
-                <div class="w-full text-sky-400 p-4 text-center">"\u{2014} \u{1f33f} \u{2014}"</div>
+                <div class="web-results-end w-full text-sky-400 p-4 text-center">"\u{2014} \u{1f33f} \u{2014}"</div>
             }
         })
     };
@@ -1272,9 +1272,9 @@ pub fn Results(
     };
 
     let wrap_cls = if embedded {
-        "gallery-wrap gallery-embedded flex flex-col"
+        "web-results-wrap web-results-wrap--embedded gallery-wrap gallery-embedded flex flex-col"
     } else {
-        "gallery-wrap flex flex-col"
+        "web-results-wrap gallery-wrap flex flex-col"
     };
 
     let has_masonry_items =
@@ -1466,13 +1466,13 @@ pub fn Results(
         })}
         <div node_ref=size_el class=wrap_cls>
             {embedded.then(|| view! {
-                <div class="gallery-floating-bar flex-wrap gap-2">
+                <div class="web-results-toolbar gallery-floating-bar flex-wrap gap-2">
                     {heading.map(|h| view! {
-                        <h2 class="text-sky-700 text-base sm:text-lg md:text-xl font-semibold leading-tight m-0">
+                        <h2 class="web-results-heading text-sky-700 text-base sm:text-lg md:text-xl font-semibold leading-tight m-0">
                             {h}
                         </h2>
                     })}
-                    <div class="ml-auto flex flex-wrap items-center gap-2 sm:gap-3">
+                    <div class="web-results-toolbar-controls ml-auto flex flex-wrap items-center gap-2 sm:gap-3">
                         <MinSimilaritySlider
                             value=sim_slider
                             label="Min sim"
@@ -1487,13 +1487,13 @@ pub fn Results(
                 </div>
             })}
             {ssr_fallback_view}
-            <div class="gallery-masonry">
+            <div class="web-results-masonry gallery-masonry">
                 <For
                     each=move || 0..col_count.get()
                     key=|i| *i
                     let(i)
                 >
-                    <div class="gallery-col">
+                    <div class="web-results-col gallery-col">
                         <For
                             each=move || {
                                 columns
@@ -1516,7 +1516,7 @@ pub fn Results(
                 </For>
             </div>
 
-            <div node_ref=sentinel class="w-full min-h-10"></div>
+            <div node_ref=sentinel class="web-results-sentinel w-full min-h-10"></div>
 
             {loading_view}
             {error_view}

@@ -849,7 +849,7 @@ body {
   min-width: 0;
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 8px 10px;
   padding: 4px 6px 4px 2px;
   border: 0;
@@ -859,6 +859,7 @@ body {
   font: inherit;
   text-align: left;
   cursor: pointer;
+  overflow: hidden;
   transition: background 0.14s ease;
 }
 
@@ -881,9 +882,13 @@ body {
 }
 
 .adm-policy-summary-name {
+  flex: 0 0 auto;
+  max-width: 240px;
   font-size: 14.5px;
   font-weight: 700;
   color: var(--adm-ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -946,13 +951,15 @@ body {
 }
 
 .adm-policy-selector-summary {
+  flex: 0 1 320px;
+  min-width: 64px;
   font-size: 12px;
   color: var(--adm-muted);
   background: #f1f7fc;
   border: 1px solid #dcebf7;
   padding: 2px 8px;
   border-radius: 8px;
-  max-width: 340px;
+  max-width: 320px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -960,9 +967,13 @@ body {
 }
 
 .adm-policy-bypass-summary {
+  flex: 0 0 auto;
+  max-width: 280px;
   font-size: 12px;
   font-weight: 600;
   color: #365976;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -1621,6 +1632,17 @@ body {
 }
 
 @media (max-width: 960px) {
+  .adm-policy-summary-bar {
+    flex-wrap: wrap;
+  }
+  .adm-policy-toggle-btn {
+    flex-wrap: wrap;
+    overflow: visible;
+  }
+  .adm-policy-selector-summary {
+    flex: 0 1 auto;
+    max-width: 100%;
+  }
   .adm-policy-lower-grid {
     grid-template-columns: 1fr;
   }

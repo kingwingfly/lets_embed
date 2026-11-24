@@ -209,16 +209,16 @@ pub fn AccountWidget() -> impl IntoView {
             format!("{base} opacity-0 scale-95 pointer-events-none invisible")
         }
     };
-    let card_cls = "bg-white/95 backdrop-blur-md rounded-2xl ring-1 ring-sky-200 \
+    let card_cls = "web-account-menu-card bg-white/95 backdrop-blur-md rounded-2xl ring-1 ring-sky-200 \
         shadow-lg shadow-sky-200/50 p-4 text-sm text-slate-700";
 
     view! {
-        <div node_ref=root_ref class="relative flex items-center gap-1.5 shrink-0">
+        <div node_ref=root_ref class="web-account-widget relative flex items-center gap-1.5 shrink-0">
             {move || matches!(state.get(), Some(AccountState::Loaded(_))).then(|| view! {
                 <a
                     href="/user/favorites"
                     rel="external"
-                    class="flex items-center gap-1 rounded-full py-1.5 sm:py-2 px-2.5 sm:px-3 bg-white/85 backdrop-blur-md
+                    class="web-account-favorites-btn flex items-center gap-1 rounded-full py-1.5 sm:py-2 px-2.5 sm:px-3 bg-white/85 backdrop-blur-md
                         ring-1 ring-sky-200 shadow-sm shadow-sky-200/50 text-sky-600 font-medium
                         hover:ring-sky-300 hover:text-amber-500 hover:scale-105 transition-all whitespace-nowrap"
                     title="Favorites"
@@ -234,7 +234,7 @@ pub fn AccountWidget() -> impl IntoView {
                 aria-expanded=move || open.get().to_string()
                 aria-controls="account-menu-panel"
                 on:click=move |_| open.update(|o| *o = !*o)
-                class="flex items-center gap-1.5 rounded-full py-1.5 sm:py-2 px-2.5 sm:px-3 bg-white/80 backdrop-blur-md
+                class="web-account-trigger flex items-center gap-1.5 rounded-full py-1.5 sm:py-2 px-2.5 sm:px-3 bg-white/80 backdrop-blur-md
                     ring-1 ring-sky-200 shadow-sm shadow-sky-200/50 text-sky-600 font-medium
                     hover:ring-sky-300 hover:scale-105 transition-all cursor-pointer whitespace-nowrap"
                 title="Account"
@@ -242,23 +242,23 @@ pub fn AccountWidget() -> impl IntoView {
                 <span class="text-base sm:text-lg leading-none select-none">"\u{1F464}"</span>
                 {move || match state.get() {
                     Some(AccountState::Loaded(acc)) => view! {
-                        <span class="tabular-nums text-sm">
+                        <span class="web-account-balance tabular-nums text-sm">
                             <span class="select-none">"\u{1FA99} "</span>
                             {acc.balance.clone()}
                         </span>
                     }.into_any(),
                     Some(AccountState::SignedOut) => view! {
-                        <span class="text-sky-500 text-sm">"Sign in"</span>
+                        <span class="web-account-signin-label text-sky-500 text-sm">"Sign in"</span>
                     }.into_any(),
                     None => view! {
-                        <span class="text-sky-300 select-none">"\u{2026}"</span>
+                        <span class="web-account-loading text-sky-300 select-none">"\u{2026}"</span>
                     }.into_any(),
                 }}
             </button>
 
             <div
                 id="account-menu-panel"
-                class=panel_cls
+                class=move || format!("web-account-menu {}", panel_cls())
                 aria-hidden=move || (!open.get()).to_string()
                 inert=move || !open.get()
             >
@@ -270,24 +270,24 @@ pub fn AccountWidget() -> impl IntoView {
                         let views = fmt_usage(acc.views_remaining, has_plan);
                         let searches = fmt_usage(acc.searches_remaining, has_plan);
                         view! {
-                            <div class="flex items-center justify-between gap-2">
+                            <div class="web-account-row web-account-row--points flex items-center justify-between gap-2">
                                 <span class="text-sky-500">"Points"</span>
                                 <span class="font-semibold tabular-nums text-slate-800">
                                     {acc.balance.clone()}
                                 </span>
                             </div>
-                            <div class="flex items-center justify-between gap-2 mt-2">
+                            <div class="web-account-row web-account-row--plan flex items-center justify-between gap-2 mt-2">
                                 <span class="text-sky-500">"Plan"</span>
                                 <span class="font-medium text-slate-800 truncate max-w-[8rem]">
                                     {plan}
                                 </span>
                             </div>
                             <div class="my-2 h-px bg-gradient-to-r from-transparent via-sky-200 to-transparent" />
-                            <div class="flex items-center justify-between gap-2">
+                            <div class="web-account-row web-account-row--views flex items-center justify-between gap-2">
                                 <span class="text-sky-500">"Views left"</span>
                                 <span class="tabular-nums text-slate-800">{views}</span>
                             </div>
-                            <div class="flex items-center justify-between gap-2 mt-1">
+                            <div class="web-account-row web-account-row--searches flex items-center justify-between gap-2 mt-1">
                                 <span class="text-sky-500">"Searches left"</span>
                                 <span class="tabular-nums text-slate-800">{searches}</span>
                             </div>
@@ -295,7 +295,7 @@ pub fn AccountWidget() -> impl IntoView {
                                 href="/user/favorites"
                                 rel="external"
                                 on:click=move |_| open.set(false)
-                                class="block text-center mt-3 bg-sky-50 ring-1 ring-sky-200
+                                class="web-account-action web-account-action--favorites block text-center mt-3 bg-sky-50 ring-1 ring-sky-200
                                     text-sky-700 font-medium rounded-full py-1.5 px-4
                                     hover:bg-sky-100 transition-all"
                             >
@@ -305,7 +305,7 @@ pub fn AccountWidget() -> impl IntoView {
                                 href="/user/account#device-login"
                                 rel="external"
                                 on:click=move |_| open.set(false)
-                                class="block text-center mt-2 bg-sky-50 ring-1 ring-sky-200
+                                class="web-account-action web-account-action--device-login block text-center mt-2 bg-sky-50 ring-1 ring-sky-200
                                     text-sky-700 font-medium rounded-full py-1.5 px-4
                                     hover:bg-sky-100 transition-all"
                             >
@@ -315,7 +315,7 @@ pub fn AccountWidget() -> impl IntoView {
                                 href="/user/account"
                                 rel="external"
                                 on:click=move |_| open.set(false)
-                                class="block text-center mt-2 bg-gradient-to-r from-sky-400 to-blue-500
+                                class="web-account-action web-account-action--details block text-center mt-2 bg-gradient-to-r from-sky-400 to-blue-500
                                     text-white font-medium rounded-full py-1.5 px-4 shadow-sm shadow-sky-300/60
                                     hover:from-sky-500 hover:to-blue-600 transition-all"
                             >
@@ -324,13 +324,13 @@ pub fn AccountWidget() -> impl IntoView {
                         }.into_any()
                     }
                     Some(AccountState::SignedOut) => view! {
-                        <div class="flex flex-col gap-2">
+                        <div class="web-account-signed-out flex flex-col gap-2">
                             <span class="text-slate-600">"You\u{2019}re not signed in."</span>
                             <a
                                 href="/user/login"
                                 rel="external"
                                 on:click=move |_| open.set(false)
-                                class="text-center bg-gradient-to-r from-sky-400 to-blue-500 text-white
+                                class="web-account-action web-account-action--signin text-center bg-gradient-to-r from-sky-400 to-blue-500 text-white
                                     font-medium rounded-full py-1.5 px-4 shadow-sm shadow-sky-300/60
                                     hover:from-sky-500 hover:to-blue-600 transition-all"
                             >
@@ -339,7 +339,7 @@ pub fn AccountWidget() -> impl IntoView {
                         </div>
                     }.into_any(),
                     None => view! {
-                        <span class="text-sky-300">"Loading\u{2026}"</span>
+                        <span class="web-account-loading text-sky-300">"Loading\u{2026}"</span>
                     }.into_any(),
                 }}
                 </div>

@@ -697,7 +697,7 @@ pub fn LikeButton(
                 ),
             };
             format!(
-                "inline-flex items-center justify-center gap-1 h-8 min-w-8 px-2 rounded-full \
+                "web-like-btn web-like-btn--card web-like-btn--{kind} inline-flex items-center justify-center gap-1 h-8 min-w-8 px-2 rounded-full \
                  ring-1 backdrop-blur-xs shadow-sm text-base leading-none select-none \
                  cursor-pointer transition-all hover:scale-105 active:scale-95 {vis} {color}"
             )
@@ -710,7 +710,7 @@ pub fn LikeButton(
                 ),
             };
             format!(
-                "inline-flex items-center justify-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-full \
+                "web-like-btn web-like-btn--overlay web-like-btn--{kind} inline-flex items-center justify-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-full \
                  border text-xs sm:text-sm font-semibold leading-none select-none \
                  cursor-pointer transition-colors {color}"
             )
@@ -721,7 +721,7 @@ pub fn LikeButton(
                 _ => "text-sky-600 bg-sky-50/90 ring-sky-200 hover:bg-sky-100",
             };
             format!(
-                "inline-flex items-center justify-center gap-1.5 px-3 py-1 rounded-full \
+                "web-like-btn web-like-btn--inline web-like-btn--{kind} inline-flex items-center justify-center gap-1.5 px-3 py-1 rounded-full \
                  ring-1 text-sm md:text-base font-medium leading-none select-none \
                  cursor-pointer transition-all hover:scale-105 active:scale-95 {color}"
             )

@@ -18,10 +18,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use site_access::{
     AgeGateTrigger, AgeVerificationPolicy, AuthProviderId, AuthProviderPublicConfig, ChargeKind,
-    ContentPolicy, DEFAULT_POLICY_TAG_MIN, GeoPolicy, LegalDocConfig, PlaceholderPreset,
-    PolicyAction, PolicyBypass, PublicSitePolicy, SITE_POLICY_SCHEMA_VERSION, SimilarityDefaults,
-    compute_next_grant_generations, compute_next_min_enforce_rev, compute_policy_digest,
-    compute_terms_digest, is_eth_address, is_sol_principal, validate_policy_set_with_mode,
+    ContentPolicy, GeoPolicy, LegalDocConfig, PublicSitePolicy, SITE_POLICY_SCHEMA_VERSION,
+    SimilarityDefaults, compute_next_grant_generations, compute_next_min_enforce_rev,
+    compute_policy_digest, compute_terms_digest, is_eth_address, is_sol_principal,
+    validate_policy_set_with_mode,
 };
 use worker::{Env, Result};
 
@@ -791,74 +791,7 @@ pub fn validate_provider_updates(
 /// Built-in Policy v3 safety presets for the `/admin` builder using compact
 /// single-row `tag IN (...) >= 0.45` expressions (zero stacked `OR` clauses).
 pub fn compact_admin_safety_presets() -> Vec<ContentPolicy> {
-    vec![
-        ContentPolicy {
-            id: "r18".to_string(),
-            grant_generation: 1,
-            enabled: true,
-            priority: 10,
-            name: "NSFW / Explicit".to_string(),
-            preset: PlaceholderPreset::R18,
-            match_expr: "tag IN (explicit, nude, nipples, pussy, penis, sex, uncensored, censored, topless, bottomless) >= 0.45".to_string(),
-            except_expr: None,
-            default_tag_min: DEFAULT_POLICY_TAG_MIN,
-            action: PolicyAction::Block,
-            bypass: PolicyBypass {
-                include_switcher: true,
-                include_click: false,
-                include_live_admin: false,
-                require_gallery_login: true,
-                require_age_18: false,
-                require_current_terms: true,
-                exclude_anonymous: true,
-                exclude_countries: Vec::new(),
-            },
-        },
-        ContentPolicy {
-            id: "sensitive".to_string(),
-            grant_generation: 1,
-            enabled: true,
-            priority: 20,
-            name: "Suggestive / Ecchi".to_string(),
-            preset: PlaceholderPreset::Sensitive,
-            match_expr: "tag IN (questionable, sensitive, lingerie, bikini, underwear, panties, cleavage, bdsm) >= 0.45".to_string(),
-            except_expr: None,
-            default_tag_min: DEFAULT_POLICY_TAG_MIN,
-            action: PolicyAction::Blur,
-            bypass: PolicyBypass {
-                include_switcher: true,
-                include_click: true,
-                include_live_admin: false,
-                require_gallery_login: false,
-                require_age_18: false,
-                require_current_terms: false,
-                exclude_anonymous: false,
-                exclude_countries: Vec::new(),
-            },
-        },
-        ContentPolicy {
-            id: "blood".to_string(),
-            grant_generation: 1,
-            enabled: true,
-            priority: 30,
-            name: "Blood / Violence".to_string(),
-            preset: PlaceholderPreset::Blood,
-            match_expr: "tag IN (blood) >= 0.45".to_string(),
-            except_expr: None,
-            default_tag_min: DEFAULT_POLICY_TAG_MIN,
-            action: PolicyAction::Block,
-            bypass: PolicyBypass {
-                include_switcher: true,
-                include_click: false,
-                include_live_admin: false,
-                require_gallery_login: false,
-                require_age_18: false,
-                require_current_terms: false,
-                exclude_anonymous: false,
-                exclude_countries: Vec::new(),
-            },
-        },
-    ]
+    site_access::builtin_safety_presets()
 }
 
 /// Returns `true` when normalized incoming [`AccessPolicy`] matches the currently

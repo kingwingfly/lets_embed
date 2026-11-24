@@ -851,10 +851,10 @@ mod ssr_render_tests {
             });
             view! { <QueryRuleBuilder draft=draft /> }
         });
-        assert!(html.contains("R-18 / Explicit"));
-        assert!(html.contains("Suggestive / Ecchi"));
-        assert!(html.contains("Blood / Violence"));
-        assert!(html.contains("Custom"));
+        assert!(html.contains("NSFW / Adult &amp; Explicit"));
+        assert!(html.contains("Sensitive / Niche Themes"));
+        assert!(html.contains("Extreme / Gore &amp; Illegal"));
+        assert!(!html.contains("le-preset-btn--custom"));
         assert!(html.contains("le-rule-group-paren"));
         assert!(html.contains("( ... )"));
         assert!(html.contains("le-rule-remove-btn"));
@@ -1238,10 +1238,10 @@ mod ssr_render_tests {
         });
 
         assert!(html.contains(r#"data-mode="safety""#));
-        assert!(html.contains("R-18 / Explicit"));
-        assert!(html.contains("Suggestive / Ecchi"));
-        assert!(html.contains("Blood / Violence"));
-        assert!(html.contains("Custom"));
+        assert!(html.contains("NSFW / Adult &amp; Explicit"));
+        assert!(html.contains("Sensitive / Niche Themes"));
+        assert!(html.contains("Extreme / Gore &amp; Illegal"));
+        assert!(!html.contains("le-preset-btn--custom"));
         assert!(html.contains("WD Tag"));
         assert!(html.contains("Post Tag"));
         assert!(html.contains("Unclassified"));
@@ -1574,8 +1574,9 @@ fn query_builder_in_and_not_in_parse_format_presets_and_validation() {
         id
     };
 
-    // Built-in Safety Presets produce 1 single compact WD Tag IN [...] >= 0.45 row
+    // Built-in Safety Presets: exactly 3 presets, each collapsing to 1 compact WD Tag IN [...] >= 0.45 row
     let builtins = PresetTemplate::builtins();
+    assert_eq!(builtins.len(), 3);
     for preset_id in ["r18", "sensitive", "blood"] {
         let tpl = builtins
             .iter()

@@ -3599,6 +3599,7 @@ version = "0.1.0"
 dependencies = [
  "js-sys",
  "leptos",
+ "search_types",
  "serde",
  "serde_json",
  "wasm-bindgen",

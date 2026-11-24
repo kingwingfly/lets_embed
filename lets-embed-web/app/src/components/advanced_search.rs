@@ -495,7 +495,7 @@ fn UploadSlotControl(
     };
 
     view! {
-        <div class="flex flex-wrap items-center gap-2 min-w-0 w-full">
+        <div class="web-adv-upload-slot flex flex-wrap items-center gap-2 min-w-0 w-full">
             <input
                 node_ref=input_ref
                 type="file"
@@ -505,14 +505,14 @@ fn UploadSlotControl(
             />
             {move || if is_encoding() {
                 view! {
-                    <span class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-sky-50 text-sky-700 text-xs font-medium ring-1 ring-sky-200 animate-pulse">
+                    <span class="web-adv-upload-encoding inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-sky-50 text-sky-700 text-xs font-medium ring-1 ring-sky-200 animate-pulse">
                         "Encoding image\u{2026}"
                     </span>
                 }
                 .into_any()
             } else if let Some(slot) = current_slot.get() {
                 view! {
-                    <div class="flex items-center gap-2 min-w-0 flex-1 bg-sky-50/80 ring-1 ring-sky-200 rounded-xl px-2 py-1">
+                    <div class="web-adv-upload-preview flex items-center gap-2 min-w-0 flex-1 bg-sky-50/80 ring-1 ring-sky-200 rounded-xl px-2 py-1">
                         <img
                             src=slot.preview_url
                             alt=slot.filename.clone()
@@ -523,7 +523,7 @@ fn UploadSlotControl(
                         </span>
                         <button
                             type="button"
-                            class="shrink-0 px-2 py-0.5 rounded-lg text-[11px] font-semibold text-sky-700 bg-white hover:bg-sky-100 ring-1 ring-sky-200 cursor-pointer"
+                            class="web-adv-upload-replace-btn shrink-0 px-2 py-0.5 rounded-lg text-[11px] font-semibold text-sky-700 bg-white hover:bg-sky-100 ring-1 ring-sky-200 cursor-pointer"
                             on:click=move |_| {
                                 #[cfg(feature = "hydrate")]
                                 if let Some(el) = input_ref.get() {
@@ -535,7 +535,7 @@ fn UploadSlotControl(
                         </button>
                         <button
                             type="button"
-                            class="shrink-0 px-2 py-0.5 rounded-lg text-[11px] font-medium text-rose-600 bg-white hover:bg-rose-50 ring-1 ring-rose-200 cursor-pointer"
+                            class="web-adv-upload-clear-btn shrink-0 px-2 py-0.5 rounded-lg text-[11px] font-medium text-rose-600 bg-white hover:bg-rose-50 ring-1 ring-rose-200 cursor-pointer"
                             on:click=clear_upload
                         >
                             "Clear"
@@ -547,7 +547,7 @@ fn UploadSlotControl(
                 view! {
                     <button
                         type="button"
-                        class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold
+                        class="web-adv-upload-pick-btn inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold
                                text-sky-700 bg-sky-50 hover:bg-sky-100 ring-1 ring-sky-200/90 transition-colors cursor-pointer"
                         on:click=move |_| {
                             #[cfg(feature = "hydrate")]
@@ -752,21 +752,21 @@ pub fn AdvancedSearchPanel(
             aria-modal="true"
             aria-label="Advanced Search Query Builder"
             tabindex="-1"
-            class="fixed inset-0 z-[55] flex items-start sm:items-center justify-center p-2 sm:p-4
+            class="web-adv-backdrop fixed inset-0 z-[55] flex items-start sm:items-center justify-center p-2 sm:p-4
                    bg-slate-900/50 backdrop-blur-xs overflow-y-auto overscroll-contain outline-none"
             on:click=move |_| open.set(false)
         >
             <form
                 on:submit=on_submit
                 on:click=|ev| ev.stop_propagation()
-                class="w-full max-w-3xl my-auto rounded-2xl sm:rounded-3xl bg-white/98 backdrop-blur-md
+                class="web-adv-modal w-full max-w-3xl my-auto rounded-2xl sm:rounded-3xl bg-white/98 backdrop-blur-md
                        ring-1 ring-sky-200/90 shadow-2xl shadow-sky-900/20 flex flex-col max-h-[92dvh] overflow-hidden"
             >
                 // Modal Header
-                <div class="shrink-0 flex items-center justify-between gap-2 px-4 sm:px-5 py-3
+                <div class="web-adv-header shrink-0 flex items-center justify-between gap-2 px-4 sm:px-5 py-3
                             border-b border-sky-100 bg-gradient-to-r from-sky-50/90 via-white to-indigo-50/70">
-                    <div class="flex items-center gap-2 min-w-0 flex-wrap">
-                        <h2 class="text-sm sm:text-base font-bold text-slate-800 m-0 truncate">
+                    <div class="web-adv-title-group flex items-center gap-2 min-w-0 flex-wrap">
+                        <h2 class="web-adv-title text-sm sm:text-base font-bold text-slate-800 m-0 truncate">
                             "Advanced Query Builder"
                         </h2>
                         {move || match validation.get() {
@@ -783,12 +783,12 @@ pub fn AdvancedSearchPanel(
                                 };
                                 Some(view! {
                                     <span class=format!(
-                                        "px-2 py-0.5 rounded-full text-[11px] font-semibold ring-1 whitespace-nowrap {kind_cls}"
+                                        "web-adv-kind-badge px-2 py-0.5 rounded-full text-[11px] font-semibold ring-1 whitespace-nowrap {kind_cls}"
                                     )>
                                         {kind_lbl}
                                     </span>
                                     {tier_badge.map(|tb| view! {
-                                        <span class="px-2 py-0.5 rounded-full text-[11px] font-medium bg-slate-100 text-slate-600 ring-1 ring-slate-200 whitespace-nowrap">
+                                        <span class="web-adv-tier-badge px-2 py-0.5 rounded-full text-[11px] font-medium bg-slate-100 text-slate-600 ring-1 ring-slate-200 whitespace-nowrap">
                                             {tb}
                                         </span>
                                     })}
@@ -801,7 +801,7 @@ pub fn AdvancedSearchPanel(
                         type="button"
                         aria-label="Close Advanced Search"
                         title="Close (Esc)"
-                        class="w-8 h-8 rounded-full flex items-center justify-center text-slate-400 hover:text-slate-700
+                        class="web-adv-close-btn w-8 h-8 rounded-full flex items-center justify-center text-slate-400 hover:text-slate-700
                                hover:bg-sky-100/80 transition-colors cursor-pointer shrink-0 text-lg"
                         on:click=move |_| open.set(false)
                     >
@@ -810,9 +810,9 @@ pub fn AdvancedSearchPanel(
                 </div>
 
                 // Scrollable Body with unified QueryBuilder
-                <div class="flex-1 min-h-0 overflow-y-auto overscroll-contain p-3.5 sm:p-5 flex flex-col gap-3.5">
+                <div class="web-adv-body flex-1 min-h-0 overflow-y-auto overscroll-contain p-3.5 sm:p-5 flex flex-col gap-3.5">
                     // Quick Examples bar
-                    <div class="flex flex-wrap items-center gap-1.5">
+                    <div class="web-adv-examples flex flex-wrap items-center gap-1.5">
                         <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mr-1">
                             "Examples:"
                         </span>
@@ -821,7 +821,7 @@ pub fn AdvancedSearchPanel(
                             view! {
                                 <button
                                     type="button"
-                                    class="px-2.5 py-1 rounded-full text-[11px] font-medium bg-sky-50 hover:bg-sky-100
+                                    class="web-adv-example-btn px-2.5 py-1 rounded-full text-[11px] font-medium bg-sky-50 hover:bg-sky-100
                                            text-sky-700 ring-1 ring-sky-200/80 transition-colors cursor-pointer"
                                     on:click=move |_| apply_example(q)
                                 >
@@ -843,16 +843,16 @@ pub fn AdvancedSearchPanel(
 
                     // Optional Tag Sort toggle when query is metadata-only with positive tags
                     {move || show_sort_toggle.get().then(|| view! {
-                        <div class="flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-xl bg-sky-50/70 ring-1 ring-sky-200/70">
+                        <div class="web-adv-sort-bar flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded-xl bg-sky-50/70 ring-1 ring-sky-200/70">
                             <span class="text-xs font-semibold text-slate-700">"Tag result order"</span>
-                            <div class="inline-flex items-center p-0.5 rounded-full bg-white ring-1 ring-sky-200">
+                            <div class="web-adv-sort-group inline-flex items-center p-0.5 rounded-full bg-white ring-1 ring-sky-200">
                                 <button
                                     type="button"
                                     aria-pressed=move || (sort.get() == AdvancedSort::Relevance).to_string()
                                     class=move || if sort.get() == AdvancedSort::Relevance {
-                                        "px-3 py-1 rounded-full text-xs font-semibold bg-sky-500 text-white shadow-xs cursor-pointer"
+                                        "web-adv-sort-btn is-active px-3 py-1 rounded-full text-xs font-semibold bg-sky-500 text-white shadow-xs cursor-pointer"
                                     } else {
-                                        "px-3 py-1 rounded-full text-xs font-medium text-slate-600 hover:text-sky-700 cursor-pointer"
+                                        "web-adv-sort-btn px-3 py-1 rounded-full text-xs font-medium text-slate-600 hover:text-sky-700 cursor-pointer"
                                     }
                                     on:click=move |_| sort.set(AdvancedSort::Relevance)
                                 >
@@ -862,9 +862,9 @@ pub fn AdvancedSearchPanel(
                                     type="button"
                                     aria-pressed=move || (sort.get() == AdvancedSort::Newest).to_string()
                                     class=move || if sort.get() == AdvancedSort::Newest {
-                                        "px-3 py-1 rounded-full text-xs font-semibold bg-sky-500 text-white shadow-xs cursor-pointer"
+                                        "web-adv-sort-btn is-active px-3 py-1 rounded-full text-xs font-semibold bg-sky-500 text-white shadow-xs cursor-pointer"
                                     } else {
-                                        "px-3 py-1 rounded-full text-xs font-medium text-slate-600 hover:text-sky-700 cursor-pointer"
+                                        "web-adv-sort-btn px-3 py-1 rounded-full text-xs font-medium text-slate-600 hover:text-sky-700 cursor-pointer"
                                     }
                                     on:click=move |_| sort.set(AdvancedSort::Newest)
                                 >
@@ -876,20 +876,20 @@ pub fn AdvancedSearchPanel(
                 </div>
 
                 // Modal Footer
-                <div class="shrink-0 flex items-center justify-between gap-2 px-4 sm:px-5 py-3
+                <div class="web-adv-footer shrink-0 flex items-center justify-between gap-2 px-4 sm:px-5 py-3
                             border-t border-sky-100 bg-sky-50/40">
                     <button
                         type="button"
-                        class="px-3.5 py-1.5 rounded-full text-xs sm:text-sm font-medium text-slate-600
+                        class="web-adv-reset-btn px-3.5 py-1.5 rounded-full text-xs sm:text-sm font-medium text-slate-600
                                hover:text-rose-600 hover:bg-rose-50 ring-1 ring-slate-200/90 transition-colors cursor-pointer"
                         on:click=clear_all
                     >
                         "Reset"
                     </button>
-                    <div class="flex items-center gap-2">
+                    <div class="web-adv-footer-actions flex items-center gap-2">
                         <button
                             type="button"
-                            class="px-4 py-1.5 rounded-full text-xs sm:text-sm font-medium text-slate-600
+                            class="web-adv-cancel-btn px-4 py-1.5 rounded-full text-xs sm:text-sm font-medium text-slate-600
                                    bg-white hover:bg-slate-50 ring-1 ring-slate-200 transition-colors cursor-pointer"
                             on:click=move |_| open.set(false)
                         >
@@ -898,7 +898,7 @@ pub fn AdvancedSearchPanel(
                         <button
                             type="submit"
                             prop:disabled=move || !matches!(validation.get(), ValidationState::Valid(_))
-                            class="px-5 py-2 rounded-full text-xs sm:text-sm font-semibold text-white
+                            class="web-adv-submit-btn px-5 py-2 rounded-full text-xs sm:text-sm font-semibold text-white
                                    bg-gradient-to-r from-sky-400 via-blue-500 to-indigo-500
                                    shadow-sm shadow-sky-300/60 hover:brightness-105 active:scale-95
                                    disabled:opacity-45 disabled:cursor-not-allowed disabled:active:scale-100

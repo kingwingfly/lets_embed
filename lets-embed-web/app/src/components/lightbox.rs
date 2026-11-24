@@ -405,23 +405,23 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
             aria-modal="true"
             aria-label="Post album"
             tabindex="-1"
-            class="fixed inset-0 h-dvh bg-black/95 z-50 overflow-hidden cursor-zoom-out flex flex-col outline-none"
+            class="web-lightbox fixed inset-0 h-dvh bg-black/95 z-50 overflow-hidden cursor-zoom-out flex flex-col outline-none"
             on:click=move |ev| { ev.stop_propagation(); lightbox.set(None); }
         >
             <div
-                class="sticky top-0 z-10 flex flex-wrap items-center justify-between gap-x-3 gap-y-2 px-3 sm:px-4 py-2 bg-black/85 backdrop-blur text-white shrink-0 border-b border-sky-400/30 cursor-default"
+                class="web-lightbox-header sticky top-0 z-10 flex flex-wrap items-center justify-between gap-x-3 gap-y-2 px-3 sm:px-4 py-2 bg-black/85 backdrop-blur text-white shrink-0 border-b border-sky-400/30 cursor-default"
                 on:click=|ev| ev.stop_propagation()
             >
-                <div class="order-1 min-w-0 flex-1">
-                    <div class="font-semibold truncate text-sky-100">{title}</div>
+                <div class="web-lightbox-title-block order-1 min-w-0 flex-1">
+                    <div class="web-lightbox-title font-semibold truncate text-sky-100">{title}</div>
                     {header_meta}
                 </div>
                 {move || (total_images() > 0).then(|| view! {
-                    <div class="order-3 md:order-2 w-full md:w-auto flex items-center justify-start md:justify-end">
+                    <div class="web-lightbox-density-slot order-3 md:order-2 w-full md:w-auto flex items-center justify-start md:justify-end">
                         <DensityPicker density=density dark=true persist=true />
                     </div>
                 })}
-                <div class="order-2 md:order-3 flex items-center gap-2 sm:gap-3 shrink-0">
+                <div class="web-lightbox-actions order-2 md:order-3 flex items-center gap-2 sm:gap-3 shrink-0">
                     <LikeButton
                         kind="post"
                         target_id=post_id
@@ -439,7 +439,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                             <button
                                 type="button"
                                 title="Report post"
-                                class="px-2.5 py-1 rounded-full bg-white/10 hover:bg-rose-500/70 text-sky-100 text-xs font-medium transition-colors cursor-pointer"
+                                class="web-lightbox-report-btn px-2.5 py-1 rounded-full bg-white/10 hover:bg-rose-500/70 text-sky-100 text-xs font-medium transition-colors cursor-pointer"
                                 on:click=move |_| {
                                     s.open_report(ReportTargetKind::Post, post_id, lbl.clone());
                                 }
@@ -448,7 +448,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                             </button>
                         }
                     })}
-                    <div class="text-xs sm:text-sm text-sky-200/70 tabular-nums whitespace-nowrap">
+                    <div class="web-lightbox-counter text-xs sm:text-sm text-sky-200/70 tabular-nums whitespace-nowrap">
                         {move || {
                             let tot = total_images();
                             format!("{} / {}", visible.get().min(tot), tot)
@@ -457,19 +457,19 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
                     <button
                         type="button"
                         aria-label="Close post"
-                        class="px-3 py-1 rounded-full bg-sky-500/30 hover:bg-sky-500/60 text-sky-50 text-xs sm:text-sm font-medium transition-colors cursor-pointer"
+                        class="web-lightbox-close-btn px-3 py-1 rounded-full bg-sky-500/30 hover:bg-sky-500/60 text-sky-50 text-xs sm:text-sm font-medium transition-colors cursor-pointer"
                         on:click=move |_| lightbox.set(None)
                     >"Close"</button>
                 </div>
             </div>
 
             <div
-                class="flex-1 min-h-0 flex flex-col md:flex-row gap-2 p-2 cursor-default"
+                class="web-lightbox-body flex-1 min-h-0 flex flex-col md:flex-row gap-2 p-2 cursor-default"
                 on:click=move |ev| ev.stop_propagation()
             >
                 <div
                     node_ref=album_scroll_el
-                    class="flex-[2] min-w-0 overflow-y-auto overscroll-contain"
+                    class="web-lightbox-images flex-[2] min-w-0 overflow-y-auto overscroll-contain"
                 >
                     <div class="flex items-start gap-2 w-full">
                         <For

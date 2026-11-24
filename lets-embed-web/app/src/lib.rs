@@ -482,8 +482,8 @@ pub fn App() -> impl IntoView {
         <Meta property="og:site_name" content="Let's Embed"/>
         <Meta name="twitter:card" content="summary_large_image"/>
         <Router>
-            <div class="min-h-screen w-full flex flex-col overflow-x-clip bg-gradient-to-b from-sky-50 via-white to-sky-100">
-                <main class="flex-1 w-full">
+            <div class="web-app-shell min-h-screen w-full flex flex-col overflow-x-clip bg-gradient-to-b from-sky-50 via-white to-sky-100">
+                <main class="web-main flex-1 w-full">
                     <Routes fallback=|| "Page not found.".into_view()>
                         <ParentRoute path=path!("") view=SearchBar>
                             <Route path=path!("/details/:id") view=ImageDetails ssr=SsrMode::Async/>
@@ -491,14 +491,14 @@ pub fn App() -> impl IntoView {
                         </ParentRoute>
                     </Routes>
                 </main>
-                <footer class="w-full py-4 px-4 border-t border-sky-200/70 bg-white/60 text-xs text-slate-500">
-                    <div class="max-w-[1640px] mx-auto flex flex-wrap items-center justify-between gap-2">
-                        <span class="font-medium text-sky-800/80">"Let\u{2019}s Embed"</span>
-                        <nav aria-label="Legal and policies" class="flex flex-wrap items-center gap-3">
-                            <a href="/terms" rel="external" class="hover:text-sky-600 hover:underline">"Terms"</a>
-                            <a href="/privacy" rel="external" class="hover:text-sky-600 hover:underline">"Privacy"</a>
-                            <a href="/dmca" rel="external" class="hover:text-sky-600 hover:underline">"DMCA"</a>
-                            <a href="/content-policy" rel="external" class="hover:text-sky-600 hover:underline">"Content Policy"</a>
+                <footer class="web-footer w-full py-4 px-4 border-t border-sky-200/70 bg-white/60 text-xs text-slate-500">
+                    <div class="web-footer-inner max-w-[1640px] mx-auto flex flex-wrap items-center justify-between gap-2">
+                        <span class="web-footer-brand font-medium text-sky-800/80">"Let\u{2019}s Embed"</span>
+                        <nav aria-label="Legal and policies" class="web-footer-nav flex flex-wrap items-center gap-3">
+                            <a href="/terms" rel="external" class="web-footer-link hover:text-sky-600 hover:underline">"Terms"</a>
+                            <a href="/privacy" rel="external" class="web-footer-link hover:text-sky-600 hover:underline">"Privacy"</a>
+                            <a href="/dmca" rel="external" class="web-footer-link hover:text-sky-600 hover:underline">"DMCA"</a>
+                            <a href="/content-policy" rel="external" class="web-footer-link hover:text-sky-600 hover:underline">"Content Policy"</a>
                         </nav>
                     </div>
                 </footer>

@@ -9,6 +9,7 @@ documentation.workspace = true
 
 [dependencies]
 leptos = { version = "0.8", features = ["nightly"] }
+search_types = { path = "../search_types" }
 serde.workspace = true
 wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }

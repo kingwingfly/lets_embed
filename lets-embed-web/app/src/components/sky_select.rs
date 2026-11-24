@@ -482,8 +482,8 @@ pub fn SkySelect(
     };
 
     let wrapper_cls = match variant {
-        SelectVariant::SearchPill => "relative shrink-0 self-stretch inline-flex items-stretch",
-        _ => "relative shrink-0 inline-flex items-center",
+        SelectVariant::SearchPill => "web-sky-select web-sky-select--search-pill relative shrink-0 self-stretch inline-flex items-stretch",
+        _ => "web-sky-select relative shrink-0 inline-flex items-center",
     };
 
     let list_id_aria = list_id.clone();
@@ -509,9 +509,9 @@ pub fn SkySelect(
                 }
                 class=move || {
                     if open.get() {
-                        format!("{trigger_base} {trigger_class} {open_ring}")
+                        format!("web-sky-select-trigger is-open {trigger_base} {trigger_class} {open_ring}")
                     } else {
-                        format!("{trigger_base} {trigger_class}")
+                        format!("web-sky-select-trigger {trigger_base} {trigger_class}")
                     }
                 }
                 on:click=toggle
@@ -578,7 +578,7 @@ pub fn SkySelect(
                             style=max_h_style
                             on:mousedown=|ev| ev.prevent_default()
                             class=format!(
-                                "absolute {h_align} {placement_cls} z-[80] overflow-y-auto overscroll-contain \
+                                "web-sky-select-menu absolute {h_align} {placement_cls} z-[80] overflow-y-auto overscroll-contain \
                                  rounded-2xl bg-white/95 backdrop-blur-md ring-1 {menu_ring} \
                                  shadow-xl p-1.5 flex flex-col gap-0.5"
                             )
@@ -599,7 +599,7 @@ pub fn SkySelect(
                                         aria-disabled=is_disabled.to_string()
                                         disabled=is_disabled
                                         class=move || {
-                                            let base = "w-full text-left px-3 py-1.5 rounded-xl text-xs sm:text-[13px] \
+                                            let base = "web-sky-select-option w-full text-left px-3 py-1.5 rounded-xl text-xs sm:text-[13px] \
                                                         flex items-center justify-between gap-2.5 transition-colors whitespace-nowrap";
                                             if is_disabled {
                                                 format!("{base} opacity-40 cursor-not-allowed text-slate-400")

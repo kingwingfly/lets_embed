@@ -365,7 +365,7 @@ pub fn Viewer(
             aria-modal="true"
             aria-label="Image viewer"
             tabindex="-1"
-            class="fixed inset-0 h-dvh bg-black/95 z-[60] overflow-hidden cursor-zoom-out select-none touch-none
+            class="web-viewer fixed inset-0 h-dvh bg-black/95 z-[60] overflow-hidden cursor-zoom-out select-none touch-none
                    flex flex-col outline-none"
             on:click=move |ev| {
                 if !(ev.alt_key() || ev.ctrl_key() || ev.meta_key() || ev.shift_key()) {
@@ -381,27 +381,27 @@ pub fn Viewer(
             }
         >
             <div
-                class="shrink-0 z-20 flex items-center justify-between gap-1.5 sm:gap-2
+                class="web-viewer-topbar shrink-0 z-20 flex items-center justify-between gap-1.5 sm:gap-2
                        px-2.5 sm:px-3 py-2 bg-black/85 border-b border-white/10 cursor-default"
                 on:click=|ev| ev.stop_propagation()
                 on:touchstart=|ev: TouchEvent| ev.stop_propagation()
                 on:touchend=|ev: TouchEvent| ev.stop_propagation()
             >
-                <div class="flex items-center gap-1.5 min-w-0">
-                    <div class="text-xs sm:text-sm font-medium text-sky-100 bg-white/10 px-2.5 sm:px-3 py-1 rounded-full shrink-0 tabular-nums">
+                <div class="web-viewer-meta flex items-center gap-1.5 min-w-0">
+                    <div class="web-viewer-counter text-xs sm:text-sm font-medium text-sky-100 bg-white/10 px-2.5 sm:px-3 py-1 rounded-full shrink-0 tabular-nums">
                         {move || index.get().map(|i| format!("{} / {}", i + 1, total)).unwrap_or_default()}
                     </div>
                     {move || current_image.get().and_then(|im| {
                         let (w, h) = (im.width(), im.height());
                         (w > 0 && h > 0).then(|| view! {
-                            <span class="hidden sm:inline-block text-xs text-sky-200/75 bg-white/5 px-2.5 py-1 rounded-full tabular-nums">
+                            <span class="web-viewer-dims hidden sm:inline-block text-xs text-sky-200/75 bg-white/5 px-2.5 py-1 rounded-full tabular-nums">
                                 {format!("{w} × {h}")}
                             </span>
                         })
                     })}
                 </div>
 
-                <div class="flex items-center gap-1.5 sm:gap-2 justify-end shrink-0">
+                <div class="web-viewer-actions flex items-center gap-1.5 sm:gap-2 justify-end shrink-0">
                     {post_id.map(|pid| view! {
                         <LikeButton
                             kind="post"
@@ -429,7 +429,7 @@ pub fn Viewer(
                                 <button
                                     type="button"
                                     title="Report image"
-                                    class="px-2.5 py-1.5 rounded-full bg-white/10 hover:bg-rose-500/70
+                                    class="web-viewer-report-btn px-2.5 py-1.5 rounded-full bg-white/10 hover:bg-rose-500/70
                                            text-sky-100 text-xs font-medium transition-colors cursor-pointer whitespace-nowrap"
                                     on:click=move |ev: ev::MouseEvent| {
                                         ev.stop_propagation();
@@ -446,7 +446,7 @@ pub fn Viewer(
                             {(!is_placeholder).then(|| view! {
                                 <a
                                     href=href
-                                    class="inline-flex items-center gap-1 px-2.5 sm:px-3 py-1.5 rounded-full
+                                    class="web-viewer-details-link inline-flex items-center gap-1 px-2.5 sm:px-3 py-1.5 rounded-full
                                            bg-sky-500 hover:bg-sky-400 text-white text-xs sm:text-sm
                                            font-semibold shadow-sm transition-colors whitespace-nowrap"
                                     on:click=move |ev: ev::MouseEvent| {

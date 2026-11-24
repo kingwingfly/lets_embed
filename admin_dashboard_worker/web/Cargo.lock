@@ -936,6 +936,7 @@ version = "0.1.0"
 dependencies = [
  "js-sys",
  "leptos",
+ "search_types",
  "serde",
  "wasm-bindgen",
  "web-sys",

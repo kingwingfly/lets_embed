@@ -12,7 +12,7 @@ use std::{
 use leptos::prelude::*;
 use lets_embed_ui::{QueryBuilderDraft, QueryBuilderMode};
 use site_access::{
-    AgeGateTrigger, AgeVerificationPolicy, AuthProviderId, ContentPolicy, DEFAULT_POLICY_TAG_MIN,
+    AgeGateTrigger, AgeVerificationPolicy, AuthProviderId, ContentPolicy,
     PlaceholderPreset, PolicyAction, PolicyBypass, UnclassifiedMode,
 };
 
@@ -53,90 +53,28 @@ pub fn draft_from_expr(raw: &str) -> QueryBuilderDraft {
     })
 }
 
-/// Compact single-row `tag IN (...) >= 0.45` preset templates matching `lets-embed-ui`.
+/// Compact single-row `tag IN (...) >= 0.45` preset templates matching `site_access` & `lets-embed-ui`.
 pub fn compact_safety_presets() -> Vec<ContentPolicy> {
-    vec![
-        ContentPolicy {
-            id: "r18".to_string(),
-            grant_generation: 1,
-            enabled: true,
-            priority: 10,
-            name: "NSFW / Explicit".to_string(),
-            preset: PlaceholderPreset::R18,
-            match_expr: "tag IN (explicit, nude, nipples, pussy, penis, sex, uncensored, censored, topless, bottomless) >= 0.45".to_string(),
-            except_expr: None,
-            default_tag_min: DEFAULT_POLICY_TAG_MIN,
-            action: PolicyAction::Block,
-            bypass: PolicyBypass {
-                include_switcher: true,
-                include_click: false,
-                include_live_admin: false,
-                require_gallery_login: true,
-                require_age_18: false,
-                require_current_terms: true,
-                exclude_anonymous: true,
-                exclude_countries: Vec::new(),
-            },
-        },
-        ContentPolicy {
-            id: "sensitive".to_string(),
-            grant_generation: 1,
-            enabled: true,
-            priority: 20,
-            name: "Suggestive / Ecchi".to_string(),
-            preset: PlaceholderPreset::Sensitive,
-            match_expr: "tag IN (questionable, sensitive, lingerie, bikini, underwear, panties, cleavage, bdsm) >= 0.45".to_string(),
-            except_expr: None,
-            default_tag_min: DEFAULT_POLICY_TAG_MIN,
-            action: PolicyAction::Blur,
-            bypass: PolicyBypass {
-                include_switcher: true,
-                include_click: true,
-                include_live_admin: false,
-                require_gallery_login: false,
-                require_age_18: false,
-                require_current_terms: false,
-                exclude_anonymous: false,
-                exclude_countries: Vec::new(),
-            },
-        },
-        ContentPolicy {
-            id: "blood".to_string(),
-            grant_generation: 1,
-            enabled: true,
-            priority: 30,
-            name: "Blood / Violence".to_string(),
-            preset: PlaceholderPreset::Blood,
-            match_expr: "tag IN (blood) >= 0.45".to_string(),
-            except_expr: None,
-            default_tag_min: DEFAULT_POLICY_TAG_MIN,
-            action: PolicyAction::Block,
-            bypass: PolicyBypass {
-                include_switcher: true,
-                include_click: false,
-                include_live_admin: false,
-                require_gallery_login: false,
-                require_age_18: false,
-                require_current_terms: false,
-                exclude_anonymous: false,
-                exclude_countries: Vec::new(),
-            },
-        },
-    ]
+    site_access::builtin_safety_presets()
 }
 
 /// Normalizes a server-provided preset into compact `tag IN (...) >= 0.45` form.
 pub fn normalize_preset_compact(mut tpl: ContentPolicy) -> ContentPolicy {
     match tpl.preset {
         PlaceholderPreset::R18 => {
-            tpl.match_expr = "tag IN (explicit, nude, nipples, pussy, penis, sex, uncensored, censored, topless, bottomless) >= 0.45".to_string();
+            if tpl.match_expr.trim().is_empty() || !tpl.match_expr.contains("tag IN (") {
+                tpl.match_expr = search_types::PRESET_R18_QUERY.to_string();
+            }
         }
         PlaceholderPreset::Sensitive => {
-            tpl.match_expr = "tag IN (questionable, sensitive, lingerie, bikini, underwear, panties, cleavage, bdsm) >= 0.45".to_string();
+            if tpl.match_expr.trim().is_empty() || !tpl.match_expr.contains("tag IN (") {
+                tpl.match_expr = search_types::PRESET_SENSITIVE_QUERY.to_string();
+            }
         }
         PlaceholderPreset::Blood => {
-            tpl.name = "Blood / Violence".to_string();
-            tpl.match_expr = "tag IN (blood) >= 0.45".to_string();
+            if tpl.match_expr.trim().is_empty() || !tpl.match_expr.contains("tag IN (") {
+                tpl.match_expr = search_types::PRESET_EXTREME_QUERY.to_string();
+            }
         }
         PlaceholderPreset::Custom => {}
     }
@@ -154,9 +92,9 @@ pub const fn preset_css_slug(preset: PlaceholderPreset) -> &'static str {
 
 pub const fn preset_button_label(preset: PlaceholderPreset) -> &'static str {
     match preset {
-        PlaceholderPreset::R18 => "+ NSFW",
-        PlaceholderPreset::Sensitive => "+ Suggestive / Ecchi",
-        PlaceholderPreset::Blood => "+ Blood / Violence",
+        PlaceholderPreset::R18 => "+ NSFW / Explicit",
+        PlaceholderPreset::Sensitive => "+ Sensitive / Niche",
+        PlaceholderPreset::Blood => "+ Extreme / Illegal",
         PlaceholderPreset::Custom => "+ Custom Policy",
     }
 }
@@ -165,7 +103,7 @@ pub const fn preset_badge_label(preset: PlaceholderPreset) -> &'static str {
     match preset {
         PlaceholderPreset::R18 => "R-18",
         PlaceholderPreset::Sensitive => "Sensitive",
-        PlaceholderPreset::Blood => "Blood",
+        PlaceholderPreset::Blood => "Extreme",
         PlaceholderPreset::Custom => "Custom",
     }
 }

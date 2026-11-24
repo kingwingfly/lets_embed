@@ -100,9 +100,9 @@ impl GalleryMaskPreset {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::R18 => "R-18 / Explicit",
-            Self::Blood => "Blood / Violence",
-            Self::Sensitive => "Suggestive / Sensitive",
+            Self::R18 => "NSFW / Adult & Explicit",
+            Self::Blood => "Extreme / Gore & Illegal",
+            Self::Sensitive => "Sensitive / Niche Themes",
             Self::Custom => "Restricted Content",
         }
     }
@@ -110,7 +110,7 @@ impl GalleryMaskPreset {
     pub const fn short_badge(self) -> &'static str {
         match self {
             Self::R18 => "18+",
-            Self::Blood => "Violence",
+            Self::Blood => "Extreme",
             Self::Sensitive => "Sensitive",
             Self::Custom => "Restricted",
         }
@@ -119,8 +119,8 @@ impl GalleryMaskPreset {
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "r18" | "r-18" | "nsfw" | "explicit" => Self::R18,
-            "blood" | "gore" | "violence" => Self::Blood,
-            "sensitive" | "suggestive" | "ecchi" => Self::Sensitive,
+            "blood" | "gore" | "violence" | "extreme" | "illegal" => Self::Blood,
+            "sensitive" | "suggestive" | "ecchi" | "niche" => Self::Sensitive,
             _ => Self::Custom,
         }
     }
@@ -994,45 +994,39 @@ pub struct PresetTemplate {
 impl PresetTemplate {
     /// Built-in WD-Tagger safety presets verified against canonical tag vocabulary.
     ///
-    /// Uses compact single-row `tag IN (...) >= 0.45` syntax so each preset produces
-    /// one clean multi-chip `WD Tag in [...]` condition card instead of stacked OR rows.
+    /// Exactly 3 presets using compact single-row `tag IN (...) >= 0.45` syntax so each
+    /// preset produces one clean multi-chip `WD Tag in [...]` condition card:
+    /// 1. `r18` — NSFW / Adult & Explicit (sexual, nudity, exposure, adult content)
+    /// 2. `sensitive` — Sensitive / Niche Themes (childlike, TS/femboy/futa, elderly, SM/BDSM, niche fetishes)
+    /// 3. `blood` — Extreme / Gore & Illegal (bloody, gore, kill, severe violence, self-harm, illegal — hard blocked)
     pub fn builtins() -> Vec<Self> {
         vec![
             Self {
                 id: "r18".to_string(),
-                label: "R-18 / Explicit".to_string(),
-                description: "Hard-gated NSFW switcher requiring 18+.".to_string(),
+                label: "NSFW / Adult & Explicit".to_string(),
+                description: "Sexual, explicit, nudity, and adult exposure content.".to_string(),
                 default_mode: RuleMode::Switcher,
                 preset: GalleryMaskPreset::R18,
                 requires_age: true,
-                query: "tag IN (explicit, nude, nipples, pussy, penis, sex, uncensored, censored, topless, bottomless) >= 0.45".to_string(),
+                query: search_types::PRESET_R18_QUERY.to_string(),
             },
             Self {
                 id: "sensitive".to_string(),
-                label: "Suggestive / Ecchi".to_string(),
-                description: "1-click spoiler blur for suggestive tags.".to_string(),
+                label: "Sensitive / Niche Themes".to_string(),
+                description: "Childlike, TS/femboy/futa, elderly, moderate-to-heavy SM/BDSM, and niche fetish themes.".to_string(),
                 default_mode: RuleMode::SpoilerBlur,
                 preset: GalleryMaskPreset::Sensitive,
                 requires_age: false,
-                query: "tag IN (questionable, sensitive, lingerie, bikini, underwear, panties, cleavage, bdsm) >= 0.45".to_string(),
+                query: search_types::PRESET_SENSITIVE_QUERY.to_string(),
             },
             Self {
                 id: "blood".to_string(),
-                label: "Blood / Violence".to_string(),
-                description: "Switcher gate for gore and blood tags.".to_string(),
+                label: "Extreme / Gore & Illegal".to_string(),
+                description: "Hard-blocked gore, bloody violence, killing, self-harm, non-consensual, and illegal content.".to_string(),
                 default_mode: RuleMode::Switcher,
                 preset: GalleryMaskPreset::Blood,
                 requires_age: false,
-                query: "tag IN (blood) >= 0.45".to_string(),
-            },
-            Self {
-                id: "custom".to_string(),
-                label: "Custom".to_string(),
-                description: "Start from an empty visual rule builder.".to_string(),
-                default_mode: RuleMode::Switcher,
-                preset: GalleryMaskPreset::Custom,
-                requires_age: false,
-                query: String::new(),
+                query: search_types::PRESET_EXTREME_QUERY.to_string(),
             },
         ]
     }
