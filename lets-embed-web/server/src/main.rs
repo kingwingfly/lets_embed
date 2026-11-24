@@ -120,6 +120,11 @@ fn build_app_router(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load `.env` (e.g. Cloud Run secret mounted at `/app/.env`) before reading
+    // `RUST_LOG` or validating Managed Mode env vars like `SITE_SECRET`.
+    // Existing process environment variables always take precedence over `.env`.
+    let dotenv_err = dotenvy::dotenv().err();
+
     Registry::default()
         .with(tracing_subscriber::fmt::layer())
         .with(
@@ -127,6 +132,21 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or("lets_embed_web=info,search_engine=info".into()),
         )
         .init();
+
+    if let Some(err) = dotenv_err {
+        match err {
+            dotenvy::Error::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {}
+            dotenvy::Error::Io(io_err) => {
+                tracing::warn!(kind = ?io_err.kind(), "failed to read .env file");
+            }
+            dotenvy::Error::LineParse(_, col) => {
+                tracing::warn!(column = col, "failed to parse a line in .env file");
+            }
+            _ => {
+                tracing::warn!("failed to load .env file");
+            }
+        }
+    }
 
     let args = cli::Cli::parse();
     // Validate deployment mode and all required Managed Mode secrets/URLs BEFORE touching DB or sockets.
