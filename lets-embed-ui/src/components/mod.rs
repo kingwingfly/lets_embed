@@ -58,5 +58,7 @@ pub(crate) use query_builder::merge_chip_values;
 pub(crate) use report_dialog::clamp_chars;
 #[cfg(test)]
 pub(crate) use sky_select::{
-    MenuPlacement, compute_menu_placement_from_metrics, next_enabled_index, render_select_menu_view,
+    MenuPlacement, compute_menu_placement_from_metrics, next_enabled_index,
 };
+#[cfg(all(test, feature = "ssr"))]
+pub(crate) use sky_select::render_select_menu_view;

@@ -11,7 +11,15 @@ static NEXT_SELECT_ID: AtomicUsize = AtomicUsize::new(1);
 
 const VIEWPORT_MARGIN_PX: f64 = 12.0;
 const MENU_MAX_HEIGHT_CAP_PX: f64 = 320.0;
+#[cfg_attr(
+    not(any(test, all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))),
+    allow(dead_code)
+)]
 const MENU_MIN_HEIGHT_PX: f64 = 88.0;
+#[cfg_attr(
+    not(any(test, all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))),
+    allow(dead_code)
+)]
 const MENU_MAX_WIDTH_CAP_PX: f64 = 280.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -59,7 +67,10 @@ impl MenuPlacement {
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(any(feature = "csr", feature = "hydrate", test)), allow(dead_code))]
+#[cfg_attr(
+    not(any(test, all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))),
+    allow(dead_code)
+)]
 pub(crate) fn compute_menu_placement_from_metrics(
     rect_top: f64,
     rect_bottom: f64,
