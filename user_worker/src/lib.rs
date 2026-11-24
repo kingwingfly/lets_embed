@@ -36,6 +36,8 @@ use std::sync::Arc;
 
 use axum::{
     Router,
+    http::{HeaderMap, HeaderValue, header},
+    middleware::{self, Next},
     routing::{any, delete, get, post},
 };
 use site_access::{KeyDomain, resolve_domain_secret};
@@ -153,6 +155,104 @@ pub fn verify_internal_api_auth(
     provided.len() == expected.len() && bool::from(provided.as_bytes().ct_eq(expected))
 }
 
+fn cookie_pair_name(pair: &str) -> Option<&str> {
+    let (name, _) = pair.split_once('=')?;
+    let name = name.trim();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Drops percent-encoded auth-cookie spoofs unconditionally and drops literal
+/// duplicate occurrences of `__Host-ue_session` and `__Host-auth_tx` fail-closed
+/// before `CookieManagerLayer` (`cookie::Cookie::parse_encoded`) percent-decodes
+/// cookie names with last-wins semantics (Cycle 3 H5 / Cycle 4 I1 / Cycle 5 J2).
+///
+/// Decodes `Cookie` header bytes via `std::str::from_utf8` (matching `tower-cookies`)
+/// rather than `HeaderValue::to_str()` so non-ASCII UTF-8 bytes in another cookie can
+/// never cause this sanitizer to skip the header.
+pub(crate) fn sanitize_duplicate_auth_cookies(headers: &mut HeaderMap) {
+    let mut session_count = 0usize;
+    let mut auth_tx_count = 0usize;
+    let mut has_encoded_spoof = false;
+    for raw in headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| std::str::from_utf8(v.as_bytes()).ok())
+    {
+        for pair in raw.split(';').map(str::trim).filter(|c| !c.is_empty()) {
+            let Some(name) = cookie_pair_name(pair) else {
+                continue;
+            };
+            let decoded = percent_encoding::percent_decode_str(name)
+                .decode_utf8()
+                .ok();
+            let is_encoded = decoded.as_deref().is_some_and(|d| d != name);
+            if is_encoded {
+                if matches!(
+                    decoded.as_deref(),
+                    Some(site_access::SESSION_COOKIE | site_access::AUTH_TX_COOKIE)
+                ) {
+                    has_encoded_spoof = true;
+                }
+            } else if name == site_access::SESSION_COOKIE {
+                session_count += 1;
+            } else if name == site_access::AUTH_TX_COOKIE {
+                auth_tx_count += 1;
+            }
+        }
+    }
+    if !has_encoded_spoof && session_count <= 1 && auth_tx_count <= 1 {
+        return;
+    }
+
+    let drop_session = session_count > 1;
+    let drop_auth_tx = auth_tx_count > 1;
+    let mut kept = Vec::new();
+    for raw in headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| std::str::from_utf8(v.as_bytes()).ok())
+    {
+        for pair in raw.split(';').map(str::trim).filter(|c| !c.is_empty()) {
+            let Some(name) = cookie_pair_name(pair) else {
+                continue;
+            };
+            let decoded = percent_encoding::percent_decode_str(name)
+                .decode_utf8()
+                .ok();
+            let is_encoded = decoded.as_deref().is_some_and(|d| d != name);
+            if is_encoded
+                && matches!(
+                    decoded.as_deref(),
+                    Some(site_access::SESSION_COOKIE | site_access::AUTH_TX_COOKIE)
+                )
+            {
+                continue;
+            }
+            if !is_encoded
+                && ((drop_session && name == site_access::SESSION_COOKIE)
+                    || (drop_auth_tx && name == site_access::AUTH_TX_COOKIE))
+            {
+                continue;
+            }
+            kept.push(pair.to_string());
+        }
+    }
+    headers.remove(header::COOKIE);
+    if !kept.is_empty()
+        && let Ok(val) = HeaderValue::from_str(&kept.join("; "))
+    {
+        headers.insert(header::COOKIE, val);
+    }
+}
+
+async fn strip_duplicate_auth_cookies(
+    mut req: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    sanitize_duplicate_auth_cookies(req.headers_mut());
+    next.run(req).await
+}
+
 fn read_optional_secret(env: &Env, name: &str) -> Option<String> {
     env.secret(name)
         .ok()
@@ -243,6 +343,7 @@ async fn router(env: Env, _ctx: Context) -> Result<Router> {
         // Pluggable Multi-Provider Auth (OAuth2, OIDC Age Assurance, Email OTP, Telegram)
         .route("/user/auth/email/start", post(providers::email::start))
         .route("/user/auth/email/verify", post(providers::email::verify))
+        .route("/user/auth/telegram/start", post(providers::telegram::start))
         .route("/user/auth/telegram/verify", post(providers::telegram::verify))
         .route(
             "/user/auth/telegram/callback",
@@ -309,6 +410,7 @@ async fn router(env: Env, _ctx: Context) -> Result<Router> {
         .route("/user/api/likes", get(likes::list))
         .route("/user/api/likes/status", get(likes::status_batch))
         .layer(CookieManagerLayer::new())
+        .layer(middleware::from_fn(strip_duplicate_auth_cookies))
         .with_state(state))
 }
 
@@ -412,5 +514,107 @@ mod tests {
 
         let empty = HeaderMap::new();
         assert!(!verify_internal_api_auth(&empty, Some(secret)));
+    }
+
+    #[test]
+    fn sanitize_duplicate_auth_cookies_drops_duplicates_fail_closed() {
+        // Single session & auth_tx cookies are preserved untouched.
+        let mut ok = HeaderMap::new();
+        ok.insert(
+            header::COOKIE,
+            HeaderValue::from_static("__Host-ue_session=s1; __Host-auth_tx=t1; theme=dark"),
+        );
+        sanitize_duplicate_auth_cookies(&mut ok);
+        assert_eq!(
+            ok.get(header::COOKIE).unwrap(),
+            "__Host-ue_session=s1; __Host-auth_tx=t1; theme=dark"
+        );
+
+        // Duplicate session cookie across multiple Cookie headers drops ALL session cookies
+        // while keeping single auth_tx and unrelated cookies.
+        let mut dup_session = HeaderMap::new();
+        dup_session.append(
+            header::COOKIE,
+            HeaderValue::from_static("__Host-ue_session=evil; theme=dark"),
+        );
+        dup_session.append(
+            header::COOKIE,
+            HeaderValue::from_static("__Host-ue_session=real; __Host-auth_tx=t1"),
+        );
+        sanitize_duplicate_auth_cookies(&mut dup_session);
+        assert_eq!(
+            dup_session.get(header::COOKIE).unwrap(),
+            "theme=dark; __Host-auth_tx=t1"
+        );
+
+        // Duplicate auth_tx in a single header drops ALL auth_tx occurrences, keeps single session.
+        let mut dup_tx = HeaderMap::new();
+        dup_tx.insert(
+            header::COOKIE,
+            HeaderValue::from_static("__Host-auth_tx=a; __Host-ue_session=s1; __Host-auth_tx=b"),
+        );
+        sanitize_duplicate_auth_cookies(&mut dup_tx);
+        assert_eq!(
+            dup_tx.get(header::COOKIE).unwrap(),
+            "__Host-ue_session=s1"
+        );
+
+        // If only duplicated auth cookies were present, Cookie header is removed completely.
+        let mut only_dups = HeaderMap::new();
+        only_dups.insert(
+            header::COOKIE,
+            HeaderValue::from_static("__Host-ue_session=a; __Host-ue_session=b"),
+        );
+        sanitize_duplicate_auth_cookies(&mut only_dups);
+        assert!(only_dups.get(header::COOKIE).is_none());
+
+        // Cycle 4 I1: Percent-encoded auth cookie names (e.g. %5F_Host-ue_session,
+        // __Host%2Dauth_tx) are dropped unconditionally while preserving a legitimate
+        // literal __Host- cookie.
+        let mut encoded_spoof = HeaderMap::new();
+        encoded_spoof.insert(
+            header::COOKIE,
+            HeaderValue::from_static(
+                "__Host-ue_session=real; %5F_Host-ue_session=evil; __Host%2Dauth_tx=evil_tx; theme=dark",
+            ),
+        );
+        sanitize_duplicate_auth_cookies(&mut encoded_spoof);
+        assert_eq!(
+            encoded_spoof.get(header::COOKIE).unwrap(),
+            "__Host-ue_session=real; theme=dark"
+        );
+
+        let mut sole_encoded = HeaderMap::new();
+        sole_encoded.insert(
+            header::COOKIE,
+            HeaderValue::from_static("%5f_Host-auth_tx=attacker_tx"),
+        );
+        sanitize_duplicate_auth_cookies(&mut sole_encoded);
+        assert!(sole_encoded.get(header::COOKIE).is_none());
+
+        // Cycle 5 J2: Non-ASCII UTF-8 bytes in another cookie MUST NOT bypass sanitization,
+        // and nameless/valueless tokens without '=' MUST NOT count as duplicate auth cookies.
+        let mut utf8_bypass = HeaderMap::new();
+        utf8_bypass.insert(
+            header::COOKIE,
+            HeaderValue::from_str("pad=é; __Host-ue_session=real; %5F_Host-ue_session=evil")
+                .unwrap(),
+        );
+        sanitize_duplicate_auth_cookies(&mut utf8_bypass);
+        assert_eq!(
+            std::str::from_utf8(utf8_bypass.get(header::COOKIE).unwrap().as_bytes()).unwrap(),
+            "pad=é; __Host-ue_session=real"
+        );
+
+        let mut valueless_dos = HeaderMap::new();
+        valueless_dos.insert(
+            header::COOKIE,
+            HeaderValue::from_static("__Host-ue_session; __Host-ue_session=real"),
+        );
+        sanitize_duplicate_auth_cookies(&mut valueless_dos);
+        assert_eq!(
+            valueless_dos.get(header::COOKIE).unwrap(),
+            "__Host-ue_session; __Host-ue_session=real"
+        );
     }
 }

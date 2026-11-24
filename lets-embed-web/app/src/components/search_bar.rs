@@ -1240,7 +1240,8 @@ async fn suggest_search(mode: String, q: String) -> Result<Vec<SearchSuggestion>
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
     fn to_err(e: impl std::fmt::Display) -> ServerFnError {
-        ServerFnError::Response(e.to_string())
+        tracing::error!("suggest_search failed: {e}");
+        ServerFnError::Response("Suggestions unavailable".to_string())
     }
 
     let items = match parsed_mode {

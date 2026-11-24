@@ -47,14 +47,29 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
     let busy = RwSignal::new(false);
 
     let load_accounts = move || {
-        loading.set(true);
-        let q = search_q.get_untracked();
-        let pl = plan_filter.get_untracked();
-        let st = status_filter.get_untracked();
-        let pv = provider_filter.get_untracked();
-        let so = sort_by.get_untracked();
-        let pg = page.get_untracked();
-        let sel_id = selected_account.get_untracked().map(|a| a.id);
+        let Some(q) = search_q.try_get_untracked() else {
+            return;
+        };
+        let Some(pl) = plan_filter.try_get_untracked() else {
+            return;
+        };
+        let Some(st) = status_filter.try_get_untracked() else {
+            return;
+        };
+        let Some(pv) = provider_filter.try_get_untracked() else {
+            return;
+        };
+        let Some(so) = sort_by.try_get_untracked() else {
+            return;
+        };
+        let Some(pg) = page.try_get_untracked() else {
+            return;
+        };
+        let sel_id = selected_account
+            .try_get_untracked()
+            .flatten()
+            .map(|a| a.id);
+        let _ = loading.try_set(true);
 
         let mut url = format!(
             "/admin/api/accounts?plan={pl}&status={st}&sort={so}&page={pg}"
@@ -75,25 +90,30 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
         spawn_local(async move {
             match get_json::<AccountsListResp>(&url).await {
                 Ok(resp) => {
+                    let _ = page.try_set(resp.page.max(1));
                     if let Some(sel) = resp.selected.clone() {
-                        selected_account.set(Some(sel));
+                        let _ = selected_account.try_set(Some(sel));
                     }
-                    accounts_data.set(Some(resp));
+                    let _ = accounts_data.try_set(Some(resp));
                 }
                 Err(err) => {
                     toasts.error("Failed to load accounts", Some(err));
                 }
             }
-            loading.set(false);
+            let _ = loading.try_set(false);
         });
     };
 
     let load_payments = move || {
-        let st = payments_status.get_untracked();
+        let Some(st) = payments_status.try_get_untracked() else {
+            return;
+        };
         let url = format!("/admin/api/payments?status={st}&limit=50");
         spawn_local(async move {
             match get_json::<PaymentsListResp>(&url).await {
-                Ok(resp) => payments_data.set(Some(resp)),
+                Ok(resp) => {
+                    let _ = payments_data.try_set(Some(resp));
+                }
                 Err(err) => {
                     toasts.error("Failed to load payments", Some(err));
                 }
@@ -132,7 +152,7 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                             resp.balance, resp.applied
                         )),
                     );
-                    credit_reason.set(String::new());
+                    let _ = credit_reason.try_set(String::new());
                     load_accounts();
                     on_mutated.run(());
                 }
@@ -140,7 +160,7 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                     toasts.error("Credit adjustment failed", Some(err));
                 }
             }
-            busy.set(false);
+            let _ = busy.try_set(false);
         });
     };
 
@@ -182,7 +202,7 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                     toasts.error("Plan update failed", Some(err));
                 }
             }
-            busy.set(false);
+            let _ = busy.try_set(false);
         });
     };
 
@@ -216,7 +236,7 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                     toasts.error("Ban status update failed", Some(err));
                 }
             }
-            busy.set(false);
+            let _ = busy.try_set(false);
         });
     };
 
@@ -293,6 +313,7 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                         prop:value=move || sort_by.get()
                         on:change=move |ev| {
                             sort_by.set(event_target_value(&ev));
+                            page.set(1);
                             load_accounts();
                         }
                     >
@@ -382,6 +403,60 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                         </tbody>
                     </table>
                 </div>
+
+                {move || accounts_data.get().map(|data| {
+                    let page_size = data.page_size.max(1);
+                    let effective_total = if data.live_sort_capped && data.live_sort_scan_limit > 0 {
+                        data.total.min(data.live_sort_scan_limit)
+                    } else {
+                        data.total
+                    };
+                    let total_pages = effective_total.div_ceil(page_size).max(1);
+                    let cur_page = data.page.clamp(1, total_pages);
+                    let caption = if data.live_sort_capped {
+                        format!(
+                            "Page {cur_page} of {total_pages} · showing top {} most recently active of {} matching accounts (narrow filters to inspect others)",
+                            effective_total, data.total
+                        )
+                    } else {
+                        format!("Page {cur_page} of {total_pages} · {} matching accounts", data.total)
+                    };
+                    view! {
+                        <div class="adm-row" style="justify-content: space-between; align-items: center; margin-top: 12px;">
+                            <span class="adm-sub">
+                                {caption}
+                            </span>
+                            <div class="adm-row" style="gap: 8px;">
+                                <button
+                                    type="button"
+                                    class="adm-btn adm-btn--sm"
+                                    disabled={move || loading.get() || cur_page <= 1}
+                                    on:click=move |_| {
+                                        if cur_page > 1 {
+                                            page.set(cur_page - 1);
+                                            load_accounts();
+                                        }
+                                    }
+                                >
+                                    "Previous"
+                                </button>
+                                <button
+                                    type="button"
+                                    class="adm-btn adm-btn--sm"
+                                    disabled={move || loading.get() || cur_page >= total_pages}
+                                    on:click=move |_| {
+                                        if cur_page < total_pages {
+                                            page.set(cur_page + 1);
+                                            load_accounts();
+                                        }
+                                    }
+                                >
+                                    "Next"
+                                </button>
+                            </div>
+                        </div>
+                    }
+                })}
             </section>
 
             // Selected Account Inspector

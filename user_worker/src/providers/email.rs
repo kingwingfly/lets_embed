@@ -200,6 +200,7 @@ pub async fn start(
     let api_key = match secrets::load_provider_secret(
         &st.env,
         &st.deployment_id,
+        policy.revision,
         AuthProviderId::EmailOtp.as_str(),
         "api_key",
         &["EMAIL_API_KEY", "RESEND_API_KEY"],

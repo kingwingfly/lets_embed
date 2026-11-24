@@ -56,13 +56,14 @@ use crate::auth::{
     resolve_gateway_secrets,
 };
 use crate::http_util::{
-    GALLERY_ALLOWED_METHODS, MAX_ADMIN_BODY_BYTES, MAX_GATEWAY_BODY_BYTES, MAX_REVEAL_BODY_BYTES,
-    MEDIA_ALLOWED_METHODS, USER_ALLOWED_METHODS, Upstreams, browse_route,
+    CookieLookup, GALLERY_ALLOWED_METHODS, MAX_ADMIN_BODY_BYTES, MAX_GATEWAY_BODY_BYTES,
+    MAX_REVEAL_BODY_BYTES, MEDIA_ALLOWED_METHODS, USER_ALLOWED_METHODS, Upstreams, browse_route,
     build_api_upstream_target, checked_gallery_method, checked_media_method, checked_user_method,
-    guest_id, has_reveal_csrf_header, is_always_public_path, is_canonical_path, is_hop_by_hop,
-    is_https_request, is_public_cacheable_path, is_same_origin, is_segment_prefix, is_sitemap_path,
-    login_response, metered_item, method_not_allowed, payment_required, private_no_store,
-    request_host, sanitize_origin_cookie, sanitize_user_worker_cookie,
+    extract_single_cookie, guest_id, has_reveal_csrf_header, is_always_public_path,
+    is_canonical_path, is_hop_by_hop, is_https_request, is_public_cacheable_path, is_same_origin,
+    is_segment_prefix, is_sitemap_path, login_response, metered_item, method_not_allowed,
+    payment_required, private_no_store, request_host, sanitize_origin_cookie,
+    sanitize_user_worker_cookie,
     should_strip_api_request_header,
 };
 use crate::media::{
@@ -649,16 +650,22 @@ enum SessionResolution {
 async fn resolve_live_session(
     backend: &impl GatewayBackend,
     cfg: &GatewayConfig,
-    cookies: &Cookies,
+    headers: &HeaderMap,
     now: u64,
 ) -> SessionResolution {
-    let Some(raw_cookie) = cookies.get(SESSION_COOKIE) else {
-        return SessionResolution::Unauthenticated {
-            clear_cookie: false,
-        };
+    let raw_cookie = match extract_single_cookie(headers, SESSION_COOKIE) {
+        CookieLookup::Missing => {
+            return SessionResolution::Unauthenticated {
+                clear_cookie: false,
+            };
+        }
+        CookieLookup::Duplicate => {
+            return SessionResolution::Unauthenticated { clear_cookie: true };
+        }
+        CookieLookup::Single(val) => val,
     };
     let Ok(verified) = verify_session_any(
-        raw_cookie.value(),
+        raw_cookie,
         &cfg.session_v2_secret,
         Some(&cfg.jwt_secret),
         now,
@@ -727,11 +734,13 @@ fn build_service_headers(
         let name = k.as_str();
         if is_hop_by_hop(name)
             || is_privileged_request_header(name)
+            || name.eq_ignore_ascii_case("authorization")
             || name.eq_ignore_ascii_case("x-forwarded-host")
             || name.eq_ignore_ascii_case("x-forwarded-proto")
             || name.eq_ignore_ascii_case("forwarded")
             || name.eq_ignore_ascii_case("cf-ipcountry")
             || name.eq_ignore_ascii_case("x-internal-api-secret")
+            || name.eq_ignore_ascii_case("x-internal-secret")
             || name.eq_ignore_ascii_case("cookie")
         {
             continue;
@@ -773,19 +782,32 @@ fn build_service_headers(
 
 fn build_api_headers(
     uri: &Uri,
+    worker_method: &worker::Method,
     headers: &HeaderMap,
     cfg: &GatewayConfig,
     signed_assertion: &str,
 ) -> Vec<(String, String)> {
+    let is_api_post =
+        *worker_method == worker::Method::Post && uri.path().starts_with("/api/");
     let mut out = Vec::new();
     for (k, v) in headers {
         let name = k.as_str();
         if should_strip_api_request_header(name) {
             continue;
         }
+        // Prevent `leptos_axum` HTML-form redirect rewriting (`Accept: text/html` + `Referer` ->
+        // `302 Found` with full JSON body) on `POST /api/*` server functions (Cycle 5 J1).
+        if is_api_post
+            && (name.eq_ignore_ascii_case("accept") || name.eq_ignore_ascii_case("referer"))
+        {
+            continue;
+        }
         if let Ok(val) = v.to_str() {
             out.push((name.to_string(), val.to_string()));
         }
+    }
+    if is_api_post {
+        out.push(("accept".to_string(), "application/json".to_string()));
     }
     if let Some(host) = request_host(uri, headers) {
         let proto = if is_https_request(uri) {
@@ -913,8 +935,8 @@ async fn proxy_to_api(
     };
     let req = UpstreamFetchReq {
         url: target_url,
+        headers: build_api_headers(uri, &worker_method, headers, cfg, signed_assertion),
         method: worker_method,
-        headers: build_api_headers(uri, headers, cfg, signed_assertion),
         body,
         no_cache: !allow_public_cache,
         preview_blur: None,
@@ -922,7 +944,7 @@ async fn proxy_to_api(
     match backend.fetch_upstream(req).await {
         Ok(resp) => {
             if allow_public_cache
-                && resp.status().is_success()
+                && (resp.status().is_success() || resp.status() == StatusCode::NOT_MODIFIED)
                 && !resp.headers().contains_key("set-cookie")
             {
                 resp
@@ -1068,13 +1090,17 @@ async fn handle_media_route(
     method: &Method,
     worker_method: worker::Method,
     headers: &HeaderMap,
-    cookies: &Cookies,
     is_billing_waived: bool,
     now: u64,
 ) -> Response {
     let Some((kind, id)) = parse_media_route(uri.path()) else {
         return private_no_store((StatusCode::NOT_FOUND, "Not Found").into_response());
     };
+    // Preview blur invokes Cloudflare Images on every request and is non-range,
+    // `private, no-store`; disallow `HEAD` so callers cannot trigger unmetered transforms (Cycle 2 D-7).
+    if kind == MediaCapKind::Preview && *method == Method::HEAD {
+        return method_not_allowed("GET");
+    }
     // Fail closed BEFORE billing, origin calls, or upstream fetch when fixed server-side
     // preview blur is disabled, preventing `/media/preview/*` from ever leaking clear bytes.
     if kind == MediaCapKind::Preview && !snapshot.policy.fixed_blur_enabled {
@@ -1106,7 +1132,7 @@ async fn handle_media_route(
     };
 
     // Step 2: Resolve live caller session, ActorBinding, and PolicyAccessResult.
-    let (auth, clear_cookie) = match resolve_live_session(backend, cfg, cookies, now).await {
+    let (auth, clear_cookie) = match resolve_live_session(backend, cfg, headers, now).await {
         SessionResolution::Authenticated(live) => (Some(live), false),
         SessionResolution::Unauthenticated { clear_cookie } => (None, clear_cookie),
         SessionResolution::Banned => {
@@ -1126,12 +1152,15 @@ async fn handle_media_route(
     } else {
         cfg.live_admin_email()
     };
-    let guest_cookie = cookies.get(GUEST_SESSION_COOKIE);
+    let guest_cookie = match extract_single_cookie(headers, GUEST_SESSION_COOKIE) {
+        CookieLookup::Single(val) => Some(val),
+        CookieLookup::Missing | CookieLookup::Duplicate => None,
+    };
     let live_actor = resolve_actor_binding(
         auth.as_ref(),
         clear_cookie,
         live_admin_email,
-        guest_cookie.as_ref().map(|c| c.value()),
+        guest_cookie,
         &cfg.guest_session_secret,
         now,
     );
@@ -1261,6 +1290,8 @@ async fn handle_media_route(
     };
 
     // Step 6: Billing / preview budget (ONLY after full authorization passes; waived by browse pass or live staff).
+    // Clear media GET uses reserve -> commit/release holds so failed upstream fetches never burn points/quota (Cycle 2 D-11).
+    let mut media_hold: Option<(String, bool, String)> = None;
     if !is_billing_waived {
         let guest = auth.is_none();
         let billing_status = match kind {
@@ -1271,7 +1302,7 @@ async fn handle_media_route(
                 };
                 let req = PreviewBudgetReq {
                     key: site_access::MediaBillingKey::preview_budget_key(id),
-                    head: *method == Method::HEAD,
+                    head: false,
                     guest,
                 };
                 backend
@@ -1286,33 +1317,74 @@ async fn handle_media_route(
                 let charge_req = cap
                     .billing_key()
                     .expect("image/video is billable")
-                    .to_charge_req();
-                if let Some(live) = auth.as_ref() {
-                    let op = if *method == Method::HEAD {
-                        "can-charge"
+                    .to_charge_req_with_locator(&cap.immutable_locator);
+                if *method == Method::HEAD {
+                    if let Some(live) = auth.as_ref() {
+                        backend
+                            .account_call(
+                                live.session.do_key(),
+                                "can-charge",
+                                serde_json::to_value(&charge_req).expect("serialize ChargeReq"),
+                            )
+                            .await
                     } else {
-                        "charge"
-                    };
-                    backend
-                        .account_call(
-                            live.session.do_key(),
-                            op,
+                        let g_id = guest_id(&cfg.jwt_secret, headers);
+                        let guest_req = GuestReq {
+                            item: Some(charge_req),
+                            head: true,
+                        };
+                        backend
+                            .account_call(
+                                &g_id,
+                                "guest",
+                                serde_json::to_value(&guest_req).expect("serialize GuestReq"),
+                            )
+                            .await
+                    }
+                } else if let Some(live) = auth.as_ref() {
+                    let do_key = live.session.do_key().to_string();
+                    match backend
+                        .account_reserve(
+                            &do_key,
+                            "reserve",
                             serde_json::to_value(&charge_req).expect("serialize ChargeReq"),
                         )
                         .await
+                    {
+                        Ok((status, hold_id)) => {
+                            if status == 200
+                                && let Some(hid) = hold_id
+                            {
+                                media_hold = Some((do_key, false, hid));
+                            }
+                            Ok(status)
+                        }
+                        Err(e) => Err(e),
+                    }
                 } else {
                     let g_id = guest_id(&cfg.jwt_secret, headers);
                     let guest_req = GuestReq {
                         item: Some(charge_req),
-                        head: *method == Method::HEAD,
+                        head: false,
                     };
-                    backend
-                        .account_call(
+                    match backend
+                        .account_reserve(
                             &g_id,
-                            "guest",
+                            "reserve-guest",
                             serde_json::to_value(&guest_req).expect("serialize GuestReq"),
                         )
                         .await
+                    {
+                        Ok((status, hold_id)) => {
+                            if status == 200
+                                && let Some(hid) = hold_id
+                            {
+                                media_hold = Some((g_id, true, hid));
+                            }
+                            Ok(status)
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
             }
         };
@@ -1388,6 +1460,9 @@ async fn handle_media_route(
                     resp.headers_mut().remove("set-cookie");
                     private_no_store(resp)
                 }
+            } else if resp.status() == StatusCode::NOT_MODIFIED {
+                resp.headers_mut().remove("set-cookie");
+                private_no_store(resp)
             } else if resp.status().is_redirection() {
                 private_no_store(
                     (StatusCode::BAD_GATEWAY, "Upstream redirect rejected").into_response(),
@@ -1402,6 +1477,36 @@ async fn handle_media_route(
             private_no_store((StatusCode::BAD_GATEWAY, "upstream fetch failed").into_response())
         }
     };
+
+    if let Some((account_key, is_guest, hold_id)) = media_hold {
+        let succeeded = matches!(
+            response.status(),
+            StatusCode::OK | StatusCode::PARTIAL_CONTENT | StatusCode::NOT_MODIFIED
+        );
+        let op = match (is_guest, succeeded) {
+            (false, true) => "commit",
+            (false, false) => "release",
+            (true, true) => "commit-guest",
+            (true, false) => "release-guest",
+        };
+        match backend
+            .account_call(
+                &account_key,
+                op,
+                serde_json::to_value(&HoldReq { hold_id }).expect("serialize HoldReq"),
+            )
+            .await
+        {
+            Ok(200) => {}
+            Err(err) => log_backend_error(&format!("media hold {op} failed"), &err),
+            Ok(status) => {
+                log_backend_error(
+                    &format!("media hold {op} failed"),
+                    &BackendError(format!("HTTP {status}")),
+                );
+            }
+        }
+    }
 
     maybe_clear_session_cookie(response, clear_cookie)
 }
@@ -1448,10 +1553,7 @@ async fn forward_gallery_request(
             );
         };
         actor = ActorBinding::GuestSession { gid };
-        minted_guest_cookie = Some(guest_session_set_cookie_header(
-            &signed_guest,
-            is_https_request(uri),
-        ));
+        minted_guest_cookie = Some(guest_session_set_cookie_header(&signed_guest));
     }
 
     let Ok(signed_assertion) = sign_assertion_v3(cfg, snapshot, now, actor, access, flags) else {
@@ -1470,7 +1572,9 @@ async fn forward_gallery_request(
     )
     .await;
 
-    if let Some(cookie_hdr) = minted_guest_cookie {
+    if let Some(cookie_hdr) = minted_guest_cookie
+        && resp.status().is_success()
+    {
         resp.headers_mut().append(
             "set-cookie",
             cookie_hdr.parse().expect("ASCII le_guest_sid Set-Cookie"),
@@ -1553,7 +1657,7 @@ async fn handle_gateway_request(
                 // while forcing `private, no-store` on all auth/account/API responses.
                 if matches!(method, Method::GET | Method::HEAD)
                     && is_segment_prefix(path, "/user/assets")
-                    && resp.status().is_success()
+                    && (resp.status().is_success() || resp.status() == StatusCode::NOT_MODIFIED)
                     && !resp.headers().contains_key("set-cookie")
                 {
                     resp
@@ -1592,7 +1696,6 @@ async fn handle_gateway_request(
             &method,
             worker_method,
             &headers,
-            &cookies,
             is_billing_waived,
             now,
         )
@@ -1639,7 +1742,7 @@ async fn handle_gateway_request(
     }
 
     // Resolve live caller session via `USER_ACCOUNT` DO (`POST /session-context`).
-    let (auth, clear_cookie) = match resolve_live_session(backend, cfg, &cookies, now).await {
+    let (auth, clear_cookie) = match resolve_live_session(backend, cfg, &headers, now).await {
         SessionResolution::Authenticated(live) => (Some(live), false),
         SessionResolution::Unauthenticated { clear_cookie } => (None, clear_cookie),
         SessionResolution::Banned => {
@@ -1715,12 +1818,15 @@ async fn handle_gateway_request(
             AssertionFlags::default(),
         )
     } else {
-        let guest_cookie = cookies.get(GUEST_SESSION_COOKIE);
+        let guest_cookie = match extract_single_cookie(&headers, GUEST_SESSION_COOKIE) {
+            CookieLookup::Single(val) => Some(val),
+            CookieLookup::Missing | CookieLookup::Duplicate => None,
+        };
         let resolved_actor = resolve_actor_binding(
             auth.as_ref(),
             clear_cookie,
             effective_live_admin,
-            guest_cookie.as_ref().map(|c| c.value()),
+            guest_cookie,
             &cfg.guest_session_secret,
             now,
         );
@@ -1800,7 +1906,7 @@ async fn handle_gateway_request(
 
         let resp = match reserve_res {
             Ok((200, hold_id)) => {
-                let response = proxy_to_api(
+                let mut response = proxy_to_api(
                     backend,
                     cfg,
                     &uri,
@@ -1811,6 +1917,13 @@ async fn handle_gateway_request(
                     false,
                 )
                 .await;
+                // Never forward an upstream 3xx response (and its body) alongside a
+                // released/refunded billing hold on metered search routes (Cycle 5 J1).
+                if response.status().is_redirection() {
+                    response = private_no_store(
+                        (StatusCode::BAD_GATEWAY, "Upstream redirect rejected").into_response(),
+                    );
+                }
                 if let Some(hold_id) = hold_id {
                     let op = match (guest, response.status().is_success()) {
                         (false, true) => "commit",
@@ -2800,14 +2913,14 @@ mod tests {
             .expect("must set le_guest_sid")
             .to_str()
             .unwrap();
-        assert!(sc.starts_with("le_guest_sid=gs1."));
+        assert!(sc.starts_with("__Host-le_guest_sid=gs1."));
         assert!(sc.contains("HttpOnly"));
         assert!(sc.contains("SameSite=Lax"));
         assert!(sc.contains("Path=/"));
         assert!(sc.contains("Secure"));
 
         let cookie_pair = sc.split(';').next().unwrap();
-        let raw_guest_tok = cookie_pair.strip_prefix("le_guest_sid=").unwrap();
+        let raw_guest_tok = cookie_pair.strip_prefix("__Host-le_guest_sid=").unwrap();
         let verified_guest =
             verify_guest_session(raw_guest_tok, &cfg.guest_session_secret, TEST_NOW).unwrap();
 
@@ -3003,7 +3116,18 @@ mod tests {
         );
         assert_eq!(ok.status(), StatusCode::OK);
         assert_eq!(ok.headers().get("cache-control").unwrap(), "private, no-store");
-        assert_eq!(backend.account_calls.borrow().len(), 1);
+        // Media GET uses reserve-guest -> commit-guest hold with canonical media_path (Cycle 2 D-1/D-11)
+        {
+            let calls = backend.account_calls.borrow();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].operation, "reserve-guest");
+            assert_eq!(calls[0].payload["item"]["path"], "media:image:42");
+            assert_eq!(
+                calls[0].payload["item"]["media_path"],
+                "/images/2026/01/pic_42.webp"
+            );
+            assert_eq!(calls[1].operation, "commit-guest");
+        }
         assert_eq!(backend.upstream_calls.borrow().len(), 2);
         assert_eq!(
             backend.upstream_calls.borrow()[1].url,
@@ -3506,11 +3630,31 @@ mod tests {
             Bytes::new(),
         );
         assert_eq!(get_r.status(), StatusCode::OK);
-        assert_eq!(backend.account_calls.borrow()[1].operation, "charge");
+        assert_eq!(backend.account_calls.borrow()[1].operation, "reserve");
+        assert_eq!(
+            backend.account_calls.borrow()[1].payload["media_path"],
+            "/images/restricted/item 99.webp"
+        );
+        assert_eq!(backend.account_calls.borrow()[2].operation, "commit");
         assert_eq!(
             backend.upstream_calls.borrow().last().unwrap().url,
             "https://image.gallery.test/restricted/item%2099.webp"
         );
+
+        // Upstream 500 on media GET MUST release the hold instead of burning balance (Cycle 2 D-11).
+        backend.account_calls.borrow_mut().clear();
+        backend.upstream_status = StatusCode::INTERNAL_SERVER_ERROR;
+        let err_r = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            &uri,
+            make_hdrs(make_v2_cookie(&cfg, user_id, do_key, sid)),
+            Bytes::new(),
+        );
+        assert_eq!(err_r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(backend.account_calls.borrow()[0].operation, "reserve");
+        assert_eq!(backend.account_calls.borrow()[1].operation, "release");
     }
 
     #[test]
@@ -3598,7 +3742,7 @@ mod tests {
         );
         assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
         let sc = revoked.headers().get("set-cookie").unwrap().to_str().unwrap();
-        assert!(sc.starts_with("ue_session=;"));
+        assert!(sc.starts_with("__Host-ue_session=;"));
         assert!(sc.contains("Max-Age=0"));
     }
 
@@ -3722,6 +3866,13 @@ mod tests {
         assert!(parse_upstream_origin("http://api.gallery.test").is_err());
         assert!(is_canonical_path("/media/image/42"));
         assert!(!is_canonical_path("/x/%2e%2e/api/search_advanced_clip"));
+        assert!(!is_canonical_path("/%61pi/search_by_image"));
+        assert!(!is_canonical_path("/%69nternal/validate-safety-catalog"));
+        assert!(!is_canonical_path("/%73itemap.xml"));
+        assert!(!is_canonical_path("/api/%2561"));
+        assert!(!is_canonical_path("/api/foo%00bar"));
+        assert!(should_strip_api_request_header("x-internal-secret"));
+        assert!(should_strip_api_request_header("Authorization"));
         assert_eq!(
             encode_canonical_cap_path("Demo album/a(1).webp").as_deref(),
             Some("/Demo%20album/a%281%29.webp")
@@ -3731,7 +3882,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.append(
             "cookie",
-            "pref=dark; ue_session=s1; le_guest_sid=g1; __Host-ue_admin_view=a1"
+            "pref=dark; __Host-ue_session=s1; ue_session=legacy; __Host-le_guest_sid=g1; le_guest_sid=g0; __Host-ue_admin_view=a1"
                 .parse()
                 .unwrap(),
         );
@@ -4195,5 +4346,150 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn clear_media_passes_through_304_not_modified_and_still_rejects_302_redirect() {
+        let policy = sample_safety_policy();
+        let cfg = test_cfg();
+        let cap = MediaCapability {
+            v: MEDIA_CAP_VERSION,
+            aud: MEDIA_CAP_AUDIENCE.into(),
+            kind: MediaCapKind::Image,
+            asset_id: 99,
+            immutable_locator: "2026/01/pic_99.webp".into(),
+            facts_rev: 7,
+            policy_rev: policy.revision,
+            actor_binding: ActorBinding::Anon,
+            matched_blocks: vec![],
+            matched_blurs: vec![],
+            revealed_refs: vec![],
+            exp: TEST_NOW + 300,
+        };
+        let cap_tok = sign_media_capability(&cap, &cfg.media_cap_secret).unwrap();
+
+        let mut backend_304 = MockBackend::with_policy(policy.clone());
+        backend_304.upstream_status = StatusCode::NOT_MODIFIED;
+        let mut cond_hdrs = HeaderMap::new();
+        cond_hdrs.insert("if-none-match", "\"etag-99\"".parse().unwrap());
+        let resp_304 = dispatch(
+            &backend_304,
+            &cfg,
+            Method::GET,
+            &format!("/media/image/99?cap={cap_tok}"),
+            cond_hdrs.clone(),
+            Bytes::new(),
+        );
+        assert_eq!(resp_304.status(), StatusCode::NOT_MODIFIED);
+
+        let mut backend_302 = MockBackend::with_policy(policy);
+        backend_302.upstream_status = StatusCode::FOUND;
+        let resp_302 = dispatch(
+            &backend_302,
+            &cfg,
+            Method::GET,
+            &format!("/media/image/99?cap={cap_tok}"),
+            cond_hdrs,
+            Bytes::new(),
+        );
+        assert_eq!(resp_302.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn sanitize_user_worker_cookie_drops_percent_encoded_and_duplicate_auth_cookies() {
+        let mut hdrs = HeaderMap::new();
+        let raw = format!(
+            "__Host-ue_session=real; %5F_Host-ue_session=evil; __Host%2Dauth_tx=evil_tx; %43F_Authorization=cf_tok; {}=1; theme=dark",
+            site_access::ADMIN_VIEW_COOKIE
+        );
+        hdrs.insert("cookie", raw.parse().unwrap());
+        assert_eq!(
+            http_util::sanitize_user_worker_cookie(&hdrs).as_deref(),
+            Some("__Host-ue_session=real; theme=dark")
+        );
+
+        let mut dup = HeaderMap::new();
+        dup.insert(
+            "cookie",
+            "__Host-ue_session=a; __Host-ue_session=b; __Host-auth_tx=ok"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            http_util::sanitize_user_worker_cookie(&dup).as_deref(),
+            Some("__Host-auth_tx=ok")
+        );
+
+        // Cycle 5 J2: Non-ASCII UTF-8 bytes in another cookie MUST NOT bypass sanitization,
+        // and nameless tokens without '=' are dropped cleanly rather than causing false drops.
+        let mut utf8_and_valueless = HeaderMap::new();
+        utf8_and_valueless.insert(
+            "cookie",
+            axum::http::HeaderValue::from_str(
+                "pad=é; __Host-ue_session; __Host-ue_session=real; %5F_Host-ue_session=evil",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            http_util::sanitize_user_worker_cookie(&utf8_and_valueless).as_deref(),
+            Some("pad=é; __Host-ue_session=real")
+        );
+    }
+
+    #[test]
+    fn metered_post_normalizes_accept_strips_referer_and_rejects_upstream_3xx_body() {
+        let policy = sample_safety_policy();
+        let cfg = test_cfg();
+
+        // 1. Metered POST /api/search_by_desc with `Accept: text/html` + `Referer`
+        //    must strip `referer` and force `accept: application/json` upstream so
+        //    `leptos_axum` never rewrites 200 -> 302 (Cycle 5 J1).
+        let backend_ok = MockBackend::with_policy(policy.clone());
+        let mut hdrs = HeaderMap::new();
+        hdrs.insert("host", "gallery.test".parse().unwrap());
+        hdrs.insert("origin", "https://gallery.test".parse().unwrap());
+        hdrs.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        hdrs.insert(
+            "content-type",
+            "application/x-www-form-urlencoded".parse().unwrap(),
+        );
+        hdrs.insert("accept", "text/html,application/xhtml+xml".parse().unwrap());
+        hdrs.insert("referer", "https://gallery.test/".parse().unwrap());
+        let ok_resp = dispatch(
+            &backend_ok,
+            &cfg,
+            Method::POST,
+            "/api/search_by_desc",
+            hdrs.clone(),
+            Bytes::from_static(b"q=sunset&limit=10&offset=0"),
+        );
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+        {
+            let up = backend_ok.upstream_calls.borrow();
+            assert_eq!(up.len(), 1);
+            assert_eq!(
+                header_value(&up[0].headers, "accept"),
+                Some("application/json")
+            );
+            assert_eq!(header_value(&up[0].headers, "referer"), None);
+        }
+
+        // 2. If upstream still unexpectedly returns 302 Found with a body on a metered
+        //    search POST, gateway MUST reject with 502 Bad Gateway (never leaking body
+        //    while releasing/refunding the hold).
+        let mut backend_302 = MockBackend::with_policy(policy);
+        backend_302.upstream_status = StatusCode::FOUND;
+        let resp_302 = dispatch(
+            &backend_302,
+            &cfg,
+            Method::POST,
+            "/api/search_by_desc",
+            hdrs,
+            Bytes::from_static(b"q=sunset&limit=10&offset=0"),
+        );
+        assert_eq!(resp_302.status(), StatusCode::BAD_GATEWAY);
+        let calls = backend_302.account_calls.borrow();
+        assert!(calls.iter().any(|c| c.operation == "reserve-guest"));
+        assert!(calls.iter().any(|c| c.operation == "release-guest"));
     }
 }

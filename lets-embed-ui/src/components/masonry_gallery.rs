@@ -425,11 +425,20 @@ pub fn MasonryGallery(
         })
     };
 
+    // Memoize emptiness so updating `cards` (e.g. Load more, unlike, spoiler reveal)
+    // does not re-run the outer closure and tear down the entire masonry DOM (Cycle 5 J7).
+    // Track `panic_epoch` only when `cards` updates so wiped tiles stay cleared while a
+    // post-invalidation refetch is in flight (L1) and remount cleanly once fresh cards arrive (Cycle 6).
+    let render_epoch = Memo::new(move |_| {
+        cards.track();
+        panic_epoch.map_or(0, |e| e.get_untracked())
+    });
+    let is_empty = Memo::new(move |_| cards.with(Vec::is_empty));
+
     view! {
         <div node_ref=container_ref class=wrap_cls>
             {move || {
-                let is_empty = cards.with(Vec::is_empty);
-                if is_empty {
+                if is_empty.get() {
                     return empty_message
                         .clone()
                         .map(|msg| view! { <div class="le-gallery-empty">{msg}</div> }.into_any())
@@ -447,9 +456,12 @@ pub fn MasonryGallery(
                             data-density=move || density.get().as_str()
                         >
                             <For
-                                each=move || cards.get()
-                                key=|c| c.key.clone()
-                                let(card)
+                                each=move || {
+                                    let ep = render_epoch.get();
+                                    cards.get().into_iter().map(move |c| (c, ep))
+                                }
+                                key=|(c, ep)| (c.clone(), *ep)
+                                let((card, _))
                             >
                                 {render_tile_with_opts(card, is_compact)}
                             </For>
@@ -471,12 +483,18 @@ pub fn MasonryGallery(
                                 <div class="gallery-col le-masonry-col">
                                     <For
                                         each=move || {
+                                            let ep = render_epoch.get();
                                             balanced_cols.with(|all| {
-                                                all.get(col_idx).cloned().unwrap_or_default()
+                                                all.get(col_idx)
+                                                    .cloned()
+                                                    .unwrap_or_default()
+                                                    .into_iter()
+                                                    .map(move |placed| (placed, ep))
+                                                    .collect::<Vec<_>>()
                                             })
                                         }
-                                        key=|placed| placed.item.key.clone()
-                                        let(placed)
+                                        key=|(placed, ep)| (placed.item.clone(), *ep)
+                                        let((placed, _))
                                     >
                                         {render_tile_with_opts(placed.item, is_compact)}
                                     </For>

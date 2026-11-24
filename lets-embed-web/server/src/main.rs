@@ -209,7 +209,11 @@ async fn main() -> anyhow::Result<()> {
     let addr = leptos_options.site_addr;
     tracing::info!(mode = runtime.mode.as_str(), "listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app.into_make_service()).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -395,6 +399,7 @@ mod tests {
         // 3. With explicit `--trust-proxy`, Standalone honors `X-Forwarded-Host`.
         let mut trust_state = state;
         trust_state.trust_proxy = true;
+        let trust_state_for_api = trust_state.clone();
         let trust_app = test_router(trust_state, None);
         let robots_proxy = trust_app
             .oneshot(
@@ -416,6 +421,24 @@ mod tests {
         )
         .unwrap();
         assert!(robots_proxy_txt.contains("Sitemap: https://proxy.example.com/sitemap.xml"));
+
+        // 4. Cycle 5 J1: `POST /api/*` sent with `Accept: text/html` + `Referer` MUST NOT
+        //    trigger `leptos_axum` 302 Found redirect rewriting (returns 200 OK, no Location).
+        let post_api = build_app_router(trust_state_for_api, None, Vec::new(), test_leptos_opts())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/site_config")
+                    .header("accept", "text/html,application/xhtml+xml")
+                    .header("referer", "https://evil.example/")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_api.status(), StatusCode::OK);
+        assert!(post_api.headers().get("location").is_none());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -859,15 +882,34 @@ mod tests {
             "private, no-store"
         );
 
-        // 3. `/internal/validate-safety-catalog` accepts valid v3 assertion without DB for empty arrays!
+        // 3a. `/internal/validate-safety-catalog` MUST REJECT user `X-Gateway-Assertion` alone (403, Cycle 2 D-2).
         let valid_anon = signed_assertion(assert_secret, &policy, None, now_secs() + 20);
-        let empty_catalog = app
+        let assertion_only_catalog = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/internal/validate-safety-catalog")
                     .header(GATEWAY_ASSERTION_HEADER, &valid_anon)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"post_tags":[],"authors":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(assertion_only_catalog.status(), StatusCode::FORBIDDEN);
+
+        // 3b. `/internal/validate-safety-catalog` accepts `X-Internal-Api-Secret` without DB for empty arrays!
+        let empty_catalog = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/validate-safety-catalog")
+                    .header(
+                        "x-internal-api-secret",
+                        std::str::from_utf8(internal_secret).unwrap(),
+                    )
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(r#"{"post_tags":[],"authors":[]}"#))
                     .unwrap(),

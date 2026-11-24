@@ -185,6 +185,38 @@ pub async fn like_previews_post(
         proj_videos.into_iter().map(|v| (v.id(), v)).collect();
     let post_map: HashMap<i64, _> = raw_posts.into_iter().map(|p| (p.post_id, p)).collect();
 
+    // Only query full post media clearance for posts whose projected cover is NOT already clear.
+    let need_clear_check: Vec<i64> = post_ids
+        .iter()
+        .copied()
+        .filter(|pid| {
+            let Some(p) = post_map.get(pid) else {
+                return false;
+            };
+            let cover_clear = p
+                .cover_image
+                .as_ref()
+                .and_then(|c| proj_img_map.get(&c.id))
+                .is_some_and(|im| im.is_clear())
+                || p.cover_video
+                    .as_ref()
+                    .and_then(|v| proj_vid_map.get(&v.id))
+                    .is_some_and(|v| v.is_clear());
+            !cover_clear
+        })
+        .collect();
+    let extra_clear_posts = if need_clear_check.is_empty() {
+        HashSet::new()
+    } else {
+        engine
+            .posts_with_any_clear_media(&need_clear_check, &ctx.policy, &ctx.caller)
+            .await
+            .map_err(|e| {
+                tracing::error!("like_previews_post post clearance check failed: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    };
+
     let posts = post_ids
         .into_iter()
         .filter_map(|pid| {
@@ -197,9 +229,17 @@ pub async fn like_previews_post(
                 .cover_video
                 .as_ref()
                 .and_then(|v| proj_vid_map.get(&v.id));
+            let has_clear = cover_img.is_some_and(|im| im.is_clear())
+                || cover_vid.is_some_and(|v| v.is_clear())
+                || extra_clear_posts.contains(&pid);
+            let safe_title = if has_clear {
+                p.title.clone()
+            } else {
+                format!("Restricted Post #{pid}")
+            };
             Some(build_post_preview_item(
                 pid,
-                p.title.clone(),
+                safe_title,
                 p.image_count,
                 p.video_count,
                 cover_img,
@@ -276,9 +316,20 @@ pub async fn post_images(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
+    let has_any_clear =
+        images.iter().any(|i| i.is_clear()) || videos.iter().any(|v| v.is_clear());
+    let (safe_title, safe_authors) = if has_any_clear {
+        (
+            title,
+            meta.authors.into_iter().map(|a| a.name).collect(),
+        )
+    } else {
+        (format!("Restricted Post #{}", q.post_id), Vec::new())
+    };
+
     Ok(Json(PostImagesResp {
-        title,
-        authors: meta.authors.into_iter().map(|a| a.name).collect(),
+        title: safe_title,
+        authors: safe_authors,
         images,
         videos,
     }))
@@ -613,6 +664,37 @@ pub async fn like_previews(
         proj_videos.into_iter().map(|v| (v.id(), v)).collect();
     let post_map: HashMap<i64, _> = posts.into_iter().map(|p| (p.post_id, p)).collect();
 
+    let need_clear_check: Vec<i64> = post_ids
+        .iter()
+        .copied()
+        .filter(|pid| {
+            let Some(p) = post_map.get(pid) else {
+                return false;
+            };
+            let cover_clear = p
+                .cover_image
+                .as_ref()
+                .and_then(|c| proj_img_map.get(&c.id))
+                .is_some_and(|im| im.is_clear())
+                || p.cover_video
+                    .as_ref()
+                    .and_then(|v| proj_vid_map.get(&v.id))
+                    .is_some_and(|v| v.is_clear());
+            !cover_clear
+        })
+        .collect();
+    let extra_clear_posts = if need_clear_check.is_empty() {
+        HashSet::new()
+    } else {
+        engine
+            .posts_with_any_clear_media(&need_clear_check, &ctx.policy, &ctx.caller)
+            .await
+            .map_err(|e| {
+                tracing::error!("like_previews post clearance check failed: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+    };
+
     let previews = order
         .into_iter()
         .filter_map(|(kind, id)| match kind {
@@ -624,10 +706,19 @@ pub async fn like_previews(
             }
             _ => {
                 let p = post_map.get(&id)?;
-                let title = (!p.title.trim().is_empty()).then(|| p.title.clone());
+                let cover_img = p.cover_image.as_ref().and_then(|c| proj_img_map.get(&c.id));
+                let cover_vid = p.cover_video.as_ref().and_then(|v| proj_vid_map.get(&v.id));
+                let has_clear = cover_img.is_some_and(|im| im.is_clear())
+                    || cover_vid.is_some_and(|v| v.is_clear())
+                    || extra_clear_posts.contains(&id);
+                let title = if has_clear {
+                    (!p.title.trim().is_empty()).then(|| p.title.clone())
+                } else {
+                    Some(format!("Restricted Post #{id}"))
+                };
                 let image_count = (p.image_count > 0).then_some(p.image_count);
                 let video_count = (p.video_count > 0).then_some(p.video_count);
-                if let Some(cover) = p.cover_image.as_ref().and_then(|c| proj_img_map.get(&c.id)) {
+                if let Some(cover) = cover_img {
                     Some(preview_from_projected_image(
                         "post",
                         id,
@@ -637,10 +728,9 @@ pub async fn like_previews(
                         video_count,
                     ))
                 } else {
-                    let vid = p.cover_video.as_ref().and_then(|v| proj_vid_map.get(&v.id));
                     Some(preview_from_projected_video_post(
                         id,
-                        vid,
+                        cover_vid,
                         title,
                         image_count,
                         video_count,

@@ -1398,6 +1398,129 @@ body {
   background: #f6f8fa;
 }
 
+.adm-provider-note {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.48;
+  color: var(--adm-muted);
+  text-align: left;
+}
+
+/* Collapsible per-provider step-by-step setup roadmap */
+.adm-setup-guide {
+  border: 1px solid #d5e8f7;
+  border-radius: 11px;
+  background: #f8fbff;
+  overflow: hidden;
+  text-align: left;
+}
+
+.adm-setup-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--adm-blue);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  transition: background 0.14s ease;
+}
+
+.adm-setup-summary::-webkit-details-marker {
+  display: none;
+}
+
+.adm-setup-summary:hover {
+  background: #edf6ff;
+}
+
+.adm-setup-chevron {
+  font-size: 12px;
+  transition: transform 0.16s ease;
+}
+
+.adm-setup-guide[open] .adm-setup-chevron {
+  transform: rotate(180deg);
+}
+
+.adm-setup-body {
+  padding: 10px 12px 12px;
+  border-top: 1px solid #dcebf7;
+  background: #ffffff;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.adm-setup-steps {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12.5px;
+  line-height: 1.48;
+  color: var(--adm-ink);
+}
+
+.adm-setup-steps li {
+  word-break: break-word;
+}
+
+.adm-setup-footnote {
+  margin: 0;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: #f4f9fe;
+  border: 1px solid #dcebf7;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--adm-muted);
+}
+
+.adm-setup-portal {
+  align-self: flex-start;
+  margin-top: 2px;
+}
+
+.adm-callback-box {
+  padding: 10px 12px;
+  border-radius: 11px;
+  background: #f6fafe;
+  border: 1px solid #d5e8f7;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.adm-callback-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--adm-muted);
+}
+
+.adm-callback-code {
+  display: block;
+  padding: 6px 9px;
+  border-radius: 8px;
+  background: #ffffff;
+  border: 1px solid #cde2f3;
+  color: var(--adm-ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.4;
+  word-break: break-all;
+  user-select: all;
+}
+
 .adm-secret-box {
   padding: 12px 14px;
   border-radius: 12px;

@@ -315,14 +315,12 @@ impl EditablePolicyCard {
         let match_expr = self
             .match_draft
             .with_untracked(|d| d.query.trim().to_string());
-        let except_expr = if self.except_open.get_untracked() {
-            let ex = self
-                .except_draft
-                .with_untracked(|d| d.query.trim().to_string());
-            (!ex.is_empty()).then_some(ex)
-        } else {
-            None
-        };
+        // `except_open` controls UI panel visibility ONLY — collapsing the subpanel
+        // must NEVER silently wipe an existing `except_expr` on Publish (Cycle 2 C-4).
+        let ex = self
+            .except_draft
+            .with_untracked(|d| d.query.trim().to_string());
+        let except_expr = (!ex.is_empty()).then_some(ex);
 
         ContentPolicy {
             id: self.id.get_untracked().trim().to_ascii_lowercase(),
@@ -362,10 +360,9 @@ impl EditablePolicyCard {
                 prefix
             }
         };
-        if self.except_open.get()
-            && !self
-                .except_draft
-                .with(|d| d.query.trim().is_empty())
+        if !self
+            .except_draft
+            .with(|d| d.query.trim().is_empty())
         {
             format!("{base} · +except")
         } else {
@@ -650,20 +647,68 @@ impl EditableProvider {
         }
     }
 
-    pub fn to_update(&self) -> ProviderUpdateItem {
+    /// Updates all reactive signals IN PLACE from `v` (including resetting write-only
+    /// secret inputs) so `<For key=|p| p.id.as_str()>` controls never become detached
+    /// from the serialized draft rows after Save or Discard (F27).
+    pub fn update_from_view(&self, v: &ProviderView) {
+        self.has_client_secret.set(v.has_client_secret);
+        self.kid.set(v.kid.clone());
+        self.updated_at.set(v.updated_at);
+        self.updated_by.set(v.updated_by.clone());
+        self.enabled.set(v.config.enabled);
+        self.display_name
+            .set(v.config.display_name.clone().unwrap_or_default());
+        self.issuer.set(v.config.issuer.clone().unwrap_or_default());
+        self.public_client_id
+            .set(v.config.public_client_id.clone().unwrap_or_default());
+        self.soft_birthday_check.set(v.config.soft_birthday_check);
+        self.secret_input.set(String::new());
+        self.clear_secret.set(false);
+    }
+
+    pub fn to_update(&self, age_policy: AgeVerificationPolicy) -> ProviderUpdateItem {
         let opt = |s: String| {
             let t = s.trim().to_string();
             (!t.is_empty()).then_some(t)
         };
+        let display_name = if self.id == AuthProviderId::OidcAgeAssurance {
+            opt(self.display_name.get_untracked())
+        } else {
+            None
+        };
+        let issuer = if matches!(
+            self.id,
+            AuthProviderId::OidcAgeAssurance | AuthProviderId::EmailOtp
+        ) {
+            opt(self.issuer.get_untracked())
+        } else {
+            None
+        };
+        let public_client_id = if matches!(self.id, AuthProviderId::Siwe | AuthProviderId::Siws) {
+            None
+        } else if self.id == AuthProviderId::Telegram {
+            opt(self
+                .public_client_id
+                .get_untracked()
+                .trim()
+                .trim_start_matches('@')
+                .to_string())
+        } else {
+            opt(self.public_client_id.get_untracked())
+        };
+        let clear_secret = self.clear_secret.get_untracked();
         ProviderUpdateItem {
             id: self.id,
-            enabled: self.enabled.get_untracked(),
-            display_name: opt(self.display_name.get_untracked()),
-            issuer: opt(self.issuer.get_untracked()),
-            public_client_id: opt(self.public_client_id.get_untracked()),
-            soft_birthday_check: self.soft_birthday_check.get_untracked(),
-            secret_value: opt(self.secret_input.get_untracked()),
-            clear_secret: self.clear_secret.get_untracked(),
+            enabled: self.enabled.get_untracked() && self.id.is_allowed_under(age_policy),
+            display_name,
+            issuer,
+            public_client_id,
+            soft_birthday_check: self.soft_birthday_check.get_untracked()
+                && age_policy == AgeVerificationPolicy::SelfAttestation,
+            secret_value: (!clear_secret)
+                .then(|| opt(self.secret_input.get_untracked()))
+                .flatten(),
+            clear_secret,
         }
     }
 }
@@ -678,6 +723,7 @@ pub struct ProvidersDraft {
     pub age_policy: RwSignal<AgeVerificationPolicy>,
     pub current_kid: RwSignal<String>,
     pub has_prev_key: RwSignal<bool>,
+    pub public_origin: RwSignal<String>,
     pub rows: RwSignal<Vec<EditableProvider>>,
 }
 
@@ -692,6 +738,7 @@ impl ProvidersDraft {
             age_policy: RwSignal::new(AgeVerificationPolicy::Off),
             current_kid: RwSignal::new(String::new()),
             has_prev_key: RwSignal::new(false),
+            public_origin: RwSignal::new(String::new()),
             rows: RwSignal::new(Vec::new()),
         }
     }
@@ -702,15 +749,33 @@ impl ProvidersDraft {
         self.age_policy.set(resp.age_policy);
         self.current_kid.set(resp.current_kid.clone());
         self.has_prev_key.set(resp.has_prev_key);
-        let built = self.owner.with_value(|root| {
-            root.with(|| {
-                resp.providers
+        self.public_origin.set(resp.public_origin.clone());
+        let updated_in_place = self.rows.with_untracked(|existing| {
+            if existing.len() == resp.providers.len()
+                && existing
                     .iter()
-                    .map(EditableProvider::from_view)
-                    .collect()
-            })
+                    .zip(resp.providers.iter())
+                    .all(|(r, v)| r.id == v.config.id)
+            {
+                for (row, view) in existing.iter().zip(resp.providers.iter()) {
+                    row.update_from_view(view);
+                }
+                true
+            } else {
+                false
+            }
         });
-        self.rows.set(built);
+        if !updated_in_place {
+            let built = self.owner.with_value(|root| {
+                root.with(|| {
+                    resp.providers
+                        .iter()
+                        .map(EditableProvider::from_view)
+                        .collect()
+                })
+            });
+            self.rows.set(built);
+        }
         self.loaded.set(true);
     }
 
@@ -722,8 +787,17 @@ impl ProvidersDraft {
         self.age_policy.set(resp.age_policy);
         self.current_kid.set(resp.current_kid.clone());
         self.has_prev_key.set(resp.has_prev_key);
+        self.public_origin.set(resp.public_origin.clone());
         self.rows.with_untracked(|rows| {
             for row in rows {
+                // Keep dirty draft compatible with updated `age_policy` so disabled toggles
+                // can never trap the admin in an unsaveable 400 validation loop (Cycle 2 C-3).
+                if !row.id.is_allowed_under(resp.age_policy) {
+                    row.enabled.set(false);
+                }
+                if resp.age_policy != AgeVerificationPolicy::SelfAttestation {
+                    row.soft_birthday_check.set(false);
+                }
                 if let Some(view) = resp.providers.iter().find(|v| v.config.id == row.id) {
                     row.has_client_secret.set(view.has_client_secret);
                     row.kid.set(view.kid.clone());

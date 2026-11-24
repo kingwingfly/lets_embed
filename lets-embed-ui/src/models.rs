@@ -142,7 +142,7 @@ pub enum GalleryBlurMode {
 ///
 /// Intentionally carries zero URLs or file paths so locked records can never leak
 /// media endpoints during SSR or CSR rendering.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GalleryMask {
     pub rule_id: String,
     pub label: String,
@@ -220,7 +220,7 @@ pub enum GalleryMediaKind {
 }
 
 /// Projected visibility state of an image or video asset.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum GalleryMedia {
     Clear {
@@ -370,7 +370,7 @@ impl GalleryCardKind {
 
 /// Unified gallery tile view-model supporting post-cover albums and flat
 /// image/video/favorite lists.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GalleryCard {
     /// Stable unique DOM key for reactive lists (e.g. `"post:42"`, `"image:99"`).
     pub key: String,

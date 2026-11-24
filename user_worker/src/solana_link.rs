@@ -10,21 +10,24 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
-use site_access::{AssuranceLevel, AuthProviderId};
 use tower_cookies::Cookies;
 
 use crate::{
-    AppState, auth, challenge_do,
-    identity::{self, VerifiedExternalIdentity},
-    session,
+    AppState, auth, challenge_do, identity, session,
     types::{ApiError, LinkSolReq, LinkSolResp, LinkStatusResp},
 };
 
 const OFFCHAIN_SIGNING_DOMAIN: &[u8] = b"\xffsolana offchain";
 
-/// The exact message the wallet signs. `account_id` is `user_id`; `nonce` is single-use.
+/// Purpose-bound Solana wallet linking challenge binding target account, link purpose
+/// (`"payment"` or `"login"`), and single-use nonce (F7).
+pub fn challenge_message_for_purpose(account_id: &str, purpose: &str, nonce: &str) -> String {
+    format!("Link Solana wallet for {purpose} to {account_id}\nNonce: {nonce}")
+}
+
+/// Convenience helper for Solana payment-wallet linking challenge.
 pub fn challenge_message(account_id: &str, nonce: &str) -> String {
-    format!("Link Solana wallet to {account_id}\nNonce: {nonce}")
+    challenge_message_for_purpose(account_id, "payment", nonce)
 }
 
 fn api_err(code: StatusCode, msg: &str) -> Response {
@@ -133,8 +136,8 @@ pub async fn link(
         return api_err(StatusCode::BAD_REQUEST, "invalid Solana address");
     }
 
-    // Atomic single-use nonce consumption in `AuthChallengeDO`!
-    match challenge_do::consume_nonce(&st.env, &req.nonce, "wallet").await {
+    // Atomic single-use nonce consumption in `AuthChallengeDO` scoped strictly to payment linking (F7)!
+    match challenge_do::consume_nonce(&st.env, &req.nonce, auth::NONCE_PURPOSE_LINK_PAYMENT).await {
         Ok(true) => {}
         Ok(false) => return api_err(StatusCode::BAD_REQUEST, "unknown or expired nonce"),
         Err(e) => {
@@ -143,7 +146,7 @@ pub async fn link(
         }
     }
 
-    let msg = challenge_message(&active.user_id, &req.nonce);
+    let msg = challenge_message_for_purpose(&active.user_id, "payment", &req.nonce);
     if !verify_ed25519_challenge(
         &req.solana_address,
         &req.signature,
@@ -153,40 +156,98 @@ pub async fn link(
         return api_err(StatusCode::BAD_REQUEST, "signature verification failed");
     }
 
-    // Remove any previous `purpose = 'payment'` Solana wallet owned by THIS user
-    // before inserting the new one (preserving uniqueness & never stealing from others).
-    if let Ok(db) = st.env.d1(crate::D1_BINDING)
-        && let Ok(stmt) = db
+    // Atomically replace any previous `purpose = 'payment'` Solana wallet owned by THIS user
+    // inside ONE D1 `batch` transaction so a UNIQUE conflict (replacement already linked
+    // elsewhere) rolls back cleanly and preserves the working original wallet (F15)!
+    let db = match st.env.d1(crate::D1_BINDING) {
+        Ok(db) => db,
+        Err(_) => return internal_error(),
+    };
+
+    // Idempotent check: if this user ALREADY owns this exact Solana payment wallet, succeed directly.
+    #[derive(Deserialize)]
+    struct ExistingRow {
+        user_id: String,
+        purpose: String,
+    }
+    let existing = match db
+        .prepare(
+            "SELECT user_id, purpose FROM user_identities \
+             WHERE provider_id = 'siws' AND issuer = 'solana:mainnet' AND subject = ?1",
+        )
+        .bind(&[req.solana_address.as_str().into()])
+        .map_err(|_| internal_error())
+    {
+        Ok(stmt) => match stmt.first::<ExistingRow>(None).await {
+            Ok(row) => row,
+            Err(e) => {
+                worker::console_error!("solana_link lookup failed: {e:?}");
+                return internal_error();
+            }
+        },
+        Err(r) => return r,
+    };
+
+    if let Some(ex) = existing {
+        if ex.user_id == active.user_id && ex.purpose == "payment" {
+            // Already linked as this user's payment wallet — no-op success.
+        } else {
+            return api_err(
+                StatusCode::CONFLICT,
+                "this identity or wallet is already linked to an account",
+            );
+        }
+    } else {
+        let now = session::now_secs();
+        let del_stmt = match db
             .prepare(
                 "DELETE FROM user_identities \
                  WHERE user_id = ?1 AND provider_id = 'siws' AND purpose = 'payment' AND subject != ?2",
             )
-            .bind(&[active.user_id.as_str().into(), req.solana_address.as_str().into()])
-    {
-        let _ = stmt.run().await;
-    }
-
-    let ident = VerifiedExternalIdentity {
-        provider_id: AuthProviderId::Siws,
-        issuer: "solana:mainnet".to_string(),
-        subject: req.solana_address.clone(),
-        label: Some("Linked Solana payment wallet".to_string()),
-        verified_email: None,
-        assurance_level: AssuranceLevel::None,
-        assurance_method: None,
-        assurance_verified_at: None,
-        assurance_expires_at: None,
-    };
-    if let Err(r) = identity::link_identity_atomic(&st, &active.user_id, &ident, "payment").await {
-        return r;
+            .bind(&[
+                active.user_id.as_str().into(),
+                req.solana_address.as_str().into(),
+            ]) {
+            Ok(s) => s,
+            Err(_) => return internal_error(),
+        };
+        let ins_stmt = match db
+            .prepare(
+                "INSERT INTO user_identities \
+                 (provider_id, issuer, subject, user_id, purpose, label, verified_email, \
+                  assurance_level, assurance_method, assurance_verified_at, assurance_expires_at, created_at) \
+                 VALUES ('siws', 'solana:mainnet', ?1, ?2, 'payment', 'Linked Solana payment wallet', \
+                         NULL, 'none', NULL, NULL, NULL, ?3)",
+            )
+            .bind(&[
+                req.solana_address.as_str().into(),
+                active.user_id.as_str().into(),
+                (now as f64).into(),
+            ]) {
+            Ok(s) => s,
+            Err(_) => return internal_error(),
+        };
+        if let Err(e) = db.batch(vec![del_stmt, ins_stmt]).await {
+            let msg = format!("{e:?}").to_lowercase();
+            if msg.contains("constraint") || msg.contains("unique") {
+                return api_err(
+                    StatusCode::CONFLICT,
+                    "this identity or wallet is already linked to an account",
+                );
+            }
+            worker::console_error!("solana_link atomic replace batch failed: {e:?}");
+            return internal_error();
+        }
     }
 
     // Keep legacy `users.solana_address` synced if this is a migrated ETH user.
     if session::is_eth_address(&active.user_id)
-        && let Ok(db) = st.env.d1(crate::D1_BINDING)
         && let Ok(stmt) = db
             .prepare("UPDATE users SET solana_address = ?1 WHERE address = ?2")
-            .bind(&[req.solana_address.as_str().into(), active.user_id.as_str().into()])
+            .bind(&[
+                req.solana_address.as_str().into(),
+                active.user_id.as_str().into(),
+            ])
     {
         let _ = stmt.run().await;
     }
@@ -272,7 +333,11 @@ mod tests {
     #[test]
     fn challenge_is_deterministic() {
         let m = challenge_message("0xabc", "n1");
-        assert_eq!(m, "Link Solana wallet to 0xabc\nNonce: n1");
+        assert_eq!(m, "Link Solana wallet for payment to 0xabc\nNonce: n1");
+        assert_ne!(
+            challenge_message_for_purpose("0xabc", "payment", "n1"),
+            challenge_message_for_purpose("0xabc", "login", "n1")
+        );
     }
 
     fn fixture() -> (String, String, String) {

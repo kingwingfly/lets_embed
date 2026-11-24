@@ -87,6 +87,8 @@ pub struct DoHandoffPollResp {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DoTransferCreateReq {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
     pub principal: String,
     pub code_hash: String,
     pub token_hash: String,
@@ -107,6 +109,8 @@ pub struct DoTransferClaimResp {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DoTransferRevokeReq {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
     pub principal: String,
 }
 
@@ -118,6 +122,12 @@ struct StoredPrincipalEnvelope {
     auth_method: String,
     identity_key: String,
     display_address: String,
+    /// Originating live `v2` session ID for cross-device transfers (checked at claim time, F8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_sid: Option<String>,
+    /// Original authentication timestamp from the source session (preserved on claim, F8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_time: Option<u64>,
 }
 
 const ENVELOPE_PREFIX: &str = "v2json:";
@@ -148,6 +158,8 @@ fn decode_envelope(raw: &str) -> Option<StoredPrincipalEnvelope> {
             auth_method: provider.as_str().to_string(),
             identity_key: format!("{}|{}|{}", provider.as_str(), issuer, raw),
             display_address: auth::display_address(raw),
+            source_sid: None,
+            auth_time: None,
         })
     } else {
         None
@@ -623,6 +635,8 @@ pub async fn approve_eth(
         auth_method: AuthProviderId::Siwe.as_str().to_string(),
         identity_key: ident.identity_key(),
         display_address: auth::display_address(&addr),
+        source_sid: None,
+        auth_time: None,
     };
     let do_req = DoHandoffApproveReq {
         session_id: req.session_id,
@@ -720,6 +734,8 @@ pub async fn approve_sol(
         auth_method: AuthProviderId::Siws.as_str().to_string(),
         identity_key: ident.identity_key(),
         display_address: req.solana_address.clone(),
+        source_sid: None,
+        auth_time: None,
     };
     let do_req = DoHandoffApproveReq {
         session_id: req.session_id,
@@ -804,6 +820,23 @@ pub async fn poll(
             return auth::api_error(StatusCode::FORBIDDEN, "account banned");
         }
 
+        // Recheck that the approving wallet identity is STILL linked as a `login` identity
+        // on this account at redemption time (F9 — prevents redeeming after unlink!).
+        let identities = match identity::list_user_identities(&st, &account.user_id).await {
+            Ok(list) => list,
+            Err(r) => return r,
+        };
+        let still_linked = identities.iter().any(|i| {
+            i.purpose == "login"
+                && format!("{}|{}|{}", i.provider_id, i.issuer, i.subject) == env.identity_key
+        });
+        if !still_linked {
+            return auth::api_error(
+                StatusCode::FORBIDDEN,
+                "The wallet that approved this sign-in is no longer linked to this account.",
+            );
+        }
+
         // Atomically consume approval BEFORE issuing revocable `v2` session!
         let consume_req = DoHandoffPollReq {
             ip_key,
@@ -867,26 +900,28 @@ pub async fn transfer_create(
         Err(r) => return r,
     };
 
-    let session_info = if let Some(sid) = active.sid.as_deref() {
-        do_client::do_session_info(&st.env, &active.do_key, sid)
-            .await
-            .ok()
-            .flatten()
-    } else {
-        None
+    let Some(source_sid) = active.sid.as_deref() else {
+        return auth::api_error(
+            StatusCode::FORBIDDEN,
+            "Please sign in again before creating a device transfer code.",
+        );
     };
-
-    let (auth_method, identity_key) = match session_info {
-        Some(info) => (info.auth_method, info.identity_key),
-        None => {
-            let p = if session::is_eth_address(&active.user_id) {
-                "siwe"
-            } else {
-                "siws"
-            };
-            (p.to_string(), format!("{p}|legacy|{}", active.user_id))
+    let info = match do_client::do_session_info(&st.env, &active.do_key, source_sid).await {
+        Ok(Some(info)) if info.active => info,
+        Ok(_) => {
+            return auth::api_error(StatusCode::UNAUTHORIZED, "session expired; sign in again");
+        }
+        Err(e) => {
+            worker::console_error!("transfer_create session-info failed: {e:?}");
+            return auth::api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "account service unavailable",
+            );
         }
     };
+    let auth_method = info.auth_method;
+    let identity_key = info.identity_key;
+    let orig_auth_time = info.created_at;
 
     let policy = match policy_do::load_site_policy(&st.env).await {
         Ok(e) => e.policy,
@@ -917,8 +952,11 @@ pub async fn transfer_create(
         auth_method,
         identity_key,
         display_address: auth::display_address(&active.user_id),
+        source_sid: Some(source_sid.to_string()),
+        auth_time: Some(orig_auth_time),
     };
     let do_req = DoTransferCreateReq {
+        owner_id: Some(active.user_id.clone()),
         principal: encode_envelope(&envelope),
         code_hash: sha256_hex(&format!("code:{normalized}")),
         token_hash: sha256_hex(&format!("tok:{qr_token}")),
@@ -1018,11 +1056,42 @@ pub async fn transfer_claim(
         return auth::api_error(StatusCode::FORBIDDEN, "account banned");
     }
 
+    // Verify originating source session is STILL live in `UserAccount` DO and preserve its
+    // original `auth_time` so claiming a transfer NEVER bypasses revocation or `require_recent_auth` (F8)!
+    let Some(source_sid) = env.source_sid.as_deref().filter(|s| !s.is_empty()) else {
+        return auth::api_error(
+            StatusCode::UNAUTHORIZED,
+            "Transfer code is missing originating session binding; please generate a new code.",
+        );
+    };
+    let source_info = match do_client::do_session_info(&st.env, &account.account_do_key, source_sid)
+        .await
+    {
+        Ok(Some(info)) if info.active => info,
+        Ok(_) => {
+            return auth::api_error(
+                StatusCode::UNAUTHORIZED,
+                "Transfer code is no longer valid because the originating session was signed out.",
+            );
+        }
+        Err(e) => {
+            worker::console_error!("transfer_claim source session-info failed: {e:?}");
+            return auth::api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "account service unavailable",
+            );
+        }
+    };
+    let preserved_auth_time = env
+        .auth_time
+        .map_or(source_info.created_at, |t| t.min(source_info.created_at));
+
     // Re-check linked identity provenance from D1 (unlinked or expired Verified18 loses strict privilege!).
     let now = session::now_secs();
-    let identities = identity::list_user_identities(&st, &account.user_id)
-        .await
-        .unwrap_or_default();
+    let identities = match identity::list_user_identities(&st, &account.user_id).await {
+        Ok(list) => list,
+        Err(r) => return r,
+    };
     let Some(mi) = identities.iter().find(|i| {
         i.purpose == "login"
             && format!("{}|{}|{}", i.provider_id, i.issuer, i.subject) == env.identity_key
@@ -1034,7 +1103,8 @@ pub async fn transfer_claim(
     };
     let strict_age_ok = provider_id.supports_strict_age_verification()
         && mi.assurance_level == AssuranceLevel::Verified18
-        && mi.assurance_expires_at.is_none_or(|e| e > now);
+        && mi.assurance_expires_at.is_none_or(|e| e > now)
+        && source_info.strict_age_ok;
     let assurance_level = if strict_age_ok {
         AssuranceLevel::Verified18
     } else if mi.assurance_level == AssuranceLevel::Verified18 {
@@ -1050,7 +1120,7 @@ pub async fn transfer_claim(
         return auth::api_error(StatusCode::FORBIDDEN, msg);
     }
 
-    if let Err(r) = identity::issue_v2_session(
+    if let Err(r) = identity::issue_v2_session_with_auth_time(
         &st,
         &cookies,
         &account,
@@ -1058,6 +1128,7 @@ pub async fn transfer_claim(
         &env.identity_key,
         assurance_level,
         strict_age_ok,
+        Some(preserved_auth_time),
     )
     .await
     {
@@ -1083,48 +1154,18 @@ pub async fn transfer_revoke(
         Ok(a) => a,
         Err(r) => return r,
     };
-    let session_info = if let Some(sid) = active.sid.as_deref() {
-        do_client::do_session_info(&st.env, &active.do_key, sid)
-            .await
-            .ok()
-            .flatten()
-    } else {
-        None
-    };
-    let (auth_method, identity_key) = match session_info {
-        Some(info) => (info.auth_method, info.identity_key),
-        None => {
-            let p = if session::is_eth_address(&active.user_id) {
-                "siwe"
-            } else {
-                "siws"
-            };
-            (p.to_string(), format!("{p}|legacy|{}", active.user_id))
-        }
-    };
-    let envelope = StoredPrincipalEnvelope {
-        user_id: active.user_id.clone(),
-        auth_method,
-        identity_key,
-        display_address: auth::display_address(&active.user_id),
-    };
-    let _ = call_handoff_do(
+    if let Err(r) = call_handoff_do(
         &st,
         "/transfer-revoke",
         &DoTransferRevokeReq {
-            principal: encode_envelope(&envelope),
-        },
-    )
-    .await;
-    // Also clean any legacy raw-principal entry.
-    let _ = call_handoff_do(
-        &st,
-        "/transfer-revoke",
-        &DoTransferRevokeReq {
+            owner_id: Some(active.user_id.clone()),
             principal: active.user_id,
         },
     )
-    .await;
+    .await
+    {
+        return r;
+    }
     StatusCode::OK.into_response()
 }
 

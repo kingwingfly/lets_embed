@@ -421,7 +421,7 @@ try {
     JSON.stringify(noopSave)
   );
 
-  // 3b. Auth Providers: clean SITE_SECRET copy + enable Solana (SIWS)
+  // 3b. Auth Providers: clean SITE_SECRET copy, minimal per-provider forms, & enable Solana (SIWS)
   const providersCheck = await evalJs(`
     const tab = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Auth Providers');
     if (!tab) throw new Error('Auth Providers tab not found');
@@ -431,9 +431,30 @@ try {
     const hasCleanTitle = txt.includes('Encrypted Secret Keyring (SITE_SECRET)');
     const hasStaleEnv = txt.includes('SETTINGS_ENCRYPTION_KEY');
 
-    const cards = [...document.querySelectorAll('.adm-provider-card, .adm-card, section, article, div')];
-    const siwsCard = cards.find(c => c.querySelector('[role="switch"]') && c.innerText.includes('Solana') && c.innerText.length < 700);
-    if (!siwsCard) throw new Error('Solana provider card not found');
+    const card = (slug) => document.querySelector(\`.adm-provider-card[data-provider="\${slug}"]\`);
+    const siweCard = card('siwe');
+    const siwsCard = card('siws');
+    const googleCard = card('google');
+    const telegramCard = card('telegram');
+    const emailCard = card('email_otp');
+    const oidcCard = card('oidc_age_assurance');
+    if (!siwsCard || !siweCard || !googleCard || !telegramCard || !emailCard || !oidcCard) {
+      throw new Error('Expected provider cards not found');
+    }
+
+    const siweInputs = siweCard.querySelectorAll('input').length;
+    const siwsInputs = siwsCard.querySelectorAll('input').length;
+    const googleHasCallback = (googleCard.querySelector('.adm-callback-code')?.textContent || '').includes('/user/auth/google/callback');
+    const googleNoDeadOverrides = !googleCard.innerText.includes('Issuer Override') && !googleCard.innerText.includes('Button Display Name');
+    const guideCount = document.querySelectorAll('.adm-provider-card details.adm-setup-guide').length;
+    // Open Telegram & Email setup guides to verify dynamic step-by-step tutorials
+    telegramCard.querySelector('details.adm-setup-guide summary')?.click();
+    emailCard.querySelector('details.adm-setup-guide summary')?.click();
+    await new Promise(r => setTimeout(r, 120));
+    const telegramHasBotFather = telegramCard.innerText.includes('@BotFather') && telegramCard.innerText.includes('/setdomain');
+    const emailHasResendHint = emailCard.innerText.includes('Resend') && emailCard.innerText.includes('Cloudflare Email Routing');
+    const oidcHasLabelField = oidcCard.innerText.includes('Button Label');
+
     const sw = siwsCard.querySelector('[role="switch"]');
     if (sw.getAttribute('aria-checked') !== 'true') sw.click();
     await new Promise(r => setTimeout(r, 150));
@@ -444,13 +465,31 @@ try {
     return {
       hasCleanTitle,
       hasStaleEnv,
+      siweInputs,
+      siwsInputs,
+      googleHasCallback,
+      googleNoDeadOverrides,
+      guideCount,
+      telegramHasBotFather,
+      emailHasResendHint,
+      oidcHasLabelField,
       siwsChecked: sw.getAttribute('aria-checked'),
       toast: (document.querySelector('.le-toast-host')?.innerText || '').trim(),
     };
   `);
   check(
-    '3b. Admin Auth Providers clean SITE_SECRET copy & enables Solana (SIWS)',
-    providersCheck.hasCleanTitle && !providersCheck.hasStaleEnv && providersCheck.siwsChecked === 'true',
+    '3b. Admin Auth Providers clean SITE_SECRET copy, minimal per-provider UI + 9 setup guides & enables Solana (SIWS)',
+    providersCheck.hasCleanTitle &&
+      !providersCheck.hasStaleEnv &&
+      providersCheck.siweInputs === 0 &&
+      providersCheck.siwsInputs === 0 &&
+      providersCheck.googleHasCallback &&
+      providersCheck.googleNoDeadOverrides &&
+      providersCheck.guideCount === 9 &&
+      providersCheck.telegramHasBotFather &&
+      providersCheck.emailHasResendHint &&
+      providersCheck.oidcHasLabelField &&
+      providersCheck.siwsChecked === 'true',
     JSON.stringify(providersCheck)
   );
 
@@ -826,19 +865,20 @@ try {
     body: JSON.stringify({ solana_address: solAddress, signature: sig, nonce }),
   });
   const setCookie = loginRes.headers.get('set-cookie') || '';
-  const cookieMatch = setCookie.match(/ue_session=([^;]+)/);
+  const cookieMatch = setCookie.match(/__Host-ue_session=([^;]+)/);
   check(
-    '5a. Real Ed25519 SIWS login issues revocable v2 ue_session cookie',
+    '5a. Real Ed25519 SIWS login issues revocable v2 __Host-ue_session cookie',
     loginRes.ok && Boolean(cookieMatch),
     `status=${loginRes.status}`
   );
 
   if (cookieMatch) {
     await cdp('Network.setCookie', {
-      name: 'ue_session',
+      name: '__Host-ue_session',
       value: cookieMatch[1],
-      domain: ORIGIN_HOSTNAME,
+      url: ORIGIN,
       path: '/',
+      secure: true,
       httpOnly: true,
       sameSite: 'Lax',
     });
@@ -1016,26 +1056,47 @@ try {
   const afterReveal = await evalJs(`
     const deadline = Date.now() + 20000;
     while (Date.now() < deadline) {
-      const clearNow = [...document.querySelectorAll('img')].filter(i => i.src.includes('/media/image/') && i.complete && i.naturalWidth > 0).length;
-      if (clearNow > 0) {
+      const clearImg = [...document.querySelectorAll('img')].find(i => i.src.includes('/media/image/') && i.complete && i.naturalWidth > 0);
+      if (clearImg) {
+        const clearNow = [...document.querySelectorAll('img')].filter(i => i.src.includes('/media/image/') && i.complete && i.naturalWidth > 0).length;
         const hasHideBtn = [...document.querySelectorAll('button')].some(b => b.textContent.trim() === 'Hide');
-        return { clearNow, hasHideBtn };
+        return { clearNow, hasHideBtn, firstClearSrc: clearImg.src };
       }
       const btn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('Click to reveal'));
       if (btn) btn.click();
       await new Promise(r => setTimeout(r, 400));
     }
-    return { clearNow: 0, hasHideBtn: false };
+    return { clearNow: 0, hasHideBtn: false, firstClearSrc: '' };
   `);
+  // F31: Verify guest click-to-reveal ran as an unprivileged GuestSession (NOT LiveAdmin):
+  // `__Host-le_guest_sid` cookie was minted AND the revealed `mc3.` capability binds to `guest_session`.
+  const { cookies: postRevealCookies } = await cdp('Network.getCookies', { urls: [ORIGIN] });
+  const guestCookie = postRevealCookies.find((c) => c.name === '__Host-le_guest_sid');
+  let revealedActorKind = null;
+  if (afterReveal.firstClearSrc) {
+    const capParam = new URL(afterReveal.firstClearSrc).searchParams.get('cap') || '';
+    const capParts = capParam.startsWith('mc3.') ? capParam.slice(4).split('.') : [];
+    if (capParts[0]) {
+      const capPayload = JSON.parse(Buffer.from(capParts[0], 'base64url').toString('utf8'));
+      revealedActorKind = capPayload?.actor_binding?.kind || null;
+    }
+  }
   await screenshot('e2e_blur_click_after.png');
   check(
-    '5h. Blur + Fixed Server Preview hides clear URL until click -> POST /api/safety/reveal loads clear image + Hide',
+    '5h. Blur + Fixed Server Preview hides clear URL until click -> guest POST /api/safety/reveal mints GuestSession cap + loads clear image',
     beforeReveal.spoilers > 0 &&
       beforeReveal.clearBefore === 0 &&
       beforeReveal.hasRevealBtn &&
       afterReveal.clearNow > 0 &&
-      afterReveal.hasHideBtn,
-    JSON.stringify({ beforeReveal, afterReveal })
+      afterReveal.hasHideBtn &&
+      Boolean(guestCookie?.value) &&
+      revealedActorKind === 'guest_session',
+    JSON.stringify({
+      beforeReveal,
+      afterReveal,
+      hasGuestCookie: Boolean(guestCookie?.value),
+      revealedActorKind,
+    })
   );
 
   check(

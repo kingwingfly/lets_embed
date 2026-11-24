@@ -1,8 +1,8 @@
 use leptos::{ev, html, prelude::*};
 
 use crate::browser::{
-    is_editable_target, lock_body_scroll, trap_dialog_tab, use_window_keydown,
-    wipe_media_elements_in,
+    is_editable_target, is_top_modal, lock_body_scroll, push_modal_layer, trap_dialog_tab,
+    use_window_keydown, wipe_media_elements_in,
 };
 use crate::components::{ContentMaskCard, LikeButton, SpoilerOverlay};
 use crate::models::{
@@ -68,6 +68,7 @@ fn ViewerOverlay(
     on_download: Option<Callback<ViewerItem>>,
 ) -> impl IntoView {
     lock_body_scroll();
+    let modal_layer = push_modal_layer();
 
     let dialog_ref = NodeRef::<html::Div>::new();
     let zoom_idx = RwSignal::new(0usize);
@@ -142,15 +143,58 @@ fn ViewerOverlay(
         }
     };
 
+    let can_zoom_current = move || {
+        current.get().is_some_and(|it| match it.media {
+            GalleryMedia::Clear {
+                kind: GalleryMediaKind::Image,
+                ..
+            } => true,
+            GalleryMedia::Spoiler {
+                id,
+                kind: GalleryMediaKind::Image,
+                ..
+            } => revealed_spoiler_id.get() == Some(id),
+            _ => false,
+        })
+    };
+    let can_zoom_current_untracked = move || {
+        current.get_untracked().is_some_and(|it| match it.media {
+            GalleryMedia::Clear {
+                kind: GalleryMediaKind::Image,
+                ..
+            } => true,
+            GalleryMedia::Spoiler {
+                id,
+                kind: GalleryMediaKind::Image,
+                ..
+            } => revealed_spoiler_id.get_untracked() == Some(id),
+            _ => false,
+        })
+    };
+
     let zoom_in = move || {
+        if !can_zoom_current_untracked() {
+            return;
+        }
         zoom_idx.update(|i| *i = (*i + 1).min(ZOOM_STEPS.len() - 1));
     };
     let zoom_out = move || {
+        if !can_zoom_current_untracked() {
+            return;
+        }
         zoom_idx.update(|i| *i = i.saturating_sub(1));
     };
-    let zoom_reset = move || zoom_idx.set(0);
+    let zoom_reset = move || {
+        if !can_zoom_current_untracked() {
+            return;
+        }
+        zoom_idx.set(0);
+    };
 
     use_window_keydown(false, move |e: ev::KeyboardEvent| {
+        if !is_top_modal(modal_layer) {
+            return;
+        }
         if e.alt_key() || e.ctrl_key() || e.meta_key() {
             return;
         }
@@ -166,9 +210,9 @@ fn ViewerOverlay(
             "Escape" => close_now(),
             "ArrowLeft" | "k" | "K" => step(-1),
             "ArrowRight" | "j" | "J" => step(1),
-            "+" | "=" => zoom_in(),
-            "-" | "_" => zoom_out(),
-            "0" => zoom_reset(),
+            "+" | "=" if can_zoom_current_untracked() => zoom_in(),
+            "-" | "_" if can_zoom_current_untracked() => zoom_out(),
+            "0" if can_zoom_current_untracked() => zoom_reset(),
             _ => return,
         }
         e.prevent_default();
@@ -243,8 +287,8 @@ fn ViewerOverlay(
                 </div>
 
                 <div class="le-viewer-actions">
-                    // Zoom controls (shown for images)
-                    {move || current.get().is_some_and(|it| it.kind == GalleryMediaKind::Image && !it.media.is_locked()).then(|| view! {
+                    // Zoom controls (shown only for clear or currently revealed images; Cycle 4 I7)
+                    {move || can_zoom_current().then(|| view! {
                         <div class="le-viewer-zoom-group" role="group" aria-label="Zoom controls">
                             <button
                                 type="button"
@@ -444,13 +488,6 @@ fn ViewerOverlay(
 
             <div class="le-viewer-stage">
                 {move || current.get().map(|item| {
-                    let zoom = zoom_factor();
-                    let zoom_style = if (zoom - 1.0).abs() > 0.01 {
-                        format!("transform: scale({zoom}); transform-origin: center center;")
-                    } else {
-                        String::new()
-                    };
-
                     match item.media {
                         GalleryMedia::Clear {
                             kind,
@@ -484,7 +521,14 @@ fn ViewerOverlay(
                                             }
                                             src=url
                                             alt=alt_text
-                                            style=zoom_style
+                                            style=move || {
+                                                let z = zoom_factor();
+                                                if (z - 1.0).abs() > 0.01 {
+                                                    format!("transform: scale({z}); transform-origin: center center;")
+                                                } else {
+                                                    String::new()
+                                                }
+                                            }
                                         />
                                     </div>
                                 }
@@ -529,6 +573,17 @@ fn ViewerOverlay(
                         } => view! {
                             <div
                                 class="le-viewer-spoiler-box"
+                                style=move || {
+                                    if kind == GalleryMediaKind::Image
+                                        && revealed_spoiler_id.get() == Some(id)
+                                    {
+                                        let z = zoom_factor();
+                                        if (z - 1.0).abs() > 0.01 {
+                                            return format!("transform: scale({z}); transform-origin: center center;");
+                                        }
+                                    }
+                                    String::new()
+                                }
                                 on:click=|ev: ev::MouseEvent| ev.stop_propagation()
                             >
                                 <SpoilerOverlay
@@ -547,6 +602,7 @@ fn ViewerOverlay(
                                     on_hide=Callback::new(move |hid| {
                                         if revealed_spoiler_id.get_untracked() == Some(hid) {
                                             revealed_spoiler_id.set(None);
+                                            zoom_idx.set(0);
                                         }
                                     })
                                 />

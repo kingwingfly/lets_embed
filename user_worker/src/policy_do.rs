@@ -417,6 +417,26 @@ impl SitePolicyDO {
         Ok(())
     }
 
+    fn write_stored_if_absent(
+        &self,
+        revision: u64,
+        min_enforce_rev: u64,
+        digest: &str,
+        policy_json: &str,
+    ) -> Result<()> {
+        let db = self.ensure_schema()?;
+        let rev_i64 = i64::try_from(revision)
+            .map_err(|_| worker::Error::RustError("revision overflows i64".into()))?;
+        let min_i64 = i64::try_from(min_enforce_rev)
+            .map_err(|_| worker::Error::RustError("min_enforce_rev overflows i64".into()))?;
+        db.exec(
+            "INSERT OR IGNORE INTO site_policy_state (id, revision, min_enforce_rev, digest, policy_json) \
+             VALUES (1, ?1, ?2, ?3, ?4)",
+            vec![rev_i64.into(), min_i64.into(), digest.into(), policy_json.into()],
+        )?;
+        Ok(())
+    }
+
     async fn bootstrap_from_d1(&self) -> std::result::Result<(String, String), Response> {
         let d1 = self.env.d1(crate::D1_BINDING).map_err(|e| {
             worker::console_error!("SitePolicyDO D1 binding failed: {e:?}");
@@ -453,12 +473,38 @@ impl SitePolicyDO {
 
         let canonical = canonical_policy_json(&policy);
         let digest = policy.policy_digest.clone();
-        self.write_stored(policy.revision, policy.min_enforce_rev, &digest, &canonical)
+        // Insert ONLY if the row is still absent (so a newer activation that completed
+        // while we awaited D1 can NEVER be overwritten/rolled back!), then read back
+        // the authoritative winning row from DO SQLite.
+        self.write_stored_if_absent(policy.revision, policy.min_enforce_rev, &digest, &canonical)
             .map_err(|e| {
                 worker::console_error!("SitePolicyDO SQLite persist failed: {e:?}");
                 Response::error("site policy persistence failed", 503).expect("503 response")
             })?;
-        Ok((canonical, digest))
+        match self.read_stored() {
+            Ok(Some(winner)) if winner.revision >= 0 && winner.min_enforce_rev >= 0 => {
+                let win_policy = decode_stored_policy_strict(
+                    winner.revision as u64,
+                    winner.min_enforce_rev as u64,
+                    &winner.digest,
+                    &winner.policy_json,
+                )
+                .map_err(|e| {
+                    worker::console_error!("SitePolicyDO winning stored policy invalid: {e}");
+                    Response::error(format!("site policy fail-closed: {e}"), 503)
+                        .expect("503 response")
+                })?;
+                Ok((canonical_policy_json(&win_policy), win_policy.policy_digest))
+            }
+            Ok(_) => {
+                worker::console_error!("SitePolicyDO missing or corrupt row after bootstrap insert");
+                Err(Response::error("corrupt stored site policy", 503).expect("503 response"))
+            }
+            Err(e) => {
+                worker::console_error!("SitePolicyDO read_stored after bootstrap failed: {e:?}");
+                Err(Response::error("site policy persistence failed", 503).expect("503 response"))
+            }
+        }
     }
 
     fn envelope_response(canonical_policy_json: &str, digest: &str) -> Result<Response> {

@@ -27,8 +27,10 @@ type HmacSha256 = Hmac<Sha256>;
 // Shared Cookie & Header Constants
 // ---------------------------------------------------------------------------
 
-pub const SESSION_COOKIE: &str = "ue_session";
-pub const GUEST_SESSION_COOKIE: &str = "le_guest_sid";
+pub const SESSION_COOKIE: &str = "__Host-ue_session";
+pub const GUEST_SESSION_COOKIE: &str = "__Host-le_guest_sid";
+pub const LEGACY_SESSION_COOKIE: &str = "ue_session";
+pub const LEGACY_GUEST_SESSION_COOKIE: &str = "le_guest_sid";
 pub const LEGACY_TOKEN_COOKIE: &str = "gw_token";
 pub const LEGACY_APP_COOKIE: &str = "gw_app";
 pub const AUTH_TX_COOKIE: &str = "__Host-auth_tx";
@@ -86,7 +88,9 @@ pub fn is_privileged_request_header(name: &str) -> bool {
 /// `lets-embed-web` or media origins.
 pub const STRIPPED_ORIGIN_COOKIES: &[&str] = &[
     SESSION_COOKIE,
+    LEGACY_SESSION_COOKIE,
     GUEST_SESSION_COOKIE,
+    LEGACY_GUEST_SESSION_COOKIE,
     crate::ADMIN_VIEW_COOKIE,
     LEGACY_TOKEN_COOKIE,
     LEGACY_APP_COOKIE,
@@ -992,6 +996,22 @@ impl MediaBillingKey {
         ChargeReq {
             path: self.canonical_key(),
             kind: self.charge_kind(),
+            media_path: None,
+        }
+    }
+
+    /// Builds a [`ChargeReq`] carrying both the canonical billing dedupe key
+    /// (`media:{kind}:{id}`) and the verified gallery folder path (`/{images,videos}/{locator}`)
+    /// so `free_media_folders` scope checks work accurately under Policy v3.
+    pub fn to_charge_req_with_locator(self, immutable_locator: &str) -> ChargeReq {
+        let root = match self.kind {
+            BillableMediaKind::Image => "images",
+            BillableMediaKind::Video => "videos",
+        };
+        ChargeReq {
+            path: self.canonical_key(),
+            kind: self.charge_kind(),
+            media_path: Some(format!("/{root}/{immutable_locator}")),
         }
     }
 
@@ -1109,13 +1129,83 @@ impl MediaCapability {
     }
 }
 
+const MEDIA_CAP_PREVIEW_ENC_PREFIX: &str = "enc1.";
+const MEDIA_CAP_PREVIEW_ENC_DOMAIN: &[u8] = b"media-cap-preview-locator/v3\0";
+
+/// Encrypts or decrypts `data` using a SHA-256 HMAC-CTR keystream keyed from
+/// `(secret, cap metadata)` — full Encrypt-then-MAC when paired with the outer
+/// `sign_media_capability` HMAC-SHA256! Ensures blurred Preview URLs NEVER
+/// disclose original filenames in readable base64url token payloads.
+fn preview_locator_xor_stream(
+    secret: &[u8],
+    cap: &MediaCapability,
+    data: &[u8],
+) -> Result<Vec<u8>, TokenError> {
+    let actor_bytes = serde_json::to_vec(&cap.actor_binding).map_err(|_| TokenError::InvalidPayload)?;
+    let mut out = Vec::with_capacity(data.len());
+    let mut counter: u32 = 0;
+    for chunk in data.chunks(32) {
+        let mut mac = domain_mac(
+            secret,
+            MEDIA_CAP_PREVIEW_ENC_DOMAIN,
+            &[
+                &cap.asset_id.to_be_bytes(),
+                &cap.facts_rev.to_be_bytes(),
+                &cap.policy_rev.to_be_bytes(),
+                &cap.exp.to_be_bytes(),
+                &actor_bytes,
+                &counter.to_be_bytes(),
+            ],
+        )?;
+        let _ = &mut mac;
+        let block = mac.finalize().into_bytes();
+        for (b, k) in chunk.iter().zip(block.iter()) {
+            out.push(b ^ k);
+        }
+        counter = counter
+            .checked_add(1)
+            .ok_or(TokenError::InvalidPayload)?;
+    }
+    Ok(out)
+}
+
+fn seal_preview_locator(secret: &[u8], cap: &MediaCapability) -> Result<String, TokenError> {
+    let ct = preview_locator_xor_stream(secret, cap, cap.immutable_locator.as_bytes())?;
+    Ok(format!("{MEDIA_CAP_PREVIEW_ENC_PREFIX}{}", B64.encode(ct)))
+}
+
+fn open_preview_locator(
+    secret: &[u8],
+    cap: &MediaCapability,
+) -> Result<String, TokenError> {
+    let encoded = cap
+        .immutable_locator
+        .strip_prefix(MEDIA_CAP_PREVIEW_ENC_PREFIX)
+        .ok_or(TokenError::InvalidClaims(
+            "preview capability locator must be sealed",
+        ))?;
+    let ct = B64.decode(encoded).map_err(|_| TokenError::InvalidEncoding)?;
+    let pt = preview_locator_xor_stream(secret, cap, &ct)?;
+    String::from_utf8(pt).map_err(|_| TokenError::InvalidPayload)
+}
+
 /// Signs a Policy v3 media capability (`mc3.<payload>.<sig>` with HMAC domain `media-cap/v3\0`).
+///
+/// For [`MediaCapKind::Preview`], seals `immutable_locator` with Encrypt-then-MAC
+/// (`enc1.<ciphertext>`) so blurred preview URLs never disclose original filenames.
 pub fn sign_media_capability(
     cap: &MediaCapability,
     secret: &[u8],
 ) -> Result<String, TokenError> {
     cap.validate()?;
-    let json = serde_json::to_vec(cap).map_err(|_| TokenError::InvalidPayload)?;
+    let wire_cap = if cap.kind == MediaCapKind::Preview {
+        let mut sealed = cap.clone();
+        sealed.immutable_locator = seal_preview_locator(secret, cap)?;
+        std::borrow::Cow::Owned(sealed)
+    } else {
+        std::borrow::Cow::Borrowed(cap)
+    };
+    let json = serde_json::to_vec(wire_cap.as_ref()).map_err(|_| TokenError::InvalidPayload)?;
     let payload = B64.encode(json);
     let sig = domain_mac(
         secret,
@@ -1130,6 +1220,7 @@ pub fn sign_media_capability(
 /// Verifies a Policy v3 media capability token strictly:
 /// - Rejects any `v != 3` token (including all legacy v1/v2 empty-switcher caps!).
 /// - Verifies HMAC signature, `aud`, `kind`, `asset_id`, `exp`, canonical `immutable_locator`.
+/// - Unseals `MediaCapKind::Preview` opaque locators after MAC verification.
 /// - Enforces `min_enforce_rev <= cap.policy_rev <= active_rev`.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_media_capability(
@@ -1159,8 +1250,11 @@ pub fn verify_media_capability(
     .map_err(|_| TokenError::InvalidSignature)?;
 
     let raw = B64.decode(payload).map_err(|_| TokenError::InvalidEncoding)?;
-    let cap: MediaCapability =
+    let mut cap: MediaCapability =
         serde_json::from_slice(&raw).map_err(|_| TokenError::InvalidPayload)?;
+    if cap.kind == MediaCapKind::Preview {
+        cap.immutable_locator = open_preview_locator(secret, &cap)?;
+    }
     cap.validate()?;
 
     if cap.aud != expected_aud {

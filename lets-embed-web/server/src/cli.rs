@@ -265,8 +265,10 @@ pub fn resolve_runtime_config(
                 site_secret.as_deref(),
                 KeyDomain::InternalApi,
             )
-            .ok()
-            .map(String::into_bytes);
+            .map_err(|_| {
+                anyhow::anyhow!("INTERNAL_API_SECRET or SITE_SECRET is required in managed mode")
+            })?
+            .into_bytes();
 
             let cf_access_client_id =
                 cli_or_env(&cli.cf_access_client_id, "CF_ACCESS_CLIENT_ID", &env_get);
@@ -292,7 +294,7 @@ pub fn resolve_runtime_config(
                 }),
                 gateway_assertion_secret: Some(assertion_secret.into_bytes()),
                 media_cap_secret: Some(media_cap_secret.into_bytes()),
-                internal_api_secret,
+                internal_api_secret: Some(internal_api_secret),
             })
         }
     }
@@ -376,6 +378,20 @@ mod tests {
             .is_err()
         );
 
+        // Missing INTERNAL_API_SECRET (when SITE_SECRET is absent)
+        assert!(
+            resolve_runtime_config(
+                &managed_cli,
+                env_map(&[
+                    ("PUBLIC_URL", "https://gallery.example.com"),
+                    ("POLICY_URL", "https://policy.example.com/api/policy"),
+                    ("GATEWAY_ASSERTION_SECRET", "sec1"),
+                    ("MEDIA_CAP_SECRET", "sec2"),
+                ])
+            )
+            .is_err()
+        );
+
         // Missing PUBLIC_URL
         assert!(
             resolve_runtime_config(
@@ -384,6 +400,7 @@ mod tests {
                     ("POLICY_URL", "https://policy.example.com/api/policy"),
                     ("GATEWAY_ASSERTION_SECRET", "sec1"),
                     ("MEDIA_CAP_SECRET", "sec2"),
+                    ("INTERNAL_API_SECRET", "sec3"),
                 ])
             )
             .is_err()
@@ -397,6 +414,7 @@ mod tests {
             ("PUBLIC_URL", "https://gallery.example.com/"),
             ("GATEWAY_ASSERTION_SECRET", "assert-secret"),
             ("MEDIA_CAP_SECRET", "media-secret"),
+            ("INTERNAL_API_SECRET", "internal-secret"),
         ];
 
         // Plain http:// rejected without --allow-insecure-local-policy

@@ -447,14 +447,36 @@ pub fn validate_oidc_url(raw: &str) -> Result<String, String> {
         None => return Err("OIDC URL is missing a host".into()),
     };
 
-    let host_clean = host.trim_end_matches('.').to_ascii_lowercase();
-    if host_clean.is_empty() || !host_clean.contains('.') {
-        return Err("OIDC URL host must be a fully-qualified public domain".into());
+    let lower = host.to_ascii_lowercase();
+    if lower.is_empty()
+        || lower.ends_with('.')
+        || lower.starts_with('.')
+        || lower.contains("..")
+        || !lower.contains('.')
+    {
+        return Err("OIDC URL host must be a clean fully-qualified public domain".into());
     }
-    if is_disallowed_internal_host(&host_clean) {
+    if is_disallowed_internal_host(&lower) {
         return Err(format!(
-            "OIDC URL host '{host_clean}' is a private/local domain and is not allowed"
+            "OIDC URL host '{lower}' is a private/local domain and is not allowed"
         ));
+    }
+    let labels: Vec<&str> = lower.split('.').collect();
+    for lbl in &labels {
+        if lbl.is_empty()
+            || lbl.len() > 63
+            || lbl.starts_with('-')
+            || lbl.ends_with('-')
+            || !lbl.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("OIDC URL host contains invalid DNS label characters".into());
+        }
+    }
+    if labels
+        .last()
+        .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err("OIDC URL host must not use a purely numeric TLD".into());
     }
 
     if parsed.path().contains('\\')
@@ -466,7 +488,16 @@ pub fn validate_oidc_url(raw: &str) -> Result<String, String> {
         return Err("OIDC URL path contains invalid traversal segments".into());
     }
 
-    Ok(parsed.as_str().trim_end_matches('/').to_string())
+    // Preserve an explicit trailing slash (e.g. `https://idp.example.com/tenant/` or
+    // `https://auth.example.com/`) because OIDC discovery compares `doc.issuer` by exact
+    // byte equality; strip ONLY the synthetic root `/` that `Url::parse` appends when the
+    // input had no path and no trailing slash (F17).
+    let normalized = parsed.as_str();
+    if !trimmed.ends_with('/') && parsed.path() == "/" {
+        Ok(normalized.trim_end_matches('/').to_string())
+    } else {
+        Ok(normalized.to_string())
+    }
 }
 
 fn is_disallowed_internal_host(host: &str) -> bool {
@@ -482,6 +513,7 @@ fn is_disallowed_internal_host(host: &str) -> bool {
         ".local",
         ".localdomain",
         ".internal",
+        ".arpa",
         ".home.arpa",
         ".lan",
         ".corp",

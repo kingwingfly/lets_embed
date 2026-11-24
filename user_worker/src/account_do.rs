@@ -2,7 +2,7 @@
 //! balances, subscriptions and usage. Guest instances enforce the published
 //! daily free allowances for a pseudonymous client IP.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::de::DeserializeOwned;
 use worker::{Date, DurableObject, Env, Method, Request, Response, Result, State, durable_object};
@@ -166,6 +166,7 @@ fn refund_window_counters(
 const HOLD_TTL_SECS: i64 = 600;
 const PREVIEW_BUDGET_WINDOW_SECS: i64 = 300;
 const PREVIEW_BUDGET_MAX_PER_WINDOW: u32 = 240;
+const PREVIEW_ITEM_MAX_HITS_PER_WINDOW: u32 = 4;
 
 /// Pure session-context evaluator (host-testable).
 #[derive(Debug, Clone)]
@@ -419,18 +420,51 @@ pub(crate) fn compute_session_context(
 }
 
 /// Pure preview transform rate budget decision (separate from clear-view billing).
+/// Enforces per-window unique item cap, per-item repeat hit cap, and total hits cap
+/// so repeating a single preview URL can never cause unbounded origin/transform load (Cycle 3 H7).
 pub(crate) fn decide_preview_budget(
-    seen_in_window: bool,
-    window_count: u32,
-    max_per_window: u32,
+    item_hits: u32,
+    unique_count: u32,
+    total_hits: u32,
+    max_unique: u32,
+    max_item_hits: u32,
 ) -> (bool, u32) {
-    if seen_in_window {
-        return (true, max_per_window.saturating_sub(window_count));
-    }
-    if window_count >= max_per_window {
+    let max_total_hits = max_unique.saturating_mul(2);
+    if item_hits >= max_item_hits || total_hits >= max_total_hits {
         return (false, 0);
     }
-    (true, max_per_window.saturating_sub(window_count + 1))
+    if item_hits == 0 && unique_count >= max_unique {
+        return (false, 0);
+    }
+    let next_unique = if item_hits == 0 {
+        unique_count.saturating_add(1)
+    } else {
+        unique_count
+    };
+    let next_total = total_hits.saturating_add(1);
+    let rem_unique = max_unique.saturating_sub(next_unique);
+    let rem_total = max_total_hits.saturating_sub(next_total);
+    (true, rem_unique.min(rem_total))
+}
+
+/// Pure helper determining whether a `SessionRevokeAllReq` targets a selective subset
+/// (including legacy-only invalidation) rather than revoking every active `v2` session (Cycle 3 H3).
+pub(crate) fn is_selective_revoke(req: &SessionRevokeAllReq) -> bool {
+    req.identity_key.is_some()
+        || req.strict_only
+        || req.revoke_sid.is_some()
+        || req.invalidate_legacy
+}
+
+struct RefundGuard<'a> {
+    set: &'a std::cell::RefCell<HashSet<String>>,
+    key: String,
+}
+
+impl Drop for RefundGuard<'_> {
+    fn drop(&mut self) {
+        self.set.borrow_mut().remove(&self.key);
+    }
 }
 
 enum FreeOutcome {
@@ -469,6 +503,7 @@ pub struct UserAccount {
     handoff_last_purge: std::cell::Cell<i64>,
     holds_schema_ready: std::cell::Cell<bool>,
     holds_last_purge: std::cell::Cell<i64>,
+    refunding_holds: std::cell::RefCell<HashSet<String>>,
     sessions_schema_ready: std::cell::Cell<bool>,
     sessions_last_purge: std::cell::Cell<i64>,
 }
@@ -482,6 +517,7 @@ impl DurableObject for UserAccount {
             handoff_last_purge: std::cell::Cell::new(0),
             holds_schema_ready: std::cell::Cell::new(false),
             holds_last_purge: std::cell::Cell::new(0),
+            refunding_holds: std::cell::RefCell::new(HashSet::new()),
             sessions_schema_ready: std::cell::Cell::new(false),
             sessions_last_purge: std::cell::Cell::new(0),
         }
@@ -529,9 +565,6 @@ impl DurableObject for UserAccount {
             (Method::Post, "/age-confirm") => {
                 return self.age_confirm(req.json().await?);
             }
-            (Method::Post, "/preview-budget") => {
-                return self.preview_budget(req.json().await?).await;
-            }
             (Method::Post, "/handoff-start") => {
                 return self.handoff_start(req.json().await?);
             }
@@ -563,10 +596,10 @@ impl DurableObject for UserAccount {
                 return self.release(req.json().await?).await;
             }
             (Method::Post, "/commit-guest") => {
-                return self.commit_guest(req.json().await?);
+                return self.commit_guest(req.json().await?).await;
             }
             (Method::Post, "/release-guest") => {
-                return self.release_guest(req.json().await?);
+                return self.release_guest(req.json().await?).await;
             }
             _ => {}
         }
@@ -593,8 +626,9 @@ impl DurableObject for UserAccount {
             (Method::Post, "/subscribe") => self.subscribe(req.json().await?, &policy).await,
             (Method::Post, "/unsubscribe") => self.unsubscribe(&policy).await,
             (Method::Post, "/ban") => self.ban(req.json().await?, &policy).await,
-            (Method::Post, "/guest") => self.guest(req.json().await?, &policy),
-            (Method::Post, "/reserve-guest") => self.reserve_guest(req.json().await?, &policy),
+            (Method::Post, "/guest") => self.guest(req.json().await?, &policy).await,
+            (Method::Post, "/reserve-guest") => self.reserve_guest(req.json().await?, &policy).await,
+            (Method::Post, "/preview-budget") => self.preview_budget(req.json().await?, &policy).await,
             (Method::Post, "/admin-plan") => self.admin_plan(req.json().await?, &policy).await,
             _ => Response::error("not found", 404),
         }
@@ -603,20 +637,18 @@ impl DurableObject for UserAccount {
     async fn alarm(&self) -> Result<Response> {
         let storage = self.state.storage();
         let now = now_secs();
-        if storage.get::<String>("plan").await?.is_none() {
-            return Response::ok("");
+        // Reclaim and refund any expired uncommitted charge holds (Cycle 2 D-3 / Cycle 3 H4).
+        // Propagate errors so the Workers runtime retries the alarm rather than dropping refunds.
+        self.reclaim_expired_holds(now as i64, true).await?;
+        if storage.get::<String>("plan").await?.is_some() {
+            let period_end: u64 = self.get_or("period_end", 0).await?;
+            if period_end <= now {
+                // An inactive plan already hides its allowances. Keep the counters in
+                // case the user subscribes again during the same five-hour window.
+                storage.delete("plan").await?;
+            }
         }
-        let period_end: u64 = self.get_or("period_end", 0).await?;
-        if period_end > now {
-            // fired early — re-arm at the real period end
-            storage
-                .set_alarm(((period_end - now) * 1000) as i64)
-                .await?;
-            return Response::ok("");
-        }
-        // An inactive plan already hides its allowances. Keep the counters in
-        // case the user subscribes again during the same five-hour window.
-        storage.delete("plan").await?;
+        self.schedule_next_alarm(now).await?;
         Response::ok("")
     }
 }
@@ -640,10 +672,56 @@ impl UserAccount {
             fields["win_search"] = 0.into();
         }
         self.write_fields(fields).await?;
-        if end > now {
-            storage.set_alarm(((end - now) * 1000) as i64).await?;
-        } else {
+        if end <= now {
             storage.delete("plan").await?;
+        }
+        self.schedule_next_alarm(now).await?;
+        Ok(())
+    }
+
+    /// Schedules the DO alarm for the earliest pending expiry across active
+    /// subscriptions and uncommitted `charge_holds`.
+    async fn schedule_next_alarm(&self, now: u64) -> Result<()> {
+        let storage = self.state.storage();
+        let mut earliest: Option<u64> = None;
+
+        if storage.get::<String>("plan").await?.is_some() {
+            let period_end: u64 = self.get_or("period_end", 0).await?;
+            if period_end > now {
+                earliest = Some(period_end);
+            }
+        }
+
+        if let Ok(db) = self.ensure_holds_table() {
+            #[derive(serde::Deserialize)]
+            struct MinRow {
+                min_created: Option<i64>,
+            }
+            if let Ok(rows) = db
+                .exec(
+                    "SELECT MIN(\
+                        MAX(\
+                            h.created_at,\
+                            COALESCE((SELECT MAX(l.created_at) FROM hold_leases l WHERE l.hold_id = h.hold_id), h.created_at)\
+                        )\
+                     ) AS min_created FROM charge_holds h",
+                    None,
+                )
+                .and_then(|c| c.to_array::<MinRow>())
+                && let Some(min_created) = rows.first().and_then(|r| r.min_created)
+            {
+                let hold_exp = min_created.saturating_add(HOLD_TTL_SECS).max(0) as u64;
+                earliest = Some(match earliest {
+                    Some(cur) => cur.min(hold_exp),
+                    None => hold_exp,
+                });
+            }
+        }
+
+        if let Some(target) = earliest {
+            let delta_secs = target.saturating_sub(now).max(1);
+            storage.set_alarm((delta_secs.saturating_mul(1000)) as i64).await?;
+        } else {
             storage.delete_alarm().await?;
         }
         Ok(())
@@ -659,7 +737,7 @@ impl UserAccount {
         Ok(prorated_refund(paid, plan.period_secs, end - now))
     }
 
-    fn ensure_holds_table(&self, now: i64) -> Result<worker::SqlStorage> {
+    fn ensure_holds_table(&self) -> Result<worker::SqlStorage> {
         let db = self.state.storage().sql();
         if !self.holds_schema_ready.get() {
             db.exec(
@@ -678,22 +756,115 @@ impl UserAccount {
                 None,
             )?;
             db.exec(
+                "CREATE TABLE IF NOT EXISTS hold_leases (\
+                    lease_id TEXT PRIMARY KEY,\
+                    hold_id TEXT NOT NULL,\
+                    is_guest INTEGER NOT NULL,\
+                    created_at INTEGER NOT NULL\
+                )",
+                None,
+            )?;
+            db.exec(
                 "CREATE INDEX IF NOT EXISTS idx_charge_holds_created ON charge_holds(created_at)",
+                None,
+            )?;
+            db.exec(
+                "CREATE INDEX IF NOT EXISTS idx_charge_holds_guest_path ON charge_holds(is_guest, path)",
+                None,
+            )?;
+            db.exec(
+                "CREATE INDEX IF NOT EXISTS idx_hold_leases_hold ON hold_leases(hold_id)",
+                None,
+            )?;
+            db.exec(
+                "CREATE INDEX IF NOT EXISTS idx_hold_leases_created ON hold_leases(created_at)",
                 None,
             )?;
             self.holds_schema_ready.set(true);
         }
-        if now.saturating_sub(self.holds_last_purge.get()) >= 60 {
-            db.exec(
-                "DELETE FROM charge_holds WHERE created_at <= ?",
-                vec![(now.saturating_sub(HOLD_TTL_SECS)).into()],
-            )?;
-            self.holds_last_purge.set(now);
-        }
         Ok(db)
     }
 
-    fn take_charge_hold(
+    /// Finds an active in-flight parent hold that still has at least one unexpired lease
+    /// so concurrent identical requests coalesce via per-participant `hold_leases` (Cycle 3 H1 / Cycle 4 I2-I3).
+    fn find_in_flight_hold(
+        db: &worker::SqlStorage,
+        is_guest: bool,
+        kind: &str,
+        path: &str,
+        cutoff: i64,
+    ) -> Result<Option<String>> {
+        #[derive(serde::Deserialize)]
+        struct HoldIdRow {
+            hold_id: String,
+        }
+        let guest_flag: i64 = if is_guest { 1 } else { 0 };
+        let rows: Vec<HoldIdRow> = db
+            .exec(
+                "SELECT h.hold_id FROM charge_holds h \
+                 WHERE h.is_guest = ?1 AND h.kind = ?2 AND h.path = ?3 \
+                   AND EXISTS (SELECT 1 FROM hold_leases l WHERE l.hold_id = h.hold_id AND l.created_at > ?4) \
+                 LIMIT 1",
+                vec![guest_flag.into(), kind.into(), path.into(), cutoff.into()],
+            )?
+            .to_array()?;
+        Ok(rows.into_iter().next().map(|r| r.hold_id))
+    }
+
+    fn attach_hold_lease(
+        db: &worker::SqlStorage,
+        parent_hold_id: &str,
+        is_guest: bool,
+        now: i64,
+    ) -> Result<String> {
+        let lease_id = uuid::Uuid::new_v4().to_string();
+        let guest_flag: i64 = if is_guest { 1 } else { 0 };
+        db.exec(
+            "INSERT INTO hold_leases (lease_id, hold_id, is_guest, created_at) VALUES (?1, ?2, ?3, ?4)",
+            vec![
+                lease_id.clone().into(),
+                parent_hold_id.into(),
+                guest_flag.into(),
+                now.into(),
+            ],
+        )?;
+        Ok(lease_id)
+    }
+
+    /// Resolves a caller-supplied `lease_id` (or legacy pre-deploy `hold_id` without lease rows)
+    /// to `(parent_hold_id, had_lease_row)`.
+    fn resolve_lease_hold_id(
+        db: &worker::SqlStorage,
+        lease_or_hold_id: &str,
+        is_guest: bool,
+    ) -> Result<Option<(String, bool)>> {
+        #[derive(serde::Deserialize)]
+        struct HoldIdRow {
+            hold_id: String,
+        }
+        let guest_flag: i64 = if is_guest { 1 } else { 0 };
+        let lease_rows: Vec<HoldIdRow> = db
+            .exec(
+                "SELECT hold_id FROM hold_leases WHERE lease_id = ?1 AND is_guest = ?2",
+                vec![lease_or_hold_id.into(), guest_flag.into()],
+            )?
+            .to_array()?;
+        if let Some(row) = lease_rows.into_iter().next() {
+            return Ok(Some((row.hold_id, true)));
+        }
+        // Fallback for any in-flight hold created right before `hold_leases` rollout.
+        let legacy_rows: Vec<HoldIdRow> = db
+            .exec(
+                "SELECT h.hold_id FROM charge_holds h \
+                 WHERE h.hold_id = ?1 AND h.is_guest = ?2 \
+                   AND NOT EXISTS (SELECT 1 FROM hold_leases l WHERE l.hold_id = h.hold_id)",
+                vec![lease_or_hold_id.into(), guest_flag.into()],
+            )?
+            .to_array()?;
+        Ok(legacy_rows.into_iter().next().map(|r| (r.hold_id, false)))
+    }
+
+    fn peek_charge_hold(
         db: &worker::SqlStorage,
         hold_id: &str,
         is_guest: bool,
@@ -719,10 +890,6 @@ impl UserAccount {
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
         };
-        db.exec(
-            "DELETE FROM charge_holds WHERE hold_id = ?1 AND is_guest = ?2",
-            vec![hold_id.into(), guest_flag.into()],
-        )?;
         let free_hash = if row.free_hash_hex.is_empty() {
             Vec::new()
         } else {
@@ -738,6 +905,247 @@ impl UserAccount {
             win_start: row.win_start,
             free_hash,
         }))
+    }
+
+    /// Crash-safe exact-once refund & deletion of a parent `charge_holds` row (Cycle 3 H4).
+    ///
+    /// 1. Synchronously removes `hold_leases` for `hold_id` and records `hold_id` in
+    ///    `refunding_holds` before any `.await` so no concurrent `reserve` can coalesce onto
+    ///    it and no concurrent alarm/release can double-refund it.
+    /// 2. Guards KV refunds (`balance` / `win_*`) with an atomic `"rf:{hold_id}"` marker
+    ///    written in the same `write_fields` call so a crash after KV write and before SQLite
+    ///    delete can never double-refund on retry, while a KV write failure leaves
+    ///    `charge_holds` intact for alarm retry instead of permanently losing funds.
+    /// 3. Deletes `charge_holds` in SQLite and then best-effort deletes the temporary KV marker.
+    async fn refund_and_delete_hold(
+        &self,
+        db: &worker::SqlStorage,
+        hold_id: &str,
+        hold: ChargeHold,
+        is_guest: bool,
+    ) -> Result<()> {
+        // Synchronously detach all leases before any `.await` so no concurrent `reserve`
+        // can attach a new lease to this dying hold.
+        db.exec(
+            "DELETE FROM hold_leases WHERE hold_id = ?1",
+            vec![hold_id.into()],
+        )?;
+        if !self.refunding_holds.borrow_mut().insert(hold_id.to_string()) {
+            return Ok(());
+        }
+        let _guard = RefundGuard {
+            set: &self.refunding_holds,
+            key: hold_id.to_string(),
+        };
+
+        if !hold.free_hash.is_empty() {
+            db.exec(
+                "DELETE FROM free_usage WHERE day = ?1 AND kind = ?2 AND resource = ?3",
+                vec![
+                    hold.day.into(),
+                    hold.kind.clone().into(),
+                    hold.free_hash.into(),
+                ],
+            )?;
+        }
+
+        let mut used_kv_marker: Option<String> = None;
+        if !is_guest {
+            match hold.source.as_str() {
+                "balance" => {
+                    let marker = format!("rf:{hold_id}");
+                    if self.state.storage().get::<bool>(&marker).await?.is_none() {
+                        let balance: i64 = self.get_or("balance", 0).await?;
+                        self.write_fields(serde_json::json!({
+                            "balance": balance.saturating_add(hold.cost.max(0)),
+                            (marker.clone()): true,
+                        }))
+                        .await?;
+                    }
+                    used_kv_marker = Some(marker);
+                }
+                "window" => {
+                    let marker = format!("rf:{hold_id}");
+                    if self.state.storage().get::<bool>(&marker).await?.is_none() {
+                        let current_win_start: Option<u64> =
+                            self.state.storage().get("win_start").await?;
+                        let win_views: i64 = self.get_or("win_views", 0).await?;
+                        let win_search: i64 = self.get_or("win_search", 0).await?;
+                        if let Some((next_views, next_search)) = refund_window_counters(
+                            &hold.kind,
+                            hold.cost,
+                            current_win_start,
+                            hold.win_start,
+                            win_views,
+                            win_search,
+                        ) {
+                            self.write_fields(serde_json::json!({
+                                "win_views": next_views,
+                                "win_search": next_search,
+                                (marker.clone()): true,
+                            }))
+                            .await?;
+                            used_kv_marker = Some(marker);
+                        }
+                    } else {
+                        used_kv_marker = Some(marker);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        db.exec(
+            "DELETE FROM hold_leases WHERE hold_id = ?1",
+            vec![hold_id.into()],
+        )?;
+        db.exec(
+            "DELETE FROM charge_holds WHERE hold_id = ?1",
+            vec![hold_id.into()],
+        )?;
+        if let Some(marker) = used_kv_marker {
+            let _ = self.state.storage().delete(&marker).await;
+        }
+        Ok(())
+    }
+
+    /// Targeted expiry reclaim for a single `(is_guest, kind, path)` key bypassing the 30s
+    /// `holds_last_purge` throttle, so `eval_free_item` can never observe a stale `free_usage`
+    /// row belonging to an expired uncommitted hold ignored by `find_in_flight_hold` (Cycle 4 I3).
+    async fn reclaim_expired_holds_for_item(
+        &self,
+        db: &worker::SqlStorage,
+        is_guest: bool,
+        kind: &str,
+        path: &str,
+        cutoff: i64,
+    ) -> Result<usize> {
+        let guest_flag: i64 = if is_guest { 1 } else { 0 };
+        db.exec(
+            "DELETE FROM hold_leases WHERE created_at <= ?1 AND hold_id IN (\
+                SELECT hold_id FROM charge_holds \
+                WHERE is_guest = ?2 AND kind = ?3 AND path = ?4 AND created_at <= ?1\
+             )",
+            vec![cutoff.into(), guest_flag.into(), kind.into(), path.into()],
+        )?;
+        #[derive(serde::Deserialize)]
+        struct ExpiredItemHoldRow {
+            hold_id: String,
+            kind: String,
+            source: String,
+            cost: i64,
+            day: i64,
+            path: String,
+            win_start: i64,
+            free_hash_hex: String,
+        }
+        let expired: Vec<ExpiredItemHoldRow> = db
+            .exec(
+                "SELECT h.hold_id, h.kind, h.source, h.cost, h.day, h.path, h.win_start, hex(h.free_hash) AS free_hash_hex \
+                 FROM charge_holds h \
+                 WHERE h.is_guest = ?1 AND h.kind = ?2 AND h.path = ?3 AND h.created_at <= ?4 \
+                   AND NOT EXISTS (SELECT 1 FROM hold_leases l WHERE l.hold_id = h.hold_id)",
+                vec![guest_flag.into(), kind.into(), path.into(), cutoff.into()],
+            )?
+            .to_array()?;
+        let mut reclaimed = 0usize;
+        for row in expired {
+            let free_hash = if row.free_hash_hex.is_empty() {
+                Vec::new()
+            } else {
+                hex::decode(&row.free_hash_hex).unwrap_or_default()
+            };
+            let hold = ChargeHold {
+                kind: row.kind,
+                source: row.source,
+                cost: row.cost,
+                day: row.day,
+                path: row.path,
+                win_start: row.win_start,
+                free_hash,
+            };
+            self.refund_and_delete_hold(db, &row.hold_id, hold, is_guest)
+                .await?;
+            reclaimed += 1;
+        }
+        Ok(reclaimed)
+    }
+
+    /// Reclaims and refunds all uncommitted `charge_holds` older than `HOLD_TTL_SECS` that have
+    /// no remaining live `hold_leases` (Cycle 2 D-3 / Cycle 3 H4 / Cycle 4 I2).
+    /// Returns the number of expired holds reclaimed. Updates `holds_last_purge` ONLY after the sweep succeeds.
+    async fn reclaim_expired_holds(&self, now: i64, force: bool) -> Result<usize> {
+        if !force && now.saturating_sub(self.holds_last_purge.get()) < 30 {
+            return Ok(0);
+        }
+        let db = self.ensure_holds_table()?;
+        let cutoff = now.saturating_sub(HOLD_TTL_SECS);
+        // 1. Delete expired leases first so newly attached live leases protect their parent
+        //    hold for their full TTL (Cycle 4 I2).
+        db.exec(
+            "DELETE FROM hold_leases WHERE created_at <= ?1",
+            vec![cutoff.into()],
+        )?;
+        #[derive(serde::Deserialize)]
+        struct ExpiredHoldRow {
+            hold_id: String,
+            is_guest: i64,
+            kind: String,
+            source: String,
+            cost: i64,
+            day: i64,
+            path: String,
+            win_start: i64,
+            free_hash_hex: String,
+        }
+        // 2. Only reclaim expired parent holds with zero remaining live leases.
+        let expired: Vec<ExpiredHoldRow> = db
+            .exec(
+                "SELECT h.hold_id, h.is_guest, h.kind, h.source, h.cost, h.day, h.path, h.win_start, hex(h.free_hash) AS free_hash_hex \
+                 FROM charge_holds h \
+                 WHERE h.created_at <= ?1 \
+                   AND NOT EXISTS (SELECT 1 FROM hold_leases l WHERE l.hold_id = h.hold_id)",
+                vec![cutoff.into()],
+            )?
+            .to_array()?;
+        let mut reclaimed = 0usize;
+        for row in expired {
+            let free_hash = if row.free_hash_hex.is_empty() {
+                Vec::new()
+            } else {
+                hex::decode(&row.free_hash_hex).unwrap_or_default()
+            };
+            let hold = ChargeHold {
+                kind: row.kind,
+                source: row.source,
+                cost: row.cost,
+                day: row.day,
+                path: row.path,
+                win_start: row.win_start,
+                free_hash,
+            };
+            self.refund_and_delete_hold(&db, &row.hold_id, hold, row.is_guest != 0)
+                .await?;
+            reclaimed += 1;
+        }
+        self.holds_last_purge.set(now);
+        Ok(reclaimed)
+    }
+
+    fn take_charge_hold(
+        db: &worker::SqlStorage,
+        hold_id: &str,
+        is_guest: bool,
+    ) -> Result<Option<ChargeHold>> {
+        let Some(hold) = Self::peek_charge_hold(db, hold_id, is_guest)? else {
+            return Ok(None);
+        };
+        let guest_flag: i64 = if is_guest { 1 } else { 0 };
+        db.exec(
+            "DELETE FROM charge_holds WHERE hold_id = ?1 AND is_guest = ?2",
+            vec![hold_id.into(), guest_flag.into()],
+        )?;
+        Ok(Some(hold))
     }
 
     fn eval_free_item(
@@ -803,15 +1211,33 @@ impl UserAccount {
         ))
     }
 
-    fn guest(&self, req: GuestReq, policy: &Policy) -> Result<Response> {
+    async fn guest(&self, req: GuestReq, policy: &Policy) -> Result<Response> {
         if policy.login_required {
             return Response::error("Login required", 401);
         }
+        let now = now_secs();
+        let _ = self.reclaim_expired_holds(now as i64, false).await;
         if let Some(item) = req.item {
+            let holds_db = self.ensure_holds_table()?;
+            let cutoff = (now as i64).saturating_sub(HOLD_TTL_SECS);
+            self.reclaim_expired_holds_for_item(
+                &holds_db,
+                true,
+                item.kind.name(),
+                &item.path,
+                cutoff,
+            )
+            .await?;
             let limit = policy.item(item.kind).daily_free;
-            if !policy.free_media_in_scope(&item)
-                || !self.free_item(&item, limit, now_secs() / 86_400, req.head)?
+            let in_scope = policy.free_media_in_scope(&item);
+            let mut ok = in_scope && self.free_item(&item, limit, now / 86_400, req.head)?;
+            if !ok
+                && in_scope
+                && self.reclaim_expired_holds(now as i64, true).await? > 0
             {
+                ok = self.free_item(&item, limit, now / 86_400, req.head)?;
+            }
+            if !ok {
                 return Response::error(
                     "Sign in to access this item or continue beyond the daily free allowance",
                     402,
@@ -821,7 +1247,7 @@ impl UserAccount {
         Response::ok("")
     }
 
-    fn reserve_guest(&self, req: GuestReq, policy: &Policy) -> Result<Response> {
+    async fn reserve_guest(&self, req: GuestReq, policy: &Policy) -> Result<Response> {
         if policy.login_required {
             return Response::error("Login required", 401);
         }
@@ -829,6 +1255,7 @@ impl UserAccount {
             return json(&HoldResp { hold_id: None }, 200);
         };
         let now = now_secs();
+        let _ = self.reclaim_expired_holds(now as i64, false).await;
         let day = now / 86_400;
         let limit = policy.item(item.kind).daily_free;
         if !policy.free_media_in_scope(&item) {
@@ -837,7 +1264,40 @@ impl UserAccount {
                 402,
             );
         }
-        match self.eval_free_item(&item, limit, day, req.head)? {
+        let holds_db = self.ensure_holds_table()?;
+        let cutoff = (now as i64).saturating_sub(HOLD_TTL_SECS);
+        // Reclaim any expired lease-free hold for this exact item (bypassing the 30s sweep
+        // throttle) so `eval_free_item` never observes an uncommitted `free_usage` row (Cycle 4 I3).
+        self.reclaim_expired_holds_for_item(
+            &holds_db,
+            true,
+            item.kind.name(),
+            &item.path,
+            cutoff,
+        )
+        .await?;
+        // Check for an active in-flight guest hold BEFORE `eval_free_item` so concurrent
+        // requests for the same path attach their own lease instead of bypassing lease tracking
+        // via `FreeOutcome::AlreadyCovered` (Cycle 3 H1).
+        if !req.head
+            && let Some(parent_hold_id) =
+                Self::find_in_flight_hold(&holds_db, true, item.kind.name(), &item.path, cutoff)?
+        {
+            let lease_id = Self::attach_hold_lease(&holds_db, &parent_hold_id, true, now as i64)?;
+            return json(
+                &HoldResp {
+                    hold_id: Some(lease_id),
+                },
+                200,
+            );
+        }
+        let mut outcome = self.eval_free_item(&item, limit, day, req.head)?;
+        if matches!(outcome, FreeOutcome::NotCovered)
+            && self.reclaim_expired_holds(now as i64, true).await? > 0
+        {
+            outcome = self.eval_free_item(&item, limit, day, req.head)?;
+        }
+        match outcome {
             FreeOutcome::NotCovered => Response::error(
                 "Sign in to access this item or continue beyond the daily free allowance",
                 402,
@@ -845,8 +1305,7 @@ impl UserAccount {
             FreeOutcome::AlreadyCovered => json(&HoldResp { hold_id: None }, 200),
             FreeOutcome::Reserved(free_hash) => {
                 let hold_id = uuid::Uuid::new_v4().to_string();
-                let db = self.ensure_holds_table(now as i64)?;
-                db.exec(
+                holds_db.exec(
                     "INSERT INTO charge_holds \
                      (hold_id, is_guest, kind, source, cost, day, path, win_start, free_hash, created_at) \
                      VALUES (?1, 1, ?2, 'free', 0, ?3, ?4, 0, ?5, ?6)",
@@ -859,6 +1318,16 @@ impl UserAccount {
                         (now as i64).into(),
                     ],
                 )?;
+                holds_db.exec(
+                    "INSERT INTO hold_leases (lease_id, hold_id, is_guest, created_at) \
+                     VALUES (?1, ?2, 1, ?3)",
+                    vec![
+                        hold_id.clone().into(),
+                        hold_id.clone().into(),
+                        (now as i64).into(),
+                    ],
+                )?;
+                let _ = self.schedule_next_alarm(now).await;
                 json(
                     &HoldResp {
                         hold_id: Some(hold_id),
@@ -869,28 +1338,58 @@ impl UserAccount {
         }
     }
 
-    fn commit_guest(&self, req: HoldReq) -> Result<Response> {
+    async fn commit_guest(&self, req: HoldReq) -> Result<Response> {
         let now = now_secs() as i64;
-        let db = self.ensure_holds_table(now)?;
-        db.exec(
-            "DELETE FROM charge_holds WHERE hold_id = ?1 AND is_guest = 1",
-            vec![req.hold_id.into()],
-        )?;
+        let db = self.ensure_holds_table()?;
+        // Resolve and consume `req.hold_id` BEFORE background expiry reclamation so a
+        // valid commit on the TTL boundary can never self-refund the hold being committed (Cycle 4 I2).
+        if let Some((parent_hold_id, _)) = Self::resolve_lease_hold_id(&db, &req.hold_id, true)? {
+            db.exec(
+                "DELETE FROM hold_leases WHERE hold_id = ?1",
+                vec![parent_hold_id.clone().into()],
+            )?;
+            db.exec(
+                "DELETE FROM charge_holds WHERE hold_id = ?1 AND is_guest = 1",
+                vec![parent_hold_id.into()],
+            )?;
+        }
+        let _ = self.reclaim_expired_holds(now, false).await;
         Response::ok("")
     }
 
-    fn release_guest(&self, req: HoldReq) -> Result<Response> {
+    async fn release_guest(&self, req: HoldReq) -> Result<Response> {
         let now = now_secs() as i64;
-        let db = self.ensure_holds_table(now)?;
-        let Some(hold) = Self::take_charge_hold(&db, &req.hold_id, true)? else {
+        let _ = self.reclaim_expired_holds(now, false).await;
+        let db = self.ensure_holds_table()?;
+        let Some((parent_hold_id, had_lease)) =
+            Self::resolve_lease_hold_id(&db, &req.hold_id, true)?
+        else {
             return Response::ok("");
         };
-        if !hold.free_hash.is_empty() {
+        if had_lease {
             db.exec(
-                "DELETE FROM free_usage WHERE day = ?1 AND kind = ?2 AND resource = ?3",
-                vec![hold.day.into(), hold.kind.into(), hold.free_hash.into()],
+                "DELETE FROM hold_leases WHERE lease_id = ?1 AND is_guest = 1",
+                vec![req.hold_id.into()],
             )?;
+            #[derive(serde::Deserialize)]
+            struct CountRow {
+                n: i64,
+            }
+            let remaining: Vec<CountRow> = db
+                .exec(
+                    "SELECT COUNT(*) AS n FROM hold_leases WHERE hold_id = ?1",
+                    vec![parent_hold_id.clone().into()],
+                )?
+                .to_array()?;
+            if remaining.first().is_some_and(|r| r.n > 0) {
+                return Response::ok("");
+            }
         }
+        let Some(hold) = Self::peek_charge_hold(&db, &parent_hold_id, true)? else {
+            return Response::ok("");
+        };
+        self.refund_and_delete_hold(&db, &parent_hold_id, hold, true)
+            .await?;
         Response::ok("")
     }
 
@@ -975,6 +1474,7 @@ impl UserAccount {
 
     async fn status_resp(&self, policy: &Policy) -> Result<StatusResp> {
         let now = now_secs();
+        let _ = self.reclaim_expired_holds(now as i64, false).await;
         let period_end: u64 = self.get_or("period_end", 0).await?;
         let active = self.plan_active(now).await?;
         let plan_id: Option<String> = self.state.storage().get("plan").await?;
@@ -1009,6 +1509,7 @@ impl UserAccount {
         }
         let storage = self.state.storage();
         let now = now_secs();
+        let _ = self.reclaim_expired_holds(now as i64, false).await;
         let day = now / 86_400;
         let today_key = format!("seen:{day}");
         let today: Option<HashMap<String, u64>> = storage.get(&today_key).await?;
@@ -1018,12 +1519,6 @@ impl UserAccount {
 
         let rule = policy.item(req.kind);
         let cost = rule.price;
-        // A first GET receives the signup grant. A HEAD can evaluate it without creating a wallet.
-        let mut balance: i64 = self.get_or("balance", 0).await?;
-        if check_only && storage.get::<bool>("init").await?.is_none() {
-            balance = balance.saturating_add(policy.signup_points);
-        }
-
         let active = self.plan_active(now).await?;
         let plan_cfg = if active {
             storage
@@ -1041,6 +1536,10 @@ impl UserAccount {
         // Deduped repeats within the window cost nothing and touch no state; they
         // still report the current window figures.
         if is_recent_view(&req.path, now, [&today_map, &yesterday]) {
+            let mut balance: i64 = self.get_or("balance", 0).await?;
+            if check_only && storage.get::<bool>("init").await?.is_none() {
+                balance = balance.saturating_add(policy.signup_points);
+            }
             let (views_remaining, searches_remaining, window_reset) =
                 self.window_fields(active, plan_cfg.as_ref(), now).await?;
             return json(
@@ -1056,51 +1555,99 @@ impl UserAccount {
             );
         }
 
-        // Roll the usage window if the plan is active and the current one elapsed
-        // (or was never opened).
-        let mut win_start: Option<u64> = storage.get("win_start").await?;
-        let mut win_views: i64 = self.get_or("win_views", 0).await?;
-        let mut win_search: i64 = self.get_or("win_search", 0).await?;
-        let mut window_dirty = false;
-        if active && should_roll(win_start, now) {
-            win_start = Some(now);
-            win_views = 0;
-            win_search = 0;
-            window_dirty = true;
-        }
+        // Reclaim any expired lease-free hold for this exact item (bypassing the 30s sweep
+        // throttle) so `free_item` never observes an uncommitted `free_usage` row (Cycle 4 I3).
+        let holds_db = self.ensure_holds_table()?;
+        self.reclaim_expired_holds_for_item(
+            &holds_db,
+            false,
+            req.kind.name(),
+            &req.path,
+            (now as i64).saturating_sub(HOLD_TTL_SECS),
+        )
+        .await?;
 
-        let included = cost == 0
-            || (policy.free_media_in_scope(&req)
-                && self.free_item(&req, rule.daily_free, day, check_only)?);
-        let source = if included {
-            ChargeSource::FreeUnlimited
-        } else {
-            decide_charge(
-                plan_cfg.as_ref(),
-                active,
-                req.kind,
+        // Evaluate funding; if refused (402), force-reclaim expired holds once and retry
+        // before returning 402 so stale holds never cause spurious payment errors (Cycle 3 H4).
+        let mut reclaimed_once = false;
+        let (mut balance, win_start, mut win_views, mut win_search, mut window_dirty, included, source) = loop {
+            // A first GET receives the signup grant. A HEAD can evaluate it without creating a wallet.
+            let mut balance: i64 = self.get_or("balance", 0).await?;
+            if check_only && storage.get::<bool>("init").await?.is_none() {
+                balance = balance.saturating_add(policy.signup_points);
+            }
+
+            // Roll the usage window if the plan is active and the current one elapsed
+            // (or was never opened).
+            let mut win_start: Option<u64> = storage.get("win_start").await?;
+            let mut win_views: i64 = self.get_or("win_views", 0).await?;
+            let mut win_search: i64 = self.get_or("win_search", 0).await?;
+            let mut window_dirty = false;
+            if active && should_roll(win_start, now) {
+                win_start = Some(now);
+                win_views = 0;
+                win_search = 0;
+                window_dirty = true;
+            }
+
+            let included = cost == 0
+                || (policy.free_media_in_scope(&req)
+                    && self.free_item(&req, rule.daily_free, day, check_only)?);
+            let source = if included {
+                ChargeSource::FreeUnlimited
+            } else {
+                decide_charge(
+                    plan_cfg.as_ref(),
+                    active,
+                    req.kind,
+                    win_views,
+                    win_search,
+                    balance,
+                    cost,
+                )
+            };
+            // Force-reclaim expired holds once before falling back to a costlier funding
+            // tier or refusing (402), so expired holds on other items never overcharge
+            // PAYG balance or subscription window quota during the 30s purge throttle (Cycle 5 J4).
+            let should_reclaim = source == ChargeSource::Refuse
+                || (source == ChargeSource::Balance && active && plan_cfg.is_some())
+                || (!included
+                    && cost > 0
+                    && policy.free_media_in_scope(&req)
+                    && rule.daily_free > 0);
+            if !reclaimed_once
+                && should_reclaim
+                && self.reclaim_expired_holds(now as i64, true).await? > 0
+            {
+                reclaimed_once = true;
+                continue;
+            }
+            if source == ChargeSource::Refuse {
+                let views_remaining = views_remaining(plan_cfg.as_ref(), active, win_views);
+                let searches_remaining = searches_remaining(plan_cfg.as_ref(), active, win_search);
+                let window_reset = window_reset(active, win_start, now);
+                return json(
+                    &ChargeResp {
+                        charged: false,
+                        cost,
+                        balance,
+                        views_remaining,
+                        searches_remaining,
+                        window_reset,
+                    },
+                    402,
+                );
+            }
+            break (
+                balance,
+                win_start,
                 win_views,
                 win_search,
-                balance,
-                cost,
-            )
-        };
-        if source == ChargeSource::Refuse {
-            let views_remaining = views_remaining(plan_cfg.as_ref(), active, win_views);
-            let searches_remaining = searches_remaining(plan_cfg.as_ref(), active, win_search);
-            let window_reset = window_reset(active, win_start, now);
-            return json(
-                &ChargeResp {
-                    charged: false,
-                    cost,
-                    balance,
-                    views_remaining,
-                    searches_remaining,
-                    window_reset,
-                },
-                402,
+                window_dirty,
+                included,
+                source,
             );
-        }
+        };
         if check_only {
             return Response::ok("");
         }
@@ -1156,6 +1703,7 @@ impl UserAccount {
         }
         let storage = self.state.storage();
         let now = now_secs();
+        let _ = self.reclaim_expired_holds(now as i64, false).await;
         let day = now / 86_400;
         let today: HashMap<String, u64> =
             self.get_or(&format!("seen:{day}"), HashMap::new()).await?;
@@ -1167,9 +1715,36 @@ impl UserAccount {
             return json(&HoldResp { hold_id: None }, 200);
         }
 
+        // Coalesce concurrent identical paid requests via per-participant `hold_leases`
+        // so parallel requests never double-charge AND a failing request cannot trigger
+        // a refund while a sibling request is still in flight or succeeded (Cycle 3 H1).
+        let holds_db = self.ensure_holds_table()?;
+        let cutoff = (now as i64).saturating_sub(HOLD_TTL_SECS);
+        // Reclaim any expired lease-free hold for this exact item (bypassing the 30s sweep
+        // throttle) so `eval_free_item` never observes an uncommitted `free_usage` row (Cycle 4 I3).
+        self.reclaim_expired_holds_for_item(
+            &holds_db,
+            false,
+            req.kind.name(),
+            &req.path,
+            cutoff,
+        )
+        .await?;
+        if let Some(parent_hold_id) =
+            Self::find_in_flight_hold(&holds_db, false, req.kind.name(), &req.path, cutoff)?
+        {
+            let lease_id =
+                Self::attach_hold_lease(&holds_db, &parent_hold_id, false, now as i64)?;
+            return json(
+                &HoldResp {
+                    hold_id: Some(lease_id),
+                },
+                200,
+            );
+        }
+
         let rule = policy.item(req.kind);
         let cost = rule.price;
-        let mut balance: i64 = self.get_or("balance", 0).await?;
         let active = self.plan_active(now).await?;
         let plan_cfg = if active {
             storage
@@ -1181,58 +1756,102 @@ impl UserAccount {
             None
         };
 
-        let mut win_start: Option<u64> = storage.get("win_start").await?;
-        let mut win_views: i64 = self.get_or("win_views", 0).await?;
-        let mut win_search: i64 = self.get_or("win_search", 0).await?;
-        let mut window_dirty = false;
-        if active && should_roll(win_start, now) {
-            win_start = Some(now);
-            win_views = 0;
-            win_search = 0;
-            window_dirty = true;
-        }
-
-        let (included, free_hash) = if cost == 0 {
-            (true, Vec::new())
-        } else if policy.free_media_in_scope(&req) {
-            match self.eval_free_item(&req, rule.daily_free, day, false)? {
-                FreeOutcome::NotCovered => (false, Vec::new()),
-                FreeOutcome::AlreadyCovered => (true, Vec::new()),
-                FreeOutcome::Reserved(hash) => (true, hash),
+        let mut reclaimed_once = false;
+        let (mut balance, win_start, mut win_views, mut win_search, mut window_dirty, free_hash, source) = loop {
+            let balance: i64 = self.get_or("balance", 0).await?;
+            let mut win_start: Option<u64> = storage.get("win_start").await?;
+            let mut win_views: i64 = self.get_or("win_views", 0).await?;
+            let mut win_search: i64 = self.get_or("win_search", 0).await?;
+            let mut window_dirty = false;
+            if active && should_roll(win_start, now) {
+                win_start = Some(now);
+                win_views = 0;
+                win_search = 0;
+                window_dirty = true;
             }
-        } else {
-            (false, Vec::new())
-        };
 
-        let source = if included {
-            ChargeSource::FreeUnlimited
-        } else {
-            decide_charge(
-                plan_cfg.as_ref(),
-                active,
-                req.kind,
+            // Re-check synchronously right before charging in case a sibling request created
+            // a hold while we awaited KV reads.
+            if let Some(parent_hold_id) =
+                Self::find_in_flight_hold(&holds_db, false, req.kind.name(), &req.path, cutoff)?
+            {
+                let lease_id =
+                    Self::attach_hold_lease(&holds_db, &parent_hold_id, false, now as i64)?;
+                return json(
+                    &HoldResp {
+                        hold_id: Some(lease_id),
+                    },
+                    200,
+                );
+            }
+
+            let (included, free_hash) = if cost == 0 {
+                (true, Vec::new())
+            } else if policy.free_media_in_scope(&req) {
+                match self.eval_free_item(&req, rule.daily_free, day, false)? {
+                    FreeOutcome::NotCovered => (false, Vec::new()),
+                    FreeOutcome::AlreadyCovered => (true, Vec::new()),
+                    FreeOutcome::Reserved(hash) => (true, hash),
+                }
+            } else {
+                (false, Vec::new())
+            };
+
+            let source = if included {
+                ChargeSource::FreeUnlimited
+            } else {
+                decide_charge(
+                    plan_cfg.as_ref(),
+                    active,
+                    req.kind,
+                    win_views,
+                    win_search,
+                    balance,
+                    cost,
+                )
+            };
+            // Force-reclaim expired holds once before falling back to a costlier funding
+            // tier or refusing (402), so expired holds on other items never overcharge
+            // PAYG balance or subscription window quota during the 30s purge throttle (Cycle 5 J4).
+            let should_reclaim = source == ChargeSource::Refuse
+                || (source == ChargeSource::Balance && active && plan_cfg.is_some())
+                || (!included
+                    && cost > 0
+                    && policy.free_media_in_scope(&req)
+                    && rule.daily_free > 0);
+            if !reclaimed_once
+                && should_reclaim
+                && self.reclaim_expired_holds(now as i64, true).await? > 0
+            {
+                reclaimed_once = true;
+                continue;
+            }
+            if source == ChargeSource::Refuse {
+                let views_remaining = views_remaining(plan_cfg.as_ref(), active, win_views);
+                let searches_remaining = searches_remaining(plan_cfg.as_ref(), active, win_search);
+                let window_reset = window_reset(active, win_start, now);
+                return json(
+                    &ChargeResp {
+                        charged: false,
+                        cost,
+                        balance,
+                        views_remaining,
+                        searches_remaining,
+                        window_reset,
+                    },
+                    402,
+                );
+            }
+            break (
+                balance,
+                win_start,
                 win_views,
                 win_search,
-                balance,
-                cost,
-            )
-        };
-        if source == ChargeSource::Refuse {
-            let views_remaining = views_remaining(plan_cfg.as_ref(), active, win_views);
-            let searches_remaining = searches_remaining(plan_cfg.as_ref(), active, win_search);
-            let window_reset = window_reset(active, win_start, now);
-            return json(
-                &ChargeResp {
-                    charged: false,
-                    cost,
-                    balance,
-                    views_remaining,
-                    searches_remaining,
-                    window_reset,
-                },
-                402,
+                window_dirty,
+                free_hash,
+                source,
             );
-        }
+        };
 
         let source_name = match source {
             ChargeSource::FreeUnlimited => "free",
@@ -1280,8 +1899,7 @@ impl UserAccount {
         } else {
             0
         };
-        let db = self.ensure_holds_table(now as i64)?;
-        db.exec(
+        holds_db.exec(
             "INSERT INTO charge_holds \
              (hold_id, is_guest, kind, source, cost, day, path, win_start, free_hash, created_at) \
              VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -1297,6 +1915,16 @@ impl UserAccount {
                 (now as i64).into(),
             ],
         )?;
+        holds_db.exec(
+            "INSERT INTO hold_leases (lease_id, hold_id, is_guest, created_at) \
+             VALUES (?1, ?2, 0, ?3)",
+            vec![
+                hold_id.clone().into(),
+                hold_id.clone().into(),
+                (now as i64).into(),
+            ],
+        )?;
+        let _ = self.schedule_next_alarm(now).await;
 
         json(
             &HoldResp {
@@ -1308,8 +1936,20 @@ impl UserAccount {
 
     async fn commit(&self, req: HoldReq) -> Result<Response> {
         let now = now_secs();
-        let db = self.ensure_holds_table(now as i64)?;
-        let Some(hold) = Self::take_charge_hold(&db, &req.hold_id, false)? else {
+        let db = self.ensure_holds_table()?;
+        // Resolve and consume `req.hold_id` BEFORE background expiry reclamation so a
+        // valid commit on the TTL boundary can never self-refund the hold being committed (Cycle 4 I2).
+        let Some((parent_hold_id, _)) = Self::resolve_lease_hold_id(&db, &req.hold_id, false)?
+        else {
+            let _ = self.reclaim_expired_holds(now as i64, false).await;
+            return Response::ok("");
+        };
+        db.exec(
+            "DELETE FROM hold_leases WHERE hold_id = ?1",
+            vec![parent_hold_id.clone().into()],
+        )?;
+        let Some(hold) = Self::take_charge_hold(&db, &parent_hold_id, false)? else {
+            let _ = self.reclaim_expired_holds(now as i64, false).await;
             return Response::ok("");
         };
 
@@ -1329,57 +1969,43 @@ impl UserAccount {
             "total_views": total_views,
         }))
         .await?;
+        let _ = self.reclaim_expired_holds(now as i64, false).await;
         Response::ok("")
     }
 
     async fn release(&self, req: HoldReq) -> Result<Response> {
         let now = now_secs() as i64;
-        let db = self.ensure_holds_table(now)?;
-        let Some(hold) = Self::take_charge_hold(&db, &req.hold_id, false)? else {
+        let _ = self.reclaim_expired_holds(now, false).await;
+        let db = self.ensure_holds_table()?;
+        let Some((parent_hold_id, had_lease)) =
+            Self::resolve_lease_hold_id(&db, &req.hold_id, false)?
+        else {
             return Response::ok("");
         };
-
-        if !hold.free_hash.is_empty() {
+        if had_lease {
             db.exec(
-                "DELETE FROM free_usage WHERE day = ?1 AND kind = ?2 AND resource = ?3",
-                vec![
-                    hold.day.into(),
-                    hold.kind.clone().into(),
-                    hold.free_hash.into(),
-                ],
+                "DELETE FROM hold_leases WHERE lease_id = ?1 AND is_guest = 0",
+                vec![req.hold_id.into()],
             )?;
-        }
-
-        match hold.source.as_str() {
-            "balance" => {
-                let balance: i64 = self.get_or("balance", 0).await?;
-                self.write_fields(serde_json::json!({
-                    "balance": balance.saturating_add(hold.cost.max(0)),
-                }))
-                .await?;
+            #[derive(serde::Deserialize)]
+            struct CountRow {
+                n: i64,
             }
-            "window" => {
-                let current_win_start: Option<u64> = self.state.storage().get("win_start").await?;
-                let win_views: i64 = self.get_or("win_views", 0).await?;
-                let win_search: i64 = self.get_or("win_search", 0).await?;
-                if let Some((next_views, next_search)) = refund_window_counters(
-                    &hold.kind,
-                    hold.cost,
-                    current_win_start,
-                    hold.win_start,
-                    win_views,
-                    win_search,
-                ) {
-                    self.write_fields(serde_json::json!({
-                        "win_views": next_views,
-                        "win_search": next_search,
-                    }))
-                    .await?;
-                }
+            let remaining: Vec<CountRow> = db
+                .exec(
+                    "SELECT COUNT(*) AS n FROM hold_leases WHERE hold_id = ?1",
+                    vec![parent_hold_id.clone().into()],
+                )?
+                .to_array()?;
+            if remaining.first().is_some_and(|r| r.n > 0) {
+                return Response::ok("");
             }
-            _ => {}
         }
-
+        let Some(hold) = Self::peek_charge_hold(&db, &parent_hold_id, false)? else {
+            return Response::ok("");
+        };
+        self.refund_and_delete_hold(&db, &parent_hold_id, hold, false)
+            .await?;
         Response::ok("")
     }
 
@@ -1433,6 +2059,9 @@ impl UserAccount {
         }
         let storage = self.state.storage();
         let now = now_secs();
+        // Force-reclaim any expired uncommitted holds before checking balance for a
+        // subscription purchase so stale holds never cause spurious 402s (Cycle 3 H4).
+        self.reclaim_expired_holds(now as i64, true).await?;
         let current: Option<String> = storage.get("plan").await?;
         let period_end: u64 = self.get_or("period_end", 0).await?;
 
@@ -1465,6 +2094,8 @@ impl UserAccount {
     async fn unsubscribe(&self, policy: &Policy) -> Result<Response> {
         let storage = self.state.storage();
         let now = now_secs();
+        // Force-reclaim any expired uncommitted holds so the returned balance is up to date.
+        self.reclaim_expired_holds(now as i64, true).await?;
         let current: Option<String> = storage.get("plan").await?;
         let period_end: u64 = self.get_or("period_end", 0).await?;
 
@@ -1548,10 +2179,20 @@ impl UserAccount {
                 "CREATE TABLE IF NOT EXISTS preview_budget (\
                     window_start INTEGER NOT NULL,\
                     item_key TEXT NOT NULL,\
+                    hits INTEGER NOT NULL DEFAULT 1,\
                     PRIMARY KEY (window_start, item_key)\
                 ) WITHOUT ROWID",
                 None,
             )?;
+            let pcols: Vec<ColInfo> = db
+                .exec("PRAGMA table_info(preview_budget)", None)?
+                .to_array()?;
+            if !pcols.iter().any(|c| c.name == "hits") {
+                db.exec(
+                    "ALTER TABLE preview_budget ADD COLUMN hits INTEGER NOT NULL DEFAULT 1",
+                    None,
+                )?;
+            }
             self.sessions_schema_ready.set(true);
         }
         if now.saturating_sub(self.sessions_last_purge.get()) >= 300 {
@@ -1662,6 +2303,7 @@ impl UserAccount {
             return Response::error("banned", 403);
         }
         let now = now_secs();
+        let effective_created_at = req.auth_time.map_or(now, |t| t.min(now));
         let db = self.ensure_session_tables(now as i64)?;
         let strict_flag: i64 =
             if req.strict_age_ok && req.assurance_level == AssuranceLevel::Verified18 {
@@ -1679,14 +2321,14 @@ impl UserAccount {
                 req.identity_key.into(),
                 assurance_to_str(req.assurance_level).into(),
                 strict_flag.into(),
-                (now as i64).into(),
+                (effective_created_at as i64).into(),
                 (req.expires_at as i64).into(),
             ],
         )?;
         json(
             &SessionIssueResp {
                 sid: req.sid,
-                created_at: now,
+                created_at: effective_created_at,
                 expires_at: req.expires_at,
             },
             200,
@@ -1705,36 +2347,20 @@ impl UserAccount {
 
     fn revoke_all_sessions_internal(&self, req: &SessionRevokeAllReq) -> Result<u64> {
         let now = now_secs() as i64;
+        let legacy_cutoff = now.max(1);
         let db = self.ensure_session_tables(now)?;
         #[derive(serde::Deserialize)]
         struct CountRow {
             n: i64,
         }
-        let count = if let Some(ident) = req.identity_key.as_deref() {
-            let c: Vec<CountRow> = db
-                .exec(
-                    "SELECT COUNT(*) AS n FROM sessions WHERE identity_key = ?1 AND revoked_at IS NULL",
-                    vec![ident.into()],
-                )?
-                .to_array()?;
-            db.exec(
-                "UPDATE sessions SET revoked_at = ?1 WHERE identity_key = ?2 AND revoked_at IS NULL",
-                vec![now.into(), ident.into()],
-            )?;
-            c.first().map_or(0, |r| r.n.max(0) as u64)
-        } else if req.strict_only {
-            let c: Vec<CountRow> = db
-                .exec(
-                    "SELECT COUNT(*) AS n FROM sessions WHERE strict_age_ok != 0 AND revoked_at IS NULL",
-                    None,
-                )?
-                .to_array()?;
-            db.exec(
-                "UPDATE sessions SET revoked_at = ?1 WHERE strict_age_ok != 0 AND revoked_at IS NULL",
-                vec![now.into()],
-            )?;
-            c.first().map_or(0, |r| r.n.max(0) as u64)
-        } else {
+        #[derive(serde::Deserialize)]
+        struct LegacyRow {
+            revoked_all_before: i64,
+        }
+        let mut count: u64 = 0;
+        let has_selective = is_selective_revoke(req);
+
+        if !has_selective {
             let c: Vec<CountRow> = db
                 .exec(
                     "SELECT COUNT(*) AS n FROM sessions WHERE revoked_at IS NULL",
@@ -1746,13 +2372,87 @@ impl UserAccount {
                 vec![now.into()],
             )?;
             // Also invalidate any legacy cutover sessions that lack a `sid`.
+            let prior: Vec<LegacyRow> = db
+                .exec(
+                    "SELECT revoked_all_before FROM user_safety_state WHERE id = 1",
+                    None,
+                )?
+                .to_array()?;
+            let legacy_was_active = prior
+                .first()
+                .is_none_or(|r| r.revoked_all_before == 0);
             db.exec(
                 "INSERT INTO user_safety_state (id, revoked_all_before) VALUES (1, ?1) \
-                 ON CONFLICT(id) DO UPDATE SET revoked_all_before = excluded.revoked_all_before",
-                vec![now.into()],
+                 ON CONFLICT(id) DO UPDATE SET \
+                    revoked_all_before = MAX(user_safety_state.revoked_all_before, excluded.revoked_all_before)",
+                vec![legacy_cutoff.into()],
             )?;
-            c.first().map_or(0, |r| r.n.max(0) as u64)
-        };
+            count = c.first().map_or(0, |r| r.n.max(0) as u64);
+            if legacy_was_active && count == 0 {
+                count = 1;
+            }
+        } else {
+            // Apply all requested selective revocations atomically in one DO turn (Cycle 2 B-2 / Cycle 3 H3).
+            if let Some(ident) = req.identity_key.as_deref() {
+                let c: Vec<CountRow> = db
+                    .exec(
+                        "SELECT COUNT(*) AS n FROM sessions WHERE identity_key = ?1 AND revoked_at IS NULL",
+                        vec![ident.into()],
+                    )?
+                    .to_array()?;
+                db.exec(
+                    "UPDATE sessions SET revoked_at = ?1 WHERE identity_key = ?2 AND revoked_at IS NULL",
+                    vec![now.into(), ident.into()],
+                )?;
+                count = count.saturating_add(c.first().map_or(0, |r| r.n.max(0) as u64));
+            }
+            if req.strict_only {
+                let c: Vec<CountRow> = db
+                    .exec(
+                        "SELECT COUNT(*) AS n FROM sessions WHERE strict_age_ok != 0 AND revoked_at IS NULL",
+                        None,
+                    )?
+                    .to_array()?;
+                db.exec(
+                    "UPDATE sessions SET revoked_at = ?1 WHERE strict_age_ok != 0 AND revoked_at IS NULL",
+                    vec![now.into()],
+                )?;
+                count = count.saturating_add(c.first().map_or(0, |r| r.n.max(0) as u64));
+            }
+            if let Some(sid) = req.revoke_sid.as_deref() {
+                let c: Vec<CountRow> = db
+                    .exec(
+                        "SELECT COUNT(*) AS n FROM sessions WHERE sid = ?1 AND revoked_at IS NULL",
+                        vec![sid.into()],
+                    )?
+                    .to_array()?;
+                db.exec(
+                    "UPDATE sessions SET revoked_at = ?1 WHERE sid = ?2 AND revoked_at IS NULL",
+                    vec![now.into(), sid.into()],
+                )?;
+                count = count.saturating_add(c.first().map_or(0, |r| r.n.max(0) as u64));
+            }
+            if req.invalidate_legacy {
+                let prior: Vec<LegacyRow> = db
+                    .exec(
+                        "SELECT revoked_all_before FROM user_safety_state WHERE id = 1",
+                        None,
+                    )?
+                    .to_array()?;
+                let legacy_was_active = prior
+                    .first()
+                    .is_none_or(|r| r.revoked_all_before == 0);
+                db.exec(
+                    "INSERT INTO user_safety_state (id, revoked_all_before) VALUES (1, ?1) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                        revoked_all_before = MAX(user_safety_state.revoked_all_before, excluded.revoked_all_before)",
+                    vec![legacy_cutoff.into()],
+                )?;
+                if legacy_was_active {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
         Ok(count)
     }
 
@@ -1907,7 +2607,11 @@ impl UserAccount {
 
     /// Separate preview transform rate budget — NEVER touches clear-view `balance`,
     /// `seen:{day}`, `free_usage`, `charge_holds`, `win_views`, or `total_views` (M1)!
-    async fn preview_budget(&self, req: PreviewBudgetReq) -> Result<Response> {
+    /// Enforces `policy.login_required` for guests (Cycle 2 A-3).
+    async fn preview_budget(&self, req: PreviewBudgetReq, policy: &Policy) -> Result<Response> {
+        if req.guest && policy.login_required {
+            return Response::error("Login required", 401);
+        }
         if !req.guest && self.get_or("banned", false).await? {
             return Response::error("banned", 403);
         }
@@ -1923,25 +2627,36 @@ impl UserAccount {
 
         #[derive(serde::Deserialize)]
         struct Stats {
-            seen: i64,
-            cnt: i64,
+            item_hits: i64,
+            unique_cnt: i64,
+            total_hits: i64,
         }
         let stats: Stats = db
             .exec(
-                "SELECT EXISTS(SELECT 1 FROM preview_budget WHERE window_start = ?1 AND item_key = ?2) AS seen, \
-                 COUNT(*) AS cnt FROM preview_budget WHERE window_start = ?1",
+                "SELECT \
+                    COALESCE((SELECT hits FROM preview_budget WHERE window_start = ?1 AND item_key = ?2), 0) AS item_hits, \
+                    COUNT(*) AS unique_cnt, \
+                    COALESCE(SUM(hits), 0) AS total_hits \
+                 FROM preview_budget WHERE window_start = ?1",
                 vec![window_start.into(), item_key.clone().into()],
             )?
             .one()?;
 
-        let seen = stats.seen != 0;
-        let count = stats.cnt.max(0) as u32;
+        let item_hits = stats.item_hits.max(0) as u32;
+        let unique_count = stats.unique_cnt.max(0) as u32;
+        let total_hits = stats.total_hits.max(0) as u32;
         let limit = if req.guest {
             PREVIEW_BUDGET_MAX_PER_WINDOW / 2
         } else {
             PREVIEW_BUDGET_MAX_PER_WINDOW
         };
-        let (allowed, remaining) = decide_preview_budget(seen, count, limit);
+        let (allowed, remaining) = decide_preview_budget(
+            item_hits,
+            unique_count,
+            total_hits,
+            limit,
+            PREVIEW_ITEM_MAX_HITS_PER_WINDOW,
+        );
         if !allowed {
             return json(
                 &PreviewBudgetResp {
@@ -1952,9 +2667,10 @@ impl UserAccount {
                 429,
             );
         }
-        if !req.head && !seen {
+        if !req.head {
             db.exec(
-                "INSERT OR IGNORE INTO preview_budget (window_start, item_key) VALUES (?1, ?2)",
+                "INSERT INTO preview_budget (window_start, item_key, hits) VALUES (?1, ?2, 1) \
+                 ON CONFLICT(window_start, item_key) DO UPDATE SET hits = hits + 1",
                 vec![window_start.into(), item_key.into()],
             )?;
         }
@@ -1995,6 +2711,7 @@ impl UserAccount {
             db.exec(
                 "CREATE TABLE IF NOT EXISTS transfer_codes (\
                     id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                    owner_id TEXT NOT NULL DEFAULT '',\
                     principal TEXT NOT NULL,\
                     code_hash TEXT NOT NULL UNIQUE,\
                     token_hash TEXT NOT NULL UNIQUE,\
@@ -2002,12 +2719,29 @@ impl UserAccount {
                 )",
                 None,
             )?;
+            #[derive(serde::Deserialize)]
+            struct TransferCol {
+                name: String,
+            }
+            let tcols: Vec<TransferCol> = db
+                .exec("PRAGMA table_info(transfer_codes)", None)?
+                .to_array()?;
+            if !tcols.iter().any(|c| c.name == "owner_id") {
+                db.exec(
+                    "ALTER TABLE transfer_codes ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''",
+                    None,
+                )?;
+            }
             db.exec(
                 "CREATE INDEX IF NOT EXISTS idx_transfer_exp ON transfer_codes(expires_at)",
                 None,
             )?;
             db.exec(
                 "CREATE INDEX IF NOT EXISTS idx_transfer_principal ON transfer_codes(principal)",
+                None,
+            )?;
+            db.exec(
+                "CREATE INDEX IF NOT EXISTS idx_transfer_owner ON transfer_codes(owner_id)",
                 None,
             )?;
             db.exec(
@@ -2282,19 +3016,27 @@ impl UserAccount {
     fn transfer_create(&self, req: crate::handoff::DoTransferCreateReq) -> Result<Response> {
         let now = now_secs() as i64;
         let db = self.ensure_handoff_tables(now)?;
-        let bucket = format!("tc:{}", req.principal);
+        let owner = req
+            .owner_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&req.principal)
+            .to_string();
+        let bucket = format!("tc:{owner}");
         if !Self::rate_limit_hit(&db, &bucket, now, 600, 15)? {
             return Response::error("too many codes generated — wait a few minutes", 429);
         }
-        // Keep at most one active code per user so regenerating immediately
-        // revokes the old one.
+        // Keep at most one active code per user across ALL sessions so regenerating
+        // from any browser immediately revokes the old one (Cycle 2 B-4).
         db.exec(
-            "DELETE FROM transfer_codes WHERE principal = ?1",
-            vec![req.principal.clone().into()],
+            "DELETE FROM transfer_codes WHERE owner_id = ?1 OR principal = ?2",
+            vec![owner.clone().into(), req.principal.clone().into()],
         )?;
         db.exec(
-            "INSERT INTO transfer_codes (principal, code_hash, token_hash, expires_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO transfer_codes (owner_id, principal, code_hash, token_hash, expires_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             vec![
+                owner.into(),
                 req.principal.into(),
                 req.code_hash.into(),
                 req.token_hash.into(),
@@ -2352,9 +3094,14 @@ impl UserAccount {
     fn transfer_revoke(&self, req: crate::handoff::DoTransferRevokeReq) -> Result<Response> {
         let now = now_secs() as i64;
         let db = self.ensure_handoff_tables(now)?;
+        let owner = req
+            .owner_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&req.principal);
         db.exec(
-            "DELETE FROM transfer_codes WHERE principal = ?1",
-            vec![req.principal.into()],
+            "DELETE FROM transfer_codes WHERE owner_id = ?1 OR principal = ?2",
+            vec![owner.into(), req.principal.into()],
         )?;
         Response::ok("")
     }
@@ -2759,9 +3506,31 @@ mod tests {
 
     #[test]
     fn preview_budget_dedupes_and_caps_separately_from_clear_balance() {
-        assert_eq!(decide_preview_budget(false, 0, 240), (true, 239));
-        assert_eq!(decide_preview_budget(true, 240, 240), (true, 0));
-        assert_eq!(decide_preview_budget(false, 240, 240), (false, 0));
+        // First hit on new item consumes 1 unique slot and 1 total hit.
+        assert_eq!(decide_preview_budget(0, 0, 0, 240, 4), (true, 239));
+        // Repeat hits on an already-seen item are allowed up to `max_item_hits` (4), even
+        // when unique slots are full, then denied on the 5th hit (Cycle 3 H7).
+        assert_eq!(decide_preview_budget(1, 240, 240, 240, 4), (true, 0));
+        assert_eq!(decide_preview_budget(3, 240, 242, 240, 4), (true, 0));
+        assert_eq!(decide_preview_budget(4, 240, 243, 240, 4), (false, 0));
+        assert_eq!(decide_preview_budget(4, 1, 4, 240, 4), (false, 0));
+        // New unique item rejected once unique cap reached.
+        assert_eq!(decide_preview_budget(0, 240, 240, 240, 4), (false, 0));
+        // Total hits cap (`max_unique * 2 = 480`) stops repeat amplification across items.
+        assert_eq!(decide_preview_budget(1, 200, 480, 240, 4), (false, 0));
+    }
+
+    #[test]
+    fn selective_revoke_recognizes_legacy_invalidation_without_wiping_v2_sessions() {
+        assert!(!is_selective_revoke(&SessionRevokeAllReq::default()));
+        assert!(is_selective_revoke(&SessionRevokeAllReq {
+            invalidate_legacy: true,
+            ..SessionRevokeAllReq::default()
+        }));
+        assert!(is_selective_revoke(&SessionRevokeAllReq {
+            revoke_sid: Some("sid-1".into()),
+            ..SessionRevokeAllReq::default()
+        }));
     }
 
     #[test]

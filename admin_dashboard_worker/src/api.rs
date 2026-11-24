@@ -215,6 +215,10 @@ pub struct AccountsListResp {
     pub total: usize,
     pub page: usize,
     pub page_size: usize,
+    #[serde(default)]
+    pub live_sort_capped: bool,
+    #[serde(default)]
+    pub live_sort_scan_limit: usize,
     pub accounts: Vec<AccountEntryResp>,
     pub selected: Option<AccountEntryResp>,
 }
@@ -381,6 +385,8 @@ pub struct ProvidersResp {
     pub age_policy: AgeVerificationPolicy,
     pub current_kid: String,
     pub has_prev_key: bool,
+    #[serde(default)]
+    pub public_origin: String,
     pub providers: Vec<ProviderView>,
 }
 

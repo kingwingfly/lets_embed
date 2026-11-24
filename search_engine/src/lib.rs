@@ -396,6 +396,101 @@ impl Engine {
         Ok(out)
     }
 
+    /// Returns `true` if `post_id` contains at least one image or video that evaluates
+    /// Returns the subset of `post_ids` that have at least one image or video
+    /// evaluating strictly `Clear` for `(policy, caller)`. Used to withhold post
+    /// title & authors on fully restricted posts (detail pages, SEO/Open Graph,
+    /// favorites previews, and album responses).
+    pub async fn posts_with_any_clear_media(
+        &self,
+        post_ids: &[i64],
+        policy: &CompiledPolicy,
+        caller: &CallerContext,
+    ) -> anyhow::Result<std::collections::HashSet<i64>> {
+        if post_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        if !policy.is_enabled() {
+            return Ok(post_ids.iter().copied().collect());
+        }
+        let mut clear_posts: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
+        let pi_rows = sqlx::query(
+            "SELECT post_id, image_id FROM post_images WHERE post_id = ANY($1::BIGINT[])",
+        )
+        .bind(post_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        if !pi_rows.is_empty() {
+            let mut img_to_posts: std::collections::HashMap<i64, Vec<i64>> =
+                std::collections::HashMap::new();
+            for row in pi_rows {
+                let pid: i64 = row.try_get("post_id")?;
+                let iid: i64 = row.try_get("image_id")?;
+                img_to_posts.entry(iid).or_default().push(pid);
+            }
+            let img_ids: Vec<i64> = img_to_posts.keys().copied().collect();
+            let outcomes = self.evaluate_images(&img_ids, policy, caller).await?;
+            for (iid, outcome) in outcomes {
+                if outcome.is_clear()
+                    && let Some(pids) = img_to_posts.get(&iid)
+                {
+                    clear_posts.extend(pids.iter().copied());
+                }
+            }
+        }
+
+        let remaining: Vec<i64> = post_ids
+            .iter()
+            .copied()
+            .filter(|pid| !clear_posts.contains(pid))
+            .collect();
+        if !remaining.is_empty() {
+            let pv_rows = sqlx::query(
+                "SELECT post_id, video_id FROM post_videos WHERE post_id = ANY($1::BIGINT[])",
+            )
+            .bind(&remaining)
+            .fetch_all(&self.pool)
+            .await?;
+            if !pv_rows.is_empty() {
+                let mut vid_to_posts: std::collections::HashMap<i64, Vec<i64>> =
+                    std::collections::HashMap::new();
+                for row in pv_rows {
+                    let pid: i64 = row.try_get("post_id")?;
+                    let vid: i64 = row.try_get("video_id")?;
+                    vid_to_posts.entry(vid).or_default().push(pid);
+                }
+                let vid_ids: Vec<i64> = vid_to_posts.keys().copied().collect();
+                let outcomes =
+                    safety::evaluate_videos_batch(&self.pool, &vid_ids, policy, caller).await?;
+                for (vid, outcome) in outcomes {
+                    if outcome.is_clear()
+                        && let Some(pids) = vid_to_posts.get(&vid)
+                    {
+                        clear_posts.extend(pids.iter().copied());
+                    }
+                }
+            }
+        }
+
+        Ok(clear_posts)
+    }
+
+    /// Returns `true` iff `post_id` has at least one image or video that evaluates
+    /// strictly `Clear` for `(policy, caller)`. Used to withhold post title & authors
+    /// on fully restricted posts (detail pages, SEO/Open Graph, album responses).
+    pub async fn post_has_any_clear_media(
+        &self,
+        post_id: i64,
+        policy: &CompiledPolicy,
+        caller: &CallerContext,
+    ) -> anyhow::Result<bool> {
+        let clear = self
+            .posts_with_any_clear_media(&[post_id], policy, caller)
+            .await?;
+        Ok(clear.contains(&post_id))
+    }
+
     /// Project a slice of images into typed Policy v3 [`ProjectedImage`] values before serialization.
     pub async fn project_images(
         &self,
@@ -418,6 +513,7 @@ impl Engine {
                             matched_blocks: Vec::new(),
                             matched_blurs: Vec::new(),
                             facts_rev: 1,
+                            canonical_name: None,
                         },
                         caller,
                         signer,
@@ -460,6 +556,7 @@ impl Engine {
                             matched_blocks: Vec::new(),
                             matched_blurs: Vec::new(),
                             facts_rev: 1,
+                            canonical_name: None,
                         },
                         caller,
                         signer,

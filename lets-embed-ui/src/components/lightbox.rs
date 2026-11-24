@@ -1,7 +1,8 @@
 use leptos::{ev, html, prelude::*};
 
 use crate::browser::{
-    lock_body_scroll, trap_dialog_tab, use_window_keydown, wipe_media_elements_in,
+    is_top_modal, lock_body_scroll, push_modal_layer, trap_dialog_tab, use_window_keydown,
+    wipe_media_elements_in,
 };
 use crate::components::{
     ContentMaskCard, DensityPicker, LikeButton, MasonryGallery, MasonryGalleryProps,
@@ -69,6 +70,7 @@ fn LightboxDialog(
     on_details_click: Option<Callback<(GalleryCard, String)>>,
 ) -> impl IntoView {
     lock_body_scroll();
+    let modal_layer = push_modal_layer();
 
     let dialog_ref = NodeRef::<html::Div>::new();
     let viewer_index: RwSignal<Option<usize>> = RwSignal::new(None);
@@ -102,7 +104,7 @@ fn LightboxDialog(
     }
 
     use_window_keydown(false, move |e: ev::KeyboardEvent| {
-        if viewer_open.get_untracked() {
+        if !is_top_modal(modal_layer) || viewer_open.get_untracked() {
             return;
         }
         if e.key() == "Tab" {

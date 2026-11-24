@@ -1526,7 +1526,8 @@ async fn fetch_image_details(id: Option<String>) -> Result<ProjectedImageDetails
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
     fn to_err(e: impl std::fmt::Display) -> ServerFnError {
-        ServerFnError::Response(e.to_string())
+        tracing::error!("fetch_image_details failed: {e}");
+        ServerFnError::Response("Failed to load media details".to_string())
     }
 
     let details = engine.image_details(id).await.map_err(to_err)?;
@@ -1545,10 +1546,28 @@ async fn fetch_image_details(id: Option<String>) -> Result<ProjectedImageDetails
     let public_safe_clear = is_clear && outcome.is_public_safe_clear();
     let noindex = !public_safe_clear && ctx.policy.policy.legal.noindex_restricted;
 
+    // Withhold post title & authors whenever the viewed image is restricted AND
+    // the parent post has ZERO eligible clear items for this caller (prevents
+    // leaking restricted post titles/authors in JSON, HTML, <title>, and Open Graph).
+    let show_post_meta = if is_clear {
+        true
+    } else if let Some(ref p) = details.post {
+        engine
+            .post_has_any_clear_media(p.id, &ctx.policy, &ctx.caller)
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
     Ok(ProjectedImageDetails {
         image: projected,
-        post: details.post,
-        authors: details.authors,
+        post: if show_post_meta { details.post } else { None },
+        authors: if show_post_meta {
+            details.authors
+        } else {
+            Vec::new()
+        },
         // Withhold restricted WD-tags & per-tag scores whenever image is not Clear (Placeholder or Blurred).
         tags: if is_clear { details.tags } else { Vec::new() },
         og_image_allowed: public_safe_clear,
@@ -1566,7 +1585,8 @@ pub async fn list_post_images(post_id: i64) -> Result<Vec<ProjectedImage>, Serve
     use search_engine::Engine;
 
     fn to_err(e: impl std::fmt::Display) -> ServerFnError {
-        ServerFnError::Response(e.to_string())
+        tracing::error!("fetch_image_details failed: {e}");
+        ServerFnError::Response("Failed to load media details".to_string())
     }
 
     let state = expect_context::<AppState>();
@@ -1590,7 +1610,8 @@ pub async fn list_post_videos(post_id: i64) -> Result<Vec<ProjectedVideo>, Serve
     use search_engine::Engine;
 
     fn to_err(e: impl std::fmt::Display) -> ServerFnError {
-        ServerFnError::Response(e.to_string())
+        tracing::error!("fetch_image_details failed: {e}");
+        ServerFnError::Response("Failed to load media details".to_string())
     }
 
     let state = expect_context::<AppState>();

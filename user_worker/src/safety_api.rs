@@ -527,7 +527,7 @@ pub async fn update_preferences(
         }
     };
 
-    let updated_ctx = match do_outcome {
+    let (authoritative_version, updated_ctx) = match do_outcome {
         DoPrefsUpdateOutcome::Conflict(conflict) => {
             let fresh_ctx = do_client::do_session_context(
                 &st.env,
@@ -556,20 +556,24 @@ pub async fn update_preferences(
             )
                 .into_response();
         }
-        DoPrefsUpdateOutcome::Updated(_) => {
-            // Re-read authoritative session context WITH caller's live `sid` so assurance_level /
-            // strict_age_ok reflect this session accurately.
-            do_client::do_session_context(&st.env, &active.do_key, active.sid.as_deref())
-                .await
-                .unwrap_or_else(|_| SessionContext {
-                    enabled_switchers: filtered.clone(),
-                    pref_version: active.ctx.pref_version.max(1).saturating_add(1),
-                    ..active.ctx.clone()
-                })
+        DoPrefsUpdateOutcome::Updated(updated) => {
+            // Capture the exact `pref_version` assigned to `filtered` by the single-threaded DO
+            // so the D1 mirror NEVER pairs `filtered` with a newer concurrent update's version (F18)!
+            let auth_ver = updated.pref_version.max(1);
+            // Re-read authoritative session context WITH caller's live `sid` for the HTTP response
+            // so `assurance_level` / `strict_age_ok` reflect this session accurately.
+            let fresh_ctx =
+                do_client::do_session_context(&st.env, &active.do_key, active.sid.as_deref())
+                    .await
+                    .unwrap_or_else(|_| SessionContext {
+                        enabled_switchers: filtered.clone(),
+                        pref_version: auth_ver,
+                        ..active.ctx.clone()
+                    });
+            (auth_ver, fresh_ctx)
         }
     };
 
-    let next_version = updated_ctx.pref_version.max(1);
     let prefs_json = match serde_json::to_string(&StoredContentPrefs {
         enabled_switchers: filtered.clone(),
     }) {
@@ -577,7 +581,7 @@ pub async fn update_preferences(
         Err(_) => return auth::internal_error(),
     };
 
-    // Mirror to D1 `users_v2` with monotonic `pref_version` guard so stale writes never win.
+    // Mirror `(filtered, authoritative_version)` to D1 `users_v2` with monotonic `pref_version` guard.
     let db = match st.env.d1(crate::D1_BINDING) {
         Ok(db) => db,
         Err(e) => {
@@ -593,7 +597,7 @@ pub async fn update_preferences(
         )
         .bind(&[
             prefs_json.into(),
-            (next_version as f64).into(),
+            (authoritative_version as f64).into(),
             active.user_id.as_str().into(),
         ]) {
         Ok(s) => s,
@@ -616,7 +620,7 @@ pub async fn update_preferences(
         Json(PreferencesResp {
             enabled_switchers: saved_switchers,
             effective_switchers,
-            pref_version: next_version,
+            pref_version: updated_ctx.pref_version.max(1),
             switcher_statuses,
             warnings,
         }),
@@ -1037,6 +1041,12 @@ struct LinkWalletResp {
     purpose: String,
 }
 
+/// Expected EIP-4361 statement for linking an Ethereum wallet, binding BOTH
+/// target account (`user_id`) and link purpose (`"payment"` or `"login"`) (F7).
+pub fn expected_siwe_link_statement(user_id: &str, purpose: &str) -> String {
+    format!("Link Ethereum wallet for {purpose} to account {user_id}.")
+}
+
 #[worker::send]
 pub async fn identity_link_wallet(
     State(st): State<AppState>,
@@ -1055,6 +1065,11 @@ pub async fn identity_link_wallet(
         Some("login") => "login",
         None | Some("payment") => "payment",
         _ => return auth::api_error(StatusCode::BAD_REQUEST, "invalid purpose"),
+    };
+    let nonce_purpose = if purpose == "login" {
+        auth::NONCE_PURPOSE_LINK_LOGIN
+    } else {
+        auth::NONCE_PURPOSE_LINK_PAYMENT
     };
 
     if purpose == "login" {
@@ -1085,15 +1100,13 @@ pub async fn identity_link_wallet(
             if msg.domain != *st.siwe_domain || msg.version != "1" || msg.chain_id != st.chain_id {
                 return auth::api_error(StatusCode::UNAUTHORIZED, "SIWE domain or chain mismatch");
             }
+            let expected_stmt = expected_siwe_link_statement(&active.user_id, purpose);
             if msg.uri.contains("/user/login/approve")
-                || msg
-                    .statement
-                    .as_deref()
-                    .is_some_and(|s| s.starts_with("Approve sign-in for another browser"))
+                || msg.statement.as_deref() != Some(expected_stmt.as_str())
             {
                 return auth::api_error(
                     StatusCode::UNAUTHORIZED,
-                    "handoff approval signature cannot be used for wallet linking",
+                    "SIWE statement must exactly match the wallet-link account and purpose",
                 );
             }
             let now = session::now_secs();
@@ -1114,7 +1127,7 @@ pub async fn identity_link_wallet(
                     return auth::api_error(StatusCode::UNAUTHORIZED, "message expired");
                 }
             }
-            match challenge_do::consume_nonce(&st.env, &msg.nonce, "wallet").await {
+            match challenge_do::consume_nonce(&st.env, &msg.nonce, nonce_purpose).await {
                 Ok(true) => {}
                 Ok(false) => {
                     return auth::api_error(StatusCode::UNAUTHORIZED, "unknown or expired nonce");
@@ -1176,14 +1189,15 @@ pub async fn identity_link_wallet(
             if !session::is_sol_principal(sol_addr) {
                 return auth::api_error(StatusCode::BAD_REQUEST, "invalid Solana address");
             }
-            match challenge_do::consume_nonce(&st.env, nonce, "wallet").await {
+            match challenge_do::consume_nonce(&st.env, nonce, nonce_purpose).await {
                 Ok(true) => {}
                 Ok(false) => {
                     return auth::api_error(StatusCode::UNAUTHORIZED, "unknown or expired nonce");
                 }
                 Err(_) => return auth::internal_error(),
             }
-            let expected = solana_link::challenge_message(&active.user_id, nonce);
+            let expected =
+                solana_link::challenge_message_for_purpose(&active.user_id, purpose, nonce);
             if !solana_link::verify_ed25519_challenge(
                 sol_addr,
                 &req.signature,
@@ -1262,6 +1276,9 @@ pub async fn identity_unlink(
         Ok(a) => a,
         Err(r) => return r,
     };
+    if let Err(r) = identity::require_recent_auth(&st, &active).await {
+        return r;
+    }
     match identity::unlink_identity(
         &st,
         &cookies,
@@ -1294,12 +1311,19 @@ pub async fn revoke_all_sessions(
         Ok(a) => a,
         Err(r) => return r,
     };
-    let _ = do_client::do_session_revoke_all(
+    if let Err(e) = do_client::do_session_revoke_all(
         &st.env,
         &active.do_key,
         &SessionRevokeAllReq::default(),
     )
-    .await;
+    .await
+    {
+        worker::console_error!("revoke_all_sessions DO failed: {e:?}");
+        return auth::api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "could not revoke sessions; please retry",
+        );
+    }
     cookies.add(session::clear_session_cookie());
     StatusCode::OK.into_response()
 }

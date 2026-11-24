@@ -1,53 +1,49 @@
 # user_worker (`lets-embed-user-worker`)
 
-SIWE (Sign-In with Ethereum) user system for lets_embed, running as the Cloudflare
-Worker `lets-embed-user-worker` (called by `lets-embed-gateway-worker`). Replaces the old apply/approve flow in `gateway_worker`.
+Identity, session, billing, and safety-preference Cloudflare Worker for lets_embed
+(`lets-embed-user-worker`, called via service binding by `lets-embed-gateway-worker`).
 
-- **Auth** supports Ethereum (SIWE) and Solana wallet sign-in. The gateway validates the signed `ue_session` cookie. The dashboard uses a dedicated Cloudflare Access application.
-- **Metering** uses the pricing and free allowances published at `/user/admin`. The gateway asks the account Durable Object to enforce each metered request.
-- **Billing (v2)**: pay-as-you-go points balance + optional subscription plans
+- **Auth & Sessions**: supports Ethereum (SIWE), Solana (SIWS), Google, GitHub, X, Discord, Email OTP, Telegram, and OIDC Age Assurance. Issues revocable `v2` sessions (`__Host-ue_session`, tracked in `UserAccount` DO SQLite) and hosts the `AuthChallengeDO` (single-use nonces, OAuth/OIDC/Telegram transactions, Email OTP) and `SitePolicyDO` (authoritative Policy v3 singleton).
+- **Admin Dashboard**: lives in the separate `lets-embed-admin-dashboard-worker` mounted at `/admin` behind Cloudflare Access (`/user/admin*` is retired and returns `404`).
+- **Metering & Billing (v2)**: pay-as-you-go points balance + optional subscription plans
   (per-window view/search allowances, bought/renewed **from** the balance, **no
   auto-renew** — they lapse to PAYG at period end). Overage falls back to PAYG.
   New users get a free grant.
-- **Top-ups** support ETH, SOL, USDT and USDC. The account page opens the transfer in the customer's wallet and automatically checks the receipt for points.
+- **Top-ups**: support ETH, SOL, USDT and USDC. The account page opens the transfer in the customer's wallet and automatically checks the receipt for points.
 - **Likes**: post/image/video favorites stored in D1, surfaced as like buttons
   on the Leptos details page and a `/user/favorites` page.
-- **Storage**: balance/plan/window/dedupe live only in the Durable Object; D1
-  holds `users` (incl. linked `solana_address`), `payments` (chain-aware) and
-  `likes`. D1 also keeps the published site policy revisions.
+- **Storage**: balance/plan/window/dedupe/sessions/prefs live in Durable Object SQLite; D1
+  holds `users_v2`, `user_identities`, `payments`, `likes`, `site_settings`, and
+  revision-scoped `provider_secret_versions` (AES-256-GCM encrypted).
 
 ## Routes
 
 | Route | Method | What |
 | --- | --- | --- |
-| `/user/login` | GET | wallet login page (`?next=` redirect target) |
+| `/user/login` | GET | sign-in SPA (`?next=` redirect target) |
 | `/user/upgrade` | GET | sign in after reaching a free limit, then open the account top-up form. Signed-in visitors go directly to top-up. |
-| `/user/account` | GET | balance, plan, wallet payments, transfer recovery and payment history |
+| `/user/account` | GET | balance, plan, linked sign-in methods, safety preferences, wallet payments, transfer recovery and payment history |
 | `/user/favorites` | GET | liked posts/images/videos |
-| `/user/api/nonce` | GET | issue a SIWE / SIWS / link nonce (KV, 300s, single-use) |
-| `/user/api/verify` | POST | verify SIWE message + signature, set `ue_session` |
-| `/user/api/verify_solana` | POST | verify SIWS message + ed25519 signature, set `ue_session` |
-| `/user/api/logout` | POST | clear the session cookie |
-| `/user/api/me` | GET | current address + balance / plan / window status |
+| `/user/api/nonce` | GET | issue a purpose-scoped SIWE / SIWS / link nonce (`AuthChallengeDO`, 300s, single-use) |
+| `/user/api/verify` | POST | verify SIWE message + signature, set `__Host-ue_session` |
+| `/user/api/verify_solana` | POST | verify SIWS message + ed25519 signature, set `__Host-ue_session` |
+| `/user/api/logout` | POST | revoke session in DO and clear `__Host-ue_session` |
+| `/user/api/me` | GET | current identity + balance / plan / window status |
 | `/user/api/topup/prepare` | POST | prepare an unsigned mainnet wallet transfer and point estimate for `{account, chain, token, amount}`. Supply the amount as a decimal string in asset units. |
 | `/user/api/topup` | POST | submit a `{chain, token, tx_hash, account?}` top-up for verification + credit |
 | `/user/api/payments` | GET | payment history |
 | `/user/api/subscribe` | POST | buy/renew a plan from the balance (no auto-renew) |
 | `/user/api/unsubscribe` | POST | cancel the active plan and refund prorated unused paid time |
 | `/user/api/rates` | GET | spot USD prices for ETH/SOL (Chainlink feeds) |
-| `/user/api/link_solana` | GET/POST/DELETE | read, link (by signing a challenge), or unlink a Solana wallet for an Ethereum session |
+| `/user/api/link_solana` | GET/POST/DELETE | read, link (by signing a challenge), or unlink a Solana payment wallet |
 | `/user/api/like` | GET/POST/DELETE | check / add / remove a like |
 | `/user/api/likes` | GET | list likes (keyset paginated) |
 | `/user/api/likes/status` | GET | batch check liked status for comma-separated `kind:target_id` pairs |
-| `/user/admin` | GET | admin page (Cloudflare Access protected) |
-| `/user/admin/settings` | POST | publish the visitor, pricing, plan and payment settings |
-| `/user/admin/plan` | POST | grant or revoke a customer subscription |
-| `/user/admin/credit` | POST | admin credit/deduct points |
-| `/user/admin/ban` | POST | admin ban/unban |
+| `/admin/*` | — | Served by `lets-embed-admin-dashboard-worker` behind Cloudflare Access (`/user/admin*` returns `404`) |
 
 ## Points & billing model (v2)
 
-Open **Gallery controls** at `/user/admin` on the gateway hostname. Saving checks the revision shown in the form. Reload and reapply edits if another administrator has already published a change.
+Open the Admin Dashboard at `/admin` on the gateway hostname (protected by Cloudflare Access). Saving checks the revision shown in the form. Reload and reapply edits if another administrator has already published a change.
 
 - **Browsing access** switches between wallet-required and public browsing. To show a public image gallery, select **Public browsing** and set **Image views → Free per day** to a positive number or `-1`.
 - **Free media folders** optionally limits daily free media to selected albums or files. Use decoded gallery paths, one per line, such as `/images/Sample album`. An empty list includes all folders. These rules govern access to media bytes. Search results can still list the full catalog.
@@ -104,47 +100,49 @@ Pending receipts are saved under the signed-in account in browser storage. Reope
 
 ### Solana wallet linking
 
-A customer who signed in with Solana can pay directly from that wallet. To pay from Solana while signed in with Ethereum, the customer links a Solana wallet once. They sign a challenge with the wallet
-(`ed25519` `signMessage`, e.g. Phantom) and POST it to
-`/user/api/link_solana`. The verified address is stored on
-`users.solana_address` (UNIQUE). Verification matches the sender to the linked wallet when present, or to the customer's Solana sign-in address.
+A customer who signed in with Solana can pay directly from that wallet. To pay from Solana while signed in with another provider (Ethereum, Google, Email, etc.), the customer links a Solana wallet once from `/user/account`. They sign a purpose-bound challenge with the wallet (`ed25519` `signMessage`, e.g. Phantom) and POST it to `/user/api/identities/link/wallet` (or legacy `/user/api/link_solana`). The verified address is stored in D1 `user_identities` (`purpose = 'payment'`) and synced to `users.solana_address` for migrated accounts. Verification matches the sender to the linked wallet when present, or to the customer's Solana sign-in address.
 
-## Setup & deployment
+## Setup & deployment (Policy v3 — 3-Worker Stack)
 
-1. Run `npm ci` from the repository root. For a new installation, create the nonce KV namespace and put its ID in the `NONCES` binding in `user_worker/wrangler.toml`.
-
-   ```sh
-   npx wrangler kv namespace create NONCES --cwd user_worker
-   ```
-
-2. Set `SIWE_DOMAIN` to your public gallery hostname in `user_worker/wrangler.toml`. Configure `RPC_URL`, `CHAIN_ID` and `SOL_RPC_URL` there. Fresh deployments start with deposits closed. Enter your receiving addresses in **Payments & credits**.
-3. Protect the public gateway's `/user/admin` path and descendants with an administrator-only Access policy. Put its audience in `gateway_worker/wrangler.toml`. The gateway calls the user Worker through the dedicated admin service binding. [Gateway Access setup](../gateway_worker/README.md#cloudflare-access-and-deployment)
-4. For a fresh D1 database, apply `0001_users.sql` first. An existing wallet site with the `users`, `payments` and `likes` tables can start at `0002_site_settings.sql`. This migration adds the settings table and seeds revision 0. It is safe to rerun.
+1. Run `npm ci` from the repository root. All single-use auth nonces, OAuth/OIDC/Telegram transactions, Email OTP challenges, and Policy v3 snapshots live in Durable Object SQLite (`UserAccount`, `AuthChallengeDO`, `SitePolicyDO`) — no KV `NONCES` namespace is required.
+2. Configure `SIWE_DOMAIN`, `PUBLIC_URL`, `DEPLOYMENT_ID`, `RPC_URL`, `CHAIN_ID`, and `SOL_RPC_URL` in `user_worker/wrangler.toml`, and matching host/upstream settings in `admin_dashboard_worker/wrangler.toml` and `gateway_worker/wrangler.toml`. Fresh deployments start with deposits closed; configure receiving addresses in `/admin` → **Access & Pricing**.
+3. Protect ONLY the public gateway's `/admin` and `/admin/*` paths with an administrator-only Cloudflare Access policy (do NOT attach Access to public gallery routes). Put its audience in `CF_ACCESS_AUD` and allowlisted staff emails in `ADMIN_ALLOWED_EMAILS` in `gateway_worker/wrangler.toml`. (`/user/admin` is retired and returns `404`.) See [Gateway Access setup](../gateway_worker/README.md#cloudflare-access-and-deployment).
+4. Apply ALL D1 migrations in order (`0001` through `0005`). Existing pre-v3 deployments can apply any missing migrations starting from their last applied file; all migrations are idempotent where possible:
 
    ```sh
    npx wrangler d1 execute lets-embed --cwd user_worker --remote --file migrations/0001_users.sql
    npx wrangler d1 execute lets-embed --cwd user_worker --remote --file migrations/0002_site_settings.sql
+   npx wrangler d1 execute lets-embed --cwd user_worker --remote --file migrations/0003_identities_safety.sql
+   npx wrangler d1 execute lets-embed --cwd user_worker --remote --file migrations/0004_policy_v3.sql
+   npx wrangler d1 execute lets-embed --cwd user_worker --remote --file migrations/0005_versioned_provider_secrets.sql
    npx wrangler d1 execute lets-embed --cwd user_worker --remote --command 'SELECT MAX(revision) AS revision FROM site_settings'
    ```
 
-5. New deployments need the same `JWT_SECRET` in both Workers. Run `npx wrangler secret put JWT_SECRET --cwd user_worker` and `npx wrangler secret put JWT_SECRET --cwd gateway_worker`. Upgrades reuse the existing secret. Set the gateway’s upstream variables (`API_UPSTREAM`, `IMAGE_UPSTREAM`, `VIDEO_UPSTREAM`) and upstream service token as described in its README.
-6. Deploy `lets-embed-user-worker` first, then `lets-embed-gateway-worker`. If the site still uses `DEPOSIT_ADDRESS` or `SOL_DEPOSIT_ADDRESS` and has yet to publish settings from the dashboard, add `--keep-vars` to the user Worker command until the first dashboard save imports those addresses.
+5. Configure a single high-entropy master `SITE_SECRET` (at least 32 random bytes; RFC 5869 HKDF-SHA256 automatically derives isolated domain keys for sessions, internal APIs, admin assertions, media capabilities, guest sessions, and AES-256-GCM provider secrets) identically across ALL THREE Workers AND the managed `lets-embed-web` origin:
 
    ```sh
+   npx wrangler secret put SITE_SECRET --cwd user_worker
+   npx wrangler secret put SITE_SECRET --cwd admin_dashboard_worker
+   npx wrangler secret put SITE_SECRET --cwd gateway_worker
+   ```
+
+   Upgrading deployments with live legacy wallet sessions may additionally keep `JWT_SECRET` set on `user_worker` and `gateway_worker` during the cutover window. Set the gateway's upstream variables (`API_UPSTREAM`, `IMAGE_UPSTREAM`, `VIDEO_UPSTREAM`) and upstream Access service token (`CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET`) on both `gateway_worker` and `admin_dashboard_worker`.
+6. Build both SPAs (`./build-web.sh` in `user_worker` and `admin_dashboard_worker`) and deploy `lets-embed-user-worker` first, then `lets-embed-admin-dashboard-worker`, then `lets-embed-gateway-worker`:
+
+   ```sh
+   (cd user_worker && ./build-web.sh)
+   (cd admin_dashboard_worker && ./build-web.sh)
    npx wrangler deploy --cwd user_worker
+   npx wrangler deploy --cwd admin_dashboard_worker
    npx wrangler deploy --cwd gateway_worker
    ```
 
-   > **Upgrading from the previous `user-worker` / `gateway-worker` script names:** `user_worker/wrangler.toml` keeps `[[migrations]] tag = "v1" new_sqlite_classes = ["UserAccount"]` for fresh installs. Cloudflare scopes Durable Object namespaces to the owning Worker script name, so deploying under the new `lets-embed-user-worker` name creates a separate empty `UserAccount` namespace rather than inheriting state from an existing `user-worker` script. Existing deployments with live Durable Object balances/plans must either keep the old script name until migrating state or run a Cloudflare Durable Objects transfer migration (`transferred_classes` from `user-worker` to `lets-embed-user-worker`) before retiring `user-worker` and switching `lets-embed-gateway-worker`'s bindings.
+   > **Upgrading from legacy `user-worker` / `gateway-worker` script names:** `user_worker/wrangler.toml` keeps `[[migrations]] tag = "v1" new_sqlite_classes = ["UserAccount"]` (and subsequent tags for `AuthChallengeDO` and `SitePolicyDO`) for fresh installs. Cloudflare scopes Durable Object namespaces to the owning Worker script name, so deploying under the new `lets-embed-user-worker` name creates a separate empty `UserAccount` namespace rather than inheriting state from an existing `user-worker` script. Existing deployments with live Durable Object balances/plans must either keep the old script name until migrating state or run a Cloudflare Durable Objects transfer migration (`transferred_classes` from `user-worker` to `lets-embed-user-worker`) before retiring `user-worker` and switching bindings.
 
-7. Open `/user/admin` from the public gallery hostname. On an upgrade, verify that each chain accepting payments shows its existing receiving address. If an address is unexpectedly blank or wrong, restore its legacy variable on the user Worker and reload before the first save. The first save snapshots those variables for transfers made before the change.
-8. Leave **Require a wallet** selected for the first save. Choose **View gallery** to check admin browsing without a wallet, then verify a customer account and a signed-out private window. To enable guest browsing, select **Public browsing**, set **Image views → Free per day** to a positive number or `-1` for unlimited, choose any free media folders, and save. To close public browsing again, select **Require a wallet** and save.
+7. Open `/admin` from the public gallery hostname (authenticated via Cloudflare Access). Verify **Content Safety**, **Auth Providers**, and **Access & Pricing**, then publish revision #1 to activate Policy v3 in `SitePolicyDO`.
+8. Leave **Require sign-in** selected for the first save if you want a closed gallery, or disable it for public browsing with daily free quotas. Use **View gallery** to obtain a billing-waived browse pass (note that the browse pass never waives content safety rules), and test both a normal customer account and a signed-out private window.
 
 ## Limitations
 
-- **EOA only.** Signatures are verified by ecrecover; EIP-1271 contract
-  wallets (Safe, etc.) cannot sign in.
-- **KV nonces are eventually consistent.** A nonce issued at one edge
-  location may briefly be invisible (or appear unconsumed) at another;
-  worst case a login retry, not a security hole — verification still
-  requires a valid signature over a fresh nonce.
+- **EOA only.** Signatures are verified by ecrecover; EIP-1271 contract wallets (Safe, etc.) cannot sign in.
+- **Durable Object single-use challenges.** Wallet nonces, OAuth/Telegram states, Email OTPs, and handoff transfers are verified atomically in `AuthChallengeDO` / `UserAccount` SQLite storage.

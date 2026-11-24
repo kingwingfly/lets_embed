@@ -40,6 +40,7 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
     let safety = use_context::<SafetyUiState>();
 
     lock_body_scroll();
+    let modal_layer = lets_embed_ui::browser::push_modal_layer();
     push_modal_history(move || lightbox.set(None));
 
     // Move keyboard focus into the dialog on mount.
@@ -131,9 +132,9 @@ pub fn Lightbox(post: PostItem, lightbox: RwSignal<Option<PostItem>>) -> impl In
             || (full_videos.is_some_and(|r| r.get().is_none()) && expected_vid_count > 0)
     };
 
-    // Close the lightbox on Escape and trap Tab when the nested Viewer is not on top.
+    // Close the lightbox on Escape and trap Tab when this modal is topmost.
     let _ = use_event_listener(window(), ev::keydown, move |e| {
-        if viewer_open.get_untracked() {
+        if !lets_embed_ui::browser::is_top_modal(modal_layer) || viewer_open.get_untracked() {
             return;
         }
         if e.key() == "Tab" {
@@ -667,13 +668,28 @@ async fn fetch_post_meta(post_id: i64) -> Result<PostMeta, ServerFnError> {
     use search_engine::Engine;
 
     let state = expect_context::<AppState>();
-    let _ctx = RequestSafetyContext::from_leptos_context(&state)?;
+    let ctx = RequestSafetyContext::from_leptos_context(&state)?;
     let State(engine): State<Arc<Engine>> = extract_with_state(&state).await?;
 
-    engine
-        .post_meta(post_id)
-        .await
-        .map_err(|e| ServerFnError::Response(e.to_string()))
+    if ctx.policy.is_enabled() {
+        let has_clear = engine
+            .post_has_any_clear_media(post_id, &ctx.policy, &ctx.caller)
+            .await
+            .map_err(|e| -> ServerFnError {
+                tracing::error!(post_id, "fetch_post_meta safety check failed: {e}");
+                ServerFnError::Response("Failed to load post metadata".to_string())
+            })?;
+        if !has_clear {
+            return Ok(PostMeta {
+                authors: Vec::new(),
+            });
+        }
+    }
+
+    engine.post_meta(post_id).await.map_err(|e| {
+        tracing::error!(post_id, "fetch_post_meta failed: {e}");
+        ServerFnError::Response("Failed to load post metadata".to_string())
+    })
 }
 
 #[cfg(feature = "ssr")]

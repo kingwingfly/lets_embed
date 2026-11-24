@@ -672,10 +672,13 @@ impl PublicSitePolicy {
     /// Returns enabled providers filtered by the active [`AgeVerificationPolicy`].
     ///
     /// Mirrors `user_worker::identity::is_provider_enabled_in_policy`: on a fresh
-    /// zero-config deployment (`enabled_providers` empty and `age_policy == Off`),
-    /// defaults to Ethereum (SIWE) and Solana (SIWS) so `/user/login` stays usable.
+    /// zero-config deployment (`enabled_providers` empty and `age_policy != StrictProviderVerified18`),
+    /// defaults to Ethereum (SIWE) and Solana (SIWS) so `/user/login` stays usable
+    /// under both `Off` and `SelfAttestation`.
     pub fn effective_login_providers(&self) -> Vec<AuthProviderPublicConfig> {
-        if self.enabled_providers.is_empty() && self.age_policy == AgeVerificationPolicy::Off {
+        if self.enabled_providers.is_empty()
+            && self.age_policy != AgeVerificationPolicy::StrictProviderVerified18
+        {
             return vec![
                 AuthProviderPublicConfig {
                     id: AuthProviderId::Siwe,
@@ -1895,6 +1898,18 @@ mod tests {
             .map(|p| p.id)
             .collect();
         assert_eq!(ids, vec![AuthProviderId::Siwe, AuthProviderId::Siws]);
+
+        // Under SelfAttestation, zero-config preserves SIWE + SIWS defaults
+        let self_attested = PublicSitePolicy {
+            age_policy: AgeVerificationPolicy::SelfAttestation,
+            ..PublicSitePolicy::default()
+        };
+        let self_ids: Vec<AuthProviderId> = self_attested
+            .effective_login_providers()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(self_ids, vec![AuthProviderId::Siwe, AuthProviderId::Siws]);
 
         // Under StrictProviderVerified18, zero-config does NOT expose SIWE/SIWS
         let strict = PublicSitePolicy {

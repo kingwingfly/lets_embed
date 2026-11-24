@@ -299,7 +299,7 @@ fn default_pref_version() -> u64 {
 #[derive(Clone, Debug, Deserialize)]
 pub struct QrMatrix {
     pub size: usize,
-    pub rows: Vec<String>,
+    pub bits: String,
 }
 
 impl QrMatrix {
@@ -307,9 +307,11 @@ impl QrMatrix {
         let quiet = 4usize;
         let dim = self.size + quiet * 2;
         let mut rects = String::new();
-        for (y, row) in self.rows.iter().enumerate() {
-            for (x, ch) in row.chars().enumerate() {
-                if ch == '1' || ch == '#' {
+        let bytes = self.bits.as_bytes();
+        for y in 0..self.size {
+            let row_start = y * self.size;
+            for x in 0..self.size {
+                if bytes.get(row_start + x).is_some_and(|&b| b == b'1' || b == b'#') {
                     let rx = x + quiet;
                     let ry = y + quiet;
                     rects.push_str(&format!(
@@ -322,6 +324,11 @@ impl QrMatrix {
             r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {dim} {dim}" shape-rendering="crispEdges"><rect width="{dim}" height="{dim}" fill="#ffffff"/>{rects}</svg>"##
         )
     }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct TelegramStartResp {
+    pub auth_url: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -552,8 +559,20 @@ pub fn sanitize_next(raw: Option<&str>) -> String {
     let Some(s) = raw.map(str::trim) else {
         return "/".to_string();
     };
-    if !s.starts_with('/') || s.starts_with("//") || s.contains('\\') || s.len() > 512 {
+    if !s.starts_with('/')
+        || s.starts_with("//")
+        || s.contains('\\')
+        || s.chars().any(char::is_control)
+        || s.len() > 512
+    {
         return "/".to_string();
+    }
+    let origin = current_origin();
+    if !origin.is_empty() {
+        match web_sys::Url::new_with_base(s, &origin) {
+            Ok(resolved) if resolved.origin() == origin => {}
+            _ => return "/".to_string(),
+        }
     }
     s.to_string()
 }

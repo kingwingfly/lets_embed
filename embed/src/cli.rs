@@ -721,6 +721,12 @@ async fn record(
         let vocab_digest = Arc::clone(&vocab_digest);
         writes.spawn(
             async move {
+                // Deduplicate by image_id (keeping the latest result per id) so a reclaimed
+                // duplicate in the same batch cannot trigger Postgres error 21000 on ON CONFLICT.
+                let mut deduped: std::collections::BTreeMap<i64, _> = std::collections::BTreeMap::new();
+                for (id, opt_out) in res {
+                    deduped.insert(id, opt_out);
+                }
                 let mut wd_ids = vec![];
                 let mut tag_names = vec![];
                 let mut scores = vec![];
@@ -728,7 +734,7 @@ async fn record(
                 let mut clip_embeddings = vec![];
                 let mut dino_embeddings = vec![];
                 let mut failed_ids = vec![];
-                for (id, opt_out) in res {
+                for (id, opt_out) in deduped {
                     match opt_out {
                         Some((tags, clip_embedding, dino_embedding)) => {
                             for (tag, score) in tags {
@@ -752,28 +758,47 @@ async fn record(
                     .instrument(tracing::info_span!("acquire connection"))
                     .await?;
 
-                // each statement is a round trip: skip those with nothing to write
-                if !tag_names.is_empty() {
-                    // tags first, then associations in a separate statement: a concurrent writer
-                    // (another write here, or another node) may insert the same new tag, in which
-                    // case `DO NOTHING` returns no row and a join in the same statement couldn't
-                    // see the winner's row in its snapshot; the next statement's snapshot does
-                    sqlx::query!(
-                        r#"
+                // Wrap tag replacement, embedding persistence, status='completed', and
+                // WD coverage metadata inside a single transaction so partial failures
+                // can never strand images as completed with NULL coverage (Cycle 2 A-5).
+                // Acquire deterministic ascending row locks on parent posts, sibling videos,
+                // and images before mutating so concurrent writers cannot deadlock on
+                // Policy v3 facts_rev trigger updates (Cycle 3 H9 / Cycle 4 I5).
+                if !completed_ids.is_empty() {
+                    use sqlx::Connection as _;
+
+                    let mut tx = conn
+                        .begin()
+                        .instrument(tracing::info_span!("begin record transaction"))
+                        .await?;
+
+                    lock_images_and_siblings_for_update(&mut tx, &completed_ids).await?;
+
+                    sqlx::query(
+                        r#"DELETE FROM wd_tag_images WHERE image_id = ANY($1::BIGINT[])"#,
+                    )
+                    .bind(&completed_ids)
+                    .execute(&mut *tx)
+                    .instrument(tracing::info_span!("clear stale wd_tag_images"))
+                    .await?;
+
+                    if !tag_names.is_empty() {
+                        sqlx::query!(
+                            r#"
             INSERT INTO wd_tags (name)
             SELECT DISTINCT name FROM unnest($1::TEXT[]) AS _(name)
             WHERE trim(name) != ''
             ORDER BY name
             ON CONFLICT DO NOTHING
         "#,
-                        &tag_names as _
-                    )
-                    .execute(&mut *conn)
-                    .instrument(tracing::info_span!("insert wd_tags"))
-                    .await?;
+                            &tag_names as _
+                        )
+                        .execute(&mut *tx)
+                        .instrument(tracing::info_span!("insert wd_tags"))
+                        .await?;
 
-                    sqlx::query!(
-                        r#"
+                        sqlx::query!(
+                            r#"
             INSERT INTO wd_tag_images (wd_tag_id, image_id, score)
             SELECT wt.id, i.id, i.score
             FROM unnest($1::BIGINT[], $2::TEXT[], $3::REAL[]) AS i(id, name, score)
@@ -781,56 +806,53 @@ async fn record(
             ON CONFLICT (wd_tag_id, image_id) DO UPDATE
             SET score = EXCLUDED.score
         "#,
-                        &wd_ids,
-                        &tag_names as _,
-                        &scores
-                    )
-                    .execute(&mut *conn)
-                    .instrument(tracing::info_span!("upsert wd_tag_images"))
-                    .await?;
-                }
+                            &wd_ids,
+                            &tag_names as _,
+                            &scores
+                        )
+                        .execute(&mut *tx)
+                        .instrument(tracing::info_span!("upsert wd_tag_images"))
+                        .await?;
+                    }
 
-                if !completed_ids.is_empty() {
-                    // embeddings and status in one statement: every `UPDATE images` changes an
-                    // indexed column, so it can't be a HOT update and adds the new row version to
-                    // every index on `images`, both HNSW indexes included
-                    sqlx::query!(
+                    // Embeddings, status='completed', and Policy v3 tag coverage in ONE
+                    // single UPDATE so `images` writes only one row version per batch
+                    // (avoiding double HNSW writes and double facts_rev triggers).
+                    sqlx::query(
                         r#"
             UPDATE images
             SET dinov3_embedding = embeddings.dinov3_embedding,
                 clip_embedding = embeddings.clip_embedding,
-                status = 'completed'::process_status
+                status = 'completed'::process_status,
+                wd_min_persisted_score = $4,
+                wd_vocab_digest = $5
             FROM unnest($1::BIGINT[], $2::halfvec[], $3::halfvec[])
                 AS embeddings(id, dinov3_embedding, clip_embedding)
             WHERE embeddings.id = images.id
         "#,
-                        &completed_ids,
-                        &dino_embeddings as _,
-                        &clip_embeddings as _
-                    )
-                    .execute(&mut *conn)
-                    .instrument(tracing::info_span!("complete images"))
-                    .await?;
-
-                    // Policy v3 tag coverage metadata persisted via runtime query so `.sqlx/`
-                    // offline cache for existing `sqlx::query!` statements remains untouched.
-                    sqlx::query(
-                        r#"
-            UPDATE images
-            SET wd_min_persisted_score = $2,
-                wd_vocab_digest = $3
-            WHERE id = ANY($1::BIGINT[])
-        "#,
                     )
                     .bind(&completed_ids)
+                    .bind(&dino_embeddings)
+                    .bind(&clip_embeddings)
                     .bind(min_persisted_score)
                     .bind(vocab_digest.as_str())
-                    .execute(&mut *conn)
-                    .instrument(tracing::info_span!("record wd coverage"))
+                    .execute(&mut *tx)
+                    .instrument(tracing::info_span!("complete images with wd coverage"))
                     .await?;
+
+                    tx.commit()
+                        .instrument(tracing::info_span!("commit record transaction"))
+                        .await?;
                 }
 
                 if !failed_ids.is_empty() {
+                    use sqlx::Connection as _;
+
+                    let mut tx = conn
+                        .begin()
+                        .instrument(tracing::info_span!("begin reset failed transaction"))
+                        .await?;
+                    lock_images_and_siblings_for_update(&mut tx, &failed_ids).await?;
                     sqlx::query!(
                         r#"
             UPDATE images SET status = 'pending'::process_status
@@ -839,9 +861,12 @@ async fn record(
         "#,
                         &failed_ids
                     )
-                    .execute(&mut *conn)
+                    .execute(&mut *tx)
                     .instrument(tracing::info_span!("reset failed images"))
                     .await?;
+                    tx.commit()
+                        .instrument(tracing::info_span!("commit reset failed transaction"))
+                        .await?;
                 }
 
                 static COMPLETE_COUNTER: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -874,6 +899,48 @@ async fn record(
         }
     }
     failure.map_or(Ok(()), Err)
+}
+
+/// Acquire deterministic ascending row locks on parent `posts`, sibling `videos`,
+/// and target `images` before mutating tags or status so concurrent writers cannot
+/// deadlock on Policy v3 `facts_rev` trigger updates (Cycle 3 H9 / Cycle 4 I5).
+async fn lock_images_and_siblings_for_update(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    image_ids: &[i64],
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"SELECT id FROM posts
+           WHERE id IN (SELECT post_id FROM post_images WHERE image_id = ANY($1::BIGINT[]))
+           ORDER BY id FOR NO KEY UPDATE"#,
+    )
+    .bind(image_ids)
+    .execute(&mut **tx)
+    .instrument(tracing::info_span!("lock parent posts"))
+    .await?;
+
+    sqlx::query(
+        r#"SELECT id FROM videos
+           WHERE id IN (
+               SELECT pv.video_id FROM post_videos pv
+               JOIN post_images pi ON pi.post_id = pv.post_id
+               WHERE pi.image_id = ANY($1::BIGINT[])
+           )
+           ORDER BY id FOR NO KEY UPDATE"#,
+    )
+    .bind(image_ids)
+    .execute(&mut **tx)
+    .instrument(tracing::info_span!("lock sibling videos"))
+    .await?;
+
+    sqlx::query(
+        r#"SELECT id FROM images WHERE id = ANY($1::BIGINT[]) ORDER BY id FOR NO KEY UPDATE"#,
+    )
+    .bind(image_ids)
+    .execute(&mut **tx)
+    .instrument(tracing::info_span!("lock target images"))
+    .await?;
+
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1009,7 +1076,15 @@ async fn run_retag_safety(
             }
         }
 
-        let mut conn = pool.acquire().await?;
+        let mut tx = pool.begin().await?;
+        lock_images_and_siblings_for_update(&mut tx, &batch_ids).await?;
+        // Atomically replace all WD-Tagger scores for every retagged image in this batch
+        // so stale high scores that now fall below `min_persisted_score` never remain active!
+        sqlx::query("DELETE FROM wd_tag_images WHERE image_id = ANY($1::BIGINT[])")
+            .bind(&batch_ids)
+            .execute(&mut *tx)
+            .await?;
+
         if !tag_names.is_empty() {
             sqlx::query(
                 r#"
@@ -1021,7 +1096,7 @@ async fn run_retag_safety(
                 "#,
             )
             .bind(&tag_names)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
 
             sqlx::query(
@@ -1037,7 +1112,7 @@ async fn run_retag_safety(
             .bind(&wd_ids)
             .bind(&tag_names)
             .bind(&scores)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await?;
         }
 
@@ -1052,8 +1127,10 @@ async fn run_retag_safety(
         .bind(&batch_ids)
         .bind(params.min_persisted_score)
         .bind(params.vocab_digest.as_str())
-        .execute(&mut *conn)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
 
         processed += batch_ids.len() as u64;
         tracing::info!(

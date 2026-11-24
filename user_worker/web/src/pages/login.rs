@@ -12,7 +12,7 @@ use site_access::{AgeVerificationPolicy, AuthProviderId, AuthProviderPublicConfi
 use crate::{
     api::{
         self, BootstrapResp, EmailStartResp, EmailVerifyResp, HandoffPollResp, HandoffStartResp,
-        NonceResp,
+        NonceResp, TelegramStartResp,
     },
     wallet,
 };
@@ -86,10 +86,27 @@ pub fn LoginView(
     // Transfer code state
     let transfer_code = RwSignal::new(String::new());
 
-    // Initial bootstrap + auto-handle magic link (`?email_token=`) or `#transfer=` fragment.
+    // Portable link confirmation states (F13): NEVER silently auto-redeem magic links or
+    // `#transfer=` URLs on page load without explicit user confirmation!
+    let pending_email_link = RwSignal::new(None::<(String, String)>);
+    let pending_transfer_token = RwSignal::new(None::<String>);
+
+    // Initial bootstrap + stage magic link (`?email_token=`) or `#transfer=` for confirmation.
     Effect::new(move |_| {
         if let Some(err) = api::current_search_param("error") {
             toasts.error("Sign-in failed", Some(err));
+        }
+        if let (Some(email), Some(token)) = (
+            api::current_search_param("email"),
+            api::current_search_param("email_token"),
+        ) && !email.trim().is_empty()
+            && !token.trim().is_empty()
+        {
+            pending_email_link.set(Some((email, token)));
+        }
+        let hash = api::current_hash();
+        if let Some(tok) = hash.strip_prefix("#transfer=").filter(|s| !s.is_empty()) {
+            pending_transfer_token.set(Some(tok.to_string()));
         }
         spawn_local(async move {
             match api::get_json::<BootstrapResp>("/user/api/bootstrap").await {
@@ -100,55 +117,61 @@ pub fn LoginView(
                     toasts.error("Could not load sign-in options", Some(e.display()));
                 }
             }
-
-            // Magic-link email token landing
-            if let (Some(email), Some(token)) = (
-                api::current_search_param("email"),
-                api::current_search_param("email_token"),
-            ) {
-                busy.set(true);
-                toasts.info("Verifying sign-in link...", None);
-                match api::post_json::<_, EmailVerifyResp>(
-                    "/user/auth/email/verify",
-                    &json!({ "email": email, "token": token }),
-                )
-                .await
-                {
-                    Ok(resp) => {
-                        api::broadcast_safety_invalidation("account_change");
-                        api::navigate_hard(&api::sanitize_next(Some(&resp.next)));
-                        return;
-                    }
-                    Err(e) => {
-                        toasts.error("Email sign-in failed", Some(e.display()));
-                    }
-                }
-                busy.set(false);
-            }
-
-            // Cross-device `#transfer=<token>` fragment landing
-            let hash = api::current_hash();
-            if let Some(tok) = hash.strip_prefix("#transfer=").filter(|s| !s.is_empty()) {
-                busy.set(true);
-                toasts.info("Claiming transfer token...", None);
-                match api::post_json_empty("/user/api/transfer/claim", &json!({ "token": tok }))
-                    .await
-                {
-                    Ok(()) => {
-                        api::broadcast_safety_invalidation("account_change");
-                        api::navigate_hard(&next_url.get_value());
-                        return;
-                    }
-                    Err(e) => {
-                        toasts.error("Transfer claim failed", Some(e.display()));
-                    }
-                }
-                busy.set(false);
-            }
         });
     });
 
-    // Mount Telegram Login Widget using CSP-safe redirect callback (`data-auth-url`).
+    // Confirm magic-link email sign-in explicitly
+    let on_confirm_email_link = move |_| {
+        let Some((email, token)) = pending_email_link.get_untracked() else {
+            return;
+        };
+        busy.set(true);
+        spawn_local(async move {
+            match api::post_json::<_, EmailVerifyResp>(
+                "/user/auth/email/verify",
+                &json!({ "email": email, "token": token }),
+            )
+            .await
+            {
+                Ok(resp) => {
+                    pending_email_link.set(None);
+                    api::broadcast_safety_invalidation("account_change");
+                    api::navigate_hard(&api::sanitize_next(Some(&resp.next)));
+                    return;
+                }
+                Err(e) => {
+                    toasts.error("Email sign-in failed", Some(e.display()));
+                }
+            }
+            busy.set(false);
+        });
+    };
+
+    // Confirm `#transfer=<token>` sign-in explicitly
+    let on_confirm_transfer_link = move |_| {
+        let Some(tok) = pending_transfer_token.get_untracked() else {
+            return;
+        };
+        busy.set(true);
+        let dest = next_url.get_value();
+        spawn_local(async move {
+            match api::post_json_empty("/user/api/transfer/claim", &json!({ "token": tok })).await {
+                Ok(()) => {
+                    pending_transfer_token.set(None);
+                    api::broadcast_safety_invalidation("account_change");
+                    api::navigate_hard(&dest);
+                    return;
+                }
+                Err(e) => {
+                    toasts.error("Transfer claim failed", Some(e.display()));
+                }
+            }
+            busy.set(false);
+        });
+    };
+
+    // Mount Telegram Login Widget using a browser-bound `state` + `__Host-auth_tx` cookie
+    // obtained from `POST /user/auth/telegram/start` (F13).
     Effect::new(move |_| {
         let Some(b) = boot.get() else {
             return;
@@ -165,11 +188,27 @@ pub fn LoginView(
                 .map(|s| s.trim().trim_start_matches('@'))
                 .filter(|s| !s.is_empty())
         {
-            let auth_url = format!(
-                "/user/auth/telegram/callback?next={}",
-                urlencoding::encode(&next_url.get_value())
-            );
-            wallet::mount_telegram_widget("le-telegram-login-mount", bot, &auth_url);
+            let bot_owned = bot.to_string();
+            let dest = next_url.get_value();
+            spawn_local(async move {
+                match api::post_json::<_, TelegramStartResp>(
+                    "/user/auth/telegram/start",
+                    &json!({ "next": dest }),
+                )
+                .await
+                {
+                    Ok(resp) => {
+                        wallet::mount_telegram_widget(
+                            "le-telegram-login-mount",
+                            &bot_owned,
+                            &resp.auth_url,
+                        );
+                    }
+                    Err(e) => {
+                        toasts.error("Could not initialize Telegram login", Some(e.display()));
+                    }
+                }
+            });
         }
     });
 
@@ -237,7 +276,7 @@ pub fn LoginView(
         busy.set(true);
         let dest = next_url.get_value();
         spawn_local(async move {
-            let nonce_resp = match api::get_json::<NonceResp>("/user/api/nonce").await {
+            let nonce_resp = match api::get_json::<NonceResp>("/user/api/nonce?purpose=login").await {
                 Ok(n) => n,
                 Err(e) => {
                     toasts.error("Sign-in failed", Some(e.display()));
@@ -287,7 +326,7 @@ pub fn LoginView(
         busy.set(true);
         let dest = next_url.get_value();
         spawn_local(async move {
-            let nonce_resp = match api::get_json::<NonceResp>("/user/api/nonce").await {
+            let nonce_resp = match api::get_json::<NonceResp>("/user/api/nonce?purpose=login").await {
                 Ok(n) => n,
                 Err(e) => {
                     toasts.error("Sign-in failed", Some(e.display()));
@@ -644,6 +683,84 @@ pub fn LoginView(
 
             <div class="u-stack">
                 {extra_header.map(|f| f.run())}
+
+                {move || pending_email_link.get().map(|(email, _)| view! {
+                    <section class="u-card">
+                        <h2>"Confirm email sign-in"</h2>
+                        <p class="u-sub">
+                            {format!(
+                                "You opened a one-time sign-in link for {email}. Confirm below only if you requested this link yourself — signing in will switch this browser to that account."
+                            )}
+                        </p>
+                        <div class="u-row">
+                            <button
+                                type="button"
+                                class="u-btn"
+                                disabled=move || busy.get()
+                                on:click=on_confirm_email_link
+                            >
+                                {format!("Continue as {email}")}
+                            </button>
+                            <button
+                                type="button"
+                                class="u-btn u-btn--secondary"
+                                disabled=move || busy.get()
+                                on:click=move |_| {
+                                    pending_email_link.set(None);
+                                    if let Some(w) = web_sys::window()
+                                        && let Ok(h) = w.history()
+                                    {
+                                        let _ = h.replace_state_with_url(
+                                            &wasm_bindgen::JsValue::NULL,
+                                            "",
+                                            Some("/user/login"),
+                                        );
+                                    }
+                                }
+                            >
+                                "Cancel"
+                            </button>
+                        </div>
+                    </section>
+                })}
+
+                {move || pending_transfer_token.get().map(|_| view! {
+                    <section class="u-card">
+                        <h2>"Confirm device transfer sign-in"</h2>
+                        <p class="u-sub">
+                            "You opened a cross-device sign-in transfer link. Confirm below only if you generated this QR code on your own signed-in device — claiming it will switch this browser to that account."
+                        </p>
+                        <div class="u-row">
+                            <button
+                                type="button"
+                                class="u-btn"
+                                disabled=move || busy.get()
+                                on:click=on_confirm_transfer_link
+                            >
+                                "Continue & Sign In"
+                            </button>
+                            <button
+                                type="button"
+                                class="u-btn u-btn--secondary"
+                                disabled=move || busy.get()
+                                on:click=move |_| {
+                                    pending_transfer_token.set(None);
+                                    if let Some(w) = web_sys::window()
+                                        && let Ok(h) = w.history()
+                                    {
+                                        let _ = h.replace_state_with_url(
+                                            &wasm_bindgen::JsValue::NULL,
+                                            "",
+                                            Some("/user/login"),
+                                        );
+                                    }
+                                }
+                            >
+                                "Cancel"
+                            </button>
+                        </div>
+                    </section>
+                })}
 
                 <section class="u-card">
                     <h1>{heading}</h1>

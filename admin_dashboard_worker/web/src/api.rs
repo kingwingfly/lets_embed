@@ -226,6 +226,10 @@ pub struct AccountsListResp {
     pub total: usize,
     pub page: usize,
     pub page_size: usize,
+    #[serde(default)]
+    pub live_sort_capped: bool,
+    #[serde(default)]
+    pub live_sort_scan_limit: usize,
     pub accounts: Vec<AccountEntryResp>,
     pub selected: Option<AccountEntryResp>,
 }
@@ -375,6 +379,8 @@ pub struct ProvidersResp {
     pub age_policy: AgeVerificationPolicy,
     pub current_kid: String,
     pub has_prev_key: bool,
+    #[serde(default)]
+    pub public_origin: String,
     pub providers: Vec<ProviderView>,
 }
 
@@ -582,6 +588,57 @@ pub fn url_encode_component(raw: &str) -> String {
     js_sys::encode_uri_component(raw)
         .as_string()
         .unwrap_or_default()
+}
+
+/// Copies `text` to the system clipboard using the async Clipboard API first,
+/// falling back to a temporary `<textarea>` + `document.execCommand("copy")`
+/// for non-secure HTTP LAN contexts.
+pub async fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
+    let Some(window) = web_sys::window() else {
+        return Err("Browser window unavailable".to_string());
+    };
+
+    let nav = window.navigator();
+    let clip_prop = js_sys::Reflect::get(nav.as_ref(), &"clipboard".into()).ok();
+    if clip_prop
+        .as_ref()
+        .is_some_and(|v| !v.is_undefined() && !v.is_null())
+    {
+        let promise = nav.clipboard().write_text(text);
+        if JsFuture::from(promise).await.is_ok() {
+            return Ok(());
+        }
+    }
+
+    let document = window
+        .document()
+        .ok_or_else(|| "Document unavailable".to_string())?;
+    let body = document
+        .body()
+        .ok_or_else(|| "Document body unavailable".to_string())?;
+    let ta: web_sys::HtmlTextAreaElement = document
+        .create_element("textarea")
+        .map_err(|_| "Failed to create temporary textarea".to_string())?
+        .dyn_into()
+        .map_err(|_| "Failed to cast textarea".to_string())?;
+    ta.set_value(text);
+    let _ = ta.set_attribute("readonly", "");
+    let _ = ta.set_attribute(
+        "style",
+        "position:fixed;top:-9999px;left:-9999px;opacity:0;pointer-events:none;",
+    );
+    let _ = body.append_child(&ta);
+    ta.select();
+    let html_doc: web_sys::HtmlDocument = document
+        .dyn_into()
+        .map_err(|_| "HtmlDocument unavailable".to_string())?;
+    let copied = html_doc.exec_command("copy").unwrap_or(false);
+    let _ = body.remove_child(&ta);
+    if copied {
+        Ok(())
+    } else {
+        Err("Clipboard write was blocked by the browser".to_string())
+    }
 }
 
 pub fn format_ts_utc(secs: i64) -> String {

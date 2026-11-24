@@ -639,59 +639,121 @@ pub fn validate_provider_updates(
             }
         }
 
-        let display_name = item
-            .display_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                if s.len() > 80 || s.chars().any(char::is_control) {
-                    Err(format!(
-                        "Provider '{}' display_name is invalid",
-                        item.id.as_str()
-                    ))
-                } else {
-                    Ok(s.to_string())
-                }
-            })
-            .transpose()?;
+        // Only Age-Assurance OIDC supports a custom button label (all built-in
+        // providers use fixed standard names on `/user/login`).
+        let display_name = if item.id == AuthProviderId::OidcAgeAssurance {
+            item.display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    if s.len() > 80 || s.chars().any(char::is_control) {
+                        Err(format!(
+                            "Provider '{}' display_name is invalid",
+                            item.id.as_str()
+                        ))
+                    } else {
+                        Ok(s.to_string())
+                    }
+                })
+                .transpose()?
+        } else {
+            None
+        };
 
-        let public_client_id = item
-            .public_client_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                if s.len() > 256 || s.chars().any(char::is_control) {
-                    Err(format!(
-                        "Provider '{}' public_client_id is invalid",
-                        item.id.as_str()
-                    ))
-                } else {
-                    Ok(s.to_string())
-                }
-            })
-            .transpose()?;
+        // Wallet providers (`siwe`/`siws`) are zero-config and ignore `public_client_id`.
+        // Telegram strips any leading `@` so `@my_bot` normalizes cleanly to `my_bot`.
+        let public_client_id = if matches!(item.id, AuthProviderId::Siwe | AuthProviderId::Siws) {
+            None
+        } else {
+            item.public_client_id
+                .as_deref()
+                .map(|raw| {
+                    let trimmed = raw.trim();
+                    if item.id == AuthProviderId::Telegram {
+                        trimmed.trim_start_matches('@').trim()
+                    } else {
+                        trimmed
+                    }
+                })
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    if s.len() > 256 || s.chars().any(char::is_control) {
+                        Err(format!(
+                            "Provider '{}' public_client_id is invalid",
+                            item.id.as_str()
+                        ))
+                    } else {
+                        Ok(s.to_string())
+                    }
+                })
+                .transpose()?
+        };
 
-        let issuer = match item
-            .issuer
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(raw_url) => Some(validate_oidc_url(raw_url).map_err(|e| {
-                format!("Provider '{}' issuer URL rejected: {e}", item.id.as_str())
-            })?),
-            None => {
-                if item.enabled && item.id == AuthProviderId::OidcAgeAssurance {
+        // When enabled, OAuth/OIDC providers MUST have a non-empty Client ID and Telegram
+        // MUST have a non-empty bot username so the dashboard cannot publish a broken provider (F29).
+        if item.enabled && public_client_id.is_none() {
+            match item.id {
+                AuthProviderId::Google
+                | AuthProviderId::GitHub
+                | AuthProviderId::X
+                | AuthProviderId::Discord
+                | AuthProviderId::OidcAgeAssurance => {
+                    return Err(format!(
+                        "Provider '{}' requires a non-empty Client ID when enabled",
+                        item.id.as_str()
+                    ));
+                }
+                AuthProviderId::Telegram => {
                     return Err(
-                        "Age-Assurance OIDC requires a valid https:// issuer URL when enabled"
-                            .into(),
+                        "Provider 'telegram' requires a non-empty bot username when enabled".into(),
                     );
                 }
-                None
+                AuthProviderId::EmailOtp | AuthProviderId::Siwe | AuthProviderId::Siws => {}
             }
+        }
+
+        // Only `OidcAgeAssurance` (required OIDC discovery issuer) and `EmailOtp`
+        // (optional HTTP mail API endpoint) use `issuer`. Standard OAuth providers
+        // (`Google`, `GitHub`, `X`, `Discord`) use fixed official endpoints.
+        let issuer = if matches!(
+            item.id,
+            AuthProviderId::OidcAgeAssurance | AuthProviderId::EmailOtp
+        ) {
+            match item
+                .issuer
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(raw_url) => Some(validate_oidc_url(raw_url).map_err(|e| {
+                    format!("Provider '{}' issuer URL rejected: {e}", item.id.as_str())
+                })?),
+                None => {
+                    if item.enabled && item.id == AuthProviderId::OidcAgeAssurance {
+                        return Err(
+                            "Age-Assurance OIDC requires a valid https:// issuer URL when enabled"
+                                .into(),
+                        );
+                    }
+                    None
+                }
+            }
+        } else {
+            None
         };
+
+        if item.clear_secret
+            && item
+                .secret_value
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+        {
+            return Err(format!(
+                "Provider '{}' cannot both set secret_value and clear_secret in the same request",
+                item.id.as_str()
+            ));
+        }
 
         if let Some(secret) = item.secret_value.as_deref() {
             if !secret.is_empty() && secret_field_for_provider(item.id).is_none() {
@@ -844,11 +906,15 @@ pub fn is_public_policy_unchanged(prev: &PublicSitePolicy, next: &PublicSitePoli
 }
 
 /// Expands and normalizes a slice of [`AuthProviderPublicConfig`] into canonical
-/// order across all [`AuthProviderId::ALL`] entries so fresh/sparse stored lists
-/// compare equal to full default-disabled submissions from the admin UI.
+/// order across all [`AuthProviderId::ALL`] entries, matching runtime effective
+/// defaults (on a fresh empty list with `age_policy != StrictProviderVerified18`,
+/// `siwe` and `siws` default to `enabled: true` so explicitly disabling them persists, F28).
 pub fn canonical_provider_configs(
+    age_policy: AgeVerificationPolicy,
     configured: &[AuthProviderPublicConfig],
 ) -> Vec<AuthProviderPublicConfig> {
+    let empty_defaults_wallets =
+        configured.is_empty() && age_policy != AgeVerificationPolicy::StrictProviderVerified18;
     let mut out: Vec<AuthProviderPublicConfig> = AuthProviderId::ALL
         .iter()
         .map(|&id| {
@@ -857,29 +923,49 @@ pub fn canonical_provider_configs(
                 Some(c) => AuthProviderPublicConfig {
                     id,
                     enabled: c.enabled,
-                    display_name: c
-                        .display_name
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string),
-                    issuer: c
-                        .issuer
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string),
-                    public_client_id: c
-                        .public_client_id
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string),
+                    display_name: if id == AuthProviderId::OidcAgeAssurance {
+                        c.display_name
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    } else {
+                        None
+                    },
+                    issuer: if matches!(
+                        id,
+                        AuthProviderId::OidcAgeAssurance | AuthProviderId::EmailOtp
+                    ) {
+                        c.issuer
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    } else {
+                        None
+                    },
+                    public_client_id: if matches!(id, AuthProviderId::Siwe | AuthProviderId::Siws) {
+                        None
+                    } else {
+                        c.public_client_id
+                            .as_deref()
+                            .map(|raw| {
+                                let trimmed = raw.trim();
+                                if id == AuthProviderId::Telegram {
+                                    trimmed.trim_start_matches('@').trim()
+                                } else {
+                                    trimmed
+                                }
+                            })
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    },
                     soft_birthday_check: c.soft_birthday_check,
                 },
                 None => AuthProviderPublicConfig {
                     id,
-                    enabled: false,
+                    enabled: empty_defaults_wallets
+                        && matches!(id, AuthProviderId::Siwe | AuthProviderId::Siws),
                     display_name: None,
                     issuer: None,
                     public_client_id: None,
@@ -893,13 +979,16 @@ pub fn canonical_provider_configs(
 }
 
 /// Returns `true` when incoming provider public configs are canonically identical
-/// to stored configs AND no secret upserts or deletions were submitted.
+/// to effective stored configs AND no secret upserts or deletions were submitted.
 pub fn are_providers_unchanged(
+    age_policy: AgeVerificationPolicy,
     prev: &[AuthProviderPublicConfig],
     next: &[AuthProviderPublicConfig],
     has_secret_mutations: bool,
 ) -> bool {
-    !has_secret_mutations && canonical_provider_configs(prev) == canonical_provider_configs(next)
+    !has_secret_mutations
+        && canonical_provider_configs(age_policy, prev)
+            == canonical_provider_configs(age_policy, next)
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,16 +1143,19 @@ impl LoadedSettings {
     }
 
     /// Phase 1 of Two-Phase Activation:
-    /// Atomically commits `doc` at `expected_revision + 1` in D1 via CAS with
-    /// `activation_status = 'pending_do_ack'` BEFORE notifying `SitePolicyDO`.
+    /// Atomically commits `doc` at `expected_revision + 1` in D1 with
+    /// `activation_status = 'pending_do_ack'` alongside any extra revision-scoped
+    /// writes (e.g. `provider_secret_versions`) inside ONE single D1 `batch`
+    /// transaction BEFORE notifying `SitePolicyDO` (Cycle 2 C-1).
     ///
-    /// Returns `Ok(Some((new_rev, stored_public_policy, digest)))` on success,
-    /// or `Ok(None)` on revision conflict (409).
-    pub async fn save_d1_cas_pending(
+    /// Relies on `site_settings.revision INTEGER PRIMARY KEY` so any concurrent
+    /// revision write aborts and rolls back the entire batch cleanly -> `Ok(None)` (409).
+    pub async fn save_d1_cas_pending_with_writes(
         env: &Env,
         expected_revision: u64,
         doc: &SiteSettingsDocument,
         editor: &str,
+        extra_writes: Vec<worker::D1PreparedStatement>,
     ) -> Result<Option<(u64, PublicSitePolicy, String)>> {
         let new_revision = expected_revision.saturating_add(1);
         let mut to_store = doc.clone();
@@ -1075,38 +1167,92 @@ impl LoadedSettings {
         let digest = to_store.public.policy_digest.clone();
 
         let db = env.d1(D1_BINDING)?;
-        let mut writes = Vec::new();
+        let mut writes = Vec::with_capacity(extra_writes.len() + 2);
         if expected_revision == 0 {
             writes.push(
                 db.prepare("UPDATE site_settings SET document=? WHERE revision=0 AND document='{}'")
                     .bind(&[serde_json::to_string(&initial_document(env))?.into()])?,
             );
         }
-        writes.push(
-            db.prepare(
-                "INSERT INTO site_settings (revision, document, updated_at, updated_by, activation_status) \
-                 SELECT revision+1, ?, unixepoch(), ?, 'pending_do_ack' FROM site_settings \
-                 WHERE revision=? AND revision=(SELECT MAX(revision) FROM site_settings)",
-            )
-            .bind(&[
-                serde_json::to_string(&to_store)?.into(),
-                editor.into(),
-                (expected_revision as f64).into(),
-            ])?,
-        );
-        let results = db.batch(writes).await?;
-        let inserted = results
-            .last()
-            .expect("at least one write")
-            .meta()?
-            .and_then(|m| m.changes)
-            == Some(1);
+        if extra_writes.is_empty() {
+            writes.push(
+                db.prepare(
+                    "INSERT INTO site_settings (revision, document, updated_at, updated_by, activation_status) \
+                     SELECT revision+1, ?, unixepoch(), ?, 'pending_do_ack' FROM site_settings \
+                     WHERE revision=? AND revision=(SELECT MAX(revision) FROM site_settings)",
+                )
+                .bind(&[
+                    serde_json::to_string(&to_store)?.into(),
+                    editor.into(),
+                    (expected_revision as f64).into(),
+                ])?,
+            );
+            let results = db.batch(writes).await?;
+            let inserted = results
+                .last()
+                .expect("at least one write")
+                .meta()?
+                .and_then(|m| m.changes)
+                == Some(1);
+            if !inserted {
+                return Ok(None);
+            }
+            return Ok(Some((new_revision, to_store.public, digest)));
+        }
 
-        if !inserted {
+        // Verify expected_revision is the current latest revision BEFORE executing the
+        // atomic PK-enforced batch so future/skipped revision numbers are rejected as 409.
+        #[derive(Deserialize)]
+        struct MaxRevRow {
+            max_rev: Option<i64>,
+        }
+        let max_rev = db
+            .prepare("SELECT MAX(revision) AS max_rev FROM site_settings")
+            .first::<MaxRevRow>(None)
+            .await?
+            .and_then(|r| r.max_rev)
+            .unwrap_or(0)
+            .max(0) as u64;
+        if max_rev != expected_revision {
             return Ok(None);
         }
 
-        Ok(Some((new_revision, to_store.public, digest)))
+        writes.push(
+            db.prepare(
+                "INSERT INTO site_settings (revision, document, updated_at, updated_by, activation_status) \
+                 VALUES (?, ?, unixepoch(), ?, 'pending_do_ack')",
+            )
+            .bind(&[
+                (new_revision as f64).into(),
+                serde_json::to_string(&to_store)?.into(),
+                editor.into(),
+            ])?,
+        );
+        writes.extend(extra_writes);
+
+        match db.batch(writes).await {
+            Ok(_) => Ok(Some((new_revision, to_store.public, digest))),
+            Err(e) => {
+                let msg = format!("{e:?}");
+                if msg.contains("UNIQUE constraint")
+                    || msg.contains("PRIMARY KEY constraint")
+                    || msg.contains("SQLITE_CONSTRAINT")
+                {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    pub async fn save_d1_cas_pending(
+        env: &Env,
+        expected_revision: u64,
+        doc: &SiteSettingsDocument,
+        editor: &str,
+    ) -> Result<Option<(u64, PublicSitePolicy, String)>> {
+        Self::save_d1_cas_pending_with_writes(env, expected_revision, doc, editor, Vec::new()).await
     }
 
     /// Marks a D1 `site_settings` revision as `'active'` ONLY after exact

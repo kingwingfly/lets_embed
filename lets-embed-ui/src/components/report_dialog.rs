@@ -1,6 +1,8 @@
 use leptos::{ev, html, prelude::*};
 
-use crate::browser::{lock_body_scroll, trap_dialog_tab, use_window_keydown};
+use crate::browser::{
+    is_top_modal, lock_body_scroll, push_modal_layer, trap_dialog_tab, use_window_keydown,
+};
 use crate::components::SkySelect;
 use crate::models::{
     MAX_REPORT_NOTE_CHARS, ReportReason, ReportSubmission, ReportTargetKind, SelectVariant,
@@ -56,6 +58,7 @@ fn ReportDialogModal(
     on_close: Callback<()>,
 ) -> impl IntoView {
     lock_body_scroll();
+    let modal_layer = push_modal_layer();
 
     let dialog_ref = NodeRef::<html::Div>::new();
     let reason = RwSignal::new(ReportReason::MisclassifiedSafety);
@@ -70,6 +73,9 @@ fn ReportDialogModal(
     });
 
     use_window_keydown(false, move |e: ev::KeyboardEvent| {
+        if !is_top_modal(modal_layer) {
+            return;
+        }
         if e.key() == "Tab" {
             trap_dialog_tab(&e, dialog_ref.get_untracked());
             return;
