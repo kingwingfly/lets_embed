@@ -421,7 +421,7 @@ try {
     JSON.stringify(noopSave)
   );
 
-  // 3b. Auth Providers: clean SITE_SECRET copy + enable Solana (SIWS)
+  // 3b. Auth Providers: clean SITE_SECRET copy, minimal per-provider forms, & enable Solana (SIWS)
   const providersCheck = await evalJs(`
     const tab = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Auth Providers');
     if (!tab) throw new Error('Auth Providers tab not found');
@@ -431,9 +431,30 @@ try {
     const hasCleanTitle = txt.includes('Encrypted Secret Keyring (SITE_SECRET)');
     const hasStaleEnv = txt.includes('SETTINGS_ENCRYPTION_KEY');
 
-    const cards = [...document.querySelectorAll('.adm-provider-card, .adm-card, section, article, div')];
-    const siwsCard = cards.find(c => c.querySelector('[role="switch"]') && c.innerText.includes('Solana') && c.innerText.length < 700);
-    if (!siwsCard) throw new Error('Solana provider card not found');
+    const card = (slug) => document.querySelector(\`.adm-provider-card[data-provider="\${slug}"]\`);
+    const siweCard = card('siwe');
+    const siwsCard = card('siws');
+    const googleCard = card('google');
+    const telegramCard = card('telegram');
+    const emailCard = card('email_otp');
+    const oidcCard = card('oidc_age_assurance');
+    if (!siwsCard || !siweCard || !googleCard || !telegramCard || !emailCard || !oidcCard) {
+      throw new Error('Expected provider cards not found');
+    }
+
+    const siweInputs = siweCard.querySelectorAll('input').length;
+    const siwsInputs = siwsCard.querySelectorAll('input').length;
+    const googleHasCallback = (googleCard.querySelector('.adm-callback-code')?.textContent || '').includes('/user/auth/google/callback');
+    const googleNoDeadOverrides = !googleCard.innerText.includes('Issuer Override') && !googleCard.innerText.includes('Button Display Name');
+    const guideCount = document.querySelectorAll('.adm-provider-card details.adm-setup-guide').length;
+    // Open Telegram & Email setup guides to verify dynamic step-by-step tutorials
+    telegramCard.querySelector('details.adm-setup-guide summary')?.click();
+    emailCard.querySelector('details.adm-setup-guide summary')?.click();
+    await new Promise(r => setTimeout(r, 120));
+    const telegramHasBotFather = telegramCard.innerText.includes('@BotFather') && telegramCard.innerText.includes('/setdomain');
+    const emailHasResendHint = emailCard.innerText.includes('Resend') && emailCard.innerText.includes('Cloudflare Email Routing');
+    const oidcHasLabelField = oidcCard.innerText.includes('Button Label');
+
     const sw = siwsCard.querySelector('[role="switch"]');
     if (sw.getAttribute('aria-checked') !== 'true') sw.click();
     await new Promise(r => setTimeout(r, 150));
@@ -444,13 +465,31 @@ try {
     return {
       hasCleanTitle,
       hasStaleEnv,
+      siweInputs,
+      siwsInputs,
+      googleHasCallback,
+      googleNoDeadOverrides,
+      guideCount,
+      telegramHasBotFather,
+      emailHasResendHint,
+      oidcHasLabelField,
       siwsChecked: sw.getAttribute('aria-checked'),
       toast: (document.querySelector('.le-toast-host')?.innerText || '').trim(),
     };
   `);
   check(
-    '3b. Admin Auth Providers clean SITE_SECRET copy & enables Solana (SIWS)',
-    providersCheck.hasCleanTitle && !providersCheck.hasStaleEnv && providersCheck.siwsChecked === 'true',
+    '3b. Admin Auth Providers clean SITE_SECRET copy, minimal per-provider UI + 9 setup guides & enables Solana (SIWS)',
+    providersCheck.hasCleanTitle &&
+      !providersCheck.hasStaleEnv &&
+      providersCheck.siweInputs === 0 &&
+      providersCheck.siwsInputs === 0 &&
+      providersCheck.googleHasCallback &&
+      providersCheck.googleNoDeadOverrides &&
+      providersCheck.guideCount === 9 &&
+      providersCheck.telegramHasBotFather &&
+      providersCheck.emailHasResendHint &&
+      providersCheck.oidcHasLabelField &&
+      providersCheck.siwsChecked === 'true',
     JSON.stringify(providersCheck)
   );
 

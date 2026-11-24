@@ -655,12 +655,37 @@ impl EditableProvider {
             let t = s.trim().to_string();
             (!t.is_empty()).then_some(t)
         };
+        let display_name = if self.id == AuthProviderId::OidcAgeAssurance {
+            opt(self.display_name.get_untracked())
+        } else {
+            None
+        };
+        let issuer = if matches!(
+            self.id,
+            AuthProviderId::OidcAgeAssurance | AuthProviderId::EmailOtp
+        ) {
+            opt(self.issuer.get_untracked())
+        } else {
+            None
+        };
+        let public_client_id = if matches!(self.id, AuthProviderId::Siwe | AuthProviderId::Siws) {
+            None
+        } else if self.id == AuthProviderId::Telegram {
+            opt(self
+                .public_client_id
+                .get_untracked()
+                .trim()
+                .trim_start_matches('@')
+                .to_string())
+        } else {
+            opt(self.public_client_id.get_untracked())
+        };
         ProviderUpdateItem {
             id: self.id,
             enabled: self.enabled.get_untracked(),
-            display_name: opt(self.display_name.get_untracked()),
-            issuer: opt(self.issuer.get_untracked()),
-            public_client_id: opt(self.public_client_id.get_untracked()),
+            display_name,
+            issuer,
+            public_client_id,
             soft_birthday_check: self.soft_birthday_check.get_untracked(),
             secret_value: opt(self.secret_input.get_untracked()),
             clear_secret: self.clear_secret.get_untracked(),
@@ -678,6 +703,7 @@ pub struct ProvidersDraft {
     pub age_policy: RwSignal<AgeVerificationPolicy>,
     pub current_kid: RwSignal<String>,
     pub has_prev_key: RwSignal<bool>,
+    pub public_origin: RwSignal<String>,
     pub rows: RwSignal<Vec<EditableProvider>>,
 }
 
@@ -692,6 +718,7 @@ impl ProvidersDraft {
             age_policy: RwSignal::new(AgeVerificationPolicy::Off),
             current_kid: RwSignal::new(String::new()),
             has_prev_key: RwSignal::new(false),
+            public_origin: RwSignal::new(String::new()),
             rows: RwSignal::new(Vec::new()),
         }
     }
@@ -702,6 +729,7 @@ impl ProvidersDraft {
         self.age_policy.set(resp.age_policy);
         self.current_kid.set(resp.current_kid.clone());
         self.has_prev_key.set(resp.has_prev_key);
+        self.public_origin.set(resp.public_origin.clone());
         let built = self.owner.with_value(|root| {
             root.with(|| {
                 resp.providers
@@ -722,6 +750,7 @@ impl ProvidersDraft {
         self.age_policy.set(resp.age_policy);
         self.current_kid.set(resp.current_kid.clone());
         self.has_prev_key.set(resp.has_prev_key);
+        self.public_origin.set(resp.public_origin.clone());
         self.rows.with_untracked(|rows| {
             for row in rows {
                 if let Some(view) = resp.providers.iter().find(|v| v.config.id == row.id) {

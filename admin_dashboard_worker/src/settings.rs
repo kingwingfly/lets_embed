@@ -639,58 +639,85 @@ pub fn validate_provider_updates(
             }
         }
 
-        let display_name = item
-            .display_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                if s.len() > 80 || s.chars().any(char::is_control) {
-                    Err(format!(
-                        "Provider '{}' display_name is invalid",
-                        item.id.as_str()
-                    ))
-                } else {
-                    Ok(s.to_string())
-                }
-            })
-            .transpose()?;
+        // Only Age-Assurance OIDC supports a custom button label (all built-in
+        // providers use fixed standard names on `/user/login`).
+        let display_name = if item.id == AuthProviderId::OidcAgeAssurance {
+            item.display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    if s.len() > 80 || s.chars().any(char::is_control) {
+                        Err(format!(
+                            "Provider '{}' display_name is invalid",
+                            item.id.as_str()
+                        ))
+                    } else {
+                        Ok(s.to_string())
+                    }
+                })
+                .transpose()?
+        } else {
+            None
+        };
 
-        let public_client_id = item
-            .public_client_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                if s.len() > 256 || s.chars().any(char::is_control) {
-                    Err(format!(
-                        "Provider '{}' public_client_id is invalid",
-                        item.id.as_str()
-                    ))
-                } else {
-                    Ok(s.to_string())
-                }
-            })
-            .transpose()?;
+        // Wallet providers (`siwe`/`siws`) are zero-config and ignore `public_client_id`.
+        // Telegram strips any leading `@` so `@my_bot` normalizes cleanly to `my_bot`.
+        let public_client_id = if matches!(item.id, AuthProviderId::Siwe | AuthProviderId::Siws) {
+            None
+        } else {
+            item.public_client_id
+                .as_deref()
+                .map(|raw| {
+                    let trimmed = raw.trim();
+                    if item.id == AuthProviderId::Telegram {
+                        trimmed.trim_start_matches('@').trim()
+                    } else {
+                        trimmed
+                    }
+                })
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    if s.len() > 256 || s.chars().any(char::is_control) {
+                        Err(format!(
+                            "Provider '{}' public_client_id is invalid",
+                            item.id.as_str()
+                        ))
+                    } else {
+                        Ok(s.to_string())
+                    }
+                })
+                .transpose()?
+        };
 
-        let issuer = match item
-            .issuer
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(raw_url) => Some(validate_oidc_url(raw_url).map_err(|e| {
-                format!("Provider '{}' issuer URL rejected: {e}", item.id.as_str())
-            })?),
-            None => {
-                if item.enabled && item.id == AuthProviderId::OidcAgeAssurance {
-                    return Err(
-                        "Age-Assurance OIDC requires a valid https:// issuer URL when enabled"
-                            .into(),
-                    );
+        // Only `OidcAgeAssurance` (required OIDC discovery issuer) and `EmailOtp`
+        // (optional HTTP mail API endpoint) use `issuer`. Standard OAuth providers
+        // (`Google`, `GitHub`, `X`, `Discord`) use fixed official endpoints.
+        let issuer = if matches!(
+            item.id,
+            AuthProviderId::OidcAgeAssurance | AuthProviderId::EmailOtp
+        ) {
+            match item
+                .issuer
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(raw_url) => Some(validate_oidc_url(raw_url).map_err(|e| {
+                    format!("Provider '{}' issuer URL rejected: {e}", item.id.as_str())
+                })?),
+                None => {
+                    if item.enabled && item.id == AuthProviderId::OidcAgeAssurance {
+                        return Err(
+                            "Age-Assurance OIDC requires a valid https:// issuer URL when enabled"
+                                .into(),
+                        );
+                    }
+                    None
                 }
-                None
             }
+        } else {
+            None
         };
 
         if let Some(secret) = item.secret_value.as_deref() {
@@ -857,24 +884,43 @@ pub fn canonical_provider_configs(
                 Some(c) => AuthProviderPublicConfig {
                     id,
                     enabled: c.enabled,
-                    display_name: c
-                        .display_name
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string),
-                    issuer: c
-                        .issuer
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string),
-                    public_client_id: c
-                        .public_client_id
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string),
+                    display_name: if id == AuthProviderId::OidcAgeAssurance {
+                        c.display_name
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    } else {
+                        None
+                    },
+                    issuer: if matches!(
+                        id,
+                        AuthProviderId::OidcAgeAssurance | AuthProviderId::EmailOtp
+                    ) {
+                        c.issuer
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    } else {
+                        None
+                    },
+                    public_client_id: if matches!(id, AuthProviderId::Siwe | AuthProviderId::Siws) {
+                        None
+                    } else {
+                        c.public_client_id
+                            .as_deref()
+                            .map(|raw| {
+                                let trimmed = raw.trim();
+                                if id == AuthProviderId::Telegram {
+                                    trimmed.trim_start_matches('@').trim()
+                                } else {
+                                    trimmed
+                                }
+                            })
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    },
                     soft_birthday_check: c.soft_birthday_check,
                 },
                 None => AuthProviderPublicConfig {

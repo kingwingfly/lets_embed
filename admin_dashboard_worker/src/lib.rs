@@ -68,6 +68,24 @@ pub struct AppState {
     pub keyring: Arc<KeyRing>,
 }
 
+impl AppState {
+    /// Returns the canonical public origin used for OAuth callbacks and email links
+    /// (`PUBLIC_URL` if configured, else `https://{SIWE_DOMAIN}`, else empty).
+    pub fn public_origin(&self) -> String {
+        if let Some(url) = self.public_url.as_deref() {
+            let trimmed = url.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        let domain = self.siwe_domain.trim();
+        if !domain.is_empty() {
+            return format!("https://{domain}");
+        }
+        String::new()
+    }
+}
+
 fn optional_secret(env: &Env, name: &str) -> Option<String> {
     env.secret(name)
         .ok()

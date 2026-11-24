@@ -156,6 +156,7 @@ pub async fn get_providers(
         age_policy: public.age_policy,
         current_kid: st.keyring.current.kid().to_string(),
         has_prev_key: st.keyring.has_previous(),
+        public_origin: st.public_origin(),
         providers,
     })
     .into_response()
@@ -277,6 +278,7 @@ pub async fn save_providers(
             age_policy,
             current_kid: st.keyring.current.kid().to_string(),
             has_prev_key: st.keyring.has_previous(),
+            public_origin: st.public_origin(),
             providers,
         })
         .into_response();
@@ -408,6 +410,7 @@ pub async fn save_providers(
                 age_policy,
                 current_kid: st.keyring.current.kid().to_string(),
                 has_prev_key: st.keyring.has_previous(),
+                public_origin: st.public_origin(),
                 providers,
             })
             .into_response()

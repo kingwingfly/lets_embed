@@ -381,6 +381,8 @@ pub struct ProvidersResp {
     pub age_policy: AgeVerificationPolicy,
     pub current_kid: String,
     pub has_prev_key: bool,
+    #[serde(default)]
+    pub public_origin: String,
     pub providers: Vec<ProviderView>,
 }
 

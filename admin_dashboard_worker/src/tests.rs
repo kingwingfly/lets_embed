@@ -934,6 +934,96 @@ fn oidc_url_validator_blocks_ssrf_and_accepts_public_https() {
     }
 }
 
+#[test]
+fn validate_provider_updates_strips_unused_fields_and_normalizes_telegram_handle() {
+    let items = vec![
+        ProviderUpdateItem {
+            id: AuthProviderId::Google,
+            enabled: true,
+            display_name: Some("Ignored Google Name".into()),
+            issuer: Some("https://evil-unused.example.com".into()),
+            public_client_id: Some("  google-client-id  ".into()),
+            soft_birthday_check: false,
+            secret_value: None,
+            clear_secret: false,
+        },
+        ProviderUpdateItem {
+            id: AuthProviderId::Telegram,
+            enabled: true,
+            display_name: Some("Ignored TG".into()),
+            issuer: None,
+            public_client_id: Some("  @@my_gallery_bot ".into()),
+            soft_birthday_check: false,
+            secret_value: None,
+            clear_secret: false,
+        },
+        ProviderUpdateItem {
+            id: AuthProviderId::Siws,
+            enabled: true,
+            display_name: Some("Ignored Sol".into()),
+            issuer: Some("https://unused.example.com".into()),
+            public_client_id: Some("unused-wallet-label".into()),
+            soft_birthday_check: false,
+            secret_value: None,
+            clear_secret: false,
+        },
+        ProviderUpdateItem {
+            id: AuthProviderId::EmailOtp,
+            enabled: true,
+            display_name: Some("Ignored Email".into()),
+            issuer: Some("https://api.resend.com/emails".into()),
+            public_client_id: Some("noreply@example.com".into()),
+            soft_birthday_check: false,
+            secret_value: None,
+            clear_secret: false,
+        },
+        ProviderUpdateItem {
+            id: AuthProviderId::OidcAgeAssurance,
+            enabled: true,
+            display_name: Some("Verify 18+ with Yoti".into()),
+            issuer: Some("https://auth.yoti.com/".into()),
+            public_client_id: Some("yoti-cid".into()),
+            soft_birthday_check: false,
+            secret_value: None,
+            clear_secret: false,
+        },
+    ];
+
+    let normalized =
+        validate_provider_updates(AgeVerificationPolicy::SelfAttestation, &items).expect("valid");
+
+    let by_id = |id: AuthProviderId| {
+        normalized
+            .iter()
+            .find(|c| c.id == id)
+            .expect("provider present")
+    };
+
+    let google = by_id(AuthProviderId::Google);
+    assert_eq!(google.display_name, None);
+    assert_eq!(google.issuer, None);
+    assert_eq!(google.public_client_id.as_deref(), Some("google-client-id"));
+
+    let tg = by_id(AuthProviderId::Telegram);
+    assert_eq!(tg.display_name, None);
+    assert_eq!(tg.public_client_id.as_deref(), Some("my_gallery_bot"));
+
+    let siws = by_id(AuthProviderId::Siws);
+    assert_eq!(siws.display_name, None);
+    assert_eq!(siws.issuer, None);
+    assert_eq!(siws.public_client_id, None);
+
+    let email = by_id(AuthProviderId::EmailOtp);
+    assert_eq!(email.display_name, None);
+    assert_eq!(email.issuer.as_deref(), Some("https://api.resend.com/emails"));
+    assert_eq!(email.public_client_id.as_deref(), Some("noreply@example.com"));
+
+    let oidc = by_id(AuthProviderId::OidcAgeAssurance);
+    assert_eq!(oidc.display_name.as_deref(), Some("Verify 18+ with Yoti"));
+    assert_eq!(oidc.issuer.as_deref(), Some("https://auth.yoti.com"));
+    assert_eq!(oidc.public_client_id.as_deref(), Some("yoti-cid"));
+}
+
 // ---------------------------------------------------------------------------
 // 7. CSRF, Security Headers, Asset Paths, Geo, Access & Legacy Decode
 // ---------------------------------------------------------------------------
