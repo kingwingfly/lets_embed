@@ -8,7 +8,7 @@ pub use safety::{
     CLICK_REVEAL_MEDIA_CAP_TTL_SECS, CallerContext, CatalogValidationResult, CompiledPolicy,
     ImageFacts, ImageParentPostFacts, MASK_NO_UNLOCK_MARKER, MediaOutcome, MediaSigner,
     PUBLIC_MEDIA_CAP_TTL_SECS, ParentPostFacts, RESTRICTED_MEDIA_CAP_TTL_SECS, RevealCheckResult,
-    SafetyFilter, SeedLockedError,
+    SafetyFilter, SeedLockedError, SelectedPostCover,
 };
 
 use std::{
@@ -45,6 +45,10 @@ pub const INFERENCE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
 pub const METADATA_STATEMENT_TIMEOUT_SQL: &str = "SET statement_timeout = '5s'";
 /// Transaction-local Postgres statement timeout for vector HNSW queries (DoS guard M2: 15s).
 pub const VECTOR_STATEMENT_TIMEOUT_SQL: &str = "SET LOCAL statement_timeout = '15s'";
+/// Transaction-local Postgres statement timeout for full-catalog XML sitemap queries (30s).
+pub const SITEMAP_STATEMENT_TIMEOUT_SQL: &str = "SET LOCAL statement_timeout = '30s'";
+/// In-process TTL for policy-digest-keyed XML sitemap query results (5 minutes).
+const SITEMAP_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Compact post summary returned by batch preview lookups.
 #[derive(Debug, Clone)]
@@ -63,6 +67,24 @@ pub struct PostGalleryCover {
     pub title: String,
     pub cover_image: Option<Image>,
     pub cover_video: Option<Video>,
+    pub image_count: usize,
+    pub video_count: usize,
+}
+
+/// Policy v3 projected gallery cover summary ready for `/`, search results, and favorites.
+///
+/// Uses safe cover fallback (first `Clear` image for the caller so mixed albums are never
+/// penalized by `MIN(image_id)` being filtered) while locking albums containing any
+/// unsatisfied non-bypassable hard-blocked image (e.g. `Extreme / Gore & Illegal`).
+#[derive(Debug, Clone)]
+pub struct ProjectedPostGalleryCover {
+    pub post_id: i64,
+    pub title: String,
+    pub safe_title: String,
+    pub title_displayable: bool,
+    pub has_hard_block: bool,
+    pub cover_image: Option<ProjectedImage>,
+    pub cover_video: Option<ProjectedVideo>,
     pub image_count: usize,
     pub video_count: usize,
 }
@@ -234,6 +256,8 @@ pub struct Engine {
     tokenizer: Option<Arc<Tokenizer>>,
     dinov3_session: Option<LazyModel>,
     inference_sem: Arc<tokio::sync::Semaphore>,
+    sitemap_count_cache: Cache<String, i64>,
+    sitemap_entries_cache: Cache<(String, i64, i64), Vec<SitemapPostEntry>>,
 }
 
 impl Engine {
@@ -303,6 +327,14 @@ impl Engine {
             inference_sem: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_MAX_CONCURRENT_INFERENCE,
             )),
+            sitemap_count_cache: Cache::builder()
+                .max_capacity(16)
+                .time_to_live(SITEMAP_CACHE_TTL)
+                .build(),
+            sitemap_entries_cache: Cache::builder()
+                .max_capacity(64)
+                .time_to_live(SITEMAP_CACHE_TTL)
+                .build(),
         })
     }
 
@@ -324,6 +356,14 @@ impl Engine {
             inference_sem: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_MAX_CONCURRENT_INFERENCE,
             )),
+            sitemap_count_cache: Cache::builder()
+                .max_capacity(16)
+                .time_to_live(SITEMAP_CACHE_TTL)
+                .build(),
+            sitemap_entries_cache: Cache::builder()
+                .max_capacity(64)
+                .time_to_live(SITEMAP_CACHE_TTL)
+                .build(),
         })
     }
 
@@ -1490,6 +1530,280 @@ impl Engine {
             .map_err(Into::into)
     }
 
+    /// Batch-fetch and project gallery covers for `ids` with Policy v3 safe cover fallback:
+    /// - When safety is disabled: uses `MIN(image_id)` / `MIN(video_id)` directly.
+    /// - When safety is enabled: evaluates all images of `ids` inside a single `REPEATABLE READ`
+    ///   snapshot and applies [`CompiledPolicy::select_post_cover_image`] (locking Extreme/Gore
+    ///   albums, otherwise picking the post's first `Clear` image, otherwise falling back to the
+    ///   first bypassable / `MIN(image_id)` image).
+    pub async fn projected_post_gallery_covers(
+        &self,
+        ids: &[i64],
+        policy: &CompiledPolicy,
+        caller: &CallerContext,
+        signer: &MediaSigner,
+    ) -> anyhow::Result<Vec<ProjectedPostGalleryCover>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !policy.is_enabled() {
+            let covers = self.post_gallery_covers_by_ids(ids).await?;
+            let cover_images: Vec<Image> = covers
+                .iter()
+                .filter_map(|c| c.cover_image.clone())
+                .collect();
+            let cover_videos: Vec<Video> = covers
+                .iter()
+                .filter_map(|c| c.cover_video.clone())
+                .collect();
+            let (proj_imgs, proj_vids) = tokio::try_join!(
+                self.project_images(&cover_images, policy, caller, signer),
+                self.project_videos(&cover_videos, policy, caller, signer),
+            )?;
+            let mut img_map: HashMap<i64, ProjectedImage> =
+                proj_imgs.into_iter().map(|im| (im.id(), im)).collect();
+            let mut vid_map: HashMap<i64, ProjectedVideo> =
+                proj_vids.into_iter().map(|v| (v.id(), v)).collect();
+            return Ok(covers
+                .into_iter()
+                .map(|c| {
+                    let cover_image = c.cover_image.and_then(|im| img_map.remove(&im.id));
+                    let cover_video = c.cover_video.and_then(|v| vid_map.remove(&v.id));
+                    let safe_title = c.title.clone();
+                    ProjectedPostGalleryCover {
+                        post_id: c.post_id,
+                        title: c.title,
+                        safe_title,
+                        title_displayable: true,
+                        has_hard_block: false,
+                        cover_image,
+                        cover_video,
+                        image_count: c.image_count,
+                        video_count: c.video_count,
+                    }
+                })
+                .collect());
+        }
+
+        let mut tx = safety::begin_repeatable_read_tx(&self.pool).await?;
+
+        // 1. Post titles + video counts + deterministic cover video (MIN(video_id)).
+        let post_rows = sqlx::query(
+            r#"
+            WITH target_posts AS (
+                SELECT p.id, p.title::TEXT AS title
+                FROM posts p
+                WHERE p.id = ANY($1::BIGINT[])
+            ),
+            vid_counts AS (
+                SELECT pv.post_id, COUNT(*)::BIGINT AS cnt
+                FROM post_videos pv
+                WHERE pv.post_id = ANY($1::BIGINT[])
+                GROUP BY pv.post_id
+            ),
+            vid_covers AS (
+                SELECT DISTINCT ON (pv.post_id)
+                    pv.post_id,
+                    v.id AS video_id,
+                    v.name::TEXT AS video_name,
+                    v.width AS video_width,
+                    v.height AS video_height,
+                    v.duration AS video_duration
+                FROM post_videos pv
+                JOIN videos v ON v.id = pv.video_id
+                WHERE pv.post_id = ANY($1::BIGINT[])
+                ORDER BY pv.post_id, v.id ASC
+            )
+            SELECT
+                tp.id AS post_id,
+                tp.title,
+                vcov.video_id,
+                vcov.video_name,
+                vcov.video_width,
+                vcov.video_height,
+                vcov.video_duration,
+                COALESCE(vc.cnt, 0) AS video_count
+            FROM target_posts tp
+            LEFT JOIN vid_covers vcov ON vcov.post_id = tp.id
+            LEFT JOIN vid_counts vc ON vc.post_id = tp.id
+            "#,
+        )
+        .bind(ids)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        struct RawPostMeta {
+            post_id: i64,
+            title: String,
+            cover_video: Option<Video>,
+            video_count: usize,
+        }
+
+        let mut post_metas = Vec::with_capacity(post_rows.len());
+        let mut raw_cover_videos = Vec::new();
+        for r in post_rows {
+            let post_id: i64 = r.try_get("post_id")?;
+            let title: String = r.try_get("title")?;
+            let video_id: Option<i64> = r.try_get("video_id")?;
+            let cover_video = match video_id {
+                Some(vid_id) => {
+                    let v = Video {
+                        id: vid_id,
+                        name: r.try_get("video_name")?,
+                        width: r.try_get("video_width")?,
+                        height: r.try_get("video_height")?,
+                        duration: r.try_get("video_duration")?,
+                    };
+                    raw_cover_videos.push(v.clone());
+                    Some(v)
+                }
+                None => None,
+            };
+            let video_count = r.try_get::<i64, _>("video_count")?.max(0) as usize;
+            post_metas.push(RawPostMeta {
+                post_id,
+                title,
+                cover_video,
+                video_count,
+            });
+        }
+
+        // 2. All `(post_id, image_id)` pairs sorted ascending per post for safe cover selection.
+        let pi_rows = sqlx::query(
+            r#"
+            SELECT pi.post_id, pi.image_id
+            FROM post_images pi
+            WHERE pi.post_id = ANY($1::BIGINT[])
+            ORDER BY pi.post_id ASC, pi.image_id ASC
+            "#,
+        )
+        .bind(ids)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut post_image_ids: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut unique_image_ids: std::collections::BTreeSet<i64> =
+            std::collections::BTreeSet::new();
+        for r in pi_rows {
+            let pid: i64 = r.try_get("post_id")?;
+            let iid: i64 = r.try_get("image_id")?;
+            post_image_ids.entry(pid).or_default().push(iid);
+            unique_image_ids.insert(iid);
+        }
+
+        // 3. Batch-load exact safety facts for all candidate images inside the same snapshot.
+        let all_image_ids: Vec<i64> = unique_image_ids.into_iter().collect();
+        let facts_map = if all_image_ids.is_empty() {
+            HashMap::new()
+        } else {
+            safety::load_image_facts_in_tx(&mut tx, &all_image_ids, policy).await?
+        };
+
+        // 4. Deterministically select each post's cover image in memory.
+        let mut selected_by_post: HashMap<i64, SelectedPostCover> =
+            HashMap::with_capacity(post_metas.len());
+        let mut chosen_cover_ids: std::collections::BTreeSet<i64> =
+            std::collections::BTreeSet::new();
+        for pm in &post_metas {
+            let img_ids = post_image_ids
+                .get(&pm.post_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let sel = policy.select_post_cover_image(img_ids, &facts_map, caller);
+            if let Some(cid) = sel.image_id {
+                chosen_cover_ids.insert(cid);
+            }
+            selected_by_post.insert(pm.post_id, sel);
+        }
+
+        // 5. Fetch display metadata (`name, width, height`) ONLY for the <= N selected covers.
+        let chosen_vec: Vec<i64> = chosen_cover_ids.into_iter().collect();
+        let mut cover_img_meta: HashMap<i64, Image> = HashMap::with_capacity(chosen_vec.len());
+        if !chosen_vec.is_empty() {
+            let img_rows = sqlx::query(
+                r#"
+                SELECT id, name::TEXT AS name, width, height
+                FROM images
+                WHERE id = ANY($1::BIGINT[])
+                "#,
+            )
+            .bind(&chosen_vec)
+            .fetch_all(&mut *tx)
+            .await?;
+            for r in img_rows {
+                let id: i64 = r.try_get("id")?;
+                cover_img_meta.insert(
+                    id,
+                    Image {
+                        id,
+                        name: r.try_get("name")?,
+                        width: r.try_get("width")?,
+                        height: r.try_get("height")?,
+                    },
+                );
+            }
+        }
+
+        tx.commit().await?;
+
+        // 6. Project cover videos (inherits sibling-image safety across parent posts).
+        let proj_vids = self
+            .project_videos(&raw_cover_videos, policy, caller, signer)
+            .await?;
+        let mut proj_vid_map: HashMap<i64, ProjectedVideo> =
+            proj_vids.into_iter().map(|v| (v.id(), v)).collect();
+
+        // 7. Assemble final projected covers & safe titles.
+        let mut out = Vec::with_capacity(post_metas.len());
+        for pm in post_metas {
+            let image_count = post_image_ids.get(&pm.post_id).map_or(0, Vec::len);
+            let sel = selected_by_post
+                .remove(&pm.post_id)
+                .unwrap_or(SelectedPostCover {
+                    image_id: None,
+                    outcome: None,
+                    has_hard_block: false,
+                    title_displayable: false,
+                });
+            let cover_image = match (sel.image_id, sel.outcome) {
+                (Some(cid), Some(outcome)) => cover_img_meta
+                    .get(&cid)
+                    .map(|img| policy.project_image(img, outcome, caller, signer)),
+                _ => None,
+            };
+            let cover_video = pm.cover_video.and_then(|v| proj_vid_map.remove(&v.id));
+
+            let title_displayable = if sel.has_hard_block {
+                false
+            } else if sel.title_displayable {
+                true
+            } else if let Some(ref cv) = cover_video {
+                cv.is_bypassable_or_clear()
+            } else {
+                false
+            };
+            let safe_title = if title_displayable {
+                pm.title.clone()
+            } else {
+                format!("Restricted Post #{}", pm.post_id)
+            };
+
+            out.push(ProjectedPostGalleryCover {
+                post_id: pm.post_id,
+                title: pm.title,
+                safe_title,
+                title_displayable,
+                has_hard_block: sel.has_hard_block,
+                cover_image,
+                cover_video,
+                image_count,
+                video_count: pm.video_count,
+            });
+        }
+
+        Ok(out)
+    }
+
     /// Batch-fetch post titles, deterministic cover image (`MIN(image_id)`),
     /// deterministic cover video (`MIN(video_id)`), and media counts in one query.
     pub async fn post_gallery_covers_by_ids(
@@ -2373,21 +2687,37 @@ impl Engine {
         &self,
         policy: &CompiledPolicy,
     ) -> anyhow::Result<i64> {
-        if !policy.is_enabled() {
-            return self.sitemap_post_count().await;
-        }
-        let mut qb = QueryBuilder::<Postgres>::new(
-            "WITH covers AS (SELECT DISTINCT ON (pi.post_id) pi.post_id, pi.image_id FROM post_images pi ORDER BY pi.post_id, pi.image_id ASC) SELECT COUNT(*)::BIGINT FROM covers c JOIN images i ON i.id = c.image_id WHERE TRUE",
-        );
-        if policy.policy.legal.noindex_restricted {
-            let anon = CallerContext::anonymous();
-            policy.push_caller_allowed_image_sql(&mut qb, &anon, "i");
+        let cache_key = if policy.is_enabled() {
+            policy.digest.clone()
         } else {
-            policy.push_indexable_image_sql(&mut qb, "i");
-        }
-        let row = qb.build().fetch_one(&self.pool).await?;
-        let count: i64 = row.try_get(0)?;
-        Ok(count)
+            "disabled".to_string()
+        };
+        let pool = self.pool.clone();
+        let policy = policy.clone();
+        self.sitemap_count_cache
+            .try_get_with(cache_key, async move {
+                if !policy.is_enabled() {
+                    let count: i64 = sqlx::query_scalar(
+                        r#"
+                        SELECT COUNT(*)::BIGINT
+                        FROM posts p
+                        WHERE EXISTS (SELECT 1 FROM post_images pi WHERE pi.post_id = p.id)
+                        "#,
+                    )
+                    .fetch_one(&pool)
+                    .await?;
+                    return Ok::<i64, anyhow::Error>(count);
+                }
+                let mut tx = safety::begin_repeatable_read_tx(&pool).await?;
+                tx.execute(SITEMAP_STATEMENT_TIMEOUT_SQL).await?;
+                let mut qb = policy.build_sitemap_count_query();
+                let row = qb.build().fetch_one(&mut *tx).await?;
+                tx.commit().await?;
+                let count: i64 = row.try_get(0)?;
+                Ok(count)
+            })
+            .await
+            .map_err(|e| anyhow!("{e}"))
     }
 
     /// Return a page of canonical post cover image IDs + UTC `YYYY-MM-DD` dates
@@ -2447,34 +2777,70 @@ impl Engine {
         if limit <= 0 || offset < 0 {
             return Ok(Vec::new());
         }
-        if !policy.is_enabled() {
-            return self.sitemap_post_entries(limit, offset).await;
-        }
-        let mut qb = QueryBuilder::<Postgres>::new(
-            "WITH covers AS (SELECT DISTINCT ON (pi.post_id) pi.post_id, pi.image_id FROM post_images pi ORDER BY pi.post_id, pi.image_id ASC) SELECT c.image_id AS cover_id, to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS lastmod FROM covers c JOIN posts p ON p.id = c.post_id JOIN images i ON i.id = c.image_id WHERE TRUE",
+        let cache_key = (
+            if policy.is_enabled() {
+                policy.digest.clone()
+            } else {
+                "disabled".to_string()
+            },
+            limit,
+            offset,
         );
-        if policy.policy.legal.noindex_restricted {
-            let anon = CallerContext::anonymous();
-            policy.push_caller_allowed_image_sql(&mut qb, &anon, "i");
-        } else {
-            policy.push_indexable_image_sql(&mut qb, "i");
-        }
-        qb.push(" ORDER BY p.id DESC LIMIT ");
-        qb.push_bind(limit);
-        qb.push(" OFFSET ");
-        qb.push_bind(offset);
+        let pool = self.pool.clone();
+        let policy = policy.clone();
+        self.sitemap_entries_cache
+            .try_get_with(cache_key, async move {
+                if !policy.is_enabled() {
+                    let rows = sqlx::query(
+                        r#"
+                        SELECT
+                            (SELECT pi.image_id
+                             FROM post_images pi
+                             WHERE pi.post_id = p.id
+                             ORDER BY pi.image_id ASC
+                             LIMIT 1) AS cover_id,
+                            to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS lastmod
+                        FROM posts p
+                        WHERE EXISTS (SELECT 1 FROM post_images pi WHERE pi.post_id = p.id)
+                        ORDER BY p.id DESC
+                        LIMIT $1 OFFSET $2
+                        "#,
+                    )
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(&pool)
+                    .await?;
+                    let mut out = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        if let Some(cover_image_id) = row.try_get::<Option<i64>, _>("cover_id")? {
+                            let lastmod: Option<String> = row.try_get("lastmod")?;
+                            out.push(SitemapPostEntry {
+                                cover_image_id,
+                                lastmod,
+                            });
+                        }
+                    }
+                    return Ok::<Vec<SitemapPostEntry>, anyhow::Error>(out);
+                }
 
-        let rows = qb.build().fetch_all(&self.pool).await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let cover_image_id: i64 = row.try_get("cover_id")?;
-            let lastmod: Option<String> = row.try_get("lastmod")?;
-            out.push(SitemapPostEntry {
-                cover_image_id,
-                lastmod,
-            });
-        }
-        Ok(out)
+                let mut tx = safety::begin_repeatable_read_tx(&pool).await?;
+                tx.execute(SITEMAP_STATEMENT_TIMEOUT_SQL).await?;
+                let mut qb = policy.build_sitemap_entries_query(limit, offset);
+                let rows = qb.build().fetch_all(&mut *tx).await?;
+                tx.commit().await?;
+                let mut out = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let cover_image_id: i64 = row.try_get("cover_id")?;
+                    let lastmod: Option<String> = row.try_get("lastmod")?;
+                    out.push(SitemapPostEntry {
+                        cover_image_id,
+                        lastmod,
+                    });
+                }
+                Ok(out)
+            })
+            .await
+            .map_err(|e| anyhow!("{e}"))
     }
 }
 
