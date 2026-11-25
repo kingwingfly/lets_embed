@@ -264,6 +264,8 @@ pub struct MeResp {
     pub window_reset: u64,
     pub banned: bool,
     pub total_views: i64,
+    #[serde(default)]
+    pub allow_paid_media: bool,
     pub user_id: String,
     pub account_do_key: String,
     pub display_name: Option<String>,
@@ -419,6 +421,11 @@ pub struct PreferencesResp {
     pub switcher_statuses: Vec<SwitcherEligibility>,
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct BillingPreferencesResp {
+    pub allow_paid_media: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]

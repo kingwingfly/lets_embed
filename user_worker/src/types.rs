@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 //   POST /subscribe     SubscribeReq -> 200 StatusResp | 400 | 402
 //   POST /unsubscribe             -> 200 StatusResp
 //   POST /ban           BanReq    -> 200 StatusResp
+//   POST /billing-prefs BillingPrefsReq -> 200 BillingPrefsResp
 // ---------------------------------------------------------------------------
 
 pub use site_access::{ChargeKind, ChargeReq, HoldReq, HoldResp};
@@ -98,6 +99,10 @@ pub struct StatusResp {
     pub window_reset: u64,
     pub banned: bool,
     pub total_views: i64,
+    /// Opt-in flag: only when `true` may billable image/video loads deduct from
+    /// the PAYG points balance after daily free quota & plan windows run out.
+    #[serde(default)]
+    pub allow_paid_media: bool,
 }
 
 // ---------------------------------------------------------------------------

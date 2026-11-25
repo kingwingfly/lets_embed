@@ -440,6 +440,7 @@ struct MeResp {
     window_reset: u64,
     banned: bool,
     total_views: i64,
+    allow_paid_media: bool,
     // Unified multi-auth + safety fields
     user_id: String,
     account_do_key: String,
@@ -600,6 +601,7 @@ pub async fn me(State(st): State<AppState>, headers: HeaderMap, cookies: Cookies
             window_reset: status.window_reset,
             banned: status.banned,
             total_views: status.total_views,
+            allow_paid_media: status.allow_paid_media,
             user_id: active.user_id,
             account_do_key: active.do_key,
             display_name: account.as_ref().and_then(|a| a.display_name.clone()),

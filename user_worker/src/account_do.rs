@@ -14,9 +14,10 @@ use crate::types::{
 use crate::{
     config,
     do_client::{
-        AgeConfirmReq, DoPrefsConflictResp, PrefsUpdateReq, PreviewBudgetReq, PreviewBudgetResp,
-        SessionContextReq, SessionInfoResp, SessionIssueReq, SessionIssueResp,
-        SessionRevokeAllReq, SessionRevokeAllResp, SessionRevokeReq, TermsAcceptReq,
+        AgeConfirmReq, BillingPrefsReq, BillingPrefsResp, DoPrefsConflictResp, PrefsUpdateReq,
+        PreviewBudgetReq, PreviewBudgetResp, SessionContextReq, SessionInfoResp, SessionIssueReq,
+        SessionIssueResp, SessionRevokeAllReq, SessionRevokeAllResp, SessionRevokeReq,
+        TermsAcceptReq,
     },
     identity::{assurance_from_str, assurance_to_str},
     settings::{self, Policy},
@@ -65,6 +66,7 @@ enum ChargeSource {
 /// Pure (plain values + caller-provided window counters) so it is host-testable.
 /// `win_views` / `win_search` are the counters for the *current* (already rolled)
 /// window.
+#[allow(clippy::too_many_arguments)]
 fn decide_charge(
     plan: Option<&config::Plan>,
     active: bool,
@@ -73,6 +75,7 @@ fn decide_charge(
     win_search: i64,
     balance: i64,
     cost: i64,
+    allow_paid_media: bool,
 ) -> ChargeSource {
     if active && let Some(plan) = plan {
         match kind {
@@ -97,7 +100,10 @@ fn decide_charge(
         }
     }
     // No plan, or the window quota is exhausted: fall back to PAYG.
-    if balance >= cost {
+    // Loading images & videos using PAYG credits requires explicit opt-in (`allow_paid_media`).
+    let paid_media_blocked =
+        !allow_paid_media && matches!(kind, ChargeKind::Image | ChargeKind::Video);
+    if !paid_media_blocked && balance >= cost {
         ChargeSource::Balance
     } else {
         ChargeSource::Refuse
@@ -558,6 +564,9 @@ impl DurableObject for UserAccount {
             }
             (Method::Post, "/prefs-update") => {
                 return self.prefs_update(req.json().await?).await;
+            }
+            (Method::Post, "/billing-prefs") => {
+                return self.billing_prefs(req.json().await?).await;
             }
             (Method::Post, "/terms-accept") => {
                 return self.terms_accept(req.json().await?);
@@ -1472,6 +1481,19 @@ impl UserAccount {
         ))
     }
 
+    async fn billing_prefs(&self, req: BillingPrefsReq) -> Result<Response> {
+        self.state
+            .storage()
+            .put("allow_paid_media", req.allow_paid_media)
+            .await?;
+        json(
+            &BillingPrefsResp {
+                allow_paid_media: req.allow_paid_media,
+            },
+            200,
+        )
+    }
+
     async fn status_resp(&self, policy: &Policy) -> Result<StatusResp> {
         let now = now_secs();
         let _ = self.reclaim_expired_holds(now as i64, false).await;
@@ -1491,6 +1513,7 @@ impl UserAccount {
             window_reset,
             banned: self.get_or("banned", false).await?,
             total_views: self.get_or("total_views", 0).await?,
+            allow_paid_media: self.get_or("allow_paid_media", false).await?,
         })
     }
 
@@ -1582,6 +1605,7 @@ impl UserAccount {
             let mut win_start: Option<u64> = storage.get("win_start").await?;
             let mut win_views: i64 = self.get_or("win_views", 0).await?;
             let mut win_search: i64 = self.get_or("win_search", 0).await?;
+            let allow_paid_media: bool = self.get_or("allow_paid_media", false).await?;
             let mut window_dirty = false;
             if active && should_roll(win_start, now) {
                 win_start = Some(now);
@@ -1604,6 +1628,7 @@ impl UserAccount {
                     win_search,
                     balance,
                     cost,
+                    allow_paid_media,
                 )
             };
             // Force-reclaim expired holds once before falling back to a costlier funding
@@ -1762,6 +1787,7 @@ impl UserAccount {
             let mut win_start: Option<u64> = storage.get("win_start").await?;
             let mut win_views: i64 = self.get_or("win_views", 0).await?;
             let mut win_search: i64 = self.get_or("win_search", 0).await?;
+            let allow_paid_media: bool = self.get_or("allow_paid_media", false).await?;
             let mut window_dirty = false;
             if active && should_roll(win_start, now) {
                 win_start = Some(now);
@@ -1771,7 +1797,8 @@ impl UserAccount {
             }
 
             // Re-check synchronously right before charging in case a sibling request created
-            // a hold while we awaited KV reads.
+            // a hold while we awaited KV reads. Everything from here through `eval_free_item`
+            // and `decide_charge` MUST stay synchronous (no `.await`) to preserve hold coalescing.
             if let Some(parent_hold_id) =
                 Self::find_in_flight_hold(&holds_db, false, req.kind.name(), &req.path, cutoff)?
             {
@@ -1808,6 +1835,7 @@ impl UserAccount {
                     win_search,
                     balance,
                     cost,
+                    allow_paid_media,
                 )
             };
             // Force-reclaim expired holds once before falling back to a costlier funding
@@ -3201,12 +3229,21 @@ mod tests {
     fn pro_media_views_are_free_unlimited() {
         let c = view_cost(ChargeKind::Image);
         assert_eq!(
-            decide_charge(Some(pro()), true, ChargeKind::Image, 0, 0, 0, c),
+            decide_charge(Some(pro()), true, ChargeKind::Image, 0, 0, 0, c, false),
             ChargeSource::FreeUnlimited
         );
-        // still free with a huge accumulated count and zero balance
+        // still free with a huge accumulated count and zero balance (even with paid media toggle OFF)
         assert_eq!(
-            decide_charge(Some(pro()), true, ChargeKind::Video, 1_000_000, 0, 0, c),
+            decide_charge(
+                Some(pro()),
+                true,
+                ChargeKind::Video,
+                1_000_000,
+                0,
+                0,
+                c,
+                false
+            ),
             ChargeSource::FreeUnlimited
         );
     }
@@ -3215,13 +3252,22 @@ mod tests {
     fn basic_media_within_window_consumes_quota() {
         let c = view_cost(ChargeKind::Image);
         assert_eq!(
-            decide_charge(Some(basic()), true, ChargeKind::Image, 0, 0, 0, c),
+            decide_charge(Some(basic()), true, ChargeKind::Image, 0, 0, 0, c, false),
             ChargeSource::Window
         );
-        // exactly at the limit boundary (limit - cost) still fits
+        // exactly at the limit boundary (limit - cost) still fits even with paid media toggle OFF
         let limit = basic().views_per_window.unwrap();
         assert_eq!(
-            decide_charge(Some(basic()), true, ChargeKind::Image, limit - c, 0, 0, c),
+            decide_charge(
+                Some(basic()),
+                true,
+                ChargeKind::Image,
+                limit - c,
+                0,
+                0,
+                c,
+                false
+            ),
             ChargeSource::Window
         );
     }
@@ -3230,14 +3276,46 @@ mod tests {
     fn basic_media_exhausted_falls_back_to_balance_then_refuses() {
         let c = view_cost(ChargeKind::Video);
         let limit = basic().views_per_window.unwrap();
-        // window full: fall back to PAYG when the balance covers it
+        // window full + paid media toggle OFF: refuse even with ample balance
         assert_eq!(
-            decide_charge(Some(basic()), true, ChargeKind::Video, limit, 0, 100, c),
+            decide_charge(
+                Some(basic()),
+                true,
+                ChargeKind::Video,
+                limit,
+                0,
+                100,
+                c,
+                false
+            ),
+            ChargeSource::Refuse
+        );
+        // window full + paid media toggle ON: fall back to PAYG when the balance covers it
+        assert_eq!(
+            decide_charge(
+                Some(basic()),
+                true,
+                ChargeKind::Video,
+                limit,
+                0,
+                100,
+                c,
+                true
+            ),
             ChargeSource::Balance
         );
-        // window full AND broke: refuse
+        // window full AND broke: refuse even when toggle ON
         assert_eq!(
-            decide_charge(Some(basic()), true, ChargeKind::Video, limit, 0, c - 1, c),
+            decide_charge(
+                Some(basic()),
+                true,
+                ChargeKind::Video,
+                limit,
+                0,
+                c - 1,
+                c,
+                true
+            ),
             ChargeSource::Refuse
         );
     }
@@ -3247,20 +3325,47 @@ mod tests {
         let c = view_cost(ChargeKind::Search);
         let limit = basic().searches_per_window;
         assert_eq!(
-            decide_charge(Some(basic()), true, ChargeKind::Search, 0, 0, 0, c),
+            decide_charge(Some(basic()), true, ChargeKind::Search, 0, 0, 0, c, false),
             ChargeSource::Window
         );
         assert_eq!(
-            decide_charge(Some(basic()), true, ChargeKind::Search, 0, limit - 1, 0, c),
+            decide_charge(
+                Some(basic()),
+                true,
+                ChargeKind::Search,
+                0,
+                limit - 1,
+                0,
+                c,
+                false
+            ),
             ChargeSource::Window
         );
         // window searches exhausted: PAYG if funded, else refuse
         assert_eq!(
-            decide_charge(Some(basic()), true, ChargeKind::Search, 0, limit, c, c),
+            decide_charge(
+                Some(basic()),
+                true,
+                ChargeKind::Search,
+                0,
+                limit,
+                c,
+                c,
+                false
+            ),
             ChargeSource::Balance
         );
         assert_eq!(
-            decide_charge(Some(basic()), true, ChargeKind::Search, 0, limit, c - 1, c),
+            decide_charge(
+                Some(basic()),
+                true,
+                ChargeKind::Search,
+                0,
+                limit,
+                c - 1,
+                c,
+                false
+            ),
             ChargeSource::Refuse
         );
     }
@@ -3280,7 +3385,8 @@ mod tests {
                 0,
                 pro().searches_per_window,
                 0,
-                c
+                c,
+                false
             ),
             ChargeSource::FreeUnlimited
         );
@@ -3294,7 +3400,8 @@ mod tests {
                 vlimit - c,
                 basic().searches_per_window,
                 0,
-                c
+                c,
+                false
             ),
             ChargeSource::Window
         );
@@ -3307,7 +3414,8 @@ mod tests {
                 vlimit,
                 0,
                 c,
-                c
+                c,
+                false
             ),
             ChargeSource::Balance
         );
@@ -3323,19 +3431,48 @@ mod tests {
         ] {
             let c = view_cost(kind);
             assert_eq!(
-                decide_charge(None, false, kind, 0, 0, c, c),
+                decide_charge(None, false, kind, 0, 0, c, c, true),
                 ChargeSource::Balance
             );
             assert_eq!(
-                decide_charge(None, false, kind, 0, 0, c - 1, c),
+                decide_charge(None, false, kind, 0, 0, c - 1, c, true),
                 ChargeSource::Refuse
             );
         }
-        // an inactive plan behaves like no plan
+        // an inactive plan behaves like no plan (when paid media opt-in is enabled)
         assert_eq!(
-            decide_charge(Some(basic()), false, ChargeKind::Image, 0, 0, 1, 1),
+            decide_charge(Some(basic()), false, ChargeKind::Image, 0, 0, 1, 1, true),
             ChargeSource::Balance
         );
+    }
+
+    #[test]
+    fn paid_media_toggle_gates_payg_image_and_video_loads() {
+        // OFF (default): images & videos MUST NOT deduct from balance after quota runs out
+        for kind in [ChargeKind::Image, ChargeKind::Video] {
+            let c = view_cost(kind);
+            assert_eq!(
+                decide_charge(None, false, kind, 0, 0, 10_000, c, false),
+                ChargeSource::Refuse
+            );
+            assert_eq!(
+                decide_charge(Some(basic()), false, kind, 0, 0, 10_000, c, false),
+                ChargeSource::Refuse
+            );
+            // ON: images & videos spend credits from balance when sufficient
+            assert_eq!(
+                decide_charge(None, false, kind, 0, 0, 10_000, c, true),
+                ChargeSource::Balance
+            );
+        }
+        // Explicit searches still draw from balance when funded regardless of media toggle
+        for kind in [ChargeKind::Search, ChargeKind::Description] {
+            let c = view_cost(kind);
+            assert_eq!(
+                decide_charge(None, false, kind, 0, 0, 10_000, c, false),
+                ChargeSource::Balance
+            );
+        }
     }
 
     #[test]

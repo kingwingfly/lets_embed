@@ -372,6 +372,10 @@ async fn router(env: Env, _ctx: Context) -> Result<Router> {
         .route("/user/api/policy", get(safety_api::get_policy))
         .route("/user/api/bootstrap", get(safety_api::bootstrap))
         .route("/user/api/preferences", post(safety_api::update_preferences))
+        .route(
+            "/user/api/billing-preferences",
+            post(safety_api::update_billing_preferences),
+        )
         .route("/user/api/accept_terms", post(safety_api::accept_terms))
         .route("/user/api/age-confirm", post(safety_api::confirm_age))
         .route("/user/api/reports", post(safety_api::create_report))
