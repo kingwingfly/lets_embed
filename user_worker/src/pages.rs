@@ -42,7 +42,8 @@ const FALLBACK_SPA_HTML: &str = r#"<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow">
-  <title>Account — Gallery</title>
+  <title>Account — Let’s Embed</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>💠</text></svg>">
   <script src="/user/assets/wallet-bridge.js" defer></script>
   <script type="module" src="/user/assets/boot.js"></script>
 </head>

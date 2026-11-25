@@ -291,15 +291,34 @@
     const cleanBot = typeof botUsername === "string" ? botUsername.trim().replace(/^@+/, "") : "";
     if (!el || !cleanBot || !authUrl) return;
     el.innerHTML = "";
+    el.dataset.tgState = "loading";
     const script = document.createElement("script");
     script.async = true;
     script.src = "https://telegram.org/js/telegram-widget.js?22";
     script.setAttribute("data-telegram-login", cleanBot);
     script.setAttribute("data-size", "large");
-    script.setAttribute("data-radius", "10");
+    script.setAttribute("data-radius", "12");
     // Use redirect callback (`data-auth-url`) instead of `data-onauth` so strict CSP
     // without 'unsafe-eval' never blocks Telegram login.
     script.setAttribute("data-auth-url", authUrl);
+    script.onerror = function () {
+      if (!el.querySelector("iframe")) {
+        el.dataset.tgState = "unavailable";
+      }
+    };
+    const obs = new MutationObserver(function () {
+      if (el.querySelector("iframe")) {
+        el.dataset.tgState = "ready";
+        obs.disconnect();
+      }
+    });
+    obs.observe(el, { childList: true, subtree: true });
+    setTimeout(function () {
+      if (!el.querySelector("iframe") && el.dataset.tgState === "loading") {
+        el.dataset.tgState = "unavailable";
+        obs.disconnect();
+      }
+    }, 6000);
     el.appendChild(script);
   }
 
