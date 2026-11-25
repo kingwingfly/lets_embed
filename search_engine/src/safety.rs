@@ -857,7 +857,11 @@ impl CompiledPolicy {
                     PolicyAction::Block => agg.add_block(item),
                     PolicyAction::Blur => agg.add_blur(item),
                 },
-                TriBool::Unknown => agg.add_unknown(item),
+                TriBool::Unknown => {
+                    if self.policy.unclassified_mode == UnclassifiedMode::Placeholder {
+                        agg.add_unknown(item);
+                    }
+                }
                 TriBool::False => {}
             }
         }
@@ -1261,11 +1265,13 @@ impl CompiledPolicy {
             emitted = true;
         }
 
+        let allow_unknown = self.policy.unclassified_mode == UnclassifiedMode::Continue;
         let expected_vocab = self.policy.vocab_digest.as_str();
         for item in &self.policies {
             let has_grant = caller.has_direct_grant(&item.policy_ref);
-            if has_grant && !item.references_wd_tags {
-                // Directly granted policy with purely 2-valued predicates can never be Unknown.
+            if has_grant && (!item.references_wd_tags || allow_unknown) {
+                // Directly granted policy with purely 2-valued predicates (or under
+                // UnclassifiedMode::Continue) never blocks on Unknown.
                 continue;
             }
             if has_grant {
@@ -1273,9 +1279,9 @@ impl CompiledPolicy {
                 qb.push(" AND ");
                 push_policy_not_unknown_sql(qb, item, img_alias, expected_vocab);
             } else {
-                // Unsatisfied Block OR Blur policy MUST evaluate strictly to FALSE across all contexts.
+                // Unsatisfied Block OR Blur policy MUST evaluate strictly to FALSE (or NOT TRUE under Continue).
                 qb.push(" AND ");
-                push_policy_strictly_false_sql(qb, item, img_alias, expected_vocab);
+                push_policy_strictly_false_sql(qb, item, img_alias, expected_vocab, allow_unknown);
             }
             emitted = true;
         }
@@ -1308,17 +1314,19 @@ impl CompiledPolicy {
             emitted = true;
         }
 
+        let allow_unknown = self.policy.unclassified_mode == UnclassifiedMode::Continue;
         let expected_vocab = self.policy.vocab_digest.as_str();
         for item in &self.policies {
             let bypassable = policy_has_user_unlock_path(item, &self.policy);
             if !bypassable {
-                // Non-bypassable policy (zero user unlock path) MUST evaluate strictly to FALSE.
+                // Non-bypassable policy (zero user unlock path) MUST evaluate strictly to FALSE
+                // (or NOT TRUE when UnclassifiedMode::Continue waives indeterminate coverage).
                 qb.push(" AND ");
-                push_policy_strictly_false_sql(qb, item, img_alias, expected_vocab);
+                push_policy_strictly_false_sql(qb, item, img_alias, expected_vocab, allow_unknown);
                 emitted = true;
-            } else if item.references_wd_tags {
+            } else if item.references_wd_tags && !allow_unknown {
                 // Bypassable WD-tag policy may match (TRUE) or not match (FALSE),
-                // but indeterminate coverage (NULL / Unknown) still fails closed.
+                // but indeterminate coverage (NULL / Unknown) fails closed under Placeholder mode.
                 qb.push(" AND ");
                 push_policy_not_unknown_sql(qb, item, img_alias, expected_vocab);
                 emitted = true;
@@ -1337,8 +1345,13 @@ impl CompiledPolicy {
     pub fn build_sitemap_count_query(&self) -> QueryBuilder<Postgres> {
         let mut qb = QueryBuilder::<Postgres>::new("");
         let has_blocked_cte = self.push_sitemap_blocked_ctes(&mut qb);
+        let allow_unknown = self.policy.unclassified_mode == UnclassifiedMode::Continue;
         if has_blocked_cte {
-            qb.push(", covers AS (SELECT DISTINCT ON (pi.post_id) pi.post_id, pi.image_id FROM post_images pi ORDER BY pi.post_id, pi.image_id ASC) SELECT COUNT(*)::BIGINT FROM covers c JOIN images i ON i.id = c.image_id LEFT JOIN _sm_blocked_images _smb ON _smb.image_id = i.id WHERE _smb.image_id IS NULL");
+            if allow_unknown {
+                qb.push(", covers AS (SELECT DISTINCT ON (pi.post_id) pi.post_id, pi.image_id FROM post_images pi ORDER BY pi.post_id, pi.image_id ASC) SELECT COUNT(*)::BIGINT FROM covers c JOIN images i ON i.id = c.image_id LEFT JOIN _sm_blocked_images _smb ON _smb.image_id = i.id WHERE (_smb.image_id IS NULL OR i.status <> 'completed'::process_status)");
+            } else {
+                qb.push(", covers AS (SELECT DISTINCT ON (pi.post_id) pi.post_id, pi.image_id FROM post_images pi ORDER BY pi.post_id, pi.image_id ASC) SELECT COUNT(*)::BIGINT FROM covers c JOIN images i ON i.id = c.image_id LEFT JOIN _sm_blocked_images _smb ON _smb.image_id = i.id WHERE _smb.image_id IS NULL");
+            }
         } else {
             qb.push("WITH covers AS (SELECT DISTINCT ON (pi.post_id) pi.post_id, pi.image_id FROM post_images pi ORDER BY pi.post_id, pi.image_id ASC) SELECT COUNT(*)::BIGINT FROM covers c JOIN images i ON i.id = c.image_id WHERE TRUE");
         }
@@ -1355,6 +1368,7 @@ impl CompiledPolicy {
     ) -> QueryBuilder<Postgres> {
         let mut qb = QueryBuilder::<Postgres>::new("");
         let has_blocked_cte = self.push_sitemap_blocked_ctes(&mut qb);
+        let allow_unknown = self.policy.unclassified_mode == UnclassifiedMode::Continue;
         if has_blocked_cte {
             qb.push(" ");
         }
@@ -1362,7 +1376,11 @@ impl CompiledPolicy {
         // so `LIMIT`/`OFFSET` stops early without scanning & sorting all of `post_images`.
         qb.push("SELECT c.image_id AS cover_id, to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS lastmod FROM posts p CROSS JOIN LATERAL (SELECT pi.image_id FROM post_images pi WHERE pi.post_id = p.id ORDER BY pi.image_id ASC LIMIT 1) c JOIN images i ON i.id = c.image_id");
         if has_blocked_cte {
-            qb.push(" LEFT JOIN _sm_blocked_images _smb ON _smb.image_id = i.id WHERE _smb.image_id IS NULL");
+            if allow_unknown {
+                qb.push(" LEFT JOIN _sm_blocked_images _smb ON _smb.image_id = i.id WHERE (_smb.image_id IS NULL OR i.status <> 'completed'::process_status)");
+            } else {
+                qb.push(" LEFT JOIN _sm_blocked_images _smb ON _smb.image_id = i.id WHERE _smb.image_id IS NULL");
+            }
         } else {
             qb.push(" WHERE TRUE");
         }
@@ -1450,10 +1468,12 @@ impl CompiledPolicy {
     fn push_sitemap_where_clauses(&self, qb: &mut QueryBuilder<Postgres>) {
         let part = self.sitemap_policy_partition();
         let expected_vocab = self.policy.vocab_digest.as_str();
+        let allow_unknown = self.policy.unclassified_mode == UnclassifiedMode::Continue;
 
-        if self.policy.unclassified_mode == UnclassifiedMode::Placeholder
-            || !part.sf_pure_or.is_empty()
-            || !part.nn_pure_or.is_empty()
+        if !allow_unknown
+            && (self.policy.unclassified_mode == UnclassifiedMode::Placeholder
+                || !part.sf_pure_or.is_empty()
+                || !part.nn_pure_or.is_empty())
         {
             qb.push(" AND i.status = 'completed'::process_status");
         }
@@ -1461,7 +1481,9 @@ impl CompiledPolicy {
         // Single combined O(1) coverage short-circuit across ALL pure-OR WD-tag policies
         // (`blood`, `r18`, `sensitive`): backfilled completed images pass in nanoseconds
         // with ZERO per-row `wd_tag_images` lookups; legacy rows fall back to exact 3-valued checks.
-        if !part.sf_pure_or.is_empty() || !part.nn_pure_or.is_empty() {
+        // Under `UnclassifiedMode::Continue`, indeterminate coverage is allowed so only
+        // explicit `_sm_blocked_images` matches are excluded.
+        if !allow_unknown && (!part.sf_pure_or.is_empty() || !part.nn_pure_or.is_empty()) {
             let overall_min = part
                 .sf_pure_or
                 .iter()
@@ -1489,11 +1511,13 @@ impl CompiledPolicy {
 
         for item in part.sf_general {
             qb.push(" AND ");
-            push_policy_strictly_false_sql(qb, item, "i", expected_vocab);
+            push_policy_strictly_false_sql(qb, item, "i", expected_vocab, allow_unknown);
         }
-        for item in part.nn_general {
-            qb.push(" AND ");
-            push_policy_not_unknown_sql(qb, item, "i", expected_vocab);
+        if !allow_unknown {
+            for item in part.nn_general {
+                qb.push(" AND ");
+                push_policy_not_unknown_sql(qb, item, "i", expected_vocab);
+            }
         }
     }
 
@@ -1659,35 +1683,59 @@ fn push_policy_strictly_false_sql(
     item: &CompiledPolicyItem,
     img_alias: &'static str,
     expected_vocab_digest: &str,
+    allow_unknown: bool,
 ) {
     if let Some(wd_tags) = item.pure_or_wd_tags() {
         // Pure OR-of-WdTag set-based SQL: top-level `NOT EXISTS` lets Postgres plan a
         // single Hash Anti-Join on `wd_tag_images(wd_tag_id, image_id)` instead of
         // N*2 correlated `CASE WHEN EXISTS` SubPlans per row, while preserving exact
         // 3-valued Kleene semantics.
-        qb.push("(");
-        qb.push(img_alias);
-        qb.push(".status = 'completed'::process_status AND NOT ");
-        push_wd_tag_any_match_exists_sql(qb, img_alias, &wd_tags);
-        qb.push(" AND ");
-        push_wd_tag_all_covered_sql(qb, img_alias, &wd_tags, expected_vocab_digest);
-        qb.push(")");
+        if allow_unknown {
+            qb.push("(");
+            qb.push(img_alias);
+            qb.push(".status <> 'completed'::process_status OR NOT ");
+            push_wd_tag_any_match_exists_sql(qb, img_alias, &wd_tags);
+            qb.push(")");
+        } else {
+            qb.push("(");
+            qb.push(img_alias);
+            qb.push(".status = 'completed'::process_status AND NOT ");
+            push_wd_tag_any_match_exists_sql(qb, img_alias, &wd_tags);
+            qb.push(" AND ");
+            push_wd_tag_all_covered_sql(qb, img_alias, &wd_tags, expected_vocab_digest);
+            qb.push(")");
+        }
     } else if !item.uses_post_context {
         qb.push("((");
         item.push_policy_match_sql(qb, img_alias, None, expected_vocab_digest);
-        qb.push(") IS FALSE)");
+        qb.push(if allow_unknown {
+            ") IS NOT TRUE)"
+        } else {
+            ") IS FALSE)"
+        });
     } else {
-        // Multi-parent invariant: EVERY parent post must evaluate strictly to FALSE,
-        // AND if the image has zero parent posts, the orphan context must evaluate to FALSE.
+        // Multi-parent invariant: EVERY parent post must pass (FALSE, or NOT TRUE under Continue),
+        // AND if the image has zero parent posts, the orphan context must pass as well.
+        let fail_cmp = if allow_unknown {
+            ") IS TRUE))"
+        } else {
+            ") IS NOT FALSE))"
+        };
+        let pass_cmp = if allow_unknown {
+            ") IS NOT TRUE)))"
+        } else {
+            ") IS FALSE)))"
+        };
         qb.push("(NOT EXISTS (SELECT 1 FROM post_images pi WHERE pi.image_id = ");
         qb.push(img_alias);
         qb.push(".id AND ((");
         item.push_policy_match_sql(qb, img_alias, Some("pi.post_id"), expected_vocab_digest);
-        qb.push(") IS NOT FALSE)) AND (EXISTS (SELECT 1 FROM post_images pi WHERE pi.image_id = ");
+        qb.push(fail_cmp);
+        qb.push(" AND (EXISTS (SELECT 1 FROM post_images pi WHERE pi.image_id = ");
         qb.push(img_alias);
         qb.push(".id) OR ((");
         item.push_policy_match_sql(qb, img_alias, None, expected_vocab_digest);
-        qb.push(") IS FALSE)))");
+        qb.push(pass_cmp);
     }
 }
 
@@ -3187,9 +3235,66 @@ mod tests {
                 authors: HashSet::from(["bad_artist".into()]),
                 facts_rev: 2,
             }],
-            ..pending_safe_author
+            ..pending_safe_author.clone()
         };
         assert!(cont_compiled.evaluate_image(&pending_bad_author, &anon).is_placeholder());
+
+        // 6. UnclassifiedMode::Continue with WD-tag policies (`r18`, `sensitive`, `blood`) enabled:
+        //    - Pending image (`is_completed = false`) -> Clear (does NOT fail closed on Unknown WD tags!)
+        //    - Legacy completed image (`wd_min_persisted_score = None`) with no matching tags -> Clear
+        //    - Legacy completed image (`wd_min_persisted_score = None`) WITH explicit `explicit = 0.90` -> STILL Placeholder!
+        //    - Video-only post (0 images) -> Clear under Continue (vs Placeholder under Placeholder)
+        //    - Sitemap SQL under Continue does NOT force `i.status = 'completed'` while still excluding `_sm_blocked_images`.
+        let mut cont_wd_pol = PublicSitePolicy {
+            revision: 3,
+            min_enforce_rev: 1,
+            safety_enabled: true,
+            unclassified_mode: UnclassifiedMode::Continue,
+            age_policy: AgeVerificationPolicy::SelfAttestation,
+            policies: site_access::builtin_safety_presets(),
+            ..PublicSitePolicy::default()
+        };
+        cont_wd_pol.refresh_policy_digest();
+        let cont_wd = CompiledPolicy::compile(cont_wd_pol).unwrap();
+
+        assert!(
+            cont_wd.evaluate_image(&pending_safe_author, &anon).is_clear(),
+            "UnclassifiedMode::Continue must allow pending images even when WD-tag policies are enabled"
+        );
+        let legacy_clean = ImageFacts {
+            image_id: 4,
+            exists: true,
+            is_completed: true,
+            wd_min_persisted_score: None,
+            wd_vocab_digest: None,
+            ..ImageFacts::default()
+        };
+        assert!(cont_wd.evaluate_image(&legacy_clean, &anon).is_clear());
+
+        let legacy_explicit = ImageFacts {
+            wd_tag_scores: HashMap::from([("explicit".into(), 0.90)]),
+            ..legacy_clean
+        };
+        assert!(
+            cont_wd.evaluate_image(&legacy_explicit, &anon).is_placeholder(),
+            "explicitly matching WD tags must still enforce under UnclassifiedMode::Continue"
+        );
+
+        let video_only_posts = vec![ParentPostFacts {
+            post_id: 99,
+            post_facts_rev: 1,
+            images: Vec::new(),
+            post_tags: HashSet::new(),
+            authors: HashSet::new(),
+        }];
+        assert!(cont_wd.evaluate_video_posts(&video_only_posts, 1, &anon).is_clear());
+
+        let mut sm_qb = cont_wd.build_sitemap_count_query();
+        let sm_built = sm_qb.build();
+        let sm_sql = sm_built.sql();
+        assert!(sm_sql.as_str().contains("_sm_blocked_images AS MATERIALIZED"));
+        assert!(!sm_sql.as_str().contains("AND i.status = 'completed'"));
+        assert!(sm_sql.as_str().contains("OR i.status <> 'completed'::process_status"));
     }
 
     #[test]
