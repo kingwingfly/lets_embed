@@ -110,6 +110,15 @@ pub struct StatusResp {
     /// Epoch secs of the next UTC midnight when daily free counters reset.
     #[serde(default)]
     pub daily_free_reset: u64,
+    /// Whether this account has recorded 18+ self-attestation in DO `user_safety_state`.
+    #[serde(default)]
+    pub self_attested_18: bool,
+    /// Whether this account is suspended (e.g., drained & closed via account merge).
+    #[serde(default)]
+    pub suspended: bool,
+    /// Target `account_do_key` when this account was fused into another account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_into: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
