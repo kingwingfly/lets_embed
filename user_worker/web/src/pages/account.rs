@@ -120,6 +120,18 @@ fn format_accepted_badge(version: u32, accepted_at: Option<u64>) -> String {
     }
 }
 
+fn has_media_balance(data: &MeResp) -> bool {
+    let min_media_cost = data
+        .pricing
+        .items
+        .iter()
+        .filter(|it| matches!(it.kind.as_str(), "image" | "video") && it.price > 0)
+        .map(|it| it.price)
+        .min()
+        .unwrap_or(1);
+    data.balance >= min_media_cost
+}
+
 fn quota_exhausted_notice(data: &MeResp, deposit_open: Option<bool>) -> (&'static str, String) {
     let bal = api::format_points(data.balance);
     let deposit_note = if deposit_open == Some(false) {
@@ -129,8 +141,9 @@ fn quota_exhausted_notice(data: &MeResp, deposit_open: Option<bool>) -> (&'stati
     };
     let views_zero = data.views_remaining == Some(0);
     let searches_zero = data.searches_remaining == Some(0);
-    let media_credit_spend_blocked =
-        !data.allow_paid_media && data.balance > 0 && !(data.plan.is_some() && !views_zero && searches_zero);
+    let media_credit_spend_blocked = !data.allow_paid_media
+        && has_media_balance(data)
+        && !(data.plan.is_some() && !views_zero && searches_zero);
 
     if media_credit_spend_blocked {
         let reset_hint = if data.plan.is_some() {
@@ -377,19 +390,18 @@ pub fn AccountPage() -> impl IntoView {
                             m.allow_paid_media = enabled;
                         }
                     });
-                    api::broadcast_safety_invalidation("prefs_change");
                     if enabled {
-                        if arrived_for_quota.get_value() {
+                        let can_load_media = me.get_untracked().is_some_and(|m| has_media_balance(&m));
+                        if arrived_for_quota.get_value() && can_load_media {
                             quota_notice_dismissed.set(true);
                             api::clear_search_param("reason");
                         }
-                        toasts.success(
-                            "Paid media loading enabled",
-                            Some(
-                                "Images & videos beyond your daily free quota can now use your points balance."
-                                    .into(),
-                            ),
-                        );
+                        let detail = if can_load_media {
+                            "Images & videos beyond your daily free quota can now use your points balance."
+                        } else {
+                            "Top up points below to load images & videos beyond your daily free quota."
+                        };
+                        toasts.success("Paid media loading enabled", Some(detail.into()));
                     } else {
                         toasts.info(
                             "Paid media loading turned off",
@@ -1682,7 +1694,9 @@ pub fn AccountPage() -> impl IntoView {
                                         } else {
                                             ("OFF \u{00B7} Balance protected", "u-state-badge u-state-badge--off")
                                         };
-                                        let show_return_gallery = allow_paid && arrived_for_quota.get_value();
+                                        let show_return_gallery = allow_paid
+                                            && arrived_for_quota.get_value()
+                                            && has_media_balance(&data);
                                         view! {
                                             <div id="billing-prefs" class="u-billing-toggle-box">
                                                 <div class="u-policy-header">

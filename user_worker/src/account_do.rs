@@ -1605,6 +1605,7 @@ impl UserAccount {
             let mut win_start: Option<u64> = storage.get("win_start").await?;
             let mut win_views: i64 = self.get_or("win_views", 0).await?;
             let mut win_search: i64 = self.get_or("win_search", 0).await?;
+            let allow_paid_media: bool = self.get_or("allow_paid_media", false).await?;
             let mut window_dirty = false;
             if active && should_roll(win_start, now) {
                 win_start = Some(now);
@@ -1616,7 +1617,6 @@ impl UserAccount {
             let included = cost == 0
                 || (policy.free_media_in_scope(&req)
                     && self.free_item(&req, rule.daily_free, day, check_only)?);
-            let allow_paid_media: bool = self.get_or("allow_paid_media", false).await?;
             let source = if included {
                 ChargeSource::FreeUnlimited
             } else {
@@ -1787,6 +1787,7 @@ impl UserAccount {
             let mut win_start: Option<u64> = storage.get("win_start").await?;
             let mut win_views: i64 = self.get_or("win_views", 0).await?;
             let mut win_search: i64 = self.get_or("win_search", 0).await?;
+            let allow_paid_media: bool = self.get_or("allow_paid_media", false).await?;
             let mut window_dirty = false;
             if active && should_roll(win_start, now) {
                 win_start = Some(now);
@@ -1796,7 +1797,8 @@ impl UserAccount {
             }
 
             // Re-check synchronously right before charging in case a sibling request created
-            // a hold while we awaited KV reads.
+            // a hold while we awaited KV reads. Everything from here through `eval_free_item`
+            // and `decide_charge` MUST stay synchronous (no `.await`) to preserve hold coalescing.
             if let Some(parent_hold_id) =
                 Self::find_in_flight_hold(&holds_db, false, req.kind.name(), &req.path, cutoff)?
             {
@@ -1822,7 +1824,6 @@ impl UserAccount {
                 (false, Vec::new())
             };
 
-            let allow_paid_media: bool = self.get_or("allow_paid_media", false).await?;
             let source = if included {
                 ChargeSource::FreeUnlimited
             } else {
