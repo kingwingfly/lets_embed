@@ -184,6 +184,14 @@ pub struct DoStatusResp {
     pub window_reset: u64,
     pub banned: bool,
     pub total_views: i64,
+    #[serde(default)]
+    pub allow_paid_media: bool,
+    #[serde(default)]
+    pub self_attested_18: bool,
+    #[serde(default)]
+    pub suspended: bool,
+    #[serde(default)]
+    pub merged_into: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

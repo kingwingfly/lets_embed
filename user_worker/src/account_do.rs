@@ -1387,6 +1387,26 @@ impl UserAccount {
             .collect()
     }
 
+    /// Read whether this account has recorded 18+ self-attestation in `user_safety_state`.
+    /// Safely returns `false` if `user_safety_state` has not been created yet.
+    fn is_self_attested_18(&self) -> bool {
+        #[derive(serde::Deserialize)]
+        struct Row {
+            self_attested_18: i64,
+        }
+        let db = self.state.storage().sql();
+        let Ok(cursor) = db.exec(
+            "SELECT self_attested_18 FROM user_safety_state WHERE id = 1",
+            None,
+        ) else {
+            return false;
+        };
+        let Ok(rows) = cursor.to_array::<Row>() else {
+            return false;
+        };
+        rows.first().is_some_and(|r| r.self_attested_18 != 0)
+    }
+
     async fn guest(&self, req: GuestReq, policy: &Policy) -> Result<Response> {
         if policy.login_required {
             return Response::error("Login required", 401);
@@ -1689,6 +1709,9 @@ impl UserAccount {
             allow_paid_media: self.get_or("allow_paid_media", false).await?,
             daily_free_used: self.daily_free_usage(day),
             daily_free_reset: next_utc_day_reset(now),
+            self_attested_18: self.is_self_attested_18(),
+            suspended: self.get_or("suspended", false).await?,
+            merged_into: self.state.storage().get("merged_into").await?,
         })
     }
 

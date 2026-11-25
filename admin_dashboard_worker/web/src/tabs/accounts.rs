@@ -11,7 +11,8 @@ use wasm_bindgen_futures::spawn_local;
 use crate::api::{
     AccountEntryResp, AccountsListResp, AdminBanMutationReq, AdminBanMutationResp,
     AdminCreditMutationReq, AdminCreditMutationResp, AdminPlanMutationReq, AdminPlanMutationResp,
-    PaymentsListResp, format_ts_utc, get_json, post_json, url_encode_component,
+    DoStatusResp, IdentitySummary, PaymentsListResp, format_ts_utc, get_json, post_json,
+    url_encode_component,
 };
 
 fn assurance_badge_cls(level: &str) -> &'static str {
@@ -19,6 +20,68 @@ fn assurance_badge_cls(level: &str) -> &'static str {
         "verified_18" => "adm-badge adm-badge--ok",
         "provider_self_reported_dob" | "self_attestation" => "adm-badge adm-badge--warn",
         _ => "adm-badge",
+    }
+}
+
+fn identity_chip_text(id: &IdentitySummary) -> String {
+    if id.purpose == "payment" {
+        format!("{} (pay)", id.provider_id)
+    } else {
+        match id.assurance_level.as_str() {
+            "verified_18" => format!("{} (18+)", id.provider_id),
+            "provider_self_reported_dob" => format!("{} (DOB)", id.provider_id),
+            _ => id.provider_id.clone(),
+        }
+    }
+}
+
+fn account_age_badge(
+    identities: &[IdentitySummary],
+    live_status: Option<&DoStatusResp>,
+) -> (&'static str, &'static str) {
+    if identities
+        .iter()
+        .any(|id| id.purpose == "login" && id.assurance_level == "verified_18")
+    {
+        ("Verified 18+", "adm-badge adm-badge--ok")
+    } else if identities
+        .iter()
+        .any(|id| id.purpose == "login" && id.assurance_level == "provider_self_reported_dob")
+    {
+        ("DOB 18+", "adm-badge adm-badge--warn")
+    } else if live_status.is_some_and(|s| s.self_attested_18) {
+        ("Self-attested 18+", "adm-badge adm-badge--ok")
+    } else {
+        ("Unconfirmed", "adm-badge")
+    }
+}
+
+fn account_plan_label(plan: Option<&str>, live_status: Option<&DoStatusResp>) -> String {
+    match plan.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(p) => {
+            let mut chars = p.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => "Free".to_string(),
+            }
+        }
+        None if live_status.is_some_and(|s| s.allow_paid_media) => "PAYG".to_string(),
+        None => "Free".to_string(),
+    }
+}
+
+fn account_status_badge(
+    banned: bool,
+    live_status: Option<&DoStatusResp>,
+) -> (&'static str, &'static str) {
+    if banned {
+        ("Banned", "adm-badge adm-badge--err")
+    } else if live_status.is_some_and(|s| s.merged_into.is_some()) {
+        ("Merged", "adm-badge adm-badge--warn")
+    } else if live_status.is_some_and(|s| s.suspended) {
+        ("Suspended", "adm-badge adm-badge--warn")
+    } else {
+        ("Active", "adm-badge adm-badge--ok")
     }
 }
 
@@ -362,7 +425,18 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                                             .as_ref()
                                             .map(|s| format!("{} pts", s.balance))
                                             .unwrap_or_else(|| "—".to_string());
-                                        let plan_str = acc.plan.clone().unwrap_or_else(|| "PAYG".to_string());
+                                        let plan_str = account_plan_label(
+                                            acc.plan.as_deref(),
+                                            acc.live_status.as_ref(),
+                                        );
+                                        let (age_label, age_cls) = account_age_badge(
+                                            &acc.identities,
+                                            acc.live_status.as_ref(),
+                                        );
+                                        let (status_label, status_cls) = account_status_badge(
+                                            acc.banned,
+                                            acc.live_status.as_ref(),
+                                        );
                                         view! {
                                             <tr>
                                                 <td>
@@ -373,17 +447,16 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                                                     <div class="adm-chips">
                                                         {acc.identities.iter().map(|id| view! {
                                                             <span class=assurance_badge_cls(&id.assurance_level)>
-                                                                {format!("{} ({})", id.provider_id, id.assurance_level)}
+                                                                {identity_chip_text(id)}
                                                             </span>
                                                         }).collect_view()}
+                                                        <span class=age_cls>{age_label}</span>
                                                     </div>
                                                 </td>
                                                 <td><span class="adm-badge">{plan_str}</span></td>
                                                 <td class="adm-mono">{balance_str}</td>
                                                 <td>
-                                                    <span class=if acc.banned { "adm-badge adm-badge--err" } else { "adm-badge adm-badge--ok" }>
-                                                        {if acc.banned { "Banned" } else { "Active" }}
-                                                    </span>
+                                                    <span class=status_cls>{status_label}</span>
                                                 </td>
                                                 <td>{format_ts_utc(acc.last_login)}</td>
                                                 <td>
@@ -493,13 +566,30 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                                     }).collect_view()}
                                 </ul>
                                 <p class="adm-sub">
-                                    {format!(
-                                        "Terms accepted: {} · Likes: {} · Top-ups: {} ({} pts)",
-                                        acc.terms_version_accepted.map(|v| format!("v{v}")).unwrap_or_else(|| "Never".into()),
-                                        acc.like_count,
-                                        acc.topup_count,
-                                        acc.topup_points
-                                    )}
+                                    {
+                                        let (age_label, _) = account_age_badge(
+                                            &acc.identities,
+                                            acc.live_status.as_ref(),
+                                        );
+                                        let paid_media = acc
+                                            .live_status
+                                            .as_ref()
+                                            .map(|s| if s.allow_paid_media { "On" } else { "Off" })
+                                            .unwrap_or("—");
+                                        let merged_note = acc
+                                            .live_status
+                                            .as_ref()
+                                            .and_then(|s| s.merged_into.as_deref())
+                                            .map(|m| format!(" · Merged into: {m}"))
+                                            .unwrap_or_default();
+                                        format!(
+                                            "Age: {age_label} · Paid media: {paid_media} · Terms: {} · Likes: {} · Top-ups: {} ({} pts){merged_note}",
+                                            acc.terms_version_accepted.map(|v| format!("v{v}")).unwrap_or_else(|| "Never".into()),
+                                            acc.like_count,
+                                            acc.topup_count,
+                                            acc.topup_points
+                                        )
+                                    }
                                 </p>
                             </div>
 
