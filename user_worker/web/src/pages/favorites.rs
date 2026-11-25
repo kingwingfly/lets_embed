@@ -454,7 +454,7 @@ pub fn FavoritesPage() -> impl IntoView {
             let likes_resp = match api::get_json::<LikesResp>(&url).await {
                 Ok(r) => r,
                 Err(e) if e.status == 401 => {
-                    api::navigate_hard("/user/login?next=/user/favorites");
+                    api::navigate_hard("/user/login?next=/user/favorites&reason=session_expired");
                     return;
                 }
                 Err(e) => {

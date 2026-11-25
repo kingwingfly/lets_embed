@@ -805,7 +805,13 @@ pub(crate) fn login_response(uri: &Uri, method: &Method) -> Response {
         return private_no_store((StatusCode::UNAUTHORIZED, "Login required").into_response());
     }
     let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    private_no_store(Redirect::to(&format!("/user/login?next={}", encode_next(pq))).into_response())
+    private_no_store(
+        Redirect::to(&format!(
+            "/user/login?next={}&reason=login_required",
+            encode_next(pq)
+        ))
+        .into_response(),
+    )
 }
 
 pub(crate) fn payment_required(headers: &HeaderMap, guest: bool) -> Response {
@@ -837,12 +843,17 @@ pub(crate) fn payment_required(headers: &HeaderMap, guest: bool) -> Response {
             })
     };
     let response = if navigation {
-        Redirect::to(UPGRADE_PATH).into_response()
+        let target = if guest {
+            format!("{UPGRADE_PATH}?reason=free_limit")
+        } else {
+            format!("{UPGRADE_PATH}?reason=quota")
+        };
+        Redirect::to(&target).into_response()
     } else {
         let reason = if guest {
-            "Free access does not cover this item"
+            "Daily free allowance reached — sign in to continue"
         } else {
-            "out of points"
+            "Out of points or quota — top up or wait for window reset"
         };
         (
             StatusCode::PAYMENT_REQUIRED,

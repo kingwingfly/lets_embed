@@ -854,6 +854,120 @@ a:hover { text-decoration: underline; }
   background: rgba(255, 255, 255, 0.96);
 }
 
+/* Contextual redirect / limit callout banner on /user/login & /user/upgrade */
+.u-login-callout {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  width: 100%;
+  padding: 15px 17px;
+  border-radius: 18px;
+  border: 1px solid rgba(14, 165, 233, 0.26);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 12px 28px -12px rgba(12, 74, 110, 0.14);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+.u-login-callout--warn {
+  border-color: rgba(217, 119, 6, 0.38);
+  background: linear-gradient(135deg, rgba(255, 251, 235, 0.96) 0%, rgba(254, 243, 199, 0.9) 100%);
+  color: #78350f;
+}
+
+.u-login-callout--info {
+  border-color: rgba(2, 132, 199, 0.3);
+  background: linear-gradient(135deg, rgba(240, 249, 255, 0.96) 0%, rgba(224, 242, 254, 0.9) 100%);
+  color: #0c4a6e;
+}
+
+.u-login-callout-icon {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 11px;
+  display: grid;
+  place-items: center;
+  margin-top: 1px;
+}
+
+.u-login-callout--warn .u-login-callout-icon {
+  background: rgba(217, 119, 6, 0.15);
+  color: #b45309;
+}
+
+.u-login-callout--info .u-login-callout-icon {
+  background: rgba(2, 132, 199, 0.14);
+  color: #0284c7;
+}
+
+.u-login-callout-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.u-login-callout-title {
+  font-size: 0.95rem;
+  font-weight: 750;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+}
+
+.u-login-callout-text {
+  margin: 0;
+  font-size: 0.85rem;
+  line-height: 1.48;
+  opacity: 0.92;
+}
+
+.u-login-callout-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 5px;
+}
+
+.u-login-callout-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 0.76rem;
+  font-weight: 650;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(180, 83, 9, 0.22);
+  color: #78350f;
+}
+
+.u-login-callout-pill--ok {
+  background: rgba(209, 250, 229, 0.92);
+  border-color: rgba(5, 150, 105, 0.3);
+  color: #065f46;
+}
+
+.u-login-callout-note {
+  margin: 4px 0 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  line-height: 1.4;
+  color: #92400e;
+}
+
+#topup,
+#terms,
+#content-safety,
+#age-confirm,
+#linked-identities {
+  scroll-margin-top: 84px;
+}
+
+.u-topup-notice {
+  margin: 8px 0 14px;
+}
+
 .u-login-hero {
   display: flex;
   flex-direction: column;

@@ -5044,4 +5044,77 @@ mod tests {
         assert_eq!(private_resp.status(), StatusCode::OK);
         assert!(backend.sitemap_cache.borrow().is_empty());
     }
+
+    #[test]
+    fn login_and_payment_redirects_preserve_reason_and_allowance_contract() {
+        // 1. HTML login redirect includes both `next` and `reason=login_required`.
+        let uri: Uri = "/details/42?mode=similar".parse().unwrap();
+        let login_resp = login_response(&uri, &Method::GET);
+        assert_eq!(login_resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            login_resp.headers().get("location").unwrap(),
+            "/user/login?next=/details/42%3Fmode=similar&reason=login_required"
+        );
+
+        // 2. HTML navigation 402 redirects to `/user/upgrade` with guest vs signed-in reason.
+        let mut nav_headers = HeaderMap::new();
+        nav_headers.insert("sec-fetch-mode", "navigate".parse().unwrap());
+        let guest_nav = payment_required(&nav_headers, true);
+        assert_eq!(guest_nav.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            guest_nav.headers().get("location").unwrap(),
+            "/user/upgrade?reason=free_limit"
+        );
+        let user_nav = payment_required(&nav_headers, false);
+        assert_eq!(user_nav.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            user_nav.headers().get("location").unwrap(),
+            "/user/upgrade?reason=quota"
+        );
+
+        // 3. Subresource/API 402 keeps exact `location: /user/upgrade` and
+        // `server-timing: gallery-allowance` required by `assets/gallery-allowance.js`,
+        // with clear JSON error copy for both guest and signed-in callers.
+        let api_headers = HeaderMap::new();
+        let guest_api = payment_required(&api_headers, true);
+        assert_eq!(guest_api.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            guest_api.headers().get("location").unwrap(),
+            site_access::UPGRADE_PATH
+        );
+        assert_eq!(
+            guest_api.headers().get("server-timing").unwrap(),
+            "gallery-allowance"
+        );
+        let guest_json: serde_json::Value = serde_json::from_slice(
+            &block_on(axum::body::to_bytes(guest_api.into_body(), 4096)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            guest_json["error"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("allowance")
+        );
+        assert_eq!(guest_json["redirect_to"], site_access::UPGRADE_PATH);
+
+        let user_api = payment_required(&api_headers, false);
+        assert_eq!(user_api.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            user_api.headers().get("location").unwrap(),
+            site_access::UPGRADE_PATH
+        );
+        let user_json: serde_json::Value = serde_json::from_slice(
+            &block_on(axum::body::to_bytes(user_api.into_body(), 4096)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            user_json["error"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("out of points")
+        );
+    }
 }

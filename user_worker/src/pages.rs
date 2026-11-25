@@ -153,13 +153,17 @@ pub async fn approve_page(State(st): State<AppState>) -> Response {
     serve_spa_shell(&st).await
 }
 
+const SIGNED_IN_UPGRADE_REDIRECT: &str = "/user/account?reason=quota#topup";
+const ACCOUNT_LOGIN_REDIRECT: &str = "/user/login?next=/user/account&reason=auth_required";
+const FAVORITES_LOGIN_REDIRECT: &str = "/user/login?next=/user/favorites&reason=auth_required";
+
 #[worker::send]
 pub async fn upgrade_page(State(st): State<AppState>, cookies: Cookies) -> Response {
     if identity::optional_active_session(&st, &cookies)
         .await
         .is_some()
     {
-        return redirect_no_store("/user/account#topup");
+        return redirect_no_store(SIGNED_IN_UPGRADE_REDIRECT);
     }
     serve_spa_shell(&st).await
 }
@@ -170,7 +174,7 @@ pub async fn account_page(State(st): State<AppState>, cookies: Cookies) -> Respo
         .await
         .is_none()
     {
-        return redirect_no_store("/user/login?next=/user/account");
+        return redirect_no_store(ACCOUNT_LOGIN_REDIRECT);
     }
     serve_spa_shell(&st).await
 }
@@ -181,7 +185,7 @@ pub async fn favorites_page(State(st): State<AppState>, cookies: Cookies) -> Res
         .await
         .is_none()
     {
-        return redirect_no_store("/user/login?next=/user/favorites");
+        return redirect_no_store(FAVORITES_LOGIN_REDIRECT);
     }
     serve_spa_shell(&st).await
 }
@@ -313,6 +317,19 @@ mod tests {
                 .get("x-robots-tag")
                 .and_then(|v| v.to_str().ok()),
             Some("noindex, nofollow")
+        );
+    }
+
+    #[test]
+    fn redirect_targets_include_clear_reason_parameters() {
+        assert_eq!(SIGNED_IN_UPGRADE_REDIRECT, "/user/account?reason=quota#topup");
+        assert_eq!(
+            ACCOUNT_LOGIN_REDIRECT,
+            "/user/login?next=/user/account&reason=auth_required"
+        );
+        assert_eq!(
+            FAVORITES_LOGIN_REDIRECT,
+            "/user/login?next=/user/favorites&reason=auth_required"
         );
     }
 }
