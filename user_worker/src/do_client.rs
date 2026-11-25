@@ -113,6 +113,16 @@ pub struct AgeConfirmReq {
     pub sid: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BillingPrefsReq {
+    pub allow_paid_media: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BillingPrefsResp {
+    pub allow_paid_media: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreviewBudgetReq {
     #[serde(default, alias = "path")]
@@ -274,4 +284,15 @@ pub async fn do_terms_accept(env: &Env, do_key: &str, req: &TermsAcceptReq) -> R
 pub async fn do_age_confirm(env: &Env, do_key: &str, req: &AgeConfirmReq) -> Result<()> {
     let resp = call_do(env, do_key, Method::Post, "/age-confirm", Some(req)).await?;
     expect_ok(&resp, "do age-confirm")
+}
+
+pub async fn do_billing_prefs(
+    env: &Env,
+    do_key: &str,
+    allow_paid_media: bool,
+) -> Result<BillingPrefsResp> {
+    let req = BillingPrefsReq { allow_paid_media };
+    let mut resp = call_do(env, do_key, Method::Post, "/billing-prefs", Some(&req)).await?;
+    expect_ok(&resp, "do billing-prefs")?;
+    resp.json().await
 }

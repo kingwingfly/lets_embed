@@ -631,6 +631,50 @@ pub async fn update_preferences(
 }
 
 // ---------------------------------------------------------------------------
+// POST /user/api/billing-preferences (Per-account paid media spending toggle)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct BillingPreferencesReq {
+    pub allow_paid_media: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BillingPreferencesResp {
+    pub allow_paid_media: bool,
+}
+
+#[worker::send]
+pub async fn update_billing_preferences(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    cookies: Cookies,
+    Json(req): Json<BillingPreferencesReq>,
+) -> Response {
+    if let Err(r) = auth::require_same_origin(&st, &headers) {
+        return r;
+    }
+    let active = match identity::require_active_session(&st, &cookies).await {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+
+    match do_client::do_billing_prefs(&st.env, &active.do_key, req.allow_paid_media).await {
+        Ok(updated) => (
+            [(header::CACHE_CONTROL, "private, no-store")],
+            Json(BillingPreferencesResp {
+                allow_paid_media: updated.allow_paid_media,
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            worker::console_error!("billing_prefs DO update failed: {e:?}");
+            auth::internal_error()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // POST /user/api/accept_terms
 // ---------------------------------------------------------------------------
 

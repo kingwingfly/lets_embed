@@ -16,9 +16,9 @@ use site_access::{
 
 use crate::{
     api::{
-        self, AcceptTermsConflictResp, AcceptTermsOkResp, AgeConfirmResp, BootstrapResp,
-        LinkStartResp, MeResp, NonceResp, PaymentRow, PreferencesConflictResp, PreferencesResp,
-        PrepareCheckoutResp, RatesResp, TopupResp, TransferCreateResp,
+        self, AcceptTermsConflictResp, AcceptTermsOkResp, AgeConfirmResp, BillingPreferencesResp,
+        BootstrapResp, LinkStartResp, MeResp, NonceResp, PaymentRow, PreferencesConflictResp,
+        PreferencesResp, PrepareCheckoutResp, RatesResp, TopupResp, TransferCreateResp,
     },
     wallet,
 };
@@ -127,12 +127,31 @@ fn quota_exhausted_notice(data: &MeResp, deposit_open: Option<bool>) -> (&'stati
     } else {
         ""
     };
+    let views_zero = data.views_remaining == Some(0);
+    let searches_zero = data.searches_remaining == Some(0);
+    let media_credit_spend_blocked =
+        !data.allow_paid_media && data.balance > 0 && !(data.plan.is_some() && !views_zero && searches_zero);
+
+    if media_credit_spend_blocked {
+        let reset_hint = if data.plan.is_some() {
+            api::format_time_until(data.window_reset)
+                .map(|t| format!("or wait for your 5-hour window ({t}) / daily UTC reset"))
+                .unwrap_or_else(|| "or wait for your quota to reset".to_string())
+        } else {
+            "or wait for the daily free allowance reset at 00:00 UTC".to_string()
+        };
+        return (
+            "Daily quota reached \u{2014} paid media loading is off",
+            format!(
+                "You\u{2019}ve reached today\u{2019}s free viewing quota (and any active plan window). You still have {bal} available, but spending credits to load images & videos is currently turned off. Turn on \"Use credits to load images & videos after quota runs out\" below to keep browsing with your points, {reset_hint}."
+            ),
+        );
+    }
+
     if data.plan.is_some() {
         let reset_hint = api::format_time_until(data.window_reset)
             .map(|t| format!("Wait for your 5-hour window to reset ({t})"))
             .unwrap_or_else(|| "Wait for your 5-hour window to reset".to_string());
-        let views_zero = data.views_remaining == Some(0);
-        let searches_zero = data.searches_remaining == Some(0);
         let (title, subject) = match (views_zero, searches_zero) {
             (false, true) => (
                 "5-hour search quota reached",
@@ -272,6 +291,9 @@ pub fn AccountPage() -> impl IntoView {
             "#topup" => {
                 api::scroll_to_element("topup");
             }
+            "#billing-prefs" => {
+                api::scroll_to_element("billing-prefs");
+            }
             _ => {}
         }
     });
@@ -335,6 +357,54 @@ pub fn AccountPage() -> impl IntoView {
             if let Ok(r) = api::get_json::<RatesResp>("/user/api/rates").await {
                 rates.set(Some(r));
             }
+        });
+    });
+
+    // Save per-account paid media credit spending toggle (`POST /user/api/billing-preferences`)
+    let save_billing_prefs = Callback::new(move |allow_paid_media: bool| {
+        busy.set(true);
+        spawn_local(async move {
+            match api::post_json::<_, BillingPreferencesResp>(
+                "/user/api/billing-preferences",
+                &json!({ "allow_paid_media": allow_paid_media }),
+            )
+            .await
+            {
+                Ok(resp) => {
+                    let enabled = resp.allow_paid_media;
+                    me.update(|opt| {
+                        if let Some(m) = opt {
+                            m.allow_paid_media = enabled;
+                        }
+                    });
+                    api::broadcast_safety_invalidation("prefs_change");
+                    if enabled {
+                        if arrived_for_quota.get_value() {
+                            quota_notice_dismissed.set(true);
+                            api::clear_search_param("reason");
+                        }
+                        toasts.success(
+                            "Paid media loading enabled",
+                            Some(
+                                "Images & videos beyond your daily free quota can now use your points balance."
+                                    .into(),
+                            ),
+                        );
+                    } else {
+                        toasts.info(
+                            "Paid media loading turned off",
+                            Some(
+                                "Images & videos will stop loading once your daily free quota and plan window run out, protecting your balance."
+                                    .into(),
+                            ),
+                        );
+                    }
+                }
+                Err(e) => {
+                    toasts.error("Could not save billing preference", Some(e.display()));
+                }
+            }
+            busy.set(false);
         });
     });
 
@@ -1167,6 +1237,20 @@ pub fn AccountPage() -> impl IntoView {
                                                     {accepted_badge_text.clone()}
                                                 </span>
                                             })}
+                                            <a
+                                                href="#billing-prefs"
+                                                class=if data.allow_paid_media {
+                                                    "u-badge u-badge--ok"
+                                                } else {
+                                                    "u-badge"
+                                                }
+                                            >
+                                                {if data.allow_paid_media {
+                                                    "Paid media: On"
+                                                } else {
+                                                    "Paid media: Off"
+                                                }}
+                                            </a>
                                         </div>
                                     </div>
                                     <div class="u-stats">
@@ -1588,6 +1672,45 @@ pub fn AccountPage() -> impl IntoView {
                                             </div>
                                         })
                                     }}
+
+                                    {
+                                        let allow_paid = data.allow_paid_media;
+                                        let checked_paid = Signal::derive(move || allow_paid);
+                                        let disabled_paid = Signal::derive(move || busy.get());
+                                        let (badge_txt, badge_cls) = if allow_paid {
+                                            ("ON \u{00B7} Credit spending enabled", "u-state-badge u-state-badge--on")
+                                        } else {
+                                            ("OFF \u{00B7} Balance protected", "u-state-badge u-state-badge--off")
+                                        };
+                                        let show_return_gallery = allow_paid && arrived_for_quota.get_value();
+                                        view! {
+                                            <div id="billing-prefs" class="u-billing-toggle-box">
+                                                <div class="u-policy-header">
+                                                    <div class="u-policy-header-left">
+                                                        <strong class="u-policy-title">"Credit Spending Protection"</strong>
+                                                    </div>
+                                                    <span class=badge_cls>{badge_txt}</span>
+                                                </div>
+                                                <ToggleSwitch
+                                                    checked=checked_paid
+                                                    label="Use credits to load images & videos after quota runs out"
+                                                    description="OFF (default): stop loading paid images & videos once your daily free allowance and plan window run out, protecting your balance. ON: automatically spend points to keep loading media."
+                                                    disabled=disabled_paid
+                                                    on_change=Callback::new(move |next_on: bool| {
+                                                        save_billing_prefs.run(next_on);
+                                                    })
+                                                />
+                                                {show_return_gallery.then(|| view! {
+                                                    <div class="u-billing-toggle-actions">
+                                                        <a class="u-btn u-btn--small" href="/">
+                                                            "Back to Gallery \u{2192}"
+                                                        </a>
+                                                    </div>
+                                                })}
+                                            </div>
+                                        }
+                                    }
+
                                     <p class="u-sub">
                                         {format!(
                                             "{} points per USD \u{00B7} Minimum top-up: {} \u{00B7} Repeat views within {}h are free.",
