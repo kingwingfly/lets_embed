@@ -187,6 +187,8 @@ pub struct BootstrapResp {
     pub deposit_open: bool,
     pub points_per_usd: i64,
     pub minimum_topup: i64,
+    #[serde(default)]
+    pub signup_points: i64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -583,11 +585,76 @@ pub fn navigate_hard(url: &str) {
     }
 }
 
+pub fn clear_search_param(name: &str) {
+    let Some(win) = web_sys::window() else {
+        return;
+    };
+    let search = win.location().search().unwrap_or_default();
+    let Ok(params) = web_sys::UrlSearchParams::new_with_str(&search) else {
+        return;
+    };
+    if !params.has(name) {
+        return;
+    }
+    params.delete(name);
+    let path = win.location().pathname().unwrap_or_default();
+    let hash = win.location().hash().unwrap_or_default();
+    let next_search: String = params.to_string().into();
+    let clean_url = if next_search.is_empty() {
+        format!("{path}{hash}")
+    } else {
+        format!("{path}?{next_search}{hash}")
+    };
+    if let Ok(hist) = win.history() {
+        let _ = hist.replace_state_with_url(&JsValue::NULL, "", Some(&clean_url));
+    }
+}
+
+pub fn format_number(n: i64) -> String {
+    let neg = n < 0;
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + usize::from(neg));
+    if neg {
+        out.push('-');
+    }
+    for (idx, ch) in digits.chars().enumerate() {
+        if idx > 0 && (digits.len() - idx).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 pub fn format_points(n: i64) -> String {
     if n == 1 {
         "1 point".to_string()
     } else {
-        format!("{n} points")
+        format!("{} points", format_number(n))
+    }
+}
+
+/// Format remaining time until `epoch_secs` (e.g. `"in 2h 15m"`, `"in 18m"`).
+/// Returns `None` if `epoch_secs == 0` or already elapsed.
+pub fn format_time_until(epoch_secs: u64) -> Option<String> {
+    if epoch_secs == 0 {
+        return None;
+    }
+    let now_secs = (js_sys::Date::now() / 1000.0).floor().max(0.0) as u64;
+    if epoch_secs <= now_secs {
+        return None;
+    }
+    let rem = epoch_secs - now_secs;
+    let hours = rem / 3600;
+    let mins = (rem % 3600) / 60;
+    if hours > 0 && mins > 0 {
+        Some(format!("in {hours}h {mins}m"))
+    } else if hours > 0 {
+        Some(format!("in {hours}h"))
+    } else if mins > 0 {
+        Some(format!("in {mins}m"))
+    } else {
+        Some("in under 1m".to_string())
     }
 }
 

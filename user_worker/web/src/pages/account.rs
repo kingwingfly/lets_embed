@@ -120,6 +120,48 @@ fn format_accepted_badge(version: u32, accepted_at: Option<u64>) -> String {
     }
 }
 
+fn quota_exhausted_notice(data: &MeResp, deposit_open: Option<bool>) -> (&'static str, String) {
+    let bal = api::format_points(data.balance);
+    let deposit_note = if deposit_open == Some(false) {
+        " New crypto deposits are currently closed."
+    } else {
+        ""
+    };
+    if data.plan.is_some() {
+        let reset_hint = api::format_time_until(data.window_reset)
+            .map(|t| format!("Wait for your 5-hour window to reset ({t})"))
+            .unwrap_or_else(|| "Wait for your 5-hour window to reset".to_string());
+        let views_zero = data.views_remaining == Some(0);
+        let searches_zero = data.searches_remaining == Some(0);
+        let (title, subject) = match (views_zero, searches_zero) {
+            (false, true) => (
+                "5-hour search quota reached",
+                "Your plan\u{2019}s 5-hour search quota is used up",
+            ),
+            (true, false) => (
+                "5-hour view quota reached",
+                "Your plan\u{2019}s 5-hour viewing quota is used up",
+            ),
+            _ => (
+                "Plan quota & points limit reached",
+                "Your 5-hour plan quota is used up",
+            ),
+        };
+        return (
+            title,
+            format!(
+                "{subject} and your balance ({bal}) isn\u{2019}t enough to cover pay-as-you-go fallback. {reset_hint}, top up points, or upgrade your plan below.{deposit_note}"
+            ),
+        );
+    }
+    (
+        "Quota or points balance exhausted",
+        format!(
+            "You\u{2019}ve reached today\u{2019}s free allowance and your current balance ({bal}) isn\u{2019}t enough to cover this item or search. Top up points or subscribe to a plan below \u{2014} or wait for the daily free allowance reset at 00:00 UTC.{deposit_note}"
+        ),
+    )
+}
+
 #[component]
 pub fn AccountPage() -> impl IntoView {
     let toasts = use_toast_store();
@@ -131,6 +173,11 @@ pub fn AccountPage() -> impl IntoView {
 
     let pref_version = RwSignal::new(1u64);
     let busy = RwSignal::new(false);
+    let arrived_for_quota = StoredValue::new(matches!(
+        api::current_search_param("reason").as_deref(),
+        Some("quota" | "limit" | "free_limit")
+    ));
+    let quota_notice_dismissed = RwSignal::new(false);
 
     // Terms state (updates dynamically on 409 Conflict!)
     let terms_version = RwSignal::new(0u32);
@@ -168,7 +215,7 @@ pub fn AccountPage() -> impl IntoView {
                     me.set(Some(data));
                 }
                 Err(e) if e.status == 401 => {
-                    api::navigate_hard("/user/login?next=/user/account");
+                    api::navigate_hard("/user/login?next=/user/account&reason=session_expired");
                 }
                 Err(e) => {
                     toasts.error("Could not load account", Some(e.display()));
@@ -1059,6 +1106,22 @@ pub fn AccountPage() -> impl IntoView {
                         let plans = data.pricing.plans.clone();
                         let items = data.pricing.items.clone();
                         let can_link = data.can_link_identity_now;
+                        let deposit_open = boot.get().map(|b| b.deposit_open);
+                        let quota_notice = arrived_for_quota
+                            .get_value()
+                            .then(|| quota_exhausted_notice(&data, deposit_open));
+                        let quota_notice_topup = quota_notice.clone();
+                        let dismiss_quota_notice = Callback::new(move |()| {
+                            quota_notice_dismissed.set(true);
+                            api::clear_search_param("reason");
+                        });
+                        let views_left_text = match (data.plan.is_some(), data.views_remaining) {
+                            (_, Some(v)) => api::format_number(v),
+                            (true, None) => "Unlimited".to_string(),
+                            (false, None) => "\u{2014}".to_string(),
+                        };
+                        let searches_left_text = data.searches_remaining.map(api::format_number);
+                        let window_reset_text = api::format_time_until(data.window_reset);
 
                         view! {
                             <div class="u-stack">
@@ -1070,6 +1133,22 @@ pub fn AccountPage() -> impl IntoView {
                                         dismissible=false
                                     />
                                 })}
+
+                                {move || {
+                                    if quota_notice_dismissed.get() {
+                                        return None;
+                                    }
+                                    let (title, body) = quota_notice.as_ref()?;
+                                    Some(view! {
+                                        <NoticeBanner
+                                            content=NoticeContent::Text(body.clone())
+                                            tone=NoticeTone::Warning
+                                            title=title.to_string()
+                                            dismissible=true
+                                            on_dismiss=dismiss_quota_notice
+                                        />
+                                    })
+                                }}
 
                                 // 1. Overview Card
                                 <section class="u-card">
@@ -1101,13 +1180,23 @@ pub fn AccountPage() -> impl IntoView {
                                         </div>
                                         <div class="u-stat">
                                             <div class="u-stat-label">"Window views left"</div>
-                                            <div class="u-stat-val">
-                                                {data.views_remaining.map(|v| v.to_string()).unwrap_or_else(|| "—".into())}
-                                            </div>
+                                            <div class="u-stat-val">{views_left_text}</div>
                                         </div>
+                                        {searches_left_text.map(|s| view! {
+                                            <div class="u-stat">
+                                                <div class="u-stat-label">"Window searches left"</div>
+                                                <div class="u-stat-val">{s}</div>
+                                            </div>
+                                        })}
+                                        {window_reset_text.map(|t| view! {
+                                            <div class="u-stat">
+                                                <div class="u-stat-label">"Window resets"</div>
+                                                <div class="u-stat-val">{t}</div>
+                                            </div>
+                                        })}
                                         <div class="u-stat">
                                             <div class="u-stat-label">"Total views"</div>
-                                            <div class="u-stat-val">{data.total_views}</div>
+                                            <div class="u-stat-val">{api::format_number(data.total_views)}</div>
                                         </div>
                                     </div>
                                 </section>
@@ -1482,6 +1571,23 @@ pub fn AccountPage() -> impl IntoView {
                                 // 5. Top-Up & Subscriptions
                                 <section id="topup" class="u-card">
                                     <h2>"Top Up & Subscriptions"</h2>
+                                    {move || {
+                                        if quota_notice_dismissed.get() {
+                                            return None;
+                                        }
+                                        let (title, body) = quota_notice_topup.as_ref()?;
+                                        Some(view! {
+                                            <div class="u-topup-notice">
+                                                <NoticeBanner
+                                                    content=NoticeContent::Text(body.clone())
+                                                    tone=NoticeTone::Warning
+                                                    title=title.to_string()
+                                                    dismissible=true
+                                                    on_dismiss=dismiss_quota_notice
+                                                />
+                                            </div>
+                                        })
+                                    }}
                                     <p class="u-sub">
                                         {format!(
                                             "{} points per USD \u{00B7} Minimum top-up: {} \u{00B7} Repeat views within {}h are free.",

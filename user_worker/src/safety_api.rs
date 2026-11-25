@@ -422,6 +422,7 @@ struct BootstrapResp {
     deposit_open: bool,
     points_per_usd: i64,
     minimum_topup: i64,
+    signup_points: i64,
 }
 
 #[worker::send]
@@ -450,6 +451,7 @@ pub async fn bootstrap(State(st): State<AppState>, cookies: Cookies) -> Response
             deposit_open,
             points_per_usd: access_policy.points_per_usd,
             minimum_topup: access_policy.minimum_topup,
+            signup_points: access_policy.signup_points,
         }),
     )
         .into_response()

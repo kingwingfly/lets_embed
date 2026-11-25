@@ -108,6 +108,81 @@ fn render_provider_icon(id: AuthProviderId) -> AnyView {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoginCalloutTone {
+    Warn,
+    Info,
+}
+
+fn login_reason_callout(
+    reason: Option<&str>,
+    next_url: &str,
+    has_explicit_next: bool,
+) -> Option<(LoginCalloutTone, &'static str, &'static str)> {
+    match reason.map(str::trim) {
+        Some("free_limit") => Some((
+            LoginCalloutTone::Warn,
+            "Daily free allowance reached",
+            "You\u{2019}ve reached today\u{2019}s free viewing or search limit, or this item isn\u{2019}t covered by anonymous free access. Sign in to continue with your account\u{2019}s points or plan, or come back after 00:00 UTC.",
+        )),
+        Some("quota") => Some((
+            LoginCalloutTone::Warn,
+            "Quota or points limit reached",
+            "Your current quota or points balance has run out. Sign in to check your balance, subscribe to a plan, or top up points.",
+        )),
+        Some("login_required") => Some((
+            LoginCalloutTone::Info,
+            "Sign in required",
+            "This gallery requires an account to browse. Sign in below to continue.",
+        )),
+        Some("session_expired") => Some((
+            LoginCalloutTone::Warn,
+            "Session expired",
+            "Your sign-in session has expired or was signed out. Please sign in again to continue.",
+        )),
+        Some("auth_required") => Some((
+            LoginCalloutTone::Info,
+            "Sign in required",
+            "Sign in below to access your account, favorites, and saved preferences.",
+        )),
+        Some("age_confirm") => Some((
+            LoginCalloutTone::Info,
+            "Age confirmation required",
+            "Sign in to confirm you are 18+ and manage age-restricted content settings.",
+        )),
+        _ if has_explicit_next => {
+            if next_url.contains("#age-confirm") {
+                Some((
+                    LoginCalloutTone::Info,
+                    "Age confirmation required",
+                    "Sign in to confirm you are 18+ and manage age-restricted content settings.",
+                ))
+            } else if next_url.starts_with("/user/favorites") {
+                Some((
+                    LoginCalloutTone::Info,
+                    "Sign in to view favorites",
+                    "Sign in below to access and manage your saved favorites.",
+                ))
+            } else if next_url.starts_with("/user/account") {
+                Some((
+                    LoginCalloutTone::Info,
+                    "Sign in to open Account Settings",
+                    "Sign in below to manage your balance, subscription, and content preferences.",
+                ))
+            } else if next_url != "/" {
+                Some((
+                    LoginCalloutTone::Info,
+                    "Sign in to continue",
+                    "Sign in below and you\u{2019}ll be returned to the page you were viewing.",
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 #[component]
 pub fn LoginPage() -> impl IntoView {
     view! {
@@ -126,11 +201,17 @@ pub fn LoginView(
     default_next: &'static str,
     #[prop(optional)] extra_header: Option<ViewFn>,
 ) -> impl IntoView {
+    let raw_next = api::current_search_param("next");
+    let has_explicit_next = raw_next.is_some();
     let next_url = StoredValue::new(api::sanitize_next(
-        api::current_search_param("next")
-            .as_deref()
-            .or(Some(default_next)),
+        raw_next.as_deref().or(Some(default_next)),
     ));
+    let reason_callout = if extra_header.is_none() {
+        let reason = api::current_search_param("reason");
+        login_reason_callout(reason.as_deref(), &next_url.get_value(), has_explicit_next)
+    } else {
+        None
+    };
 
     let toasts = use_toast_store();
     let boot = RwSignal::new(None::<BootstrapResp>);
@@ -894,7 +975,39 @@ pub fn LoginView(
             </header>
 
             <main class="u-login-main">
-                {extra_header.map(|f| f.run())}
+                {extra_header.map(|f| move || f.run())}
+
+                {reason_callout.map(|(tone, title, message)| {
+                    let cls = match tone {
+                        LoginCalloutTone::Warn => "u-login-callout u-login-callout--warn",
+                        LoginCalloutTone::Info => "u-login-callout u-login-callout--info",
+                    };
+                    let icon = match tone {
+                        LoginCalloutTone::Warn => view! {
+                            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+                                <line x1="12" y1="9" x2="12" y2="13"/>
+                                <line x1="12" y1="17" x2="12.01" y2="17"/>
+                            </svg>
+                        }.into_any(),
+                        LoginCalloutTone::Info => view! {
+                            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <circle cx="12" cy="12" r="10"/>
+                                <line x1="12" y1="16" x2="12" y2="12"/>
+                                <line x1="12" y1="8" x2="12.01" y2="8"/>
+                            </svg>
+                        }.into_any(),
+                    };
+                    view! {
+                        <aside class=cls role="status" aria-live="polite">
+                            <span class="u-login-callout-icon">{icon}</span>
+                            <div class="u-login-callout-body">
+                                <strong class="u-login-callout-title">{title}</strong>
+                                <p class="u-login-callout-text">{message}</p>
+                            </div>
+                        </aside>
+                    }
+                })}
 
                 {move || pending_email_link.get().map(|(email, _)| view! {
                     <section class="u-login-card u-login-card--confirm">
