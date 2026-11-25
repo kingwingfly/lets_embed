@@ -132,6 +132,156 @@ fn has_media_balance(data: &MeResp) -> bool {
     data.balance >= min_media_cost
 }
 
+fn plan_display_label(plan: Option<&str>, allow_paid_media: bool) -> String {
+    match plan.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => {
+            let mut chars = id.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => "Free".to_string(),
+            }
+        }
+        None if allow_paid_media => "Pay-as-you-go".to_string(),
+        None => "Free".to_string(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum QuotaTone {
+    Ok,
+    Warn,
+    Danger,
+    Unlimited,
+}
+
+impl QuotaTone {
+    fn pill_class(self) -> &'static str {
+        match self {
+            Self::Ok => "u-quota-pill u-quota-pill--ok",
+            Self::Warn => "u-quota-pill u-quota-pill--warn",
+            Self::Danger => "u-quota-pill u-quota-pill--danger",
+            Self::Unlimited => "u-quota-pill u-quota-pill--unlimited",
+        }
+    }
+
+    fn fill_class(self) -> &'static str {
+        match self {
+            Self::Ok => "u-quota-fill u-quota-fill--ok",
+            Self::Warn => "u-quota-fill u-quota-fill--warn",
+            Self::Danger => "u-quota-fill u-quota-fill--danger",
+            Self::Unlimited => "u-quota-fill u-quota-fill--unlimited",
+        }
+    }
+}
+
+struct QuotaMeter {
+    label: String,
+    status: String,
+    detail: String,
+    percent_label: Option<String>,
+    fill_width_pct: f64,
+    aria_now: Option<i64>,
+    aria_max: Option<i64>,
+    tone: QuotaTone,
+}
+
+impl QuotaMeter {
+    fn finite(label: impl Into<String>, used_raw: i64, limit: i64, unit_suffix: &str) -> Self {
+        let limit = limit.max(1);
+        let used = used_raw.clamp(0, limit);
+        let remaining = (limit - used).max(0);
+        let ratio = (used as f64) / (limit as f64);
+        let rounded_pct = (ratio * 100.0).round().clamp(0.0, 100.0) as u32;
+        let fill_width_pct = if used == 0 {
+            0.0
+        } else {
+            (ratio * 100.0).clamp(2.0, 100.0)
+        };
+        let percent_label = if used > 0 && rounded_pct == 0 {
+            "<1%".to_string()
+        } else {
+            format!("{rounded_pct}%")
+        };
+        let tone = if remaining == 0 {
+            QuotaTone::Danger
+        } else if rounded_pct >= 75 {
+            QuotaTone::Warn
+        } else {
+            QuotaTone::Ok
+        };
+        let status = if remaining == 0 {
+            "Limit reached".to_string()
+        } else {
+            format!("{} left", api::format_number(remaining))
+        };
+        let detail = if unit_suffix.is_empty() {
+            format!(
+                "{} / {} used",
+                api::format_number(used),
+                api::format_number(limit)
+            )
+        } else {
+            format!(
+                "{} / {} {unit_suffix} used",
+                api::format_number(used),
+                api::format_number(limit)
+            )
+        };
+        Self {
+            label: label.into(),
+            status,
+            detail,
+            percent_label: Some(percent_label),
+            fill_width_pct,
+            aria_now: Some(used),
+            aria_max: Some(limit),
+            tone,
+        }
+    }
+
+    fn unlimited(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            status: "Unlimited".to_string(),
+            detail: detail.into(),
+            percent_label: None,
+            fill_width_pct: 100.0,
+            aria_now: None,
+            aria_max: None,
+            tone: QuotaTone::Unlimited,
+        }
+    }
+}
+
+fn render_quota_meter(m: QuotaMeter) -> impl IntoView {
+    let aria_label = format!("{}: {}, {}", m.label, m.detail, m.status);
+    let fill_style = format!("width: {:.1}%", m.fill_width_pct);
+    let pill_cls = m.tone.pill_class();
+    let fill_cls = m.tone.fill_class();
+    view! {
+        <div class="u-quota-item">
+            <div class="u-quota-row">
+                <span class="u-quota-label">{m.label}</span>
+                <span class=pill_cls>{m.status}</span>
+            </div>
+            <div
+                class="u-quota-track"
+                role="progressbar"
+                aria-label=aria_label
+                aria-valuemin="0"
+                aria-valuemax=m.aria_max.map(|v| v.to_string())
+                aria-valuenow=m.aria_now.map(|v| v.to_string())
+            >
+                <div class=fill_cls style=fill_style />
+            </div>
+            <div class="u-quota-meta">
+                <span>{m.detail}</span>
+                {m.percent_label.map(|p| view! { <span class="u-quota-pct">{p}</span> })}
+            </div>
+        </div>
+    }
+}
+
 fn quota_exhausted_notice(data: &MeResp, deposit_open: Option<bool>) -> (&'static str, String) {
     let bal = api::format_points(data.balance);
     let deposit_note = if deposit_open == Some(false) {
@@ -1197,13 +1347,109 @@ pub fn AccountPage() -> impl IntoView {
                             quota_notice_dismissed.set(true);
                             api::clear_search_param("reason");
                         });
-                        let views_left_text = match (data.plan.is_some(), data.views_remaining) {
-                            (_, Some(v)) => api::format_number(v),
-                            (true, None) => "Unlimited".to_string(),
-                            (false, None) => "\u{2014}".to_string(),
-                        };
-                        let searches_left_text = data.searches_remaining.map(api::format_number);
+                        let plan_label = plan_display_label(
+                            data.plan.as_deref(),
+                            data.allow_paid_media,
+                        );
+                        let active_plan_cfg = data
+                            .plan
+                            .as_deref()
+                            .and_then(|pid| data.pricing.plans.iter().find(|p| p.id == pid))
+                            .cloned();
                         let window_reset_text = api::format_time_until(data.window_reset);
+                        let daily_reset_text = api::format_time_until(data.daily_free_reset);
+
+                        let mut plan_meters: Vec<QuotaMeter> = Vec::new();
+                        if data.plan.is_some() {
+                            if let Some(ref pcfg) = active_plan_cfg {
+                                match pcfg.views_per_window {
+                                    Some(limit) if limit > 0 => {
+                                        let rem = data.views_remaining.unwrap_or(limit).clamp(0, limit);
+                                        plan_meters.push(QuotaMeter::finite(
+                                            "Media views",
+                                            limit - rem,
+                                            limit,
+                                            "view units",
+                                        ));
+                                    }
+                                    None => {
+                                        plan_meters.push(QuotaMeter::unlimited(
+                                            "Media views",
+                                            format!("Included with {plan_label} plan"),
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                                if pcfg.searches_per_window > 0 {
+                                    let limit = pcfg.searches_per_window;
+                                    let rem = data
+                                        .searches_remaining
+                                        .unwrap_or(limit)
+                                        .clamp(0, limit);
+                                    plan_meters.push(QuotaMeter::finite(
+                                        "AI searches",
+                                        limit - rem,
+                                        limit,
+                                        "searches",
+                                    ));
+                                }
+                            } else {
+                                if let Some(rem) = data.views_remaining {
+                                    plan_meters.push(QuotaMeter::unlimited(
+                                        "Media views",
+                                        format!("{} remaining this window", api::format_number(rem)),
+                                    ));
+                                }
+                                if let Some(rem) = data.searches_remaining {
+                                    plan_meters.push(QuotaMeter::unlimited(
+                                        "AI searches",
+                                        format!("{} remaining this window", api::format_number(rem)),
+                                    ));
+                                }
+                            }
+                        }
+
+                        let daily_meters: Vec<QuotaMeter> = data
+                            .pricing
+                            .items
+                            .iter()
+                            .filter(|it| it.daily_free != 0 || it.price == 0)
+                            .map(|it| {
+                                if it.daily_free < 0 || it.price == 0 {
+                                    QuotaMeter::unlimited(it.label.clone(), "No daily cap")
+                                } else {
+                                    let used = data
+                                        .daily_free_used
+                                        .get(&it.kind)
+                                        .copied()
+                                        .unwrap_or(0)
+                                        .max(0);
+                                    QuotaMeter::finite(it.label.clone(), used, it.daily_free, "")
+                                }
+                            })
+                            .collect();
+
+                        let free_media_exhausted = data.pricing.items.iter().any(|it| {
+                            matches!(it.kind.as_str(), "image" | "video")
+                                && it.daily_free > 0
+                                && it.price > 0
+                                && data
+                                    .daily_free_used
+                                    .get(&it.kind)
+                                    .copied()
+                                    .unwrap_or(0)
+                                    >= it.daily_free
+                        });
+                        let has_balance_for_media = has_media_balance(&data);
+                        let has_quota_panel = !plan_meters.is_empty() || !daily_meters.is_empty();
+                        let plan_window_reset_label = match window_reset_text {
+                            Some(t) => format!("Resets {t}"),
+                            None => "Fresh 5-hour window".to_string(),
+                        };
+                        let daily_reset_label = match daily_reset_text {
+                            Some(t) => format!("Resets {t} \u{00B7} 00:00 UTC"),
+                            None => "Resets daily at 00:00 UTC".to_string(),
+                        };
 
                         view! {
                             <div class="u-stack">
@@ -1272,22 +1518,12 @@ pub fn AccountPage() -> impl IntoView {
                                         </div>
                                         <div class="u-stat">
                                             <div class="u-stat-label">"Plan"</div>
-                                            <div class="u-stat-val">{data.plan.clone().unwrap_or_else(|| "Pay-as-you-go".into())}</div>
+                                            <div class="u-stat-val">{plan_label.clone()}</div>
                                         </div>
-                                        <div class="u-stat">
-                                            <div class="u-stat-label">"Window views left"</div>
-                                            <div class="u-stat-val">{views_left_text}</div>
-                                        </div>
-                                        {searches_left_text.map(|s| view! {
+                                        {(data.plan.is_some() && data.period_end > 0).then(|| view! {
                                             <div class="u-stat">
-                                                <div class="u-stat-label">"Window searches left"</div>
-                                                <div class="u-stat-val">{s}</div>
-                                            </div>
-                                        })}
-                                        {window_reset_text.map(|t| view! {
-                                            <div class="u-stat">
-                                                <div class="u-stat-label">"Window resets"</div>
-                                                <div class="u-stat-val">{t}</div>
+                                                <div class="u-stat-label">"Plan ends"</div>
+                                                <div class="u-stat-val">{api::format_epoch_date(data.period_end)}</div>
                                             </div>
                                         })}
                                         <div class="u-stat">
@@ -1295,6 +1531,67 @@ pub fn AccountPage() -> impl IntoView {
                                             <div class="u-stat-val">{api::format_number(data.total_views)}</div>
                                         </div>
                                     </div>
+
+                                    {has_quota_panel.then(|| view! {
+                                        <div class="u-quota-panel">
+                                            {(!plan_meters.is_empty()).then(|| view! {
+                                                <div class="u-quota-section">
+                                                    <div class="u-quota-head">
+                                                        <div class="u-quota-title-row">
+                                                            <h2 class="u-quota-heading">"5-Hour Plan Quota"</h2>
+                                                            <span class="u-badge">{format!("{plan_label} plan")}</span>
+                                                        </div>
+                                                        <span class="u-quota-reset">{plan_window_reset_label}</span>
+                                                    </div>
+                                                    <div class="u-quota-grid">
+                                                        {plan_meters.into_iter().map(render_quota_meter).collect_view()}
+                                                    </div>
+                                                </div>
+                                            })}
+
+                                            {(!daily_meters.is_empty()).then(|| view! {
+                                                <div class="u-quota-section">
+                                                    <div class="u-quota-head">
+                                                        <div class="u-quota-title-row">
+                                                            <h2 class="u-quota-heading">"Daily Free Quota"</h2>
+                                                        </div>
+                                                        <span class="u-quota-reset">{daily_reset_label}</span>
+                                                    </div>
+                                                    <div class="u-quota-grid">
+                                                        {daily_meters.into_iter().map(render_quota_meter).collect_view()}
+                                                    </div>
+                                                </div>
+                                            })}
+
+                                            {(data.plan.is_none() && free_media_exhausted).then(|| {
+                                                if !data.allow_paid_media && has_balance_for_media {
+                                                    view! {
+                                                        <div class="u-quota-hint u-quota-hint--warn">
+                                                            <span>"Daily free media quota reached. Credit spending is off \u{2014} "</span>
+                                                            <a href="#billing-prefs">"enable pay-as-you-go below"</a>
+                                                            <span>" to keep browsing with your points, or wait for 00:00 UTC."</span>
+                                                        </div>
+                                                    }.into_any()
+                                                } else if !data.allow_paid_media {
+                                                    view! {
+                                                        <div class="u-quota-hint u-quota-hint--warn">
+                                                            <span>"Daily free media quota reached. "</span>
+                                                            <a href="#topup">"Top up points or choose a plan below"</a>
+                                                            <span>", or wait for the daily reset at 00:00 UTC."</span>
+                                                        </div>
+                                                    }.into_any()
+                                                } else {
+                                                    view! {
+                                                        <div class="u-quota-hint">
+                                                            <span>"Daily free media quota reached \u{2014} additional images & videos now draw from your points balance ("</span>
+                                                            <a href="#billing-prefs">"Pay-as-you-go is on"</a>
+                                                            <span>")."</span>
+                                                        </div>
+                                                    }.into_any()
+                                                }
+                                            })}
+                                        </div>
+                                    })}
                                 </section>
 
                                 // 2. Terms & Age Verification Card

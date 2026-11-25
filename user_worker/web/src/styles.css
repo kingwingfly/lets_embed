@@ -258,6 +258,198 @@ a:hover { text-decoration: underline; }
   word-break: break-all;
 }
 
+/* Visual Quota Progress Bars (Overview Card) */
+.u-quota-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(14, 165, 233, 0.16);
+}
+
+.u-quota-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.u-quota-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  flex-wrap: wrap;
+}
+
+.u-quota-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.u-quota-heading {
+  margin: 0;
+  font-size: 0.94rem;
+  font-weight: 700;
+  color: var(--u-text);
+  letter-spacing: -0.01em;
+}
+
+.u-quota-reset {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--u-muted);
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: rgba(224, 242, 254, 0.6);
+  border: 1px solid rgba(14, 165, 233, 0.16);
+  font-variant-numeric: tabular-nums;
+}
+
+.u-quota-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 12px;
+}
+
+.u-quota-item {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 11px 13px;
+  border-radius: 12px;
+  background: #f8fbff;
+  border: 1px solid rgba(14, 165, 233, 0.18);
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+
+.u-quota-item:hover {
+  border-color: rgba(2, 132, 199, 0.34);
+  box-shadow: 0 3px 10px rgba(12, 74, 110, 0.05);
+}
+
+.u-quota-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.u-quota-label {
+  font-size: 0.86rem;
+  font-weight: 700;
+  color: var(--u-text);
+  min-width: 0;
+}
+
+.u-quota-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 700;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.u-quota-pill--ok {
+  background: #e0f2fe;
+  color: #0369a1;
+}
+
+.u-quota-pill--warn {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.u-quota-pill--danger {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.u-quota-pill--unlimited {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.u-quota-track {
+  position: relative;
+  width: 100%;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(14, 165, 233, 0.14);
+  overflow: hidden;
+  box-shadow: inset 0 1px 2px rgba(12, 74, 110, 0.08);
+}
+
+.u-quota-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 320ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.u-quota-fill--ok {
+  background: linear-gradient(90deg, #38bdf8 0%, #0284c7 100%);
+}
+
+.u-quota-fill--warn {
+  background: linear-gradient(90deg, #fbbf24 0%, #d97706 100%);
+}
+
+.u-quota-fill--danger {
+  background: linear-gradient(90deg, #f87171 0%, #dc2626 100%);
+}
+
+.u-quota-fill--unlimited {
+  background: linear-gradient(90deg, #34d399 0%, #059669 100%);
+}
+
+.u-quota-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.77rem;
+  color: var(--u-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.u-quota-pct {
+  font-weight: 700;
+  color: #47667e;
+}
+
+.u-quota-hint {
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 0.83rem;
+  line-height: 1.45;
+  color: #0c4a6e;
+  background: #f0f9ff;
+  border: 1px solid rgba(14, 165, 233, 0.24);
+}
+
+.u-quota-hint--warn {
+  color: #78350f;
+  background: #fffbeb;
+  border-color: #fde68a;
+}
+
+.u-quota-hint a {
+  font-weight: 700;
+  text-decoration: underline;
+  color: inherit;
+}
+
+@media (max-width: 600px) {
+  .u-quota-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 .u-mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 0.85em;

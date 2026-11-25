@@ -149,6 +149,11 @@ fn window_reset(active: bool, win_start: Option<u64>, now: u64) -> u64 {
     }
 }
 
+/// Epoch secs of the next UTC midnight when daily free counters reset.
+fn next_utc_day_reset(now: u64) -> u64 {
+    (now / 86_400).saturating_add(1).saturating_mul(86_400)
+}
+
 /// Pure refund math for a released `Window`-sourced hold.
 /// Only adjusts counters when the window that was charged is still the active window.
 fn refund_window_counters(
@@ -1220,6 +1225,30 @@ impl UserAccount {
         ))
     }
 
+    /// Count today's (UTC) consumed daily free allowances per `ChargeKind` name.
+    /// Returns an empty map if `free_usage` has not been created yet.
+    fn daily_free_usage(&self, day: u64) -> HashMap<String, i64> {
+        #[derive(serde::Deserialize)]
+        struct KindUsage {
+            kind: String,
+            used: i64,
+        }
+        let db = self.state.storage().sql();
+        let Ok(cursor) = db.exec(
+            "SELECT kind, COUNT(*) AS used FROM free_usage WHERE day = ?1 GROUP BY kind",
+            vec![(day as i64).into()],
+        ) else {
+            return HashMap::new();
+        };
+        let Ok(rows) = cursor.to_array::<KindUsage>() else {
+            return HashMap::new();
+        };
+        rows.into_iter()
+            .filter(|r| r.used > 0)
+            .map(|r| (r.kind, r.used))
+            .collect()
+    }
+
     async fn guest(&self, req: GuestReq, policy: &Policy) -> Result<Response> {
         if policy.login_required {
             return Response::error("Login required", 401);
@@ -1503,6 +1532,7 @@ impl UserAccount {
         let plan_cfg = plan_id.as_deref().and_then(|id| policy.plan(id));
         let (views_remaining, searches_remaining, window_reset) =
             self.window_fields(active, plan_cfg.as_ref(), now).await?;
+        let day = now / 86_400;
         Ok(StatusResp {
             address: self.get_or("address", String::new()).await?,
             balance: self.get_or("balance", 0).await?,
@@ -1514,6 +1544,8 @@ impl UserAccount {
             banned: self.get_or("banned", false).await?,
             total_views: self.get_or("total_views", 0).await?,
             allow_paid_media: self.get_or("allow_paid_media", false).await?,
+            daily_free_used: self.daily_free_usage(day),
+            daily_free_reset: next_utc_day_reset(now),
         })
     }
 
@@ -3809,5 +3841,14 @@ mod tests {
         assert!(!ctx.strict_age_ok);
         assert_eq!(ctx.terms_version_accepted, None);
         assert_eq!(ctx.terms_digest_accepted, None);
+    }
+
+    #[test]
+    fn next_utc_day_reset_rolls_at_utc_midnight() {
+        assert_eq!(next_utc_day_reset(0), 86_400);
+        assert_eq!(next_utc_day_reset(86_399), 86_400);
+        assert_eq!(next_utc_day_reset(86_400), 172_800);
+        // 2026-01-01T12:30:00Z = 1_767_270_600 -> 2026-01-02T00:00:00Z = 1_767_312_000
+        assert_eq!(next_utc_day_reset(1_767_270_600), 1_767_312_000);
     }
 }
