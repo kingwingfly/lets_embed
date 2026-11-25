@@ -73,16 +73,14 @@ pub struct PostGalleryCover {
 
 /// Policy v3 projected gallery cover summary ready for `/`, search results, and favorites.
 ///
-/// Uses safe cover fallback (first `Clear` image for the caller so mixed albums are never
-/// penalized by `MIN(image_id)` being filtered) while locking albums containing any
-/// unsatisfied non-bypassable hard-blocked image (e.g. `Extreme / Gore & Illegal`).
+/// Uses image-level safe cover fallback: picks the post's first `Clear` image for the
+/// caller, otherwise the first user-bypassable image, otherwise `MIN(image_id)`.
 #[derive(Debug, Clone)]
 pub struct ProjectedPostGalleryCover {
     pub post_id: i64,
     pub title: String,
     pub safe_title: String,
     pub title_displayable: bool,
-    pub has_hard_block: bool,
     pub cover_image: Option<ProjectedImage>,
     pub cover_video: Option<ProjectedVideo>,
     pub image_count: usize,
@@ -1530,12 +1528,11 @@ impl Engine {
             .map_err(Into::into)
     }
 
-    /// Batch-fetch and project gallery covers for `ids` with Policy v3 safe cover fallback:
+    /// Batch-fetch and project gallery covers for `ids` with Policy v3 image-level safe cover fallback:
     /// - When safety is disabled: uses `MIN(image_id)` / `MIN(video_id)` directly.
-    /// - When safety is enabled: evaluates all images of `ids` inside a single `REPEATABLE READ`
-    ///   snapshot and applies [`CompiledPolicy::select_post_cover_image`] (locking Extreme/Gore
-    ///   albums, otherwise picking the post's first `Clear` image, otherwise falling back to the
-    ///   first bypassable / `MIN(image_id)` image).
+    /// - When safety is enabled: evaluates images of `ids` inside a single `REPEATABLE READ`
+    ///   snapshot and applies [`CompiledPolicy::select_post_cover_image`] (picking the post's
+    ///   first `Clear` image, otherwise the first user-bypassable image, otherwise `MIN(image_id)`).
     pub async fn projected_post_gallery_covers(
         &self,
         ids: &[i64],
@@ -1575,7 +1572,6 @@ impl Engine {
                         title: c.title,
                         safe_title,
                         title_displayable: true,
-                        has_hard_block: false,
                         cover_image,
                         cover_video,
                         image_count: c.image_count,
@@ -1762,7 +1758,6 @@ impl Engine {
                 .unwrap_or(SelectedPostCover {
                     image_id: None,
                     outcome: None,
-                    has_hard_block: false,
                     title_displayable: false,
                 });
             let cover_image = match (sel.image_id, sel.outcome) {
@@ -1773,15 +1768,10 @@ impl Engine {
             };
             let cover_video = pm.cover_video.and_then(|v| proj_vid_map.remove(&v.id));
 
-            let title_displayable = if sel.has_hard_block {
-                false
-            } else if sel.title_displayable {
-                true
-            } else if let Some(ref cv) = cover_video {
-                cv.is_bypassable_or_clear()
-            } else {
-                false
-            };
+            let title_displayable = sel.title_displayable
+                || cover_video
+                    .as_ref()
+                    .is_some_and(ProjectedVideo::is_bypassable_or_clear);
             let safe_title = if title_displayable {
                 pm.title.clone()
             } else {
@@ -1793,7 +1783,6 @@ impl Engine {
                 title: pm.title,
                 safe_title,
                 title_displayable,
-                has_hard_block: sel.has_hard_block,
                 cover_image,
                 cover_video,
                 image_count,

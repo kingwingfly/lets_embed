@@ -1497,76 +1497,17 @@ impl CompiledPolicy {
         }
     }
 
-    /// Returns `true` if `facts` explicitly matches (`TriBool::True`) at least one enabled
-    /// **non-bypassable** policy (zero user self-service unlock path, e.g. `Extreme / Gore & Illegal`,
-    /// or staff-only rule) that is NOT directly granted to `caller`.
+    /// Selects the deterministic gallery cover for a post's images (expected sorted `image_id ASC`).
     ///
-    /// Indeterminate (`TriBool::Unknown` / pending) evaluations return `false` so a single
-    /// unclassified image does not falsely lock an entire album as Extreme/Gore.
-    pub fn image_matches_unsatisfied_hard_block(
-        &self,
-        facts: &ImageFacts,
-        caller: &CallerContext,
-    ) -> bool {
-        if !self.is_enabled() || !facts.exists {
-            return false;
-        }
-        let hard_blocks: Vec<&CompiledPolicyItem> = self
-            .policies
-            .iter()
-            .filter(|item| {
-                !policy_has_user_unlock_path(item, &self.policy)
-                    && !caller.has_direct_grant(&item.policy_ref)
-            })
-            .collect();
-        if hard_blocks.is_empty() {
-            return false;
-        }
-
-        let wd_vocab_matches =
-            facts.wd_vocab_digest.as_deref() == Some(self.policy.vocab_digest.as_str());
-        let empty_set = HashSet::new();
-
-        for item in hard_blocks {
-            if facts.parent_posts.is_empty() {
-                if item.eval_context(
-                    facts.is_completed,
-                    wd_vocab_matches,
-                    facts.wd_min_persisted_score,
-                    &facts.wd_tag_scores,
-                    &empty_set,
-                    &empty_set,
-                ) == TriBool::True
-                {
-                    return true;
-                }
-            } else {
-                for parent in &facts.parent_posts {
-                    if item.eval_context(
-                        facts.is_completed,
-                        wd_vocab_matches,
-                        facts.wd_min_persisted_score,
-                        &facts.wd_tag_scores,
-                        &parent.post_tags,
-                        &parent.authors,
-                    ) == TriBool::True
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }
-
-    /// Selects the deterministic gallery cover for a post's images (expected sorted `image_id ASC`):
-    /// 1. **Extreme / Hard-Block Album Lock**: if ANY image explicitly matches an unsatisfied
-    ///    non-bypassable rule (e.g. `Extreme / Gore & Illegal`), picks the first such image,
-    ///    sets `has_hard_block = true`, and withholds the album title (`title_displayable = false`).
-    /// 2. **Safe Cover Fallback**: otherwise picks the first image evaluating strictly `Clear`
-    ///    for `caller` so mixed SFW+NSFW albums are never penalized by image #1 being filtered.
-    /// 3. **Bypassable / Default Fallback**: if zero images are `Clear`, prefers the first
-    ///    user-bypassable image (e.g. `r18` / `sensitive`), else falls back to `image_ids[0]`.
+    /// Block/Blur enforcement stays strictly at the image level — a single hard-blocked image
+    /// inside an album NEVER hijacks or locks the post's cover when other displayable images exist:
+    /// 1. **First `Clear` image**: picks the earliest image evaluating strictly `Clear` for
+    ///    `caller` (short-circuiting immediately) so mixed albums always show an unfiltered cover.
+    /// 2. **First user-bypassable image**: if zero images are `Clear`, picks the earliest
+    ///    user-bypassable image (e.g. `Blurred` / bypassable `r18` or `sensitive`), retaining the
+    ///    real post title (`title_displayable = true`).
+    /// 3. **Fallback (`image_ids[0]`)**: only when 100% of images in the post are non-bypassable
+    ///    hard-blocked or unclassified/pending (`title_displayable = false`).
     pub fn select_post_cover_image(
         &self,
         image_ids: &[i64],
@@ -1577,50 +1518,35 @@ impl CompiledPolicy {
             return SelectedPostCover {
                 image_id: None,
                 outcome: None,
-                has_hard_block: false,
                 title_displayable: !self.is_enabled(),
             };
         }
 
         let default_missing = ImageFacts::default();
-        let mut first_clear: Option<(i64, MediaOutcome)> = None;
         let mut first_bypassable: Option<(i64, MediaOutcome)> = None;
         let mut first_default: Option<(i64, MediaOutcome)> = None;
 
         for &id in image_ids {
             let facts = facts_map.get(&id).unwrap_or(&default_missing);
-            if self.image_matches_unsatisfied_hard_block(facts, caller) {
-                let outcome = self.evaluate_image(facts, caller);
+            let outcome = self.evaluate_image(facts, caller);
+            if outcome.is_clear() {
                 return SelectedPostCover {
                     image_id: Some(id),
                     outcome: Some(outcome),
-                    has_hard_block: true,
-                    title_displayable: false,
+                    title_displayable: true,
                 };
             }
-
-            let outcome = self.evaluate_image(facts, caller);
-            if first_clear.is_none() && outcome.is_clear() {
-                first_clear = Some((id, outcome));
-            } else if first_bypassable.is_none() && outcome.is_user_bypassable_or_clear() {
+            if first_bypassable.is_none() && outcome.is_user_bypassable_or_clear() {
                 first_bypassable = Some((id, outcome));
             } else if first_default.is_none() {
                 first_default = Some((id, outcome));
             }
         }
 
-        if let Some((id, outcome)) = first_clear {
+        if let Some((id, outcome)) = first_bypassable {
             SelectedPostCover {
                 image_id: Some(id),
                 outcome: Some(outcome),
-                has_hard_block: false,
-                title_displayable: true,
-            }
-        } else if let Some((id, outcome)) = first_bypassable {
-            SelectedPostCover {
-                image_id: Some(id),
-                outcome: Some(outcome),
-                has_hard_block: false,
                 title_displayable: true,
             }
         } else {
@@ -1630,7 +1556,6 @@ impl CompiledPolicy {
             SelectedPostCover {
                 image_id: Some(id),
                 outcome: Some(outcome),
-                has_hard_block: false,
                 title_displayable,
             }
         }
@@ -1642,7 +1567,6 @@ impl CompiledPolicy {
 pub struct SelectedPostCover {
     pub image_id: Option<i64>,
     pub outcome: Option<MediaOutcome>,
-    pub has_hard_block: bool,
     pub title_displayable: bool,
 }
 
@@ -4000,7 +3924,6 @@ mod tests {
         let mixed_facts = HashMap::from([(1, nsfw(1)), (2, niche(2)), (3, sfw(3)), (4, sfw(4))]);
         let mixed_anon = compiled.select_post_cover_image(&[1, 2, 3, 4], &mixed_facts, &anon);
         assert_eq!(mixed_anon.image_id, Some(3));
-        assert!(!mixed_anon.has_hard_block);
         assert!(mixed_anon.title_displayable);
         assert!(mixed_anon.outcome.as_ref().is_some_and(MediaOutcome::is_clear));
 
@@ -4018,16 +3941,14 @@ mod tests {
         let mixed_authed =
             compiled.select_post_cover_image(&[1, 2, 3, 4], &mixed_facts, &r18_unlocked);
         assert_eq!(mixed_authed.image_id, Some(1));
-        assert!(!mixed_authed.has_hard_block);
         assert!(mixed_authed.title_displayable);
         assert!(mixed_authed.outcome.as_ref().is_some_and(MediaOutcome::is_clear));
 
-        // 3. 100% NSFW/Sensitive album (0 Clear, 0 Extreme): falls back to #1 bypassable Placeholder,
+        // 3. 100% NSFW/Sensitive album (0 Clear): falls back to #1 bypassable Placeholder,
         //    retaining real post title (`title_displayable = true`).
         let all_nsfw = HashMap::from([(10, nsfw(10)), (11, niche(11))]);
         let all_nsfw_sel = compiled.select_post_cover_image(&[10, 11], &all_nsfw, &anon);
         assert_eq!(all_nsfw_sel.image_id, Some(10));
-        assert!(!all_nsfw_sel.has_hard_block);
         assert!(all_nsfw_sel.title_displayable);
         assert!(
             all_nsfw_sel
@@ -4036,26 +3957,46 @@ mod tests {
                 .is_some_and(|o| o.is_placeholder() && o.is_user_bypassable_or_clear())
         );
 
-        // 4. Extreme/Gore album where #20 & #21 are SFW and #22 is `blood`:
-        //    locks cover to #22 (`has_hard_block = true`, `title_displayable = false`) even for unlocked r18 user!
-        let extreme_album = HashMap::from([(20, sfw(20)), (21, sfw(21)), (22, gore(22))]);
+        // 4a. Mixed album with SFW #20, #21 and 1 hard-blocked `blood` #22:
+        //     block stays strictly image-level -> cover stays SFW #20 (`Clear`, real title)!
+        let sfw_with_one_gore = HashMap::from([(20, sfw(20)), (21, sfw(21)), (22, gore(22))]);
         for caller in [&anon, &r18_unlocked] {
-            let sel = compiled.select_post_cover_image(&[20, 21, 22], &extreme_album, caller);
-            assert_eq!(sel.image_id, Some(22));
-            assert!(sel.has_hard_block);
-            assert!(!sel.title_displayable);
-            assert!(
-                sel.outcome
-                    .as_ref()
-                    .is_some_and(|o| o.is_placeholder() && !o.is_user_bypassable_or_clear())
-            );
+            let sel = compiled.select_post_cover_image(&[20, 21, 22], &sfw_with_one_gore, caller);
+            assert_eq!(sel.image_id, Some(20));
+            assert!(sel.title_displayable);
+            assert!(sel.outcome.as_ref().is_some_and(MediaOutcome::is_clear));
         }
 
-        // 5. Pending image #30 does NOT falsely trigger Extreme lock; skips to #31 SFW cover!
+        // 4b. Hard-blocked `blood` #23 first + SFW #24 second: skips #23 and selects SFW #24!
+        let gore_then_sfw = HashMap::from([(23, gore(23)), (24, sfw(24))]);
+        let sel_gts = compiled.select_post_cover_image(&[23, 24], &gore_then_sfw, &anon);
+        assert_eq!(sel_gts.image_id, Some(24));
+        assert!(sel_gts.title_displayable);
+        assert!(sel_gts.outcome.as_ref().is_some_and(MediaOutcome::is_clear));
+
+        // 4c. Hard-blocked `blood` #25 first + bypassable NSFW #26 second: prefers bypassable #26!
+        let gore_then_nsfw = HashMap::from([(25, gore(25)), (26, nsfw(26))]);
+        let sel_gtn = compiled.select_post_cover_image(&[25, 26], &gore_then_nsfw, &anon);
+        assert_eq!(sel_gtn.image_id, Some(26));
+        assert!(sel_gtn.title_displayable);
+
+        // 4d. 100% hard-blocked album (#27 & #28 both `blood`): falls back to #27 hard-blocked
+        //     Placeholder with `title_displayable = false`.
+        let all_gore = HashMap::from([(27, gore(27)), (28, gore(28))]);
+        let sel_ag = compiled.select_post_cover_image(&[27, 28], &all_gore, &anon);
+        assert_eq!(sel_ag.image_id, Some(27));
+        assert!(!sel_ag.title_displayable);
+        assert!(
+            sel_ag
+                .outcome
+                .as_ref()
+                .is_some_and(|o| o.is_placeholder() && !o.is_user_bypassable_or_clear())
+        );
+
+        // 5. Pending image #30 skips to #31 SFW cover!
         let pending_then_sfw = HashMap::from([(30, pending(30)), (31, sfw(31))]);
         let sel_pts = compiled.select_post_cover_image(&[30, 31], &pending_then_sfw, &anon);
         assert_eq!(sel_pts.image_id, Some(31));
-        assert!(!sel_pts.has_hard_block);
         assert!(sel_pts.title_displayable);
         assert!(sel_pts.outcome.as_ref().is_some_and(MediaOutcome::is_clear));
 
@@ -4063,14 +4004,12 @@ mod tests {
         let pending_then_nsfw = HashMap::from([(40, pending(40)), (41, nsfw(41))]);
         let sel_ptn = compiled.select_post_cover_image(&[40, 41], &pending_then_nsfw, &anon);
         assert_eq!(sel_ptn.image_id, Some(41));
-        assert!(!sel_ptn.has_hard_block);
         assert!(sel_ptn.title_displayable);
 
         // 7. 100% pending album: falls back to #50 unclassified with `title_displayable = false`.
         let all_pending = HashMap::from([(50, pending(50)), (51, pending(51))]);
         let sel_ap = compiled.select_post_cover_image(&[50, 51], &all_pending, &anon);
         assert_eq!(sel_ap.image_id, Some(50));
-        assert!(!sel_ap.has_hard_block);
         assert!(!sel_ap.title_displayable);
     }
 }
