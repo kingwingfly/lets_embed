@@ -4,8 +4,8 @@
 use axum::{
     body::Bytes,
     http::{
-        HeaderMap, Method, StatusCode, Uri,
-        header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE},
+        HeaderMap, HeaderValue, Method, StatusCode, Uri,
+        header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE, IF_NONE_MATCH, SET_COOKIE},
     },
     response::{IntoResponse, Redirect, Response},
 };
@@ -937,4 +937,110 @@ pub(crate) fn guest_id(jwt_secret: &[u8], headers: &HeaderMap) -> String {
         .and_then(|s| s.parse().ok());
     ip.map(|ip| site_access::guest_account(jwt_secret, ip))
         .unwrap_or_else(|| "guest:unknown".into())
+}
+
+fn is_cf_access_set_cookie_value(val: &HeaderValue) -> bool {
+    let Ok(raw) = val.to_str() else {
+        return false;
+    };
+    let Some((name, _)) = raw.split_once('=') else {
+        return false;
+    };
+    let name = name.trim();
+    name.eq_ignore_ascii_case("cf_authorization") || name.eq_ignore_ascii_case("cf_appsession")
+}
+
+/// Strips Cloudflare Access infrastructure cookies (`CF_Authorization`, `CF_AppSession`)
+/// injected by Cloudflare Access on responses from private origins (e.g. `API_UPSTREAM`).
+///
+/// Prevents leaking the gateway's service-token Access JWT to end users and prevents
+/// Cloudflare Access `Set-Cookie` headers from downgrading public-cacheable responses
+/// (`/pkg/*`, `/robots.txt`, anonymous `/sitemap*.xml`) to `private, no-store`, while
+/// keeping any other unexpected origin `Set-Cookie` headers so the fail-closed cache
+/// guard remains active.
+pub(crate) fn strip_cf_access_set_cookies(headers: &mut HeaderMap) {
+    if !headers.contains_key(SET_COOKIE) {
+        return;
+    }
+    let kept: Vec<HeaderValue> = headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter(|val| !is_cf_access_set_cookie_value(val))
+        .cloned()
+        .collect();
+    headers.remove(SET_COOKIE);
+    for val in kept {
+        headers.append(SET_COOKIE, val);
+    }
+}
+
+/// Builds a canonical, policy-digest-scoped cache key URL for anonymous XML sitemaps
+/// stored in Cloudflare Workers' `caches.default`.
+///
+/// Keying on canonical path (ignoring arbitrary query strings) and `policy_digest`
+/// prevents query-string cache-busting DoS while guaranteeing zero stale-policy windows
+/// whenever `SITE_POLICY` changes.
+pub(crate) fn build_sitemap_cache_key(
+    uri: &Uri,
+    headers: &HeaderMap,
+    upstreams: &Upstreams,
+    policy_digest: &str,
+) -> Option<String> {
+    let path = uri.path();
+    if !is_canonical_path(path)
+        || !is_sitemap_path(path)
+        || policy_digest.is_empty()
+        || !policy_digest.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let origin = if let Some(host) = request_host(uri, headers) {
+        format!("https://{}", host.to_ascii_lowercase())
+    } else {
+        parse_upstream_origin(upstreams.api.as_str()).ok()?
+    };
+    let raw = format!("{origin}/__gw_sitemap_cache{path}?pd={policy_digest}");
+    let parsed = worker::Url::parse(&raw).ok()?;
+    (parsed.scheme() == "https" && parsed.fragment().is_none()).then(|| parsed.to_string())
+}
+
+/// Returns `true` iff any `Cache-Control` directive marks the response `public`
+/// and no `Cache-Control` header is non-UTF-8 or carries `private` / `no-store`.
+pub(crate) fn cache_control_allows_edge_cache(headers: &HeaderMap) -> bool {
+    let mut has_public = false;
+    for raw in headers.get_all(CACHE_CONTROL) {
+        let Ok(val) = raw.to_str() else {
+            return false;
+        };
+        for part in val.split(',') {
+            let directive = part.split('=').next().unwrap_or("").trim();
+            if directive.eq_ignore_ascii_case("private")
+                || directive.eq_ignore_ascii_case("no-store")
+            {
+                return false;
+            }
+            if directive.eq_ignore_ascii_case("public") {
+                has_public = true;
+            }
+        }
+    }
+    has_public
+}
+
+/// RFC 9110 weak-comparison `If-None-Match` evaluator matching `lets-embed-web`'s `seo.rs`.
+pub(crate) fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
+    let target = etag.trim().strip_prefix("W/").unwrap_or(etag.trim());
+    if target.is_empty() {
+        return false;
+    }
+    headers
+        .get_all(IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|inm| {
+            inm.split(',').any(|part| {
+                let trimmed = part.trim();
+                trimmed == "*" || trimmed.strip_prefix("W/").unwrap_or(trimmed) == target
+            })
+        })
 }

@@ -27,7 +27,7 @@ use axum::{
     Router,
     body::Bytes,
     extract::State,
-    http::{HeaderMap, Method, StatusCode, Uri},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Redirect, Response},
     routing::any,
 };
@@ -58,13 +58,13 @@ use crate::auth::{
 use crate::http_util::{
     CookieLookup, GALLERY_ALLOWED_METHODS, MAX_ADMIN_BODY_BYTES, MAX_GATEWAY_BODY_BYTES,
     MAX_REVEAL_BODY_BYTES, MEDIA_ALLOWED_METHODS, USER_ALLOWED_METHODS, Upstreams, browse_route,
-    build_api_upstream_target, checked_gallery_method, checked_media_method, checked_user_method,
-    extract_single_cookie, guest_id, has_reveal_csrf_header, is_always_public_path,
+    build_api_upstream_target, build_sitemap_cache_key, cache_control_allows_edge_cache,
+    checked_gallery_method, checked_media_method, checked_user_method, extract_single_cookie,
+    guest_id, has_reveal_csrf_header, if_none_match_matches, is_always_public_path,
     is_canonical_path, is_hop_by_hop, is_https_request, is_public_cacheable_path, is_same_origin,
     is_segment_prefix, is_sitemap_path, login_response, metered_item, method_not_allowed,
     payment_required, private_no_store, request_host, sanitize_origin_cookie,
-    sanitize_user_worker_cookie,
-    should_strip_api_request_header,
+    sanitize_user_worker_cookie, should_strip_api_request_header, strip_cf_access_set_cookies,
 };
 use crate::media::{
     PreviewBlurConfig, PreviewBudgetReq, build_facts_rev_target, build_media_upstream_target,
@@ -159,7 +159,25 @@ impl GatewayConfig {
 #[derive(Clone)]
 struct AppState {
     env: Arc<Env>,
+    ctx: Arc<Context>,
     cfg: GatewayConfig,
+}
+
+/// Edge TTL (seconds) for policy-digest-keyed anonymous XML sitemaps in Cloudflare
+/// Workers' `caches.default` (aligned with `search_engine`'s 5-minute `SITEMAP_CACHE_TTL`).
+const SITEMAP_EDGE_CACHE_TTL_SECS: u32 = 300;
+/// Maximum buffered sitemap XML size eligible for Workers edge caching (16 MiB).
+const MAX_CACHED_SITEMAP_BYTES: usize = 16 * 1024 * 1024;
+/// Internal header preserving the origin's client-facing `Cache-Control` while the
+/// Workers Cache API stores the entry with `public, max-age=300` for edge TTL.
+const SITEMAP_CACHE_CLIENT_CC_HEADER: &str = "x-gw-client-cache-control";
+
+#[derive(Debug, Clone)]
+struct CachedSitemapEntry {
+    content_type: String,
+    etag: Option<String>,
+    client_cache_control: String,
+    body: Bytes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +267,11 @@ trait GatewayBackend {
         &self,
         req: UpstreamFetchReq,
     ) -> std::result::Result<(u16, String), BackendError>;
+    async fn get_sitemap_cache(
+        &self,
+        cache_key: &str,
+    ) -> std::result::Result<Option<CachedSitemapEntry>, BackendError>;
+    fn put_sitemap_cache(&self, cache_key: &str, entry: CachedSitemapEntry);
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +280,7 @@ trait GatewayBackend {
 
 struct WorkerBackend<'a> {
     env: &'a Env,
+    ctx: &'a Context,
 }
 
 fn optional_env_str(env: &Env, name: &str) -> Option<String> {
@@ -523,6 +547,69 @@ impl GatewayBackend for WorkerBackend<'_> {
             Ok((status, String::new()))
         }
     }
+
+    async fn get_sitemap_cache(
+        &self,
+        cache_key: &str,
+    ) -> std::result::Result<Option<CachedSitemapEntry>, BackendError> {
+        let cache = worker::Cache::default();
+        let Some(mut resp) = cache.get(cache_key, false).await? else {
+            return Ok(None);
+        };
+        if resp.status_code() != 200 {
+            return Ok(None);
+        }
+        let headers = resp.headers();
+        let content_type = headers
+            .get("content-type")?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "application/xml; charset=utf-8".to_string());
+        let etag = headers
+            .get("etag")?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let client_cache_control = headers
+            .get(SITEMAP_CACHE_CLIENT_CC_HEADER)?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "public, max-age=0, must-revalidate".to_string());
+        let body = Bytes::from(resp.bytes().await?);
+        Ok(Some(CachedSitemapEntry {
+            content_type,
+            etag,
+            client_cache_control,
+            body,
+        }))
+    }
+
+    fn put_sitemap_cache(&self, cache_key: &str, entry: CachedSitemapEntry) {
+        let key = cache_key.to_string();
+        self.ctx.wait_until(async move {
+            let cache = worker::Cache::default();
+            let headers = worker::Headers::new();
+            let _ = headers.set("content-type", &entry.content_type);
+            let _ = headers.set(
+                "cache-control",
+                &format!("public, max-age={SITEMAP_EDGE_CACHE_TTL_SECS}"),
+            );
+            let _ = headers.set(SITEMAP_CACHE_CLIENT_CC_HEADER, &entry.client_cache_control);
+            if let Some(etag) = entry.etag.as_deref() {
+                let _ = headers.set("etag", etag);
+            }
+            match worker::Response::from_bytes(entry.body.to_vec()) {
+                Ok(resp) => {
+                    let resp = resp.with_headers(headers);
+                    if let Err(err) = cache.put(key, resp).await {
+                        worker::console_error!("sitemap edge cache put failed: {err:?}");
+                    }
+                }
+                Err(err) => {
+                    worker::console_error!("sitemap edge cache response build failed: {err:?}");
+                }
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +677,7 @@ async fn router(env: Env, ctx: Context, visitor_country: Option<String>) -> Resu
 
     let state = AppState {
         env: Arc::new(env),
+        ctx: Arc::new(ctx),
         cfg: GatewayConfig {
             jwt_secret: Arc::new(resolved.jwt_secret),
             session_v2_secret: Arc::new(resolved.session_v2_secret),
@@ -632,7 +720,10 @@ async fn gateway(
     cookies: Cookies,
     body: Bytes,
 ) -> Response {
-    let backend = WorkerBackend { env: &st.env };
+    let backend = WorkerBackend {
+        env: &st.env,
+        ctx: &st.ctx,
+    };
     handle_gateway_request(&backend, &st.cfg, uri, method, headers, cookies, body).await
 }
 
@@ -786,6 +877,7 @@ fn build_api_headers(
     headers: &HeaderMap,
     cfg: &GatewayConfig,
     signed_assertion: &str,
+    allow_public_cache: bool,
 ) -> Vec<(String, String)> {
     let is_api_post =
         *worker_method == worker::Method::Post && uri.path().starts_with("/api/");
@@ -818,7 +910,9 @@ fn build_api_headers(
         out.push(("x-forwarded-host".to_string(), host.to_string()));
         out.push(("x-forwarded-proto".to_string(), proto.to_string()));
     }
-    if let Some(cookie) = sanitize_origin_cookie(headers) {
+    if !allow_public_cache
+        && let Some(cookie) = sanitize_origin_cookie(headers)
+    {
         out.push(("cookie".to_string(), cookie));
     }
     append_cf_access_service_headers(&mut out, cfg);
@@ -935,14 +1029,22 @@ async fn proxy_to_api(
     };
     let req = UpstreamFetchReq {
         url: target_url,
-        headers: build_api_headers(uri, &worker_method, headers, cfg, signed_assertion),
+        headers: build_api_headers(
+            uri,
+            &worker_method,
+            headers,
+            cfg,
+            signed_assertion,
+            allow_public_cache,
+        ),
         method: worker_method,
         body,
         no_cache: !allow_public_cache,
         preview_blur: None,
     };
     match backend.fetch_upstream(req).await {
-        Ok(resp) => {
+        Ok(mut resp) => {
+            strip_cf_access_set_cookies(resp.headers_mut());
             if allow_public_cache
                 && (resp.status().is_success() || resp.status() == StatusCode::NOT_MODIFIED)
                 && !resp.headers().contains_key("set-cookie")
@@ -1511,6 +1613,47 @@ async fn handle_media_route(
     maybe_clear_session_cookie(response, clear_cookie)
 }
 
+fn sitemap_response_from_cache(
+    entry: &CachedSitemapEntry,
+    method: &worker::Method,
+    req_headers: &HeaderMap,
+) -> Response {
+    if let Some(etag) = entry.etag.as_deref()
+        && if_none_match_matches(req_headers, etag)
+    {
+        let mut resp = StatusCode::NOT_MODIFIED.into_response();
+        if let Ok(val) = HeaderValue::from_str(etag) {
+            resp.headers_mut().insert(header::ETAG, val);
+        }
+        if let Ok(val) = HeaderValue::from_str(&entry.client_cache_control) {
+            resp.headers_mut().insert(header::CACHE_CONTROL, val);
+        }
+        return resp;
+    }
+
+    let body = if *method == worker::Method::Head {
+        axum::body::Body::empty()
+    } else {
+        axum::body::Body::from(entry.body.clone())
+    };
+    let mut resp = Response::new(body);
+    *resp.status_mut() = StatusCode::OK;
+    if let Ok(val) = HeaderValue::from_str(&entry.content_type) {
+        resp.headers_mut().insert(header::CONTENT_TYPE, val);
+    }
+    resp.headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(entry.body.len()));
+    if let Some(etag) = entry.etag.as_deref()
+        && let Ok(val) = HeaderValue::from_str(etag)
+    {
+        resp.headers_mut().insert(header::ETAG, val);
+    }
+    if let Ok(val) = HeaderValue::from_str(&entry.client_cache_control) {
+        resp.headers_mut().insert(header::CACHE_CONTROL, val);
+    }
+    resp
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_gallery_request(
     backend: &impl GatewayBackend,
@@ -1556,6 +1699,33 @@ async fn forward_gallery_request(
         minted_guest_cookie = Some(guest_session_set_cookie_header(&signed_guest));
     }
 
+    // Anonymous public sitemaps (already authorized past Step 0 geo + `login_required` gate):
+    // serve from a policy-digest-keyed Workers Cache API entry (`caches.default`, 5 min TTL)
+    // so crawlers get instant edge HITs without waking Cloud Run or risking stale policy leaks.
+    let use_sitemap_edge_cache = allow_public_cache
+        && !is_reveal_route
+        && !clear_cookie
+        && minted_guest_cookie.is_none()
+        && matches!(worker_method, worker::Method::Get | worker::Method::Head)
+        && is_sitemap_path(uri.path());
+    let sitemap_cache_key = if use_sitemap_edge_cache {
+        build_sitemap_cache_key(uri, headers, &cfg.upstreams, &snapshot.digest)
+    } else {
+        None
+    };
+
+    if let Some(ref cache_key) = sitemap_cache_key {
+        match backend.get_sitemap_cache(cache_key).await {
+            Ok(Some(entry)) => {
+                return sitemap_response_from_cache(&entry, &worker_method, headers);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                log_backend_error("sitemap edge cache lookup failed", &err);
+            }
+        }
+    }
+
     let Ok(signed_assertion) = sign_assertion_v3(cfg, snapshot, now, actor, access, flags) else {
         return assertion_sign_error_response();
     };
@@ -1564,13 +1734,83 @@ async fn forward_gallery_request(
         backend,
         cfg,
         uri,
-        worker_method,
+        worker_method.clone(),
         headers,
         body,
         &signed_assertion,
         allow_public_cache && minted_guest_cookie.is_none(),
     )
     .await;
+
+    if let Some(ref cache_key) = sitemap_cache_key
+        && worker_method == worker::Method::Get
+        && resp.status() == StatusCode::OK
+        && !resp.headers().contains_key(header::SET_COOKIE)
+        && cache_control_allows_edge_cache(resp.headers())
+    {
+        let content_len_ok = resp
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .is_none_or(|len| len <= MAX_CACHED_SITEMAP_BYTES);
+        if content_len_ok {
+            let (mut parts, resp_body) = resp.into_parts();
+            match axum::body::to_bytes(resp_body, MAX_CACHED_SITEMAP_BYTES).await {
+                Ok(bytes) => {
+                    // `to_bytes` reads the decoded stream in workerd; drop any stale
+                    // upstream `Content-Encoding` / `Transfer-Encoding` and set exact length.
+                    parts.headers.remove(header::CONTENT_ENCODING);
+                    parts.headers.remove(header::TRANSFER_ENCODING);
+                    parts
+                        .headers
+                        .insert(header::CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+                    let content_type = parts
+                        .headers
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("application/xml; charset=utf-8")
+                        .to_string();
+                    let etag = parts
+                        .headers
+                        .get(header::ETAG)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(ToOwned::to_owned);
+                    let client_cache_control = parts
+                        .headers
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("public, max-age=0, must-revalidate")
+                        .to_string();
+                    backend.put_sitemap_cache(
+                        cache_key,
+                        CachedSitemapEntry {
+                            content_type,
+                            etag,
+                            client_cache_control,
+                            body: bytes.clone(),
+                        },
+                    );
+                    resp = Response::from_parts(parts, axum::body::Body::from(bytes));
+                }
+                Err(err) => {
+                    log_backend_error(
+                        "sitemap upstream body read failed",
+                        &BackendError(err.to_string()),
+                    );
+                    return private_no_store(
+                        (StatusCode::BAD_GATEWAY, "upstream fetch failed").into_response(),
+                    );
+                }
+            }
+        }
+    }
 
     if let Some(cookie_hdr) = minted_guest_cookie
         && resp.status().is_success()
@@ -2207,9 +2447,15 @@ mod tests {
         facts_rev_responses: HashMap<String, std::result::Result<(u16, String), String>>,
         default_facts_rev: std::result::Result<(u16, String), String>,
         upstream_status: StatusCode,
+        upstream_body: &'static str,
+        upstream_content_type: Option<&'static str>,
+        upstream_etag: Option<&'static str>,
+        upstream_content_encoding: Option<&'static str>,
         upstream_cache_control: Option<&'static str>,
         upstream_set_cookie: Option<&'static str>,
+        upstream_set_cookies: Vec<&'static str>,
         upstream_cf_resized: Option<&'static str>,
+        sitemap_cache: RefCell<HashMap<String, CachedSitemapEntry>>,
         account_calls: RefCell<Vec<RecordedAccountCall>>,
         session_calls: RefCell<Vec<(String, Option<String>)>>,
         service_calls: RefCell<Vec<RecordedServiceCall>>,
@@ -2232,9 +2478,15 @@ mod tests {
                 facts_rev_responses: HashMap::new(),
                 default_facts_rev: Ok((200, r#"{"facts_rev":7}"#.to_string())),
                 upstream_status: StatusCode::OK,
+                upstream_body: "upstream body",
+                upstream_content_type: None,
+                upstream_etag: None,
+                upstream_content_encoding: None,
                 upstream_cache_control: Some("public, max-age=3600"),
                 upstream_set_cookie: None,
+                upstream_set_cookies: Vec::new(),
                 upstream_cf_resized: Some("internal=ok/q=30 t=0.05"),
+                sitemap_cache: RefCell::new(HashMap::new()),
                 account_calls: RefCell::new(Vec::new()),
                 session_calls: RefCell::new(Vec::new()),
                 service_calls: RefCell::new(Vec::new()),
@@ -2352,13 +2604,27 @@ mod tests {
                 no_cache: req.no_cache,
                 preview_blur: req.preview_blur,
             });
-            let mut resp = (self.upstream_status, "upstream body").into_response();
+            let mut resp = (self.upstream_status, self.upstream_body).into_response();
+            if let Some(ct) = self.upstream_content_type {
+                resp.headers_mut()
+                    .insert("content-type", ct.parse().unwrap());
+            }
+            if let Some(etag) = self.upstream_etag {
+                resp.headers_mut().insert("etag", etag.parse().unwrap());
+            }
+            if let Some(ce) = self.upstream_content_encoding {
+                resp.headers_mut()
+                    .insert("content-encoding", ce.parse().unwrap());
+            }
             if let Some(cc) = self.upstream_cache_control {
                 resp.headers_mut()
                     .insert("cache-control", cc.parse().unwrap());
             }
             if let Some(sc) = self.upstream_set_cookie {
-                resp.headers_mut().insert("set-cookie", sc.parse().unwrap());
+                resp.headers_mut().append("set-cookie", sc.parse().unwrap());
+            }
+            for sc in &self.upstream_set_cookies {
+                resp.headers_mut().append("set-cookie", sc.parse().unwrap());
             }
             if is_preview && let Some(cf_resized) = self.upstream_cf_resized {
                 resp.headers_mut()
@@ -2384,6 +2650,19 @@ mod tests {
                 .get(&path)
                 .unwrap_or(&self.default_facts_rev);
             outcome.clone().map_err(BackendError)
+        }
+
+        async fn get_sitemap_cache(
+            &self,
+            cache_key: &str,
+        ) -> std::result::Result<Option<CachedSitemapEntry>, BackendError> {
+            Ok(self.sitemap_cache.borrow().get(cache_key).cloned())
+        }
+
+        fn put_sitemap_cache(&self, cache_key: &str, entry: CachedSitemapEntry) {
+            self.sitemap_cache
+                .borrow_mut()
+                .insert(cache_key.to_string(), entry);
         }
     }
 
@@ -4496,5 +4775,273 @@ mod tests {
         let calls = backend_302.account_calls.borrow();
         assert!(calls.iter().any(|c| c.operation == "reserve-guest"));
         assert!(calls.iter().any(|c| c.operation == "release-guest"));
+    }
+
+    #[test]
+    fn cf_access_set_cookies_are_stripped_and_preserve_public_cache_while_unknown_cookies_fail_closed()
+    {
+        let mut backend = MockBackend::with_policy(sample_safety_policy());
+        backend.upstream_set_cookies = vec![
+            "CF_Authorization=eyJ.svc.token; Expires=Thu, 26 Nov 2026 05:45:39 GMT; Path=/; Secure; HttpOnly; SameSite=none",
+            "CF_AppSession=sess123; Path=/; Secure; HttpOnly",
+        ];
+        let cfg = test_cfg();
+
+        // 1. Public-cacheable routes strip CF Access cookies, preserve public Cache-Control,
+        //    and omit arbitrary client cookies from upstream requests.
+        let mut client_hdrs = HeaderMap::new();
+        client_hdrs.insert("cookie", "pref=dark".parse().unwrap());
+        for path in ["/robots.txt", "/pkg/app.wasm", "/sitemap.xml"] {
+            backend.upstream_calls.borrow_mut().clear();
+            let resp = dispatch(&backend, &cfg, Method::GET, path, client_hdrs.clone(), Bytes::new());
+            assert_eq!(resp.status(), StatusCode::OK, "expected 200 on {path}");
+            assert!(
+                resp.headers().get("set-cookie").is_none(),
+                "CF Access Set-Cookie must never leak on {path}"
+            );
+            assert_eq!(
+                resp.headers().get("cache-control").unwrap(),
+                "public, max-age=3600",
+                "public Cache-Control must survive stripped CF Access cookie on {path}"
+            );
+            let up = backend.upstream_calls.borrow();
+            assert_eq!(up.len(), 1);
+            assert_eq!(
+                header_value(&up[0].headers, "cookie"),
+                None,
+                "public-cacheable route {path} should not forward client Cookie upstream"
+            );
+        }
+
+        // 2. Non-public gallery HTML still strips CF_Authorization (never leaking the JWT),
+        //    keeps `private, no-store`, and forwards non-sensitive client cookies.
+        backend.upstream_calls.borrow_mut().clear();
+        let home = dispatch(&backend, &cfg, Method::GET, "/", client_hdrs, Bytes::new());
+        assert_eq!(home.status(), StatusCode::OK);
+        assert!(home.headers().get("set-cookie").is_none());
+        assert_eq!(
+            home.headers().get("cache-control").unwrap(),
+            "private, no-store"
+        );
+        assert_eq!(
+            header_value(&backend.upstream_calls.borrow()[0].headers, "cookie"),
+            Some("pref=dark")
+        );
+
+        // 3. Mixed CF_Authorization + unexpected origin app cookie: CF_Authorization is stripped,
+        //    unexpected cookie is kept, and gateway fails closed to `private, no-store` (no caching).
+        backend.sitemap_cache.borrow_mut().clear();
+        backend.upstream_set_cookies = vec![
+            "CF_Authorization=eyJ.svc.token; Path=/; Secure; HttpOnly",
+            "origin_sid=secret; Path=/; HttpOnly",
+        ];
+        let mixed = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "/sitemap/1.xml",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(mixed.status(), StatusCode::OK);
+        assert_eq!(
+            mixed.headers().get("cache-control").unwrap(),
+            "private, no-store"
+        );
+        let cookies: Vec<&str> = mixed
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, vec!["origin_sid=secret; Path=/; HttpOnly"]);
+        assert!(
+            backend.sitemap_cache.borrow().is_empty(),
+            "response with non-CF-Access Set-Cookie must never be cached"
+        );
+    }
+
+    #[test]
+    fn sitemap_edge_cache_serves_hits_head_304_invalidates_on_policy_change_and_enforces_gates() {
+        let mut policy = sample_safety_policy();
+        let mut backend = MockBackend::with_policy(policy.clone());
+        backend.upstream_body =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><sitemapindex></sitemapindex>";
+        backend.upstream_content_type = Some("application/xml; charset=utf-8");
+        backend.upstream_etag = Some("\"sm-etag-v1\"");
+        backend.upstream_content_encoding = Some("gzip");
+        backend.upstream_cache_control = Some("public, max-age=0, must-revalidate");
+        backend.upstream_set_cookies =
+            vec!["CF_Authorization=eyJ.svc.token; Path=/; Secure; HttpOnly"];
+        let cfg = test_cfg();
+
+        // 1. First GET misses edge cache, fetches upstream once, strips CF_Authorization and
+        //    stale Content-Encoding, sets exact Content-Length, and populates edge cache.
+        let r1 = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/sitemap.xml",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(r1.status(), StatusCode::OK);
+        assert_eq!(backend.upstream_calls.borrow().len(), 1);
+        assert!(r1.headers().get("set-cookie").is_none());
+        assert!(r1.headers().get("content-encoding").is_none());
+        assert_eq!(
+            r1.headers().get("cache-control").unwrap(),
+            "public, max-age=0, must-revalidate"
+        );
+        assert_eq!(r1.headers().get("etag").unwrap(), "\"sm-etag-v1\"");
+        assert_eq!(
+            r1.headers().get("content-length").unwrap(),
+            &backend.upstream_body.len().to_string()
+        );
+        let r1_body = block_on(axum::body::to_bytes(r1.into_body(), 4096)).unwrap();
+        assert_eq!(&r1_body[..], backend.upstream_body.as_bytes());
+        assert_eq!(backend.sitemap_cache.borrow().len(), 1);
+
+        // 2. Second GET (including query-string cache-busting attempt) hits edge cache directly.
+        let r2 = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/sitemap.xml?random=123",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(r2.status(), StatusCode::OK);
+        assert_eq!(backend.upstream_calls.borrow().len(), 1);
+        assert_eq!(r2.headers().get("etag").unwrap(), "\"sm-etag-v1\"");
+        assert_eq!(
+            r2.headers().get("cache-control").unwrap(),
+            "public, max-age=0, must-revalidate"
+        );
+        let r2_body = block_on(axum::body::to_bytes(r2.into_body(), 4096)).unwrap();
+        assert_eq!(&r2_body[..], backend.upstream_body.as_bytes());
+
+        // 3. HEAD hits edge cache with Content-Length + ETag and empty body.
+        let head_resp = dispatch(
+            &backend,
+            &cfg,
+            Method::HEAD,
+            "https://gallery.test/sitemap.xml",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(head_resp.status(), StatusCode::OK);
+        assert_eq!(backend.upstream_calls.borrow().len(), 1);
+        assert_eq!(
+            head_resp.headers().get("content-length").unwrap(),
+            &backend.upstream_body.len().to_string()
+        );
+        let head_body = block_on(axum::body::to_bytes(head_resp.into_body(), 4096)).unwrap();
+        assert!(head_body.is_empty());
+
+        // 4. Conditional GET with matching weak ETag returns 304 Not Modified from edge cache.
+        let mut inm_hdrs = HeaderMap::new();
+        inm_hdrs.insert("if-none-match", "W/\"sm-etag-v1\"".parse().unwrap());
+        let r304 = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/sitemap.xml",
+            inm_hdrs,
+            Bytes::new(),
+        );
+        assert_eq!(r304.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(backend.upstream_calls.borrow().len(), 1);
+        assert_eq!(r304.headers().get("etag").unwrap(), "\"sm-etag-v1\"");
+        assert_eq!(
+            r304.headers().get("cache-control").unwrap(),
+            "public, max-age=0, must-revalidate"
+        );
+        assert!(
+            block_on(axum::body::to_bytes(r304.into_body(), 4096))
+                .unwrap()
+                .is_empty()
+        );
+
+        // 5. `login_required` gate (`guest` 401) STILL blocks BEFORE checking warm edge cache.
+        backend.account_statuses.insert("guest".to_string(), 401);
+        let blocked_login = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/sitemap.xml",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(blocked_login.status(), StatusCode::SEE_OTHER);
+        assert_eq!(backend.upstream_calls.borrow().len(), 1);
+        backend.account_statuses.insert("guest".to_string(), 200);
+
+        // 6. Step 0 geo-block STILL returns 451 BEFORE checking warm edge cache.
+        let mut geo_cfg = test_cfg();
+        geo_cfg.visitor_country = Some("KP".to_string());
+        let mut geo_policy = policy.clone();
+        geo_policy.geo.blocked_countries = vec!["KP".to_string()];
+        geo_policy.refresh_policy_digest();
+        backend.policy_envelope = Ok(policy_envelope_json(&geo_policy));
+        let geo_blocked = dispatch(
+            &backend,
+            &geo_cfg,
+            Method::GET,
+            "https://gallery.test/sitemap.xml",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(geo_blocked.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        assert_eq!(backend.upstream_calls.borrow().len(), 1);
+
+        // 7. Policy digest change IMMEDIATELY bypasses old cached sitemap and hits upstream.
+        policy.revision += 1;
+        policy.legal.noindex_restricted = !policy.legal.noindex_restricted;
+        policy.refresh_policy_digest();
+        backend.policy_envelope = Ok(policy_envelope_json(&policy));
+        backend.upstream_body =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><urlset></urlset>";
+        backend.upstream_etag = Some("\"sm-etag-v2\"");
+        let after_policy = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/sitemap.xml",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(after_policy.status(), StatusCode::OK);
+        assert_eq!(backend.upstream_calls.borrow().len(), 2);
+        assert_eq!(after_policy.headers().get("etag").unwrap(), "\"sm-etag-v2\"");
+        let v2_body = block_on(axum::body::to_bytes(after_policy.into_body(), 4096)).unwrap();
+        assert_eq!(&v2_body[..], backend.upstream_body.as_bytes());
+
+        // 8. Non-200 or `private, no-store` upstream responses are NEVER cached.
+        backend.sitemap_cache.borrow_mut().clear();
+        backend.upstream_status = StatusCode::INTERNAL_SERVER_ERROR;
+        let err_resp = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/sitemap/2.xml",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(err_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(backend.sitemap_cache.borrow().is_empty());
+
+        backend.upstream_status = StatusCode::OK;
+        backend.upstream_cache_control = Some("private, no-store");
+        let private_resp = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/sitemap/2.xml",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(private_resp.status(), StatusCode::OK);
+        assert!(backend.sitemap_cache.borrow().is_empty());
     }
 }

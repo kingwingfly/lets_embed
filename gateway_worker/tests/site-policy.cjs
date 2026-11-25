@@ -1318,6 +1318,108 @@ test('Policy v3 gateway enforces HKDF SITE_SECRET, zero implicit admin unlock, f
     headers: { cookie: signedLegacySession(wallet) },
   });
   assert.equal(legacyOk.status, 200);
+
+  // 9. Cloudflare Access `Set-Cookie: CF_Authorization` stripping + policy-digest-keyed
+  //    Workers Cache API (`caches.default`) for `/sitemap.xml`:
+  //    - Strips `CF_Authorization` (and `CF_AppSession`) so Access JWTs never leak and
+  //      public `Cache-Control` survives on `/robots.txt` and `/sitemap.xml`.
+  //    - Serves repeat GET, query-busted GET, HEAD, and If-None-Match 304 straight from
+  //      edge cache without hitting upstream again.
+  //    - Immediately invalidates when `SITE_POLICY` digest changes and still enforces Step 0 geo!
+  nextUpstreamResponse = () => {
+    const h = new Headers({
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'public, max-age=3600',
+    });
+    h.append('set-cookie', 'CF_Authorization=svc-jwt-secret; Path=/; Secure; HttpOnly; SameSite=none');
+    h.append('set-cookie', 'CF_AppSession=app-sess-secret; Path=/; Secure; HttpOnly');
+    return new Response('User-agent: *\nAllow: /\n', { status: 200, headers: h });
+  };
+  const robotsNoLeak = await site('/robots.txt');
+  assert.equal(robotsNoLeak.status, 200);
+  assert.equal(robotsNoLeak.headers.get('set-cookie'), null);
+  assert.equal(robotsNoLeak.headers.get('cache-control'), 'public, max-age=3600');
+
+  let sitemapUpstreamHits = 0;
+  let sitemapBody = '<?xml version="1.0" encoding="UTF-8"?><sitemapindex><sitemap><loc>https://gallery.test/sitemap/1.xml</loc></sitemap></sitemapindex>';
+  let sitemapEtag = '"sitemap-rev-5"';
+  const installSitemapMock = () => {
+    nextUpstreamResponse = () => {
+      sitemapUpstreamHits += 1;
+      const h = new Headers({
+        'content-type': 'application/xml; charset=utf-8',
+        'cache-control': 'public, max-age=0, must-revalidate',
+        etag: sitemapEtag,
+      });
+      h.append('set-cookie', 'CF_Authorization=svc-jwt-secret; Path=/; Secure; HttpOnly; SameSite=none');
+      return new Response(sitemapBody, { status: 200, headers: h });
+    };
+  };
+
+  // While `login_required = true`, `/sitemap.xml` MUST still redirect to login (303) before cache!
+  assert.equal((await site('/sitemap.xml')).status, 303);
+  await configureAccount(userDoKey, { loginRequired: false });
+
+  installSitemapMock();
+  const smMiss = await site('/sitemap.xml');
+  assert.equal(smMiss.status, 200);
+  assert.equal(sitemapUpstreamHits, 1);
+  assert.equal(smMiss.headers.get('set-cookie'), null);
+  assert.equal(smMiss.headers.get('cache-control'), 'public, max-age=0, must-revalidate');
+  assert.equal(smMiss.headers.get('etag'), sitemapEtag);
+  assert.equal(await smMiss.text(), sitemapBody);
+
+  // Repeat GET (and query-busted GET) hit `caches.default` with zero new upstream calls.
+  installSitemapMock();
+  const smHit = await site('/sitemap.xml?bust=1');
+  assert.equal(smHit.status, 200);
+  assert.equal(sitemapUpstreamHits, 1);
+  assert.equal(smHit.headers.get('etag'), sitemapEtag);
+  assert.equal(smHit.headers.get('cache-control'), 'public, max-age=0, must-revalidate');
+  assert.equal(await smHit.text(), sitemapBody);
+
+  // HEAD hits edge cache with Content-Length and empty body.
+  const smHead = await site('/sitemap.xml', { method: 'HEAD' });
+  assert.equal(smHead.status, 200);
+  assert.equal(sitemapUpstreamHits, 1);
+  assert.equal(smHead.headers.get('content-length'), String(Buffer.byteLength(sitemapBody)));
+  assert.equal(await smHead.text(), '');
+
+  // Matching If-None-Match returns 304 Not Modified straight from edge cache.
+  const sm304 = await site('/sitemap.xml', { headers: { 'if-none-match': sitemapEtag } });
+  assert.equal(sm304.status, 304);
+  assert.equal(sitemapUpstreamHits, 1);
+  assert.equal(sm304.headers.get('etag'), sitemapEtag);
+
+  // Re-enabling `login_required = true` STILL blocks `/sitemap.xml` (303) even with warm cache!
+  await configureAccount(userDoKey, { loginRequired: true });
+  assert.equal((await site('/sitemap.xml')).status, 303);
+  assert.equal(sitemapUpstreamHits, 1);
+  await configureAccount(userDoKey, { loginRequired: false });
+
+  // Step 0 geo-block STILL blocks `/sitemap.xml` with 451 even while edge cache is warm.
+  const smGeoBlocked = await site('/sitemap.xml', {
+    cf: { country: 'KP', httpProtocol: 'HTTP/1.1' },
+  });
+  assert.equal(smGeoBlocked.status, 451);
+  assert.equal(sitemapUpstreamHits, 1);
+
+  // Updating `SITE_POLICY` changes `policy_digest`, immediately bypassing the old cached entry!
+  const updatedPolicy = defaultPublicPolicyV3({
+    revision: 6,
+    legal: { ...policy.legal, noindex_restricted: true },
+  });
+  await setPolicy(updatedPolicy);
+  sitemapBody = '<?xml version="1.0" encoding="UTF-8"?><urlset></urlset>';
+  sitemapEtag = '"sitemap-rev-6"';
+  installSitemapMock();
+  const smAfterPolicy = await site('/sitemap.xml');
+  assert.equal(smAfterPolicy.status, 200);
+  assert.equal(sitemapUpstreamHits, 2);
+  assert.equal(smAfterPolicy.headers.get('etag'), sitemapEtag);
+  assert.equal(await smAfterPolicy.text(), sitemapBody);
+  nextUpstreamResponse = null;
+  await setPolicy(policy);
 });
 
 test('embedded resources navigate only for a same-origin gallery allowance denial', async () => {
