@@ -143,6 +143,8 @@ pub async fn sitemap_root(
         return (StatusCode::BAD_REQUEST, "Unable to determine site origin").into_response();
     };
     let engine: Arc<search_engine::Engine> = state.engine.clone();
+    // Large catalogs (> 5,000 posts) serve `<sitemapindex>` in ONE cached query without
+    // fetching and discarding 5,001 entries first; smaller catalogs render `<urlset>` directly.
     let total = match engine.sitemap_post_count_with_policy(&policy).await {
         Ok(n) => n.max(0),
         Err(e) => {
@@ -164,8 +166,8 @@ pub async fn sitemap_root(
         };
         render_urlset(&origin, true, &entries)
     } else {
-        let pages =
-            ((total + SITEMAP_PAGE_SIZE - 1) / SITEMAP_PAGE_SIZE).min(i64::from(u32::MAX)) as u32;
+        let pages = ((total + SITEMAP_PAGE_SIZE - 1) / SITEMAP_PAGE_SIZE)
+            .clamp(1, i64::from(u32::MAX)) as u32;
         render_sitemap_index(&origin, pages)
     };
 
@@ -232,19 +234,9 @@ pub async fn sitemap_page(
         return (StatusCode::BAD_REQUEST, "Unable to determine site origin").into_response();
     };
     let engine: Arc<search_engine::Engine> = state.engine.clone();
-    let total = match engine.sitemap_post_count_with_policy(&policy).await {
-        Ok(n) => n.max(0),
-        Err(e) => {
-            tracing::error!("sitemap_post_count failed: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Sitemap unavailable").into_response();
-        }
-    };
-    let total_pages = ((total + SITEMAP_PAGE_SIZE - 1) / SITEMAP_PAGE_SIZE).max(1);
-    if i64::from(page) > total_pages {
+    let Some(offset) = i64::from(page - 1).checked_mul(SITEMAP_PAGE_SIZE) else {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
-    }
-
-    let offset = (i64::from(page) - 1).saturating_mul(SITEMAP_PAGE_SIZE);
+    };
     let entries = match engine
         .sitemap_post_entries_with_policy(&policy, SITEMAP_PAGE_SIZE, offset)
         .await
@@ -255,6 +247,9 @@ pub async fn sitemap_page(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Sitemap unavailable").into_response();
         }
     };
+    if page > 1 && entries.is_empty() {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
     let xml = render_urlset(&origin, page == 1, &entries);
     let etag = format!(
         "\"{}\"",

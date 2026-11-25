@@ -136,43 +136,19 @@ pub async fn like_previews_post(
     }
 
     let engine = &state.engine;
-    let (raw_images, raw_videos, raw_posts) = tokio::try_join!(
+    let (raw_images, raw_videos, projected_posts) = tokio::try_join!(
         engine.images_by_ids(&image_ids),
         engine.videos_by_ids(&video_ids),
-        engine.post_gallery_covers_by_ids(&post_ids),
+        engine.projected_post_gallery_covers(&post_ids, &ctx.policy, &ctx.caller, &ctx.signer),
     )
     .map_err(|e| {
         tracing::error!("like_previews_post query failed: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    // Deduplicate all images (standalone + post covers) and all videos (standalone + post covers)
-    // so safety evaluation & capability signing happen in two batched passes.
-    let mut all_images_map: HashMap<i64, search_types::Image> = HashMap::new();
-    for im in &raw_images {
-        all_images_map.insert(im.id, im.clone());
-    }
-    for p in &raw_posts {
-        if let Some(im) = &p.cover_image {
-            all_images_map.insert(im.id, im.clone());
-        }
-    }
-    let mut all_videos_map: HashMap<i64, search_types::Video> = HashMap::new();
-    for v in &raw_videos {
-        all_videos_map.insert(v.id, v.clone());
-    }
-    for p in &raw_posts {
-        if let Some(v) = &p.cover_video {
-            all_videos_map.insert(v.id, v.clone());
-        }
-    }
-
-    let all_images: Vec<search_types::Image> = all_images_map.into_values().collect();
-    let all_videos: Vec<search_types::Video> = all_videos_map.into_values().collect();
-
     let (proj_images, proj_videos) = tokio::try_join!(
-        engine.project_images(&all_images, &ctx.policy, &ctx.caller, &ctx.signer),
-        engine.project_videos(&all_videos, &ctx.policy, &ctx.caller, &ctx.signer),
+        engine.project_images(&raw_images, &ctx.policy, &ctx.caller, &ctx.signer),
+        engine.project_videos(&raw_videos, &ctx.policy, &ctx.caller, &ctx.signer),
     )
     .map_err(|e| {
         tracing::error!("like_previews_post projection failed: {e}");
@@ -183,67 +159,22 @@ pub async fn like_previews_post(
         proj_images.into_iter().map(|im| (im.id(), im)).collect();
     let proj_vid_map: HashMap<i64, ProjectedVideo> =
         proj_videos.into_iter().map(|v| (v.id(), v)).collect();
-    let post_map: HashMap<i64, _> = raw_posts.into_iter().map(|p| (p.post_id, p)).collect();
-
-    // Only query full post media displayability for posts whose projected cover is hard-blocked / unclassified.
-    let need_displayable_check: Vec<i64> = post_ids
-        .iter()
-        .copied()
-        .filter(|pid| {
-            let Some(p) = post_map.get(pid) else {
-                return false;
-            };
-            let cover_displayable = p
-                .cover_image
-                .as_ref()
-                .and_then(|c| proj_img_map.get(&c.id))
-                .is_some_and(ProjectedImage::is_bypassable_or_clear)
-                || p.cover_video
-                    .as_ref()
-                    .and_then(|v| proj_vid_map.get(&v.id))
-                    .is_some_and(ProjectedVideo::is_bypassable_or_clear);
-            !cover_displayable
-        })
+    let post_map: HashMap<i64, _> = projected_posts
+        .into_iter()
+        .map(|p| (p.post_id, p))
         .collect();
-    let extra_displayable_posts = if need_displayable_check.is_empty() {
-        HashSet::new()
-    } else {
-        engine
-            .posts_with_any_displayable_media(&need_displayable_check, &ctx.policy, &ctx.caller)
-            .await
-            .map_err(|e| {
-                tracing::error!("like_previews_post post displayability check failed: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-    };
 
     let posts = post_ids
         .into_iter()
         .filter_map(|pid| {
             let p = post_map.get(&pid)?;
-            let cover_img = p
-                .cover_image
-                .as_ref()
-                .and_then(|c| proj_img_map.get(&c.id));
-            let cover_vid = p
-                .cover_video
-                .as_ref()
-                .and_then(|v| proj_vid_map.get(&v.id));
-            let has_displayable = cover_img.is_some_and(ProjectedImage::is_bypassable_or_clear)
-                || cover_vid.is_some_and(ProjectedVideo::is_bypassable_or_clear)
-                || extra_displayable_posts.contains(&pid);
-            let safe_title = if has_displayable {
-                p.title.clone()
-            } else {
-                format!("Restricted Post #{pid}")
-            };
             Some(build_post_preview_item(
                 pid,
-                safe_title,
+                p.safe_title.clone(),
                 p.image_count,
                 p.video_count,
-                cover_img,
-                cover_vid,
+                p.cover_image.as_ref(),
+                p.cover_video.as_ref(),
             ))
         })
         .collect();
@@ -625,75 +556,29 @@ pub async fn like_previews(
     }
 
     let engine = &state.engine;
-    let (images, posts) = tokio::try_join!(
+    let (images, projected_posts) = tokio::try_join!(
         engine.images_by_ids(&image_ids),
-        engine.post_gallery_covers_by_ids(&post_ids),
+        engine.projected_post_gallery_covers(&post_ids, &ctx.policy, &ctx.caller, &ctx.signer),
     )
     .map_err(|e| {
         tracing::error!("like_previews query failed: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let mut all_images_map: HashMap<i64, search_types::Image> = HashMap::new();
-    for im in &images {
-        all_images_map.insert(im.id, im.clone());
-    }
-    for p in &posts {
-        if let Some(im) = &p.cover_image {
-            all_images_map.insert(im.id, im.clone());
-        }
-    }
-    let all_images: Vec<search_types::Image> = all_images_map.into_values().collect();
-    let cover_videos: Vec<search_types::Video> = posts
-        .iter()
-        .filter_map(|p| p.cover_video.clone())
-        .collect();
-
-    let (proj_images, proj_videos) = tokio::try_join!(
-        engine.project_images(&all_images, &ctx.policy, &ctx.caller, &ctx.signer),
-        engine.project_videos(&cover_videos, &ctx.policy, &ctx.caller, &ctx.signer),
-    )
-    .map_err(|e| {
-        tracing::error!("like_previews projection failed: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let proj_images = engine
+        .project_images(&images, &ctx.policy, &ctx.caller, &ctx.signer)
+        .await
+        .map_err(|e| {
+            tracing::error!("like_previews projection failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     let proj_img_map: HashMap<i64, ProjectedImage> =
         proj_images.into_iter().map(|im| (im.id(), im)).collect();
-    let proj_vid_map: HashMap<i64, ProjectedVideo> =
-        proj_videos.into_iter().map(|v| (v.id(), v)).collect();
-    let post_map: HashMap<i64, _> = posts.into_iter().map(|p| (p.post_id, p)).collect();
-
-    let need_displayable_check: Vec<i64> = post_ids
-        .iter()
-        .copied()
-        .filter(|pid| {
-            let Some(p) = post_map.get(pid) else {
-                return false;
-            };
-            let cover_displayable = p
-                .cover_image
-                .as_ref()
-                .and_then(|c| proj_img_map.get(&c.id))
-                .is_some_and(ProjectedImage::is_bypassable_or_clear)
-                || p.cover_video
-                    .as_ref()
-                    .and_then(|v| proj_vid_map.get(&v.id))
-                    .is_some_and(ProjectedVideo::is_bypassable_or_clear);
-            !cover_displayable
-        })
+    let post_map: HashMap<i64, _> = projected_posts
+        .into_iter()
+        .map(|p| (p.post_id, p))
         .collect();
-    let extra_displayable_posts = if need_displayable_check.is_empty() {
-        HashSet::new()
-    } else {
-        engine
-            .posts_with_any_displayable_media(&need_displayable_check, &ctx.policy, &ctx.caller)
-            .await
-            .map_err(|e| {
-                tracing::error!("like_previews post displayability check failed: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?
-    };
 
     let previews = order
         .into_iter()
@@ -706,19 +591,10 @@ pub async fn like_previews(
             }
             _ => {
                 let p = post_map.get(&id)?;
-                let cover_img = p.cover_image.as_ref().and_then(|c| proj_img_map.get(&c.id));
-                let cover_vid = p.cover_video.as_ref().and_then(|v| proj_vid_map.get(&v.id));
-                let has_displayable = cover_img.is_some_and(ProjectedImage::is_bypassable_or_clear)
-                    || cover_vid.is_some_and(ProjectedVideo::is_bypassable_or_clear)
-                    || extra_displayable_posts.contains(&id);
-                let title = if has_displayable {
-                    (!p.title.trim().is_empty()).then(|| p.title.clone())
-                } else {
-                    Some(format!("Restricted Post #{id}"))
-                };
+                let title = (!p.safe_title.trim().is_empty()).then(|| p.safe_title.clone());
                 let image_count = (p.image_count > 0).then_some(p.image_count);
                 let video_count = (p.video_count > 0).then_some(p.video_count);
-                if let Some(cover) = cover_img {
+                if let Some(cover) = p.cover_image.as_ref() {
                     Some(preview_from_projected_image(
                         "post",
                         id,
@@ -730,7 +606,7 @@ pub async fn like_previews(
                 } else {
                     Some(preview_from_projected_video_post(
                         id,
-                        cover_vid,
+                        p.cover_video.as_ref(),
                         title,
                         image_count,
                         video_count,

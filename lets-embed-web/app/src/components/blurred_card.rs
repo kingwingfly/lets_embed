@@ -345,16 +345,23 @@ pub fn BlurredMediaCard(
                                     }
                                     .into_any()
                                 } else {
+                                    let is_authed =
+                                        safety.is_none_or(|s| s.caller_authenticated.get_untracked());
+                                    let (href, cta) = if is_authed {
+                                        ("/user/account#content-safety", "Manage content settings")
+                                    } else {
+                                        ("/user/login", "Sign in to unlock")
+                                    };
                                     view! {
                                         <a
-                                            href="/user/account"
+                                            href=href
                                             rel="external"
                                             class="web-blurred-card-settings-link mt-1 inline-flex items-center gap-1 px-3 py-1 rounded-full text-[11px] font-semibold
                                                    bg-white/15 hover:bg-white/25 text-white ring-1 ring-white/30 backdrop-blur-xs
                                                    transition-colors"
                                             on:click=|ev: ev::MouseEvent| ev.stop_propagation()
                                         >
-                                            "Manage content settings"
+                                            {cta}
                                         </a>
                                     }
                                     .into_any()

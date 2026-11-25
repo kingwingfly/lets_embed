@@ -1762,109 +1762,42 @@ async fn hydrate_posts(
     }
     let post_ids: Vec<i64> = posts.iter().map(|p| p.id).collect();
     let covers = engine
-        .post_gallery_covers_by_ids(&post_ids)
+        .projected_post_gallery_covers(&post_ids, &ctx.policy, &ctx.caller, &ctx.signer)
         .await
         .map_err(to_server_err)?;
 
-    let cover_images: Vec<search_types::Image> = covers
-        .iter()
-        .filter_map(|c| c.cover_image.clone())
-        .collect();
-    let cover_videos: Vec<search_types::Video> = covers
-        .iter()
-        .filter_map(|c| c.cover_video.clone())
-        .collect();
-
-    let (proj_imgs, proj_vids) = tokio::try_join!(
-        engine.project_images(&cover_images, &ctx.policy, &ctx.caller, &ctx.signer),
-        engine.project_videos(&cover_videos, &ctx.policy, &ctx.caller, &ctx.signer),
-    )
-    .map_err(to_server_err)?;
-
-    let mut proj_img_map: HashMap<i64, ProjectedImage> =
-        proj_imgs.into_iter().map(|im| (im.id(), im)).collect();
-    let mut proj_vid_map: HashMap<i64, ProjectedVideo> =
-        proj_vids.into_iter().map(|v| (v.id(), v)).collect();
-    let mut by_id: HashMap<i64, search_engine::PostGalleryCover> =
+    let mut by_id: HashMap<i64, search_engine::ProjectedPostGalleryCover> =
         covers.into_iter().map(|c| (c.post_id, c)).collect();
-
-    // Withhold post titles whenever safety policy is active and a post has ZERO displayable
-    // (Clear or user-bypassable) media — hard-blocked (e.g. Extreme / Gore & Illegal) and
-    // unclassified posts redact to `"Restricted Post #<id>"`, while bypassable posts (e.g.
-    // NSFW / Sensitive) retain their real titles for visitors and search indexing.
-    let extra_displayable_posts = if ctx.policy.is_enabled() {
-        let need_check: Vec<i64> = posts
-            .iter()
-            .filter_map(|post| {
-                let has_displayable_cover = by_id.get(&post.id).is_some_and(|c| {
-                    c.cover_image
-                        .as_ref()
-                        .and_then(|im| proj_img_map.get(&im.id))
-                        .is_some_and(ProjectedImage::is_bypassable_or_clear)
-                        || c.cover_video
-                            .as_ref()
-                            .and_then(|v| proj_vid_map.get(&v.id))
-                            .is_some_and(ProjectedVideo::is_bypassable_or_clear)
-                });
-                (!has_displayable_cover).then_some(post.id)
-            })
-            .collect();
-        if need_check.is_empty() {
-            std::collections::HashSet::new()
-        } else {
-            engine
-                .posts_with_any_displayable_media(&need_check, &ctx.policy, &ctx.caller)
-                .await
-                .map_err(to_server_err)?
-        }
-    } else {
-        std::collections::HashSet::new()
-    };
 
     let mut items = Vec::with_capacity(posts.len());
     for post in posts {
         if let Some(cover) = by_id.remove(&post.id) {
-            let images: Vec<ProjectedImage> = cover
-                .cover_image
-                .and_then(|im| proj_img_map.remove(&im.id))
-                .into_iter()
-                .collect();
-            let videos: Vec<ProjectedVideo> = cover
-                .cover_video
-                .and_then(|v| proj_vid_map.remove(&v.id))
-                .into_iter()
-                .collect();
-            let show_title = !ctx.policy.is_enabled()
-                || images.iter().any(ProjectedImage::is_bypassable_or_clear)
-                || videos.iter().any(ProjectedVideo::is_bypassable_or_clear)
-                || extra_displayable_posts.contains(&post.id);
-            let title = if show_title {
+            let title = if cover.title_displayable {
                 if post.title.is_empty() {
                     cover.title
                 } else {
                     post.title
                 }
             } else {
+                cover.safe_title
+            };
+            items.push(PostItem {
+                id: post.id,
+                title,
+                images: cover.cover_image.into_iter().collect(),
+                videos: cover.cover_video.into_iter().collect(),
+                image_count: cover.image_count,
+                video_count: cover.video_count,
+            });
+        } else {
+            let title = if !ctx.policy.is_enabled() {
+                post.title
+            } else {
                 format!("Restricted Post #{}", post.id)
             };
             items.push(PostItem {
                 id: post.id,
                 title,
-                images,
-                videos,
-                image_count: cover.image_count,
-                video_count: cover.video_count,
-            });
-        } else {
-            let show_title =
-                !ctx.policy.is_enabled() || extra_displayable_posts.contains(&post.id);
-            items.push(PostItem {
-                id: post.id,
-                title: if show_title {
-                    post.title
-                } else {
-                    format!("Restricted Post #{}", post.id)
-                },
                 images: Vec::new(),
                 videos: Vec::new(),
                 image_count: 0,

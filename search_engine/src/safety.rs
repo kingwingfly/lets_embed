@@ -4,7 +4,7 @@
 //! `MediaCapability v3` signing.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     sync::Arc,
 };
@@ -291,6 +291,36 @@ impl CompiledExpr {
         }
     }
 
+    /// Lowest `min_score` threshold across all `WdTag` leaves in this expression, if any.
+    pub fn min_wd_tag_threshold(&self) -> Option<f32> {
+        match self {
+            Self::Predicate(CompiledPredicate::WdTag { min_score, .. }) => Some(*min_score),
+            Self::Predicate(_) => None,
+            Self::Not(inner) => inner.min_wd_tag_threshold(),
+            Self::And(items) | Self::Or(items) => items
+                .iter()
+                .filter_map(Self::min_wd_tag_threshold)
+                .reduce(f32::min),
+        }
+    }
+
+    /// Collects `(tag_name -> lowest min_score)` iff `self` is purely a disjunction (`Or`)
+    /// of `CompiledPredicate::WdTag` leaves (or a single `WdTag`).
+    fn collect_pure_or_wd_tags(&self, out: &mut BTreeMap<String, f32>) -> bool {
+        match self {
+            Self::Predicate(CompiledPredicate::WdTag { name, min_score }) => {
+                out.entry(name.clone())
+                    .and_modify(|cur| *cur = cur.min(*min_score))
+                    .or_insert(*min_score);
+                true
+            }
+            Self::Or(items) if !items.is_empty() => {
+                items.iter().all(|item| item.collect_pure_or_wd_tags(out))
+            }
+            _ => false,
+        }
+    }
+
     /// Push a parameterized Postgres 3-valued (`TRUE` / `FALSE` / `NULL` = `Unknown`)
     /// SQL expression referencing `images` alias `img_alias` and optional parent-post
     /// column expression `post_id_expr` (e.g. `Some("pi.post_id")` or `None` for orphan).
@@ -439,6 +469,34 @@ impl CompiledPolicyItem {
                 )
                 .not(),
             ),
+        }
+    }
+
+    /// Lowest `min_score` threshold across all `WdTag` leaves in `match_expr` and `except_expr`.
+    pub fn min_wd_tag_threshold(&self) -> Option<f32> {
+        match (
+            self.match_expr.min_wd_tag_threshold(),
+            self.except_expr
+                .as_ref()
+                .and_then(CompiledExpr::min_wd_tag_threshold),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        }
+    }
+
+    /// Returns deduplicated `(tag_name, min_score)` pairs when this rule has NO `except_expr`
+    /// and its `match_expr` is purely an `OR` of `WdTag` predicates (true for all 3 builtin presets).
+    pub fn pure_or_wd_tags(&self) -> Option<Vec<(String, f32)>> {
+        if self.except_expr.is_some() {
+            return None;
+        }
+        let mut tags = BTreeMap::new();
+        if self.match_expr.collect_pure_or_wd_tags(&mut tags) && !tags.is_empty() {
+            Some(tags.into_iter().collect())
+        } else {
+            None
         }
     }
 
@@ -865,19 +923,24 @@ impl CompiledPolicy {
             .filter(|p| !caller.has_direct_grant(&p.policy_ref))
             .collect();
 
-        // 4. Any unsatisfied Blur -> Blurred ONLY if fixed_blur_enabled == true,
-        //    otherwise degrade to Placeholder so zero clear pixels ever leak!
+        // 4. Any unsatisfied Blur:
+        //    - Returns `Blurred` whenever `fixed_blur_enabled == true` (Cloudflare blurred
+        //      thumbnail) OR `can_click_reveal == true` (zero-cost frosted veil + object-bound
+        //      Click-to-Reveal via `POST /api/safety/reveal`, zero clear pixels before click).
+        //    - Degrades to `Placeholder` only when BOTH `fixed_blur_enabled == false` AND
+        //      `can_click_reveal == false` so unauthenticated / unverified callers receive
+        //      exact step-by-step login / 18+ / Terms / Account Settings unlock prompts.
         if !unsatisfied_blurs.is_empty() {
-            if !self.policy.fixed_blur_enabled {
+            let can_click_reveal = unsatisfied_blurs
+                .iter()
+                .all(|b| caller.is_click_eligible(&b.policy_ref));
+            if !self.policy.fixed_blur_enabled && !can_click_reveal {
                 return MediaOutcome::Placeholder {
                     mask: aggregate_placeholder_mask(&unsatisfied_blurs, &self.policy, caller),
                     facts_rev,
                 };
             }
             let primary = unsatisfied_blurs[0];
-            let can_click_reveal = unsatisfied_blurs
-                .iter()
-                .all(|b| caller.is_click_eligible(&b.policy_ref));
             let mut matched_policy_ids: Vec<String> =
                 unsatisfied_blurs.iter().map(|p| p.id.clone()).collect();
             if !unsatisfied_blurs
@@ -991,7 +1054,7 @@ impl CompiledPolicy {
                 facts_rev,
                 canonical_name,
             } => {
-                if !self.policy.fixed_blur_enabled {
+                if !self.policy.fixed_blur_enabled && !can_click_reveal {
                     return ProjectedImage::Placeholder {
                         id: image.id,
                         policy_rev,
@@ -1009,32 +1072,38 @@ impl CompiledPolicy {
                     };
                 }
                 let effective_name = canonical_name.as_deref().unwrap_or(&image.name);
-                let preview_url = match signer {
-                    // Never emit clear `/images/...` bytes as preview_url!
-                    MediaSigner::Standalone => None,
-                    MediaSigner::Managed { secret, now_secs } => {
-                        if caller.actor.is_anon() {
-                            // `MediaCapability v3` forbids Anon actor when matched_blocks/blurs are non-empty.
-                            // Card still renders frosted blur overlay + Click-to-Reveal (which upgrades to GuestSession).
-                            None
-                        } else {
-                            let locator = format!("{}.webp", effective_name.trim_start_matches('/'));
-                            match mint_cap_url_v3(
-                                secret,
-                                *now_secs,
-                                policy_rev,
-                                facts_rev,
-                                MediaCapKind::Preview,
-                                image.id,
-                                locator,
-                                &matched_blocks,
-                                &matched_blurs,
-                                &[],
-                                caller,
-                                None,
-                            ) {
-                                Ok((url, _exp)) => Some(url),
-                                Err(_) => None,
+                let preview_url = if !self.policy.fixed_blur_enabled {
+                    // Zero-cost frosted veil: emit NO `/media/preview/*` URL and NO clear URL.
+                    None
+                } else {
+                    match signer {
+                        // Never emit clear `/images/...` bytes as preview_url!
+                        MediaSigner::Standalone => None,
+                        MediaSigner::Managed { secret, now_secs } => {
+                            if caller.actor.is_anon() {
+                                // `MediaCapability v3` forbids Anon actor when matched_blocks/blurs are non-empty.
+                                // Card still renders frosted blur overlay + Click-to-Reveal (which upgrades to GuestSession).
+                                None
+                            } else {
+                                let locator =
+                                    format!("{}.webp", effective_name.trim_start_matches('/'));
+                                match mint_cap_url_v3(
+                                    secret,
+                                    *now_secs,
+                                    policy_rev,
+                                    facts_rev,
+                                    MediaCapKind::Preview,
+                                    image.id,
+                                    locator,
+                                    &matched_blocks,
+                                    &matched_blurs,
+                                    &[],
+                                    caller,
+                                    None,
+                                ) {
+                                    Ok((url, _exp)) => Some(url),
+                                    Err(_) => None,
+                                }
                             }
                         }
                     }
@@ -1083,7 +1152,7 @@ impl CompiledPolicy {
                 can_click_reveal,
                 ..
             } => {
-                if !self.policy.fixed_blur_enabled {
+                if !self.policy.fixed_blur_enabled && !can_click_reveal {
                     return ProjectedVideo::Placeholder {
                         id: video.id,
                         policy_rev,
@@ -1258,6 +1327,407 @@ impl CompiledPolicy {
 
         emitted
     }
+
+    /// Build a complete, `MATERIALIZED`-CTE-backed Postgres query for anonymous XML sitemap
+    /// post counts (`sitemap_post_count_with_policy`).
+    ///
+    /// Materializes matching WD-tag exclusions ONCE via `wd_tag_images_pkey(wd_tag_id, image_id)`
+    /// into `_sm_blocked_images` and joins via Hash Anti-Join (`LEFT JOIN ... WHERE IS NULL`)
+    /// so Postgres NEVER falls back to nested-looping millions of `wd_tag_images` rows on 1c1g.
+    pub fn build_sitemap_count_query(&self) -> QueryBuilder<Postgres> {
+        let mut qb = QueryBuilder::<Postgres>::new("");
+        let has_blocked_cte = self.push_sitemap_blocked_ctes(&mut qb);
+        if has_blocked_cte {
+            qb.push(", covers AS (SELECT DISTINCT ON (pi.post_id) pi.post_id, pi.image_id FROM post_images pi ORDER BY pi.post_id, pi.image_id ASC) SELECT COUNT(*)::BIGINT FROM covers c JOIN images i ON i.id = c.image_id LEFT JOIN _sm_blocked_images _smb ON _smb.image_id = i.id WHERE _smb.image_id IS NULL");
+        } else {
+            qb.push("WITH covers AS (SELECT DISTINCT ON (pi.post_id) pi.post_id, pi.image_id FROM post_images pi ORDER BY pi.post_id, pi.image_id ASC) SELECT COUNT(*)::BIGINT FROM covers c JOIN images i ON i.id = c.image_id WHERE TRUE");
+        }
+        self.push_sitemap_where_clauses(&mut qb);
+        qb
+    }
+
+    /// Build a complete, `MATERIALIZED`-CTE-backed Postgres query for a newest-first page
+    /// of anonymous XML sitemap post covers (`sitemap_post_entries_with_policy`).
+    pub fn build_sitemap_entries_query(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> QueryBuilder<Postgres> {
+        let mut qb = QueryBuilder::<Postgres>::new("");
+        let has_blocked_cte = self.push_sitemap_blocked_ctes(&mut qb);
+        if has_blocked_cte {
+            qb.push(" ");
+        }
+        // Walk `posts_pkey` newest-first with a LATERAL 1-row lookup into `post_images_pkey`
+        // so `LIMIT`/`OFFSET` stops early without scanning & sorting all of `post_images`.
+        qb.push("SELECT c.image_id AS cover_id, to_char(p.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS lastmod FROM posts p CROSS JOIN LATERAL (SELECT pi.image_id FROM post_images pi WHERE pi.post_id = p.id ORDER BY pi.image_id ASC LIMIT 1) c JOIN images i ON i.id = c.image_id");
+        if has_blocked_cte {
+            qb.push(" LEFT JOIN _sm_blocked_images _smb ON _smb.image_id = i.id WHERE _smb.image_id IS NULL");
+        } else {
+            qb.push(" WHERE TRUE");
+        }
+        self.push_sitemap_where_clauses(&mut qb);
+        qb.push(" ORDER BY p.id DESC LIMIT ");
+        qb.push_bind(limit);
+        qb.push(" OFFSET ");
+        qb.push_bind(offset);
+        qb
+    }
+
+    /// Partition enabled policies into pure-OR WD-tag exclusions (for the `MATERIALIZED` CTE),
+    /// pure-OR WD-tag `IS NOT NULL` checks, and general custom rules.
+    fn sitemap_policy_partition(&self) -> SitemapPolicyPartition<'_> {
+        let strict_all = self.policy.legal.noindex_restricted;
+        let mut blocked_union: BTreeMap<String, f32> = BTreeMap::new();
+        let mut sf_pure_or: Vec<Vec<(String, f32)>> = Vec::new();
+        let mut nn_pure_or: Vec<Vec<(String, f32)>> = Vec::new();
+        let mut sf_general: Vec<&CompiledPolicyItem> = Vec::new();
+        let mut nn_general: Vec<&CompiledPolicyItem> = Vec::new();
+
+        for item in &self.policies {
+            let needs_strictly_false =
+                strict_all || !policy_has_user_unlock_path(item, &self.policy);
+            if needs_strictly_false {
+                if let Some(wd_tags) = item.pure_or_wd_tags() {
+                    for (name, min_score) in &wd_tags {
+                        blocked_union
+                            .entry(name.clone())
+                            .and_modify(|cur| *cur = cur.min(*min_score))
+                            .or_insert(*min_score);
+                    }
+                    sf_pure_or.push(wd_tags);
+                } else {
+                    sf_general.push(item);
+                }
+            } else if item.references_wd_tags {
+                if let Some(wd_tags) = item.pure_or_wd_tags() {
+                    nn_pure_or.push(wd_tags);
+                } else {
+                    nn_general.push(item);
+                }
+            }
+        }
+
+        SitemapPolicyPartition {
+            blocked_tags: blocked_union.into_iter().collect(),
+            sf_pure_or,
+            nn_pure_or,
+            sf_general,
+            nn_general,
+        }
+    }
+
+    fn push_sitemap_blocked_ctes(&self, qb: &mut QueryBuilder<Postgres>) -> bool {
+        let part = self.sitemap_policy_partition();
+        let blocked_tags = &part.blocked_tags;
+        if blocked_tags.is_empty() {
+            return false;
+        }
+        let min_s = blocked_tags
+            .iter()
+            .map(|(_, s)| *s)
+            .fold(f32::INFINITY, f32::min);
+        let uniform = blocked_tags.iter().all(|(_, s)| *s == min_s);
+        let names: Vec<String> = blocked_tags.iter().map(|(n, _)| n.clone()).collect();
+
+        if uniform {
+            qb.push("WITH _sm_blocked_tags AS MATERIALIZED (SELECT id FROM wd_tags WHERE name = ANY(");
+            qb.push_bind(names);
+            qb.push("::TEXT[])), _sm_blocked_images AS MATERIALIZED (SELECT DISTINCT wti.image_id FROM _sm_blocked_tags bt JOIN wd_tag_images wti ON wti.wd_tag_id = bt.id WHERE wti.score >= ");
+            qb.push_bind(min_s);
+            qb.push(")");
+        } else {
+            let mins: Vec<f32> = blocked_tags.iter().map(|(_, s)| *s).collect();
+            qb.push("WITH _sm_blocked_tags AS MATERIALIZED (SELECT wt.id, req.min_score FROM wd_tags wt JOIN UNNEST(");
+            qb.push_bind(names);
+            qb.push("::TEXT[], ");
+            qb.push_bind(mins);
+            qb.push("::REAL[]) AS req(tag_name, min_score) ON wt.name = req.tag_name), _sm_blocked_images AS MATERIALIZED (SELECT DISTINCT wti.image_id FROM _sm_blocked_tags bt JOIN wd_tag_images wti ON wti.wd_tag_id = bt.id WHERE wti.score >= bt.min_score)");
+        }
+        true
+    }
+
+    fn push_sitemap_where_clauses(&self, qb: &mut QueryBuilder<Postgres>) {
+        let part = self.sitemap_policy_partition();
+        let expected_vocab = self.policy.vocab_digest.as_str();
+
+        if self.policy.unclassified_mode == UnclassifiedMode::Placeholder
+            || !part.sf_pure_or.is_empty()
+            || !part.nn_pure_or.is_empty()
+        {
+            qb.push(" AND i.status = 'completed'::process_status");
+        }
+
+        // Single combined O(1) coverage short-circuit across ALL pure-OR WD-tag policies
+        // (`blood`, `r18`, `sensitive`): backfilled completed images pass in nanoseconds
+        // with ZERO per-row `wd_tag_images` lookups; legacy rows fall back to exact 3-valued checks.
+        if !part.sf_pure_or.is_empty() || !part.nn_pure_or.is_empty() {
+            let overall_min = part
+                .sf_pure_or
+                .iter()
+                .chain(part.nn_pure_or.iter())
+                .flat_map(|tags| tags.iter().map(|(_, s)| *s))
+                .fold(f32::INFINITY, f32::min);
+            qb.push(" AND ((i.wd_vocab_digest = ");
+            qb.push_bind(expected_vocab.to_string());
+            qb.push(" AND i.wd_min_persisted_score IS NOT NULL AND i.wd_min_persisted_score <= ");
+            qb.push_bind(overall_min);
+            qb.push(") OR (TRUE");
+            for wd_tags in &part.sf_pure_or {
+                qb.push(" AND ");
+                push_wd_tag_all_covered_sql(qb, "i", wd_tags, expected_vocab);
+            }
+            for wd_tags in &part.nn_pure_or {
+                qb.push(" AND (");
+                push_wd_tag_all_covered_sql(qb, "i", wd_tags, expected_vocab);
+                qb.push(" OR ");
+                push_wd_tag_any_match_exists_sql(qb, "i", wd_tags);
+                qb.push(")");
+            }
+            qb.push("))");
+        }
+
+        for item in part.sf_general {
+            qb.push(" AND ");
+            push_policy_strictly_false_sql(qb, item, "i", expected_vocab);
+        }
+        for item in part.nn_general {
+            qb.push(" AND ");
+            push_policy_not_unknown_sql(qb, item, "i", expected_vocab);
+        }
+    }
+
+    /// Returns `true` if `facts` explicitly matches (`TriBool::True`) at least one enabled
+    /// **non-bypassable** policy (zero user self-service unlock path, e.g. `Extreme / Gore & Illegal`,
+    /// or staff-only rule) that is NOT directly granted to `caller`.
+    ///
+    /// Indeterminate (`TriBool::Unknown` / pending) evaluations return `false` so a single
+    /// unclassified image does not falsely lock an entire album as Extreme/Gore.
+    pub fn image_matches_unsatisfied_hard_block(
+        &self,
+        facts: &ImageFacts,
+        caller: &CallerContext,
+    ) -> bool {
+        if !self.is_enabled() || !facts.exists {
+            return false;
+        }
+        let hard_blocks: Vec<&CompiledPolicyItem> = self
+            .policies
+            .iter()
+            .filter(|item| {
+                !policy_has_user_unlock_path(item, &self.policy)
+                    && !caller.has_direct_grant(&item.policy_ref)
+            })
+            .collect();
+        if hard_blocks.is_empty() {
+            return false;
+        }
+
+        let wd_vocab_matches =
+            facts.wd_vocab_digest.as_deref() == Some(self.policy.vocab_digest.as_str());
+        let empty_set = HashSet::new();
+
+        for item in hard_blocks {
+            if facts.parent_posts.is_empty() {
+                if item.eval_context(
+                    facts.is_completed,
+                    wd_vocab_matches,
+                    facts.wd_min_persisted_score,
+                    &facts.wd_tag_scores,
+                    &empty_set,
+                    &empty_set,
+                ) == TriBool::True
+                {
+                    return true;
+                }
+            } else {
+                for parent in &facts.parent_posts {
+                    if item.eval_context(
+                        facts.is_completed,
+                        wd_vocab_matches,
+                        facts.wd_min_persisted_score,
+                        &facts.wd_tag_scores,
+                        &parent.post_tags,
+                        &parent.authors,
+                    ) == TriBool::True
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Selects the deterministic gallery cover for a post's images (expected sorted `image_id ASC`):
+    /// 1. **Extreme / Hard-Block Album Lock**: if ANY image explicitly matches an unsatisfied
+    ///    non-bypassable rule (e.g. `Extreme / Gore & Illegal`), picks the first such image,
+    ///    sets `has_hard_block = true`, and withholds the album title (`title_displayable = false`).
+    /// 2. **Safe Cover Fallback**: otherwise picks the first image evaluating strictly `Clear`
+    ///    for `caller` so mixed SFW+NSFW albums are never penalized by image #1 being filtered.
+    /// 3. **Bypassable / Default Fallback**: if zero images are `Clear`, prefers the first
+    ///    user-bypassable image (e.g. `r18` / `sensitive`), else falls back to `image_ids[0]`.
+    pub fn select_post_cover_image(
+        &self,
+        image_ids: &[i64],
+        facts_map: &HashMap<i64, ImageFacts>,
+        caller: &CallerContext,
+    ) -> SelectedPostCover {
+        if image_ids.is_empty() {
+            return SelectedPostCover {
+                image_id: None,
+                outcome: None,
+                has_hard_block: false,
+                title_displayable: !self.is_enabled(),
+            };
+        }
+
+        let default_missing = ImageFacts::default();
+        let mut first_clear: Option<(i64, MediaOutcome)> = None;
+        let mut first_bypassable: Option<(i64, MediaOutcome)> = None;
+        let mut first_default: Option<(i64, MediaOutcome)> = None;
+
+        for &id in image_ids {
+            let facts = facts_map.get(&id).unwrap_or(&default_missing);
+            if self.image_matches_unsatisfied_hard_block(facts, caller) {
+                let outcome = self.evaluate_image(facts, caller);
+                return SelectedPostCover {
+                    image_id: Some(id),
+                    outcome: Some(outcome),
+                    has_hard_block: true,
+                    title_displayable: false,
+                };
+            }
+
+            let outcome = self.evaluate_image(facts, caller);
+            if first_clear.is_none() && outcome.is_clear() {
+                first_clear = Some((id, outcome));
+            } else if first_bypassable.is_none() && outcome.is_user_bypassable_or_clear() {
+                first_bypassable = Some((id, outcome));
+            } else if first_default.is_none() {
+                first_default = Some((id, outcome));
+            }
+        }
+
+        if let Some((id, outcome)) = first_clear {
+            SelectedPostCover {
+                image_id: Some(id),
+                outcome: Some(outcome),
+                has_hard_block: false,
+                title_displayable: true,
+            }
+        } else if let Some((id, outcome)) = first_bypassable {
+            SelectedPostCover {
+                image_id: Some(id),
+                outcome: Some(outcome),
+                has_hard_block: false,
+                title_displayable: true,
+            }
+        } else {
+            let (id, outcome) = first_default
+                .expect("non-empty image_ids guarantees at least one evaluated candidate");
+            let title_displayable = outcome.is_user_bypassable_or_clear();
+            SelectedPostCover {
+                image_id: Some(id),
+                outcome: Some(outcome),
+                has_hard_block: false,
+                title_displayable,
+            }
+        }
+    }
+}
+
+/// Deterministic Policy v3 cover-selection outcome for a post's image list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedPostCover {
+    pub image_id: Option<i64>,
+    pub outcome: Option<MediaOutcome>,
+    pub has_hard_block: bool,
+    pub title_displayable: bool,
+}
+
+struct SitemapPolicyPartition<'a> {
+    blocked_tags: Vec<(String, f32)>,
+    sf_pure_or: Vec<Vec<(String, f32)>>,
+    nn_pure_or: Vec<Vec<(String, f32)>>,
+    sf_general: Vec<&'a CompiledPolicyItem>,
+    nn_general: Vec<&'a CompiledPolicyItem>,
+}
+
+fn push_wd_tag_any_match_exists_sql(
+    qb: &mut QueryBuilder<Postgres>,
+    img_alias: &'static str,
+    wd_tags: &[(String, f32)],
+) {
+    let min_s = wd_tags
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(f32::INFINITY, f32::min);
+    let uniform = wd_tags.iter().all(|(_, s)| *s == min_s);
+    let names: Vec<String> = wd_tags.iter().map(|(n, _)| n.clone()).collect();
+
+    if uniform {
+        qb.push("EXISTS (SELECT 1 FROM wd_tag_images wti JOIN wd_tags wt ON wt.id = wti.wd_tag_id WHERE wti.image_id = ");
+        qb.push(img_alias);
+        qb.push(".id AND wt.name = ANY(");
+        qb.push_bind(names);
+        qb.push("::TEXT[]) AND wti.score >= ");
+        qb.push_bind(min_s);
+        qb.push(")");
+    } else {
+        let mins: Vec<f32> = wd_tags.iter().map(|(_, s)| *s).collect();
+        qb.push("EXISTS (SELECT 1 FROM wd_tag_images wti JOIN wd_tags wt ON wt.id = wti.wd_tag_id JOIN UNNEST(");
+        qb.push_bind(names);
+        qb.push("::TEXT[], ");
+        qb.push_bind(mins);
+        qb.push("::REAL[]) AS req(tag_name, min_score) ON wt.name = req.tag_name WHERE wti.image_id = ");
+        qb.push(img_alias);
+        qb.push(".id AND wti.score >= req.min_score)");
+    }
+}
+
+fn push_wd_tag_all_covered_sql(
+    qb: &mut QueryBuilder<Postgres>,
+    img_alias: &'static str,
+    wd_tags: &[(String, f32)],
+    expected_vocab_digest: &str,
+) {
+    let min_s = wd_tags
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(f32::INFINITY, f32::min);
+    let names: Vec<String> = wd_tags.iter().map(|(n, _)| n.clone()).collect();
+    let mins: Vec<f32> = wd_tags.iter().map(|(_, s)| *s).collect();
+
+    // O(1) column fast-path: any completed image stamped with the current vocab digest
+    // and `wd_min_persisted_score <= min(tag thresholds)` is guaranteed fully covered
+    // with ZERO `wd_tag_images` lookups. Legacy/uncovered rows fall back to checking
+    // each tag explicitly.
+    qb.push("((");
+    qb.push(img_alias);
+    qb.push(".wd_vocab_digest = ");
+    qb.push_bind(expected_vocab_digest.to_string());
+    qb.push(" AND ");
+    qb.push(img_alias);
+    qb.push(".wd_min_persisted_score IS NOT NULL AND ");
+    qb.push(img_alias);
+    qb.push(".wd_min_persisted_score <= ");
+    qb.push_bind(min_s);
+    qb.push(") OR NOT EXISTS (SELECT 1 FROM UNNEST(");
+    qb.push_bind(names);
+    qb.push("::TEXT[], ");
+    qb.push_bind(mins);
+    qb.push("::REAL[]) AS req(tag_name, min_score) WHERE NOT ((");
+    qb.push(img_alias);
+    qb.push(".wd_vocab_digest = ");
+    qb.push_bind(expected_vocab_digest.to_string());
+    qb.push(" AND ");
+    qb.push(img_alias);
+    qb.push(".wd_min_persisted_score IS NOT NULL AND ");
+    qb.push(img_alias);
+    qb.push(".wd_min_persisted_score <= req.min_score) OR EXISTS (SELECT 1 FROM wd_tag_images wti JOIN wd_tags wt ON wt.id = wti.wd_tag_id WHERE wti.image_id = ");
+    qb.push(img_alias);
+    qb.push(".id AND wt.name = req.tag_name))))");
 }
 
 fn push_policy_strictly_false_sql(
@@ -1266,7 +1736,19 @@ fn push_policy_strictly_false_sql(
     img_alias: &'static str,
     expected_vocab_digest: &str,
 ) {
-    if !item.uses_post_context {
+    if let Some(wd_tags) = item.pure_or_wd_tags() {
+        // Pure OR-of-WdTag set-based SQL: top-level `NOT EXISTS` lets Postgres plan a
+        // single Hash Anti-Join on `wd_tag_images(wd_tag_id, image_id)` instead of
+        // N*2 correlated `CASE WHEN EXISTS` SubPlans per row, while preserving exact
+        // 3-valued Kleene semantics.
+        qb.push("(");
+        qb.push(img_alias);
+        qb.push(".status = 'completed'::process_status AND NOT ");
+        push_wd_tag_any_match_exists_sql(qb, img_alias, &wd_tags);
+        qb.push(" AND ");
+        push_wd_tag_all_covered_sql(qb, img_alias, &wd_tags, expected_vocab_digest);
+        qb.push(")");
+    } else if !item.uses_post_context {
         qb.push("((");
         item.push_policy_match_sql(qb, img_alias, None, expected_vocab_digest);
         qb.push(") IS FALSE)");
@@ -1291,6 +1773,40 @@ fn push_policy_not_unknown_sql(
     img_alias: &'static str,
     expected_vocab_digest: &str,
 ) {
+    if let Some(wd_tags) = item.pure_or_wd_tags() {
+        // Pure OR-of-WdTag `IS NOT NULL`: completed AND (all tags covered [O(1) fast-path]
+        // OR any tag explicitly matched >= threshold). Eliminates 100+ correlated SubPlans
+        // on bypassable rules (`r18`, `sensitive`) in sitemap SQL.
+        qb.push("(");
+        qb.push(img_alias);
+        qb.push(".status = 'completed'::process_status AND (");
+        push_wd_tag_all_covered_sql(qb, img_alias, &wd_tags, expected_vocab_digest);
+        qb.push(" OR ");
+        push_wd_tag_any_match_exists_sql(qb, img_alias, &wd_tags);
+        qb.push("))");
+        return;
+    }
+
+    // For general custom rules referencing WD tags, short-circuit to TRUE in O(1) whenever
+    // the image is completed and its persisted coverage floor covers every referenced WD tag
+    // (PostTag/Author/Unclassified predicates are strictly 2-valued and never produce NULL).
+    let fast_guard = item.min_wd_tag_threshold();
+    if let Some(min_t) = fast_guard {
+        qb.push("((");
+        qb.push(img_alias);
+        qb.push(".status = 'completed'::process_status AND ");
+        qb.push(img_alias);
+        qb.push(".wd_vocab_digest = ");
+        qb.push_bind(expected_vocab_digest.to_string());
+        qb.push(" AND ");
+        qb.push(img_alias);
+        qb.push(".wd_min_persisted_score IS NOT NULL AND ");
+        qb.push(img_alias);
+        qb.push(".wd_min_persisted_score <= ");
+        qb.push_bind(min_t);
+        qb.push(") OR ");
+    }
+
     if !item.uses_post_context {
         qb.push("((");
         item.push_policy_match_sql(qb, img_alias, None, expected_vocab_digest);
@@ -1305,6 +1821,10 @@ fn push_policy_not_unknown_sql(
         qb.push(".id) OR ((");
         item.push_policy_match_sql(qb, img_alias, None, expected_vocab_digest);
         qb.push(") IS NOT NULL)))");
+    }
+
+    if fast_guard.is_some() {
+        qb.push(")");
     }
 }
 
@@ -1546,11 +2066,8 @@ fn unclassified_mask() -> MaskMetadata {
 
 fn policy_has_user_unlock_path(item: &CompiledPolicyItem, site_policy: &PublicSitePolicy) -> bool {
     let has_branch = match item.action {
-        PolicyAction::Block => item.bypass.include_switcher || item.bypass.include_click,
-        PolicyAction::Blur => {
-            item.bypass.include_switcher
-                || (site_policy.fixed_blur_enabled && item.bypass.include_click)
-        }
+        PolicyAction::Block => item.bypass.include_switcher,
+        PolicyAction::Blur => item.bypass.include_switcher || item.bypass.include_click,
     };
     let age_impossible =
         item.bypass.require_age_18 && site_policy.age_policy == AgeVerificationPolicy::Off;
@@ -2870,34 +3387,12 @@ mod tests {
     }
 
     #[test]
-    fn blurred_degrades_to_placeholder_when_fixed_blur_disabled_and_never_mints_reveal_url() {
+    fn blurred_supports_click_reveal_without_paid_preview_and_degrades_when_ineligible() {
         let mut pol = sample_policy_v3();
         pol.fixed_blur_enabled = false;
         pol.refresh_policy_digest();
         let compiled = CompiledPolicy::compile(pol).unwrap();
 
-        let user = CallerContext {
-            actor: ActorBinding::User {
-                sub: "usr-1".into(),
-                sid: "sid-1".into(),
-            },
-            direct_grants: HashSet::new(),
-            click_eligible: HashSet::from([PolicyRef::new("sensitive", 3)]),
-            is_billing_waived: false,
-            age_verified: false,
-            terms_accepted: false,
-        };
-        let blur_img = ImageFacts::completed_with_floor(
-            Some(0.05),
-            HashMap::from([("lingerie".into(), 0.85)]),
-        );
-        let outcome = compiled.evaluate_image(&blur_img, &user);
-        assert!(outcome.is_placeholder(), "fixed_blur_enabled=false must degrade Blur to Placeholder");
-
-        // With fixed_blur_enabled = true, Managed projection emits preview_url ONLY (no reveal_url)
-        let compiled_blur = CompiledPolicy::compile(sample_policy_v3()).unwrap();
-        let outcome_blur = compiled_blur.evaluate_image(&blur_img, &user);
-        assert!(outcome_blur.is_blurred());
         let img = Image {
             id: 42,
             name: "2026/01/test".into(),
@@ -2909,6 +3404,62 @@ mod tests {
             secret: secret.clone(),
             now_secs: 2000,
         };
+        let blur_img = ImageFacts::completed_with_floor(
+            Some(0.05),
+            HashMap::from([("lingerie".into(), 0.85)]),
+        );
+
+        // 1. fixed_blur_enabled = false + caller NOT click_eligible -> degrades to Placeholder
+        let ineligible_user = CallerContext {
+            actor: ActorBinding::User {
+                sub: "usr-0".into(),
+                sid: "sid-0".into(),
+            },
+            direct_grants: HashSet::new(),
+            click_eligible: HashSet::new(),
+            is_billing_waived: false,
+            age_verified: false,
+            terms_accepted: false,
+        };
+        let ineligible_outcome = compiled.evaluate_image(&blur_img, &ineligible_user);
+        assert!(
+            ineligible_outcome.is_placeholder(),
+            "fixed_blur_enabled=false without click eligibility must degrade Blur to Placeholder"
+        );
+
+        // 2. fixed_blur_enabled = false + caller IS click_eligible -> Blurred with preview_url: None
+        //    (zero-cost frosted veil + Click-to-Reveal, ZERO clear URL and ZERO /media/preview/* cap!)
+        let user = CallerContext {
+            actor: ActorBinding::User {
+                sub: "usr-1".into(),
+                sid: "sid-1".into(),
+            },
+            direct_grants: HashSet::new(),
+            click_eligible: HashSet::from([PolicyRef::new("sensitive", 3)]),
+            is_billing_waived: false,
+            age_verified: false,
+            terms_accepted: false,
+        };
+        let free_blur_outcome = compiled.evaluate_image(&blur_img, &user);
+        assert!(
+            free_blur_outcome.is_blurred(),
+            "click-eligible caller must receive Blurred (Click to Reveal) even when fixed_blur_enabled=false"
+        );
+        let free_proj = compiled.project_image(&img, free_blur_outcome, &user, &signer);
+        assert!(matches!(
+            free_proj,
+            ProjectedImage::Blurred {
+                preview_url: None,
+                can_click_reveal: true,
+                policy_rev: 7,
+                ..
+            }
+        ));
+
+        // 3. With fixed_blur_enabled = true, Managed projection emits preview_url ONLY (no reveal_url)
+        let compiled_blur = CompiledPolicy::compile(sample_policy_v3()).unwrap();
+        let outcome_blur = compiled_blur.evaluate_image(&blur_img, &user);
+        assert!(outcome_blur.is_blurred());
         let proj = compiled_blur.project_image(&img, outcome_blur, &user, &signer);
         match proj {
             ProjectedImage::Blurred {
@@ -3313,8 +3864,11 @@ mod tests {
         let pending = ImageFacts::default();
         assert!(!compiled.evaluate_image(&pending, &anon).is_user_bypassable_or_clear());
 
-        // 7. Sitemap indexable SQL: strictly FALSE ONLY for non-bypassable (`blood`, 1 rule),
-        //    IS NOT NULL for bypassable WD-tag rules (`r18` & `sensitive`, 2 rules).
+        // 7. Sitemap indexable SQL uses set-based anti-joins + O(1) coverage short-circuit
+        //    for pure OR-of-WdTag builtin presets (ZERO 164-way `CASE WHEN EXISTS` SubPlan explosion!):
+        //    - `blood` (non-bypassable): top-level `AND NOT EXISTS (... ANY($tags::TEXT[]) ...)`
+        //    - `r18` & `sensitive` (bypassable): O(1) `wd_vocab_digest` / `wd_min_persisted_score`
+        //      short-circuit allowing TRUE/FALSE and rejecting only Unknown/NULL.
         let mut qb = QueryBuilder::<Postgres>::new("SELECT i.id FROM images i WHERE TRUE");
         assert!(compiled.push_indexable_image_sql(&mut qb, "i"));
         let built = qb.build();
@@ -3322,15 +3876,55 @@ mod tests {
         let sql = sql_str.as_str();
         assert!(sql.contains("i.status = 'completed'::process_status"));
         assert_eq!(
-            sql.matches(") IS FALSE)").count(),
-            1,
-            "only the 1 non-bypassable policy (blood) must require IS FALSE in indexable sitemap SQL"
+            sql.matches("CASE WHEN").count(),
+            0,
+            "builtin pure-OR WD-tag presets must use set-based SQL without per-tag CASE WHEN SubPlans"
         );
         assert_eq!(
-            sql.matches(") IS NOT NULL)").count(),
-            2,
-            "the 2 bypassable WD-tag policies (r18, sensitive) must allow TRUE/FALSE and reject only Unknown/NULL"
+            sql.matches("AND NOT EXISTS (SELECT 1 FROM wd_tag_images").count(),
+            1,
+            "only the 1 non-bypassable policy (blood) must emit a top-level NOT EXISTS anti-join"
         );
+        assert_eq!(
+            sql.matches("OR EXISTS (SELECT 1 FROM wd_tag_images wti JOIN wd_tags wt ON wt.id = wti.wd_tag_id WHERE wti.image_id = i.id AND wt.name = ANY(").count(),
+            2,
+            "the 2 bypassable WD-tag policies (r18, sensitive) must allow TRUE/FALSE via O(1) coverage short-circuit + ANY fallback"
+        );
+        assert!(
+            sql.matches("JOIN wd_tags wt ON wt.id = wti.wd_tag_id").count() <= 6,
+            "set-based sitemap SQL must keep wd_tags joins bounded (<= 6), got {}",
+            sql.matches("JOIN wd_tags wt ON wt.id = wti.wd_tag_id").count()
+        );
+
+        // 7b. Custom non-pure-OR policy (with `except_expr` post_tag) still uses the general
+        //     multi-parent SQL path with O(1) coverage fast-guard on IS NOT NULL.
+        let mut custom_pol = sample_policy_v3();
+        custom_pol.policies[0].bypass.include_switcher = true;
+        custom_pol.refresh_policy_digest();
+        let custom_compiled = CompiledPolicy::compile(custom_pol).unwrap();
+        let mut qb_custom = QueryBuilder::<Postgres>::new("SELECT i.id FROM images i WHERE TRUE");
+        assert!(custom_compiled.push_indexable_image_sql(&mut qb_custom, "i"));
+        let custom_built = qb_custom.build();
+        let custom_sql = custom_built.sql();
+        assert!(custom_sql.as_str().contains("IS NULL"));
+        assert!(custom_sql.as_str().contains("i.wd_min_persisted_score <="));
+
+        // 7c. Full sitemap count & entries queries materialize `_sm_blocked_tags` +
+        //     `_sm_blocked_images` ONCE via `wd_tag_images_pkey(wd_tag_id, image_id)` and use
+        //     Hash Anti-Join + single O(1) coverage short-circuit (438k+ images / 1c1g safe).
+        let mut count_qb = compiled.build_sitemap_count_query();
+        let count_built = count_qb.build();
+        let count_sql = count_built.sql();
+        assert!(count_sql.as_str().contains("WITH _sm_blocked_tags AS MATERIALIZED"));
+        assert!(count_sql.as_str().contains("_sm_blocked_images AS MATERIALIZED"));
+        assert!(count_sql.as_str().contains("LEFT JOIN _sm_blocked_images _smb ON _smb.image_id = i.id WHERE _smb.image_id IS NULL"));
+
+        let mut entries_qb = compiled.build_sitemap_entries_query(5000, 0);
+        let entries_built = entries_qb.build();
+        let entries_sql = entries_built.sql();
+        assert!(entries_sql.as_str().contains("_sm_blocked_images AS MATERIALIZED"));
+        assert!(entries_sql.as_str().contains("CROSS JOIN LATERAL"));
+        assert!(entries_sql.as_str().contains("ORDER BY p.id DESC LIMIT"));
 
         // 8. Non-bypassable Blur rule with fixed_blur_enabled=true marks MASK_NO_UNLOCK_MARKER
         let mut hard_blur_pol = PublicSitePolicy {
@@ -3358,5 +3952,125 @@ mod tests {
         let hb_out = hard_blur_compiled.evaluate_image(&gore, &anon);
         assert!(hb_out.is_blurred());
         assert!(!hb_out.is_user_bypassable_or_clear());
+    }
+
+    #[test]
+    fn select_post_cover_prefers_safe_clear_image_and_locks_extreme_albums() {
+        let mut pol = PublicSitePolicy {
+            revision: 1,
+            min_enforce_rev: 1,
+            safety_enabled: true,
+            fixed_blur_enabled: false,
+            age_policy: AgeVerificationPolicy::SelfAttestation,
+            policies: site_access::builtin_safety_presets(),
+            ..PublicSitePolicy::default()
+        };
+        pol.refresh_policy_digest();
+        let compiled = CompiledPolicy::compile(pol).expect("builtin presets compile");
+        let anon = CallerContext::anonymous();
+
+        let sfw = |id: i64| ImageFacts {
+            image_id: id,
+            ..ImageFacts::completed_with_floor(Some(0.30), HashMap::from([("1girl".into(), 0.9)]))
+        };
+        let nsfw = |id: i64| ImageFacts {
+            image_id: id,
+            ..ImageFacts::completed_with_floor(
+                Some(0.30),
+                HashMap::from([("explicit".into(), 0.9)]),
+            )
+        };
+        let niche = |id: i64| ImageFacts {
+            image_id: id,
+            ..ImageFacts::completed_with_floor(Some(0.30), HashMap::from([("bdsm".into(), 0.9)]))
+        };
+        let gore = |id: i64| ImageFacts {
+            image_id: id,
+            ..ImageFacts::completed_with_floor(Some(0.30), HashMap::from([("blood".into(), 0.9)]))
+        };
+        let pending = |id: i64| ImageFacts {
+            image_id: id,
+            exists: true,
+            is_completed: false,
+            ..ImageFacts::default()
+        };
+
+        // 1. Mixed SFW+NSFW album where image #1 is NSFW and #3 is SFW:
+        //    anonymous caller gets image #3 (first Clear SFW cover) fairly!
+        let mixed_facts = HashMap::from([(1, nsfw(1)), (2, niche(2)), (3, sfw(3)), (4, sfw(4))]);
+        let mixed_anon = compiled.select_post_cover_image(&[1, 2, 3, 4], &mixed_facts, &anon);
+        assert_eq!(mixed_anon.image_id, Some(3));
+        assert!(!mixed_anon.has_hard_block);
+        assert!(mixed_anon.title_displayable);
+        assert!(mixed_anon.outcome.as_ref().is_some_and(MediaOutcome::is_clear));
+
+        // 2. Same mixed album when user has unlocked `r18@1`: image #1 is Clear -> selects #1!
+        let r18_unlocked = CallerContext {
+            actor: ActorBinding::User {
+                sub: "u1".into(),
+                sid: "s1".into(),
+            },
+            direct_grants: HashSet::from([PolicyRef::new("r18", 1)]),
+            age_verified: true,
+            terms_accepted: true,
+            ..CallerContext::default()
+        };
+        let mixed_authed =
+            compiled.select_post_cover_image(&[1, 2, 3, 4], &mixed_facts, &r18_unlocked);
+        assert_eq!(mixed_authed.image_id, Some(1));
+        assert!(!mixed_authed.has_hard_block);
+        assert!(mixed_authed.title_displayable);
+        assert!(mixed_authed.outcome.as_ref().is_some_and(MediaOutcome::is_clear));
+
+        // 3. 100% NSFW/Sensitive album (0 Clear, 0 Extreme): falls back to #1 bypassable Placeholder,
+        //    retaining real post title (`title_displayable = true`).
+        let all_nsfw = HashMap::from([(10, nsfw(10)), (11, niche(11))]);
+        let all_nsfw_sel = compiled.select_post_cover_image(&[10, 11], &all_nsfw, &anon);
+        assert_eq!(all_nsfw_sel.image_id, Some(10));
+        assert!(!all_nsfw_sel.has_hard_block);
+        assert!(all_nsfw_sel.title_displayable);
+        assert!(
+            all_nsfw_sel
+                .outcome
+                .as_ref()
+                .is_some_and(|o| o.is_placeholder() && o.is_user_bypassable_or_clear())
+        );
+
+        // 4. Extreme/Gore album where #20 & #21 are SFW and #22 is `blood`:
+        //    locks cover to #22 (`has_hard_block = true`, `title_displayable = false`) even for unlocked r18 user!
+        let extreme_album = HashMap::from([(20, sfw(20)), (21, sfw(21)), (22, gore(22))]);
+        for caller in [&anon, &r18_unlocked] {
+            let sel = compiled.select_post_cover_image(&[20, 21, 22], &extreme_album, caller);
+            assert_eq!(sel.image_id, Some(22));
+            assert!(sel.has_hard_block);
+            assert!(!sel.title_displayable);
+            assert!(
+                sel.outcome
+                    .as_ref()
+                    .is_some_and(|o| o.is_placeholder() && !o.is_user_bypassable_or_clear())
+            );
+        }
+
+        // 5. Pending image #30 does NOT falsely trigger Extreme lock; skips to #31 SFW cover!
+        let pending_then_sfw = HashMap::from([(30, pending(30)), (31, sfw(31))]);
+        let sel_pts = compiled.select_post_cover_image(&[30, 31], &pending_then_sfw, &anon);
+        assert_eq!(sel_pts.image_id, Some(31));
+        assert!(!sel_pts.has_hard_block);
+        assert!(sel_pts.title_displayable);
+        assert!(sel_pts.outcome.as_ref().is_some_and(MediaOutcome::is_clear));
+
+        // 6. Pending #40 + bypassable NSFW #41 (0 Clear): prefers #41 bypassable cover over pending!
+        let pending_then_nsfw = HashMap::from([(40, pending(40)), (41, nsfw(41))]);
+        let sel_ptn = compiled.select_post_cover_image(&[40, 41], &pending_then_nsfw, &anon);
+        assert_eq!(sel_ptn.image_id, Some(41));
+        assert!(!sel_ptn.has_hard_block);
+        assert!(sel_ptn.title_displayable);
+
+        // 7. 100% pending album: falls back to #50 unclassified with `title_displayable = false`.
+        let all_pending = HashMap::from([(50, pending(50)), (51, pending(51))]);
+        let sel_ap = compiled.select_post_cover_image(&[50, 51], &all_pending, &anon);
+        assert_eq!(sel_ap.image_id, Some(50));
+        assert!(!sel_ap.has_hard_block);
+        assert!(!sel_ap.title_displayable);
     }
 }

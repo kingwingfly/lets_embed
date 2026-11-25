@@ -351,7 +351,7 @@ pub fn SafetyTab(
                             title="Fixed Server Preview Disabled ($0 Transformation Cost — Recommended)"
                             dismissible=false
                             content=NoticeContent::Text(
-                                "Server-side blurred previews are OFF. Any policy set to Blur safely degrades to a zero-cost hard Placeholder until fixed server previews are enabled (Cloudflare Images costs $0.50 / 1,000 unique blurred images/mo beyond 5,000 free/mo). Clear media bytes are never sent before reveal."
+                                "Server-side blurred previews are OFF. Blur rules with Click to Reveal still work using a zero-cost frosted veil (click loads the clear image via /api/safety/reveal); callers not eligible for Click to Reveal see a zero-cost Placeholder. Clear media bytes are never sent before reveal."
                                     .to_string()
                             )
                         />
@@ -917,13 +917,13 @@ pub fn SafetyTab(
                                                                             }
                                                                         >
                                                                             <strong>"Blur"</strong>
-                                                                            <small>"Cloudflare Images preview ($0.50/1k unique imgs/mo) + optional Click to Reveal; degrades to free Placeholder when preview is OFF"</small>
+                                                                            <small>"Frosted blur veil (or paid Cloudflare Images blurred thumbnail when enabled above) + optional Click to Reveal"</small>
                                                                         </button>
                                                                     </div>
 
                                                                     {move || (action_sig.get() == PolicyAction::Blur && !draft.fixed_blur_enabled.get()).then(|| view! {
                                                                         <div class="adm-inline-info">
-                                                                            "Fixed server-side blurred previews are currently OFF. Until enabled above, this Blur policy safely renders as a hard Placeholder."
+                                                                            "Fixed server-side blurred previews are OFF ($0 cost): eligible users still get a frosted veil with Click to Reveal; non-eligible visitors see a Placeholder prompt."
                                                                         </div>
                                                                     })}
                                                                 </div>

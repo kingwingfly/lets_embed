@@ -694,11 +694,20 @@ body {
   gap: 6px;
 }
 
+.adm-save-bar > .adm-sub {
+  flex: 1 1 280px;
+  min-width: 0;
+  margin: 0;
+}
+
 .adm-save-bar-actions {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   flex-wrap: wrap;
   gap: 8px;
+  flex-shrink: 0;
+  margin-left: auto;
 }
 
 /* Sticky Save Bar */
