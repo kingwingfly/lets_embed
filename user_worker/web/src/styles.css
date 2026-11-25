@@ -1,5 +1,6 @@
 /* Scoped User SPA styles layered on top of `lets_embed_ui::UI_CSS`. */
 :root {
+  color-scheme: light;
   --u-bg: #f4f9fe;
   --u-surface: rgba(255, 255, 255, 0.92);
   --u-border: rgba(14, 165, 233, 0.22);
@@ -1097,6 +1098,13 @@ a:hover { text-decoration: underline; }
   margin: 0 auto !important;
   max-width: 100%;
   border: 0;
+  background: transparent;
+  /* Match Telegram's `widget-frame.css` (`:root { color-scheme: light dark; }`) so
+     the cross-origin iframe stays transparent in OS dark mode instead of painting
+     an opaque dark canvas behind the rounded button corners. */
+  color-scheme: light dark;
+  border-radius: 12px;
+  overflow: hidden;
 }
 
 .u-login-tg-mount[data-tg-state="loading"]::before {
