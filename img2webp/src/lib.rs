@@ -20,10 +20,11 @@ use libvips::{
 };
 use mime_guess::{MimeGuess, mime::IMAGE};
 use opendal::{
-    ErrorKind, Metadata, Operator,
+    ErrorKind, HttpTransporter, Metadata, Operator,
     layers::{RetryLayer, TimeoutLayer},
     services::S3,
 };
+use opendal_http_transport_reqwest::ReqwestTransport;
 use reqwest::{
     StatusCode,
     header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER},
@@ -67,10 +68,35 @@ const KNOWN_IMAGE_EXTS: &[&str] = &[
 const MAX_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
 const SOURCE_BYTE_BUDGET: usize = 256 * 1024 * 1024;
 const MAX_IMAGE_PIXELS: usize = 100_000_000;
+const MAX_WEBP_HEADER_PROBE_BYTES: u64 = 1024 * 1024;
 const MAX_RETRY_AFTER_SECS: u64 = 900;
 const RETRY_DELAY_SECS: u64 = 15;
+const MAX_TRANSPORT_RETRY_DELAY_SECS: u64 = 300;
+const TRANSPORT_CIRCUIT_THRESHOLD: usize = 3;
 const ONE_SHOT_MAX_SETTLE_ROUNDS: u8 = 2;
+const ONE_SHOT_MAX_TOTAL_SETTLES: u8 = 16;
+const ONE_SHOT_EMPTY_CONFIRM_POLLS: u8 = 2;
+const ONE_SHOT_EMPTY_CONFIRM_DELAY: Duration = Duration::from_secs(2);
+const UNCERTAIN_PULL_GRACE: Duration = Duration::from_secs(5);
 const DEFAULT_CF_API_BASE_URL: &str = "https://api.cloudflare.com";
+const HEALTH_PROBE_KEY: &str = ".img2webp-health-probe";
+
+#[derive(Clone, Copy, Debug)]
+struct PullRuntimeOpts {
+    empty_confirm_delay: Duration,
+    retry_delay_base_secs: u64,
+    uncertain_pull_grace: Duration,
+}
+
+impl Default for PullRuntimeOpts {
+    fn default() -> Self {
+        Self {
+            empty_confirm_delay: ONE_SHOT_EMPTY_CONFIRM_DELAY,
+            retry_delay_base_secs: RETRY_DELAY_SECS,
+            uncertain_pull_grace: UNCERTAIN_PULL_GRACE,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct QueueConfig {
@@ -175,6 +201,13 @@ struct PullEnvelope {
 struct PullResultRaw {
     #[serde(default)]
     messages: Vec<serde_json::Value>,
+    #[serde(
+        default,
+        alias = "message_backlog_count",
+        alias = "messageBacklogCount",
+        alias = "backlog"
+    )]
+    backlog_count: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,23 +288,26 @@ struct AckResult {
 #[derive(Debug)]
 struct AckOutcome {
     complete: bool,
+    counts_confirmed: bool,
     exhausted_retries: usize,
+    exhausted_leases: HashSet<String>,
     max_retry_delay_secs: Option<u64>,
 }
 
 impl AckResult {
     fn outcome(&self, req: &AckRequest) -> AckOutcome {
-        let mut exhausted_retries = 0;
+        let mut exhausted_leases = HashSet::new();
         let mut max_retry_delay_secs = None;
         for retry in &req.retries {
             let warning = self.warnings.get(&retry.lease_id).and_then(|v| v.as_str());
             if warning == Some("Message has exhausted maxRetries") {
-                exhausted_retries += 1;
+                exhausted_leases.insert(retry.lease_id.clone());
             } else {
                 max_retry_delay_secs =
                     Some(retry.delay_seconds.max(max_retry_delay_secs.unwrap_or(0)));
             }
         }
+        let exhausted_retries = exhausted_leases.len();
 
         if exhausted_retries > 0 {
             tracing::warn!(
@@ -279,12 +315,25 @@ impl AckResult {
                 "Cloudflare queue messages reached the retry limit"
             );
         }
-        // Each exhausted lease can explain one missing retry in the response counts.
-        let complete = self.warnings.len() == exhausted_retries
-            && self.ack_count.is_none_or(|n| n >= req.acks.len())
-            && self
-                .retry_count
-                .is_none_or(|n| n >= req.retries.len() - exhausted_retries);
+
+        // Strict count confirmation:
+        // - ackCount must match sent_acks exactly when any acks were sent (and be 0/omitted when 0).
+        // - retryCount must fall in [sent_retries - exhausted, sent_retries] when retries were sent
+        //   (Cloudflare may or may not include exhausted leases in retryCount).
+        let ack_ok = if req.acks.is_empty() {
+            self.ack_count.is_none_or(|n| n == 0)
+        } else {
+            self.ack_count == Some(req.acks.len())
+        };
+        let retry_ok = if req.retries.is_empty() {
+            self.retry_count.is_none_or(|n| n == 0)
+        } else {
+            let min_retries = req.retries.len() - exhausted_retries;
+            self.retry_count
+                .is_some_and(|n| (min_retries..=req.retries.len()).contains(&n))
+        };
+        let counts_confirmed = ack_ok && retry_ok;
+        let complete = self.warnings.len() == exhausted_retries && counts_confirmed;
         if !complete {
             tracing::warn!(
                 sent_acks = req.acks.len(),
@@ -293,12 +342,24 @@ impl AckResult {
                 retry_count = ?self.retry_count,
                 warning_count = self.warnings.len(),
                 exhausted_retries,
-                "cloudflare queue ack had warnings or short counts"
+                counts_confirmed,
+                "cloudflare queue ack had warnings, missing counts, or mismatched counts"
+            );
+        } else {
+            tracing::debug!(
+                sent_acks = req.acks.len(),
+                ack_count = ?self.ack_count,
+                sent_retries = req.retries.len(),
+                retry_count = ?self.retry_count,
+                exhausted_retries,
+                "cloudflare queue ack confirmed"
             );
         }
         AckOutcome {
             complete,
+            counts_confirmed,
             exhausted_retries,
+            exhausted_leases,
             max_retry_delay_secs,
         }
     }
@@ -454,11 +515,12 @@ pub async fn walk_convert_prefix_with_concurrency(
                 new_path,
                 meta_key,
                 size: (width, height),
+                reason,
             }) => {
-                tracing::debug!(path, new_path, "unchanged, skipping conversion");
+                tracing::debug!(path, new_path, reason, "skipping conversion");
                 record_meta(&mut metas, &new_path, meta_key, width, height);
             }
-            Ok(ConvertOutcome::SkippedNoMeta) => {}
+            Ok(ConvertOutcome::SkippedNoMeta { .. }) => {}
             Err(e) => {
                 tracing::error!(key = ?path, error = %format_args!("{e:#}"), "scan item conversion failed");
                 item_errors += 1;
@@ -551,7 +613,20 @@ fn persist_journal(path: &Path, metas: &HashMap<String, Meta>) -> anyhow::Result
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
     Ok(())
+}
+
+async fn persist_journal_async(
+    path: PathBuf,
+    metas: HashMap<String, Meta>,
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || persist_journal(&path, &metas))
+        .await
+        .context("journal persistence task panicked")?
 }
 
 pub async fn pull_convert(
@@ -592,6 +667,91 @@ pub async fn pull_convert_and_then<T>(
     .await
 }
 
+#[derive(Debug, Clone)]
+struct PendingAck {
+    lease_id: String,
+    msg_id: String,
+    attempts: u32,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRetry {
+    lease_id: String,
+    msg_id: String,
+    delay_seconds: u64,
+}
+
+struct CoalescedLease {
+    id: String,
+    lease_id: String,
+    attempts: u32,
+}
+
+struct WorkGroup {
+    key: String,
+    leases: Vec<CoalescedLease>,
+}
+
+fn is_transport_connect_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(req_err) = cause.downcast_ref::<reqwest::Error>()
+            && (req_err.is_connect() || req_err.is_timeout())
+        {
+            return true;
+        }
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+            && matches!(
+                io_err.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::NotConnected
+            )
+        {
+            return true;
+        }
+        let msg = cause.to_string().to_ascii_lowercase();
+        if msg.contains("tls handshake eof")
+            || msg.contains("client error (connect)")
+            || msg.contains("unexpected eof")
+            || msg.contains("early eof")
+            || msg.contains("connection closed before message completed")
+            || msg.contains("incomplete message")
+            || msg.contains("broken pipe")
+            || msg.contains("connection reset")
+            || msg.contains("connection refused")
+            || msg.contains("dns error")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn retry_delay_for_attempt(attempts: u32, is_transport: bool, base_secs: u64) -> u64 {
+    if !is_transport {
+        return base_secs;
+    }
+    let shift = attempts.saturating_sub(1).min(5);
+    base_secs
+        .saturating_mul(1u64 << shift)
+        .min(MAX_TRANSPORT_RETRY_DELAY_SECS)
+}
+
+async fn probe_storage_health(op: &Operator) -> bool {
+    match storage::stat(op, HEALTH_PROBE_KEY).await {
+        Ok(_) => true,
+        Err(e) if e.kind() == ErrorKind::NotFound => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "storage endpoint health probe still failing");
+            false
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn pull_convert_inner<T>(
     src_op: Operator,
@@ -601,6 +761,32 @@ async fn pull_convert_inner<T>(
     api_base_url: &str,
     journal_override: Option<&Path>,
     cancel: CancellationToken,
+    deliver: impl FnOnce(HashSet<Meta>) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    pull_convert_inner_with_opts(
+        src_op,
+        dst_op,
+        cfg,
+        delete_origin,
+        api_base_url,
+        journal_override,
+        cancel,
+        PullRuntimeOpts::default(),
+        deliver,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pull_convert_inner_with_opts<T>(
+    src_op: Operator,
+    dst_op: Operator,
+    cfg: QueueConfig,
+    delete_origin: bool,
+    api_base_url: &str,
+    journal_override: Option<&Path>,
+    cancel: CancellationToken,
+    opts: PullRuntimeOpts,
     deliver: impl FnOnce(HashSet<Meta>) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     cfg.validate()?;
@@ -645,29 +831,43 @@ async fn pull_convert_inner<T>(
     let mut retry_wait_until: Option<Instant> = None;
     let mut retry_not_before: Option<Instant> = None;
     let mut settle_rounds: u8 = 0;
+    let mut total_settle_waits: u8 = 0;
+    let mut consecutive_empty_confirm_polls: u8 = 0;
+    let mut pending_retry_ids: HashSet<String> = HashSet::new();
+    let mut anonymous_pending_retries: usize = 0;
+    let mut uncertain_pull_pending = false;
     let mut exhausted_retries = 0usize;
+    let mut total_converted = 0usize;
+    let mut total_recovered = 0usize;
+    let mut total_failed = 0usize;
+    let mut daemon_outage_backoff = cfg.poll_interval;
 
     let io_concurrency = cfg.concurrency;
     let byte_sem = Arc::new(Semaphore::new(SOURCE_BYTE_BUDGET));
     let cpu_sem = Arc::new(Semaphore::new(cpu_concurrency()));
 
     let visibility_timeout = Duration::from_millis(cfg.visibility_timeout_ms);
-    let reserve = (visibility_timeout / 4).min(Duration::from_secs(30));
+    let max_reserve = (visibility_timeout / 2).max(Duration::from_millis(250));
+    let reserve = (visibility_timeout / 4)
+        .clamp(Duration::from_secs(1), Duration::from_secs(60))
+        .min(max_reserve);
     let flush_interval =
         (visibility_timeout / 4).clamp(Duration::from_secs(1), Duration::from_secs(15));
     let flush_threshold = (io_concurrency * 2).max(8);
 
     while !cancel.is_cancelled() {
-        let Some((batch_started, messages, parse_err_count)) = pull_with_retry(
+        let Some((batch_started, messages, parse_err_count, backlog_count)) = pull_with_retry(
             &http,
             &pull_url,
             cfg.batch_size,
             cfg.visibility_timeout_ms,
             cfg.daemon,
             cfg.poll_interval,
+            opts.uncertain_pull_grace,
             &cancel,
             &mut retry_not_before,
             &mut retry_wait_until,
+            &mut uncertain_pull_pending,
         )
         .await?
         else {
@@ -699,18 +899,68 @@ async fn pull_convert_inner<T>(
 
         if messages.is_empty() && parse_err_count == 0 {
             if !cfg.daemon {
+                let has_backlog = backlog_count.is_some_and(|n| n > 0);
+                let unresolved_retry_count = pending_retry_ids.len() + anonymous_pending_retries;
+                let has_unresolved =
+                    unresolved_retry_count > 0 || uncertain_pull_pending || has_backlog;
+
                 if let Some(until) = retry_wait_until.take() {
-                    if settle_rounds < ONE_SHOT_MAX_SETTLE_ROUNDS {
+                    if settle_rounds < ONE_SHOT_MAX_SETTLE_ROUNDS
+                        && total_settle_waits < ONE_SHOT_MAX_TOTAL_SETTLES
+                    {
                         settle_rounds += 1;
+                        total_settle_waits += 1;
+                        consecutive_empty_confirm_polls = 0;
+                        let now = Instant::now();
+                        let wake_at = if now < until {
+                            until
+                        } else if has_unresolved {
+                            now + opts.empty_confirm_delay
+                        } else {
+                            now
+                        };
+                        tracing::info!(
+                            settle_rounds,
+                            unresolved_retry_count,
+                            uncertain_pull_pending,
+                            backlog = ?backlog_count,
+                            wait_ms = wake_at.saturating_duration_since(now).as_millis() as u64,
+                            "queue poll empty; waiting for pending retries or uncertain leases to settle"
+                        );
                         tokio::select! {
                             _ = cancel.cancelled() => break,
-                            _ = tokio::time::sleep_until(until) => continue,
+                            _ = tokio::time::sleep_until(wake_at) => continue,
                         }
                     } else {
                         bail!(
-                            "one-shot settle budget exhausted with retries/uncertain pulls still pending"
+                            "one-shot settle budget exhausted with retries/uncertain pulls still pending (unresolved_retries={unresolved_retry_count}, uncertain_pull={uncertain_pull_pending}, backlog={backlog_count:?})"
                         );
                     }
+                }
+
+                if has_unresolved {
+                    if consecutive_empty_confirm_polls < ONE_SHOT_EMPTY_CONFIRM_POLLS {
+                        consecutive_empty_confirm_polls += 1;
+                        tracing::info!(
+                            confirm_poll = consecutive_empty_confirm_polls,
+                            unresolved_retry_count,
+                            uncertain_pull_pending,
+                            backlog = ?backlog_count,
+                            "empty poll while work may still be settling; re-polling after quiet delay"
+                        );
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(opts.empty_confirm_delay) => continue,
+                        }
+                    }
+                    if unresolved_retry_count == 0 && !has_backlog {
+                        // Only an uncertain pull remained, we waited past its visibility timeout,
+                        // and consecutive quiet polls confirmed no backlog or messages.
+                        break;
+                    }
+                    bail!(
+                        "one-shot queue poll returned empty while work remains unresolved (unresolved_retries={unresolved_retry_count}, backlog={backlog_count:?}); retaining metadata journal"
+                    );
                 }
                 break;
             }
@@ -720,59 +970,89 @@ async fn pull_convert_inner<T>(
             }
         }
 
+        consecutive_empty_confirm_polls = 0;
+
         tracing::info!(
             count = messages.len(),
             parse_errors = parse_err_count,
+            backlog = ?backlog_count,
             "pulled queue batch"
         );
 
         if !cfg.daemon && parse_err_count > 0 {
-            let until = batch_started + visibility_timeout + Duration::from_secs(2);
+            let until = Instant::now() + visibility_timeout + opts.uncertain_pull_grace;
             update_max_deadline(&mut retry_wait_until, until);
+            uncertain_pull_pending = true;
         }
 
         let deadline = batch_started + visibility_timeout.saturating_sub(reserve);
 
-        let mut acks: Vec<AckLease> = Vec::with_capacity(messages.len());
-        let mut retries: Vec<RetryLease> = Vec::new();
-        let mut work_items = Vec::new();
+        let mut pending_acks: Vec<PendingAck> = Vec::with_capacity(messages.len());
+        let mut pending_retries: Vec<PendingRetry> = Vec::new();
+        let mut work_groups: Vec<WorkGroup> = Vec::new();
+        let mut key_to_group: HashMap<String, usize> = HashMap::new();
 
         for msg in messages {
-            let msg_id = msg.id.as_deref().unwrap_or("<none>");
+            let msg_id = msg.id.clone().unwrap_or_default();
+            let log_id = if msg_id.is_empty() { "<none>" } else { &msg_id };
             match decode_and_classify_message(&msg, expected_bucket.as_deref()) {
                 MessageAction::Ignore(reason) => {
-                    tracing::debug!(id = %msg_id, reason, "ignoring non-upload queue message");
-                    acks.push(AckLease {
+                    tracing::debug!(
+                        id = %log_id,
+                        attempts = msg.attempts,
+                        reason,
+                        "ignoring non-upload queue message"
+                    );
+                    pending_acks.push(PendingAck {
                         lease_id: msg.lease_id,
+                        msg_id,
+                        attempts: msg.attempts,
                     });
                 }
                 MessageAction::Malformed => {
                     tracing::warn!(
-                        id = %msg_id,
+                        id = %log_id,
                         attempts = msg.attempts,
                         content_type = message_content_type(&msg).unwrap_or("<none>"),
                         meta_keys = ?msg.metadata.keys().collect::<Vec<_>>(),
                         body_preview = %body_preview(&msg.body),
                         "unrecognized or unsafe queue message payload; scheduling retry"
                     );
-                    retries.push(RetryLease {
+                    pending_retries.push(PendingRetry {
                         lease_id: msg.lease_id,
-                        delay_seconds: RETRY_DELAY_SECS,
+                        msg_id,
+                        delay_seconds: opts.retry_delay_base_secs,
                     });
                 }
                 MessageAction::Convert(key) => {
                     if !should_convert_path(&key) {
-                        tracing::debug!(id = %msg_id, %key, "skipping non-image or already-webp key");
-                        acks.push(AckLease {
+                        tracing::debug!(
+                            id = %log_id,
+                            attempts = msg.attempts,
+                            %key,
+                            "skipping non-image or already-webp key"
+                        );
+                        pending_acks.push(PendingAck {
                             lease_id: msg.lease_id,
+                            msg_id,
+                            attempts: msg.attempts,
                         });
                     } else {
-                        work_items.push((
-                            msg.id.unwrap_or_default(),
-                            msg.lease_id,
-                            msg.attempts,
-                            key,
-                        ));
+                        let lease = CoalescedLease {
+                            id: msg_id,
+                            lease_id: msg.lease_id,
+                            attempts: msg.attempts,
+                        };
+                        if let Some(&idx) = key_to_group.get(&key) {
+                            work_groups[idx].leases.push(lease);
+                        } else {
+                            let idx = work_groups.len();
+                            key_to_group.insert(key.clone(), idx);
+                            work_groups.push(WorkGroup {
+                                key,
+                                leases: vec![lease],
+                            });
+                        }
                     }
                 }
             }
@@ -782,7 +1062,7 @@ async fn pull_convert_inner<T>(
         flush_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         flush_tick.tick().await;
 
-        let mut pending = work_items.into_iter();
+        let mut pending = work_groups.into_iter();
         let mut in_flight = FuturesUnordered::new();
         let mut stopping = false;
         let mut periodic_flush_due = false;
@@ -792,34 +1072,43 @@ async fn pull_convert_inner<T>(
         let mut ack_transient_err: Option<anyhow::Error> = None;
         let mut incomplete_batch = false;
         let mut transient_ack_abort = false;
+        let mut batch_made_progress = false;
+        let mut consecutive_transport_errors = 0usize;
+        let mut circuit_tripped = false;
         let mut active_ack: Option<tokio::task::JoinHandle<AckTaskResult>> = None;
 
-        let spawn_item = |(id, lease_id, attempts, key): (String, String, u32, String)| {
+        let spawn_group = |group: WorkGroup| {
             let src_op = src_op.clone();
             let dst_op = dst_op.clone();
             let byte_sem = Arc::clone(&byte_sem);
             let cpu_sem = Arc::clone(&cpu_sem);
+            let max_attempts = group
+                .leases
+                .iter()
+                .map(|l| l.attempts)
+                .max()
+                .unwrap_or(1);
             async move {
                 let res = convert_object(
                     &src_op,
                     &dst_op,
-                    &key,
+                    &group.key,
                     None,
                     delete_origin,
                     collect_meta,
-                    attempts,
+                    max_attempts,
                     &byte_sem,
                     &cpu_sem,
                 )
                 .await;
-                (id, lease_id, attempts, key, res)
+                (group, res)
             }
         };
 
         loop {
             if !stopping && (cancel.is_cancelled() || Instant::now() >= deadline) {
                 stopping = true;
-                requeue_unstarted(&mut pending, &mut retries);
+                requeue_unstarted(&mut pending, &mut pending_retries);
             }
 
             if !stopping {
@@ -827,30 +1116,30 @@ async fn pull_convert_inner<T>(
                     && !cancel.is_cancelled()
                     && Instant::now() < deadline
                 {
-                    let Some(item) = pending.next() else {
+                    let Some(group) = pending.next() else {
                         break;
                     };
-                    in_flight.push(spawn_item(item));
+                    in_flight.push(spawn_group(group));
                 }
                 if cancel.is_cancelled() || Instant::now() >= deadline {
                     stopping = true;
-                    requeue_unstarted(&mut pending, &mut retries);
+                    requeue_unstarted(&mut pending, &mut pending_retries);
                 }
             }
 
             let all_work_done = in_flight.is_empty() && pending.as_slice().is_empty();
             let should_flush = active_ack.is_none()
                 && !ack_disabled
-                && (!acks.is_empty() || !retries.is_empty())
+                && (!pending_acks.is_empty() || !pending_retries.is_empty())
                 && (all_work_done
                     || stopping
                     || periodic_flush_due
-                    || acks.len() + retries.len() >= flush_threshold);
+                    || pending_acks.len() + pending_retries.len() >= flush_threshold);
             periodic_flush_due = false;
 
             if should_flush {
                 if collect_meta && journal_dirty && let Some(jp) = &journal_path {
-                    if let Err(e) = persist_journal(jp, &metas) {
+                    if let Err(e) = persist_journal_async(jp.clone(), metas.clone()).await {
                         tracing::error!(
                             error = %e,
                             "failed to persist metadata journal; withholding unpersisted acks"
@@ -859,31 +1148,40 @@ async fn pull_convert_inner<T>(
                             journal_err = Some(e);
                         }
                         stopping = true;
-                        requeue_unstarted(&mut pending, &mut retries);
-                        for a in acks.drain(..) {
-                            retries.push(RetryLease {
+                        requeue_unstarted(&mut pending, &mut pending_retries);
+                        for a in pending_acks.drain(..) {
+                            pending_retries.push(PendingRetry {
                                 lease_id: a.lease_id,
-                                delay_seconds: RETRY_DELAY_SECS,
+                                msg_id: a.msg_id,
+                                delay_seconds: opts.retry_delay_base_secs,
                             });
                         }
                     } else {
                         journal_dirty = false;
                     }
-                } else if journal_err.is_some() && !acks.is_empty() {
-                    for a in acks.drain(..) {
-                        retries.push(RetryLease {
+                } else if journal_err.is_some() && !pending_acks.is_empty() {
+                    for a in pending_acks.drain(..) {
+                        pending_retries.push(PendingRetry {
                             lease_id: a.lease_id,
-                            delay_seconds: RETRY_DELAY_SECS,
+                            msg_id: a.msg_id,
+                            delay_seconds: opts.retry_delay_base_secs,
                         });
                     }
                 }
 
-                if !acks.is_empty() || !retries.is_empty() {
+                if !pending_acks.is_empty() || !pending_retries.is_empty() {
+                    if Instant::now() >= batch_started + visibility_timeout {
+                        tracing::warn!(
+                            acks = pending_acks.len(),
+                            retries = pending_retries.len(),
+                            "flushing queue settlement after nominal visibility timeout elapsed"
+                        );
+                    }
                     active_ack = Some(spawn_ack_task(
                         &http,
                         &ack_url,
-                        std::mem::take(&mut acks),
-                        std::mem::take(&mut retries),
+                        std::mem::take(&mut pending_acks),
+                        std::mem::take(&mut pending_retries),
                     ));
                 }
             }
@@ -895,70 +1193,184 @@ async fn pull_convert_inner<T>(
             }
 
             tokio::select! {
-                Some((id, lease_id, attempts, key, res)) = in_flight.next(), if !in_flight.is_empty() => {
+                Some((group, res)) = in_flight.next(), if !in_flight.is_empty() => {
+                    let key = group.key;
+                    let lease_count = group.leases.len();
+                    let first_id = group
+                        .leases
+                        .first()
+                        .map(|l| if l.id.is_empty() { "<none>" } else { l.id.as_str() })
+                        .unwrap_or("<none>");
+                    let max_attempts = group.leases.iter().map(|l| l.attempts).max().unwrap_or(1);
                     match res {
                         Ok(ConvertOutcome::Converted {
                             new_path,
                             meta_key,
                             size: (width, height),
                         }) => {
-                            tracing::info!(path = %key, %new_path, "converted");
+                            consecutive_transport_errors = 0;
+                            total_converted += 1;
+                            tracing::info!(
+                                id = %first_id,
+                                attempts = max_attempts,
+                                coalesced_leases = lease_count,
+                                path = %key,
+                                %new_path,
+                                width,
+                                height,
+                                "converted"
+                            );
                             if collect_meta {
                                 record_meta(&mut metas, &new_path, meta_key, width, height);
                                 journal_dirty = true;
                             }
-                            if journal_err.is_some() {
-                                retries.push(RetryLease {
-                                    lease_id,
-                                    delay_seconds: RETRY_DELAY_SECS,
-                                });
-                            } else {
-                                acks.push(AckLease { lease_id });
+                            for lease in group.leases {
+                                if journal_err.is_some() {
+                                    pending_retries.push(PendingRetry {
+                                        lease_id: lease.lease_id,
+                                        msg_id: lease.id,
+                                        delay_seconds: opts.retry_delay_base_secs,
+                                    });
+                                } else {
+                                    pending_acks.push(PendingAck {
+                                        lease_id: lease.lease_id,
+                                        msg_id: lease.id,
+                                        attempts: lease.attempts,
+                                    });
+                                }
                             }
                         }
                         Ok(ConvertOutcome::SkippedWithMeta {
                             new_path,
                             meta_key,
                             size: (width, height),
+                            reason,
                         }) => {
+                            consecutive_transport_errors = 0;
+                            total_recovered += 1;
+                            tracing::info!(
+                                id = %first_id,
+                                attempts = max_attempts,
+                                coalesced_leases = lease_count,
+                                path = %key,
+                                %new_path,
+                                width,
+                                height,
+                                reason,
+                                "skipped conversion using existing webp"
+                            );
                             if collect_meta {
                                 record_meta(&mut metas, &new_path, meta_key, width, height);
                                 journal_dirty = true;
                             }
-                            if journal_err.is_some() {
-                                retries.push(RetryLease {
-                                    lease_id,
-                                    delay_seconds: RETRY_DELAY_SECS,
-                                });
-                            } else {
-                                acks.push(AckLease { lease_id });
+                            for lease in group.leases {
+                                if journal_err.is_some() {
+                                    pending_retries.push(PendingRetry {
+                                        lease_id: lease.lease_id,
+                                        msg_id: lease.id,
+                                        delay_seconds: opts.retry_delay_base_secs,
+                                    });
+                                } else {
+                                    pending_acks.push(PendingAck {
+                                        lease_id: lease.lease_id,
+                                        msg_id: lease.id,
+                                        attempts: lease.attempts,
+                                    });
+                                }
                             }
                         }
-                        Ok(ConvertOutcome::SkippedNoMeta) => {
-                            acks.push(AckLease { lease_id });
+                        Ok(ConvertOutcome::SkippedNoMeta { reason }) => {
+                            consecutive_transport_errors = 0;
+                            total_recovered += 1;
+                            tracing::info!(
+                                id = %first_id,
+                                attempts = max_attempts,
+                                coalesced_leases = lease_count,
+                                path = %key,
+                                reason,
+                                "skipped conversion using existing webp"
+                            );
+                            for lease in group.leases {
+                                pending_acks.push(PendingAck {
+                                    lease_id: lease.lease_id,
+                                    msg_id: lease.id,
+                                    attempts: lease.attempts,
+                                });
+                            }
                         }
                         Err(e) => {
-                            tracing::error!(
-                                cause = %e.root_cause(),
-                                id = %id,
-                                attempts,
-                                error = %format_args!("{e:#}"),
-                                %key,
-                                "conversion failed; scheduling retry"
-                            );
-                            retries.push(RetryLease {
-                                lease_id,
-                                delay_seconds: RETRY_DELAY_SECS,
-                            });
+                            total_failed += 1;
+                            let is_transport = is_transport_connect_error(&e);
+                            if is_transport {
+                                consecutive_transport_errors += 1;
+                                if consecutive_transport_errors >= TRANSPORT_CIRCUIT_THRESHOLD
+                                    && !circuit_tripped
+                                {
+                                    circuit_tripped = true;
+                                    stopping = true;
+                                    requeue_unstarted(&mut pending, &mut pending_retries);
+                                    tracing::error!(
+                                        consecutive_transport_errors,
+                                        "storage endpoint appears unreachable; tripping circuit breaker and releasing unstarted leases to preserve queue retry budget"
+                                    );
+                                }
+                            } else {
+                                consecutive_transport_errors = 0;
+                            }
+                            for lease in group.leases {
+                                let delay_seconds = retry_delay_for_attempt(
+                                    lease.attempts,
+                                    is_transport,
+                                    opts.retry_delay_base_secs,
+                                );
+                                tracing::error!(
+                                    cause = %e.root_cause(),
+                                    id = %lease.id,
+                                    attempts = lease.attempts,
+                                    delay_seconds,
+                                    transport_error = is_transport,
+                                    error = %format_args!("{e:#}"),
+                                    %key,
+                                    "conversion failed; scheduling retry"
+                                );
+                                pending_retries.push(PendingRetry {
+                                    lease_id: lease.lease_id,
+                                    msg_id: lease.id,
+                                    delay_seconds,
+                                });
+                            }
                         }
                     }
                 }
                 join_res = async { active_ack.as_mut().unwrap().await }, if active_ack.is_some() => {
                     active_ack = None;
                     match join_res {
-                        Ok((task_rnb, Ok(outcome))) => {
+                        Ok((task_rnb, Ok(outcome), sent_acks, sent_retries)) => {
                             if let Some(rnb) = task_rnb {
                                 update_max_deadline(&mut retry_not_before, rnb);
+                            }
+                            if outcome.counts_confirmed {
+                                if !sent_acks.is_empty() {
+                                    batch_made_progress = true;
+                                }
+                                for ack in &sent_acks {
+                                    if !ack.msg_id.is_empty() {
+                                        pending_retry_ids.remove(&ack.msg_id);
+                                    } else if ack.attempts > 1 && anonymous_pending_retries > 0 {
+                                        anonymous_pending_retries -= 1;
+                                    }
+                                }
+                            }
+                            for retry in &sent_retries {
+                                if outcome.exhausted_leases.contains(&retry.lease_id) {
+                                    if !retry.msg_id.is_empty() {
+                                        pending_retry_ids.remove(&retry.msg_id);
+                                    }
+                                } else if !retry.msg_id.is_empty() {
+                                    pending_retry_ids.insert(retry.msg_id.clone());
+                                } else {
+                                    anonymous_pending_retries += 1;
+                                }
                             }
                             if !cfg.daemon {
                                 exhausted_retries += outcome.exhausted_retries;
@@ -971,11 +1383,11 @@ async fn pull_convert_inner<T>(
                                 if !outcome.complete {
                                     incomplete_batch = true;
                                     stopping = true;
-                                    requeue_unstarted(&mut pending, &mut retries);
+                                    requeue_unstarted(&mut pending, &mut pending_retries);
                                 }
                             }
                         }
-                        Ok((task_rnb, Err(ApiError::Transient(err, maybe_rnb)))) => {
+                        Ok((task_rnb, Err(ApiError::Transient(err, maybe_rnb)), _sent_acks, _sent_retries)) => {
                             if let Some(rnb) = task_rnb {
                                 update_max_deadline(&mut retry_not_before, rnb);
                             }
@@ -993,9 +1405,9 @@ async fn pull_convert_inner<T>(
                             }
                             ack_disabled = true;
                             stopping = true;
-                            requeue_unstarted(&mut pending, &mut retries);
+                            requeue_unstarted(&mut pending, &mut pending_retries);
                         }
-                        Ok((task_rnb, Err(ApiError::Fatal(err)))) => {
+                        Ok((task_rnb, Err(ApiError::Fatal(err)), _sent_acks, _sent_retries)) => {
                             if let Some(rnb) = task_rnb {
                                 update_max_deadline(&mut retry_not_before, rnb);
                             }
@@ -1004,7 +1416,7 @@ async fn pull_convert_inner<T>(
                             }
                             ack_disabled = true;
                             stopping = true;
-                            requeue_unstarted(&mut pending, &mut retries);
+                            requeue_unstarted(&mut pending, &mut pending_retries);
                         }
                         Err(e) => {
                             if ack_fatal_err.is_none() {
@@ -1012,18 +1424,18 @@ async fn pull_convert_inner<T>(
                             }
                             ack_disabled = true;
                             stopping = true;
-                            requeue_unstarted(&mut pending, &mut retries);
+                            requeue_unstarted(&mut pending, &mut pending_retries);
                         }
                     }
                 }
-                _ = flush_tick.tick(), if active_ack.is_none() && !ack_disabled && (!acks.is_empty() || !retries.is_empty()) => {
+                _ = flush_tick.tick(), if active_ack.is_none() && !ack_disabled && (!pending_acks.is_empty() || !pending_retries.is_empty()) => {
                     periodic_flush_due = true;
                 }
                 _ = cancel.cancelled(), if !stopping => {}
                 _ = tokio::time::sleep_until(deadline), if !stopping => {
                     tracing::warn!("batch approaching visibility timeout, requeuing unstarted leases");
                     stopping = true;
-                    requeue_unstarted(&mut pending, &mut retries);
+                    requeue_unstarted(&mut pending, &mut pending_retries);
                 }
             }
         }
@@ -1032,25 +1444,57 @@ async fn pull_convert_inner<T>(
             && journal_dirty
             && journal_err.is_none()
             && let Some(jp) = &journal_path
-            && let Err(e) = persist_journal(jp, &metas)
         {
-            journal_err = Some(e);
+            if let Err(e) = persist_journal_async(jp.clone(), metas.clone()).await {
+                journal_err = Some(e);
+            } else {
+                journal_dirty = false;
+            }
         }
 
-        // Best-effort release of unstarted/failed leases if an earlier ack failed transiently.
+        // Best-effort settlement of remaining leases if an earlier ack failed transiently.
+        // Only send completed acks if the metadata checkpoint is clean (`journal_err.is_none()`).
         if (transient_ack_abort || ack_transient_err.is_some())
             && ack_fatal_err.is_none()
-            && !retries.is_empty()
+            && (!pending_acks.is_empty() || !pending_retries.is_empty())
         {
+            let best_effort_acks = if journal_err.is_none() {
+                std::mem::take(&mut pending_acks)
+                    .into_iter()
+                    .map(|a| AckLease {
+                        lease_id: a.lease_id,
+                    })
+                    .collect()
+            } else {
+                for a in pending_acks.drain(..) {
+                    pending_retries.push(PendingRetry {
+                        lease_id: a.lease_id,
+                        msg_id: a.msg_id,
+                        delay_seconds: opts.retry_delay_base_secs,
+                    });
+                }
+                Vec::new()
+            };
             let release_req = AckRequest {
-                acks: Vec::new(),
-                retries: std::mem::take(&mut retries),
+                acks: best_effort_acks,
+                retries: std::mem::take(&mut pending_retries)
+                    .into_iter()
+                    .map(|r| RetryLease {
+                        lease_id: r.lease_id,
+                        delay_seconds: r.delay_seconds,
+                    })
+                    .collect(),
             };
             if let Err(ApiError::Transient(_, Some(ra))) =
                 ack_once(&http, &ack_url, &release_req).await
             {
                 update_max_deadline(&mut retry_not_before, Instant::now() + ra);
             }
+        }
+
+        if batch_made_progress && !circuit_tripped {
+            settle_rounds = 0;
+            daemon_outage_backoff = cfg.poll_interval;
         }
 
         if let Some(err) = journal_err {
@@ -1074,11 +1518,44 @@ async fn pull_convert_inner<T>(
         if incomplete_batch {
             bail!("cloudflare queue ack had warnings or short counts");
         }
+        if circuit_tripped {
+            if !cfg.daemon {
+                bail!(
+                    "storage endpoint appears unreachable (consecutive_transport_errors={consecutive_transport_errors}); aborting one-shot run to preserve queue retry budget"
+                );
+            }
+            while !cancel.is_cancelled() {
+                let wait = daemon_outage_backoff;
+                daemon_outage_backoff =
+                    (daemon_outage_backoff.saturating_mul(2)).min(Duration::from_secs(300));
+                tracing::warn!(
+                    wait_secs = wait.as_secs(),
+                    "daemon circuit breaker open; waiting before storage endpoint health probe"
+                );
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(wait) => {}
+                }
+                if probe_storage_health(&dst_op).await {
+                    tracing::info!("storage endpoint health probe succeeded; resuming queue pulls");
+                    daemon_outage_backoff = cfg.poll_interval;
+                    break;
+                }
+            }
+        }
     }
 
     if collect_meta && journal_dirty && let Some(jp) = &journal_path {
-        persist_journal(jp, &metas)?;
+        persist_journal_async(jp.clone(), metas.clone()).await?;
     }
+
+    tracing::info!(
+        converted = total_converted,
+        recovered = total_recovered,
+        failed = total_failed,
+        exhausted_retries,
+        "queue run summary"
+    );
 
     if !cfg.daemon && cancel.is_cancelled() {
         bail!("queue pull interrupted by signal");
@@ -1107,36 +1584,59 @@ fn update_max_deadline(slot: &mut Option<Instant>, candidate: Instant) {
 }
 
 fn requeue_unstarted(
-    pending: &mut std::vec::IntoIter<(String, String, u32, String)>,
-    retries: &mut Vec<RetryLease>,
+    pending: &mut std::vec::IntoIter<WorkGroup>,
+    retries: &mut Vec<PendingRetry>,
 ) {
-    let count = pending.len();
-    if count > 0 {
-        tracing::info!(count, "releasing unstarted leases with zero delay");
-        for (_, lease_id, _, _) in pending.by_ref() {
-            retries.push(RetryLease {
-                lease_id,
+    let mut count = 0usize;
+    for group in pending.by_ref() {
+        for lease in group.leases {
+            count += 1;
+            retries.push(PendingRetry {
+                lease_id: lease.lease_id,
+                msg_id: lease.id,
                 delay_seconds: 0,
             });
         }
     }
+    if count > 0 {
+        tracing::info!(count, "releasing unstarted leases with zero delay");
+    }
 }
 
-type AckTaskResult = (Option<Instant>, Result<AckOutcome, ApiError>);
+type AckTaskResult = (
+    Option<Instant>,
+    Result<AckOutcome, ApiError>,
+    Vec<PendingAck>,
+    Vec<PendingRetry>,
+);
 
 fn spawn_ack_task(
     http: &reqwest::Client,
     ack_url: &str,
-    acks: Vec<AckLease>,
-    retries: Vec<RetryLease>,
+    pending_acks: Vec<PendingAck>,
+    pending_retries: Vec<PendingRetry>,
 ) -> tokio::task::JoinHandle<AckTaskResult> {
     let http = http.clone();
     let ack_url = ack_url.to_string();
-    let req = AckRequest { acks, retries };
+    let req = AckRequest {
+        acks: pending_acks
+            .iter()
+            .map(|a| AckLease {
+                lease_id: a.lease_id.clone(),
+            })
+            .collect(),
+        retries: pending_retries
+            .iter()
+            .map(|r| RetryLease {
+                lease_id: r.lease_id.clone(),
+                delay_seconds: r.delay_seconds,
+            })
+            .collect(),
+    };
     tokio::spawn(async move {
         let mut rnb: Option<Instant> = None;
         let outcome = ack_messages(&http, &ack_url, &req, &mut rnb).await;
-        (rnb, outcome)
+        (rnb, outcome, pending_acks, pending_retries)
     })
 }
 
@@ -1172,10 +1672,12 @@ async fn pull_with_retry(
     visibility_timeout_ms: u64,
     daemon: bool,
     poll_interval: Duration,
+    uncertain_pull_grace: Duration,
     cancel: &CancellationToken,
     retry_not_before: &mut Option<Instant>,
     retry_wait_until: &mut Option<Instant>,
-) -> anyhow::Result<Option<(Instant, Vec<QueueMessage>, usize)>> {
+    uncertain_pull_pending: &mut bool,
+) -> anyhow::Result<Option<(Instant, Vec<QueueMessage>, usize, Option<u64>)>> {
     let mut attempt: u32 = 0;
     loop {
         if let Some(rnb) = retry_not_before.take()
@@ -1189,13 +1691,18 @@ async fn pull_with_retry(
 
         let attempt_started = Instant::now();
         match pull_messages(http, pull_url, batch_size, visibility_timeout_ms).await {
-            Ok((msgs, parse_errs)) => return Ok(Some((attempt_started, msgs, parse_errs))),
+            Ok((msgs, parse_errs, backlog)) => {
+                return Ok(Some((attempt_started, msgs, parse_errs, backlog)));
+            }
             Err(ApiError::Fatal(e)) => return Err(e),
             Err(ApiError::Transient(e, retry_after)) => {
-                // An in-flight pull timeout/reset could have leased messages server-side
-                let uncertain_deadline =
-                    attempt_started + Duration::from_millis(visibility_timeout_ms) + Duration::from_secs(2);
+                // An in-flight pull timeout/reset could have leased messages server-side right
+                // before failing, so date the lease expiry conservatively from failure time.
+                let uncertain_deadline = Instant::now()
+                    + Duration::from_millis(visibility_timeout_ms)
+                    + uncertain_pull_grace;
                 update_max_deadline(retry_wait_until, uncertain_deadline);
+                *uncertain_pull_pending = true;
 
                 if !daemon && attempt >= 4 {
                     return Err(e);
@@ -1227,7 +1734,7 @@ async fn pull_messages(
     pull_url: &str,
     batch_size: u8,
     visibility_timeout_ms: u64,
-) -> Result<(Vec<QueueMessage>, usize), ApiError> {
+) -> Result<(Vec<QueueMessage>, usize, Option<u64>), ApiError> {
     let resp = http
         .post(pull_url)
         .json(&PullRequest {
@@ -1262,7 +1769,10 @@ async fn pull_messages(
         )));
     }
 
-    let raw_msgs = env.result.map(|r| r.messages).unwrap_or_default();
+    let (raw_msgs, backlog_count) = match env.result {
+        Some(r) => (r.messages, r.backlog_count),
+        None => (Vec::new(), None),
+    };
     let mut parsed = Vec::with_capacity(raw_msgs.len());
     let mut parse_errors = 0usize;
     for raw in raw_msgs {
@@ -1274,7 +1784,7 @@ async fn pull_messages(
             }
         }
     }
-    Ok((parsed, parse_errors))
+    Ok((parsed, parse_errors, backlog_count))
 }
 
 async fn ack_messages(
@@ -1343,7 +1853,26 @@ async fn ack_once(
         )));
     }
 
-    Ok(env.result.unwrap_or_default().outcome(req))
+    match env.result {
+        Some(res) => Ok(res.outcome(req)),
+        None if req.acks.is_empty() && req.retries.is_empty() => {
+            Ok(AckResult::default().outcome(req))
+        }
+        None => {
+            tracing::warn!(
+                sent_acks = req.acks.len(),
+                sent_retries = req.retries.len(),
+                "cloudflare queue ack succeeded without result payload; treating as unconfirmed"
+            );
+            Ok(AckOutcome {
+                complete: false,
+                counts_confirmed: false,
+                exhausted_retries: 0,
+                exhausted_leases: HashSet::new(),
+                max_retry_delay_secs: req.retries.iter().map(|r| r.delay_seconds).max(),
+            })
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1380,6 +1909,7 @@ impl SourceIdentity {
     }
 }
 
+#[derive(Debug)]
 enum ConvertOutcome {
     Converted {
         new_path: String,
@@ -1390,21 +1920,39 @@ enum ConvertOutcome {
         new_path: String,
         meta_key: String,
         size: (usize, usize),
+        reason: &'static str,
     },
-    SkippedNoMeta,
+    SkippedNoMeta {
+        reason: &'static str,
+    },
 }
 
-/// A destination's source ETag is usable only after checking which key owns it.
-fn destination_source_etag<'a>(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestinationOwnership<'a> {
+    Owned { source_etag: Option<&'a str> },
+    LegacyUnlabeled,
+}
+
+impl<'a> DestinationOwnership<'a> {
+    fn source_etag(self) -> Option<&'a str> {
+        match self {
+            Self::Owned { source_etag } => source_etag,
+            Self::LegacyUnlabeled => None,
+        }
+    }
+}
+
+/// Checks whether a destination WebP belongs to `path` and extracts its recorded source ETag.
+fn inspect_destination_ownership<'a>(
     dst_meta: &'a Metadata,
     path: &str,
     new_path: &str,
-) -> anyhow::Result<Option<&'a str>> {
+) -> anyhow::Result<DestinationOwnership<'a>> {
     let Some(um) = dst_meta.user_metadata() else {
-        return Ok(None);
+        return Ok(DestinationOwnership::LegacyUnlabeled);
     };
     let matches = match (um.get("source-key"), um.get("source-key-encoding")) {
-        (None, None) => return Ok(None),
+        (None, None) => return Ok(DestinationOwnership::LegacyUnlabeled),
         (Some(key), None) => key == path,
         (Some(key), Some("base64")) => {
             key == base64::engine::general_purpose::STANDARD.encode(path)
@@ -1414,7 +1962,9 @@ fn destination_source_etag<'a>(
     if !matches {
         bail!("destination collision for {new_path}: source key metadata does not match {path}");
     }
-    Ok(um.get("source-etag"))
+    Ok(DestinationOwnership::Owned {
+        source_etag: um.get("source-etag"),
+    })
 }
 
 enum ReadSourceOutcome {
@@ -1493,9 +2043,49 @@ async fn read_source_bytes(
     }
 }
 
+async fn reconcile_delete_precondition(
+    src_op: &Operator,
+    dst_op: &Operator,
+    path: &str,
+    new_path: &str,
+    src_id: &SourceIdentity,
+    original_err: opendal::Error,
+) -> anyhow::Result<()> {
+    match storage::stat(src_op, path).await {
+        Err(se) if se.kind() == ErrorKind::NotFound => {
+            // Source is already gone (e.g., an earlier conditional DELETE committed on R2
+            // before a retry/disconnect, or another converter deleted it). Confirm the
+            // destination still exists and belongs to `path` before accepting completion.
+            let dst_meta = storage::stat(dst_op, new_path).await.with_context(|| {
+                format!("source {path} disappeared during delete, and destination {new_path} could not be verified")
+            })?;
+            inspect_destination_ownership(&dst_meta, path, new_path)?;
+            tracing::info!(
+                %path,
+                %new_path,
+                "source already absent after conditional delete precondition; verified destination intact"
+            );
+            Ok(())
+        }
+        Ok(current_stat) => {
+            let current_id = SourceIdentity::from_meta(&current_stat);
+            if !src_id.matches(&current_id) {
+                bail!(
+                    "source object {path} changed during conversion; refusing to delete newer upload"
+                );
+            }
+            Err(original_err)
+                .with_context(|| format!("conditional delete precondition failed for unchanged source {path}"))
+        }
+        Err(se) => Err(se.into()),
+    }
+}
+
 async fn delete_source_verified(
     src_op: &Operator,
+    dst_op: &Operator,
     path: &str,
+    new_path: &str,
     src_id: &SourceIdentity,
 ) -> anyhow::Result<()> {
     if !src_id.has_version_token() {
@@ -1509,6 +2099,10 @@ async fn delete_source_verified(
         match storage::delete(src_op, path, Some(etag)).await {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == ErrorKind::ConditionNotMatch => {
+                return reconcile_delete_precondition(src_op, dst_op, path, new_path, src_id, e)
+                    .await;
+            }
             Err(e) if e.kind() == ErrorKind::Unsupported => {}
             Err(e) => return Err(e.into()),
         }
@@ -1613,7 +2207,15 @@ async fn publish_and_cleanup(
     if !published
         && let Some(ref dst_meta) = existing_dst
     {
-        let stored_etag = destination_source_etag(dst_meta, path, new_path)?;
+        let ownership = inspect_destination_ownership(dst_meta, path, new_path)?;
+        if ownership == DestinationOwnership::LegacyUnlabeled {
+            tracing::warn!(
+                %path,
+                %new_path,
+                "overwriting legacy destination lacking source-key metadata"
+            );
+        }
+        let stored_etag = ownership.source_etag();
         if stored_etag.is_none() || stored_etag != src_id.etag.as_deref() {
             let current_src = storage::stat(src_op, path).await.with_context(|| {
                 format!("source object {path} disappeared before overwriting {new_path}")
@@ -1638,7 +2240,7 @@ async fn publish_and_cleanup(
     }
 
     if delete_origin && path != new_path {
-        delete_source_verified(src_op, path, src_id).await?;
+        delete_source_verified(src_op, dst_op, path, new_path, src_id).await?;
     }
     Ok(())
 }
@@ -1659,21 +2261,76 @@ fn convert_checked(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
     convert(raw).map_err(Into::into)
 }
 
+fn parse_positive_image_size(bytes: &[u8]) -> Option<(usize, usize)> {
+    match imagesize::blob_size(bytes) {
+        Ok(sz) if sz.width > 0 && sz.height > 0 => Some((sz.width, sz.height)),
+        _ => None,
+    }
+}
+
 async fn read_webp_dimensions(
     dst_op: &Operator,
     new_path: &str,
+    content_length: Option<u64>,
 ) -> anyhow::Result<(usize, usize)> {
     let dst_path = storage::rooted_path(new_path);
-    let head = dst_op.read_with(&dst_path).range(0..4096).await;
-    if let Ok(buf) = head {
-        let bytes = buf.to_bytes();
-        if let Ok(sz) = imagesize::blob_size(&bytes) {
-            return Ok((sz.width, sz.height));
+    let effective_len = match content_length {
+        Some(0) => bail!("destination webp {new_path} is empty"),
+        Some(len) => Some(len),
+        None => None,
+    };
+
+    // Clamp range upper bound to the known object length so OpenDAL doesn't reject
+    // small WebP objects with `reader got too little data`.
+    let probe1_end = effective_len.map_or(4096, |len| len.min(4096));
+    match dst_op.read_with(&dst_path).range(0..probe1_end).await {
+        Ok(buf) => {
+            let bytes = buf.to_bytes();
+            if let Some(dims) = parse_positive_image_size(&bytes) {
+                return Ok(dims);
+            }
+            if effective_len.is_some_and(|len| len <= probe1_end) {
+                bail!("could not parse valid webp dimensions from {new_path}");
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::Unsupported => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    // Try a bounded 1 MiB header probe before considering a bounded full read.
+    if effective_len.is_none_or(|len| len > 4096) {
+        let probe2_end =
+            effective_len.map_or(MAX_WEBP_HEADER_PROBE_BYTES, |len| len.min(MAX_WEBP_HEADER_PROBE_BYTES));
+        match dst_op.read_with(&dst_path).range(0..probe2_end).await {
+            Ok(buf) => {
+                let bytes = buf.to_bytes();
+                if let Some(dims) = parse_positive_image_size(&bytes) {
+                    return Ok(dims);
+                }
+                if effective_len.is_some_and(|len| len <= probe2_end) {
+                    bail!("could not parse valid webp dimensions from {new_path}");
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Unsupported => {}
+            Err(e) => return Err(e.into()),
         }
     }
+
+    let full_len = match effective_len {
+        Some(len) => len,
+        None => storage::stat(dst_op, new_path).await?.content_length(),
+    };
+    if full_len == 0 {
+        bail!("destination webp {new_path} is empty");
+    }
+    if full_len > MAX_SOURCE_BYTES {
+        bail!(
+            "destination webp {new_path} too large ({full_len} bytes > {MAX_SOURCE_BYTES}) for dimension probe"
+        );
+    }
     let full = dst_op.read(&dst_path).await?;
-    let sz = imagesize::blob_size(&full.to_bytes())?;
-    Ok((sz.width, sz.height))
+    parse_positive_image_size(&full.to_bytes())
+        .ok_or_else(|| anyhow::anyhow!("could not parse valid webp dimensions from {new_path}"))
 }
 
 async fn recover_webp_dimensions(
@@ -1691,7 +2348,7 @@ async fn recover_webp_dimensions(
     {
         return Ok((w, h));
     }
-    read_webp_dimensions(dst_op, new_path).await
+    read_webp_dimensions(dst_op, new_path, Some(dst_meta.content_length())).await
 }
 
 async fn recover_missing_source(
@@ -1702,7 +2359,8 @@ async fn recover_missing_source(
     collect_meta: bool,
     attempts: u32,
 ) -> anyhow::Result<ConvertOutcome> {
-    // Another converter may have published the WebP and deleted the source since our first HEAD.
+    // Another converter (or an earlier unacknowledged attempt) may have published the WebP
+    // and deleted the source.
     let dst_meta = match storage::stat(dst_op, &new_path).await {
         Ok(meta) => meta,
         Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -1710,16 +2368,42 @@ async fn recover_missing_source(
         }
         Err(e) => return Err(e.into()),
     };
-    destination_source_etag(&dst_meta, path, &new_path)?;
+    let ownership = inspect_destination_ownership(&dst_meta, path, &new_path)?;
+    if ownership == DestinationOwnership::LegacyUnlabeled {
+        tracing::warn!(
+            %path,
+            %new_path,
+            attempts,
+            "recovering missing source from legacy destination lacking source-key metadata"
+        );
+        // Even when not collecting metadata (daemon mode), verify an unlabeled destination
+        // is actually a valid image before ACKing a missing source.
+        let size = recover_webp_dimensions(dst_op, &new_path, &dst_meta).await?;
+        return Ok(if collect_meta {
+            ConvertOutcome::SkippedWithMeta {
+                new_path,
+                meta_key,
+                size,
+                reason: "recovered_legacy_missing_source",
+            }
+        } else {
+            ConvertOutcome::SkippedNoMeta {
+                reason: "recovered_legacy_missing_source",
+            }
+        });
+    }
     if collect_meta {
         let size = recover_webp_dimensions(dst_op, &new_path, &dst_meta).await?;
         Ok(ConvertOutcome::SkippedWithMeta {
             new_path,
             meta_key,
             size,
+            reason: "recovered_missing_source",
         })
     } else {
-        Ok(ConvertOutcome::SkippedNoMeta)
+        Ok(ConvertOutcome::SkippedNoMeta {
+            reason: "recovered_missing_source",
+        })
     }
 }
 
@@ -1740,30 +2424,55 @@ async fn convert_object(
     }
     let (new_path, meta_key) = target_paths(path);
 
-    let existing_dst = match storage::stat(dst_op, &new_path).await {
-        Ok(m) => Some(m),
-        Err(e) if e.kind() == ErrorKind::NotFound => None,
-        Err(e) => return Err(e.into()),
-    };
-    let stored_etag = match &existing_dst {
-        Some(m) => destination_source_etag(m, path, &new_path)?,
-        None => None,
-    };
-
-    let mut src_id = if let Some(m) = list_meta.filter(|m| m.etag().is_some()) {
-        SourceIdentity::from_meta(m)
+    // In scan mode (`list_meta` present with ETag), avoid extra source HEAD RPCs.
+    // In queue mode (`list_meta` absent), check source FIRST so already-deleted replays
+    // only need 2 HEADs (source 404 + one fresh destination HEAD) instead of 3.
+    let (existing_dst, stored_etag, mut src_id) = if let Some(m) =
+        list_meta.filter(|m| m.etag().is_some())
+    {
+        let existing_dst = match storage::stat(dst_op, &new_path).await {
+            Ok(m) => Some(m),
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        let stored_etag = match &existing_dst {
+            Some(m) => inspect_destination_ownership(m, path, &new_path)?
+                .source_etag()
+                .map(str::to_owned),
+            None => None,
+        };
+        (existing_dst, stored_etag, SourceIdentity::from_meta(m))
     } else {
-        match storage::stat(src_op, path).await {
+        let src_id = match storage::stat(src_op, path).await {
             Ok(stat) => SourceIdentity::from_meta(&stat),
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                return recover_missing_source(dst_op, path, new_path, meta_key, collect_meta, attempts)
-                    .await;
+                return recover_missing_source(
+                    dst_op,
+                    path,
+                    new_path,
+                    meta_key,
+                    collect_meta,
+                    attempts,
+                )
+                .await;
             }
             Err(e) => return Err(e.into()),
-        }
+        };
+        let existing_dst = match storage::stat(dst_op, &new_path).await {
+            Ok(m) => Some(m),
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        let stored_etag = match &existing_dst {
+            Some(m) => inspect_destination_ownership(m, path, &new_path)?
+                .source_etag()
+                .map(str::to_owned),
+            None => None,
+        };
+        (existing_dst, stored_etag, src_id)
     };
 
-    if let (Some(dst_meta), Some(etag)) = (&existing_dst, stored_etag)
+    if let (Some(dst_meta), Some(etag)) = (&existing_dst, stored_etag.as_deref())
         && Some(etag) == src_id.etag.as_deref()
     {
         let size = if collect_meta {
@@ -1772,15 +2481,18 @@ async fn convert_object(
             None
         };
         if delete_origin && path != new_path {
-            delete_source_verified(src_op, path, &src_id).await?;
+            delete_source_verified(src_op, dst_op, path, &new_path, &src_id).await?;
         }
         return Ok(match size {
             Some(size) => ConvertOutcome::SkippedWithMeta {
                 new_path,
                 meta_key,
                 size,
+                reason: "unchanged",
             },
-            None => ConvertOutcome::SkippedNoMeta,
+            None => ConvertOutcome::SkippedNoMeta {
+                reason: "unchanged",
+            },
         });
     }
 
@@ -2353,6 +3065,14 @@ impl Config {
 
 pub async fn operator() -> anyhow::Result<Operator> {
     let config = Config::new()?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(60))
+        .pool_idle_timeout(Duration::from_secs(60))
+        .tcp_keepalive(Duration::from_secs(30))
+        .build()
+        .context("failed to build S3/R2 HTTP client")?;
+    let transport = HttpTransporter::new(ReqwestTransport::new(client));
     let op = Operator::new(
         S3::default()
             .endpoint(&config.endpoint)
@@ -2360,19 +3080,22 @@ pub async fn operator() -> anyhow::Result<Operator> {
             .region(&config.region)
             .access_key_id(&config.key_id)
             .secret_access_key(&config.secret),
-    )?
-    .layer(
-        TimeoutLayer::new()
-            .with_timeout(Duration::from_secs(600))
-            .with_io_timeout(Duration::from_secs(300)),
-    )
-    .layer(
-        RetryLayer::new()
-            .with_max_times(3)
-            .with_min_delay(Duration::from_millis(200))
-            .with_max_delay(Duration::from_secs(10))
-            .with_jitter(),
-    );
+    )?;
+    let ctx = op.base_context().with_http_transport(transport);
+    let op = op
+        .with_context(ctx)
+        .layer(
+            TimeoutLayer::new()
+                .with_timeout(Duration::from_secs(600))
+                .with_io_timeout(Duration::from_secs(300)),
+        )
+        .layer(
+            RetryLayer::new()
+                .with_max_times(3)
+                .with_min_delay(Duration::from_millis(200))
+                .with_max_delay(Duration::from_secs(10))
+                .with_jitter(),
+        );
     Ok(op)
 }
 
@@ -3486,19 +4209,32 @@ mod tests {
             }
             "DELETE" => {
                 st.delete_count += 1;
-                if let Some(im) = req.header("if-match")
-                    && let Some(meta) = st.objects.get(&key)
-                    && meta.etag != im.trim()
-                {
-                    return write_http_resp(
-                        writer,
-                        412,
-                        "Precondition Failed",
-                        &[],
-                        b"PreconditionFailed",
-                        None,
-                    )
-                    .await;
+                if let Some(im) = req.header("if-match") {
+                    match st.objects.get(&key) {
+                        None => {
+                            return write_http_resp(
+                                writer,
+                                404,
+                                "Not Found",
+                                &[],
+                                b"NoSuchKey",
+                                None,
+                            )
+                            .await;
+                        }
+                        Some(meta) if meta.etag != im.trim() => {
+                            return write_http_resp(
+                                writer,
+                                412,
+                                "Precondition Failed",
+                                &[],
+                                b"PreconditionFailed",
+                                None,
+                            )
+                            .await;
+                        }
+                        Some(_) => {}
+                    }
                 }
                 st.objects.remove(&key);
                 write_http_resp(writer, 204, "No Content", &[], b"", None).await
@@ -4325,8 +5061,7 @@ mod tests {
             &cpu_sem,
         )
         .await
-        .err()
-        .expect("collision must fail");
+        .expect_err("collision must fail");
         assert!(col_err.to_string().contains("destination collision"));
         assert_eq!(
             s3.state.lock().await.get_count,
@@ -4468,5 +5203,703 @@ mod tests {
         .await
         .unwrap();
         assert!(ok_metas.is_empty());
+    }
+
+    #[test]
+    fn ack_result_rejects_missing_or_oversized_counts_and_backoff_scales() {
+        let req = AckRequest {
+            acks: vec![AckLease {
+                lease_id: "ok".into(),
+            }],
+            retries: vec![RetryLease {
+                lease_id: "r1".into(),
+                delay_seconds: 15,
+            }],
+        };
+
+        // Missing ackCount / retryCount on non-empty request must NOT be considered confirmed
+        let missing_ack = AckResult {
+            ack_count: None,
+            retry_count: Some(1),
+            warnings: HashMap::new(),
+        };
+        let out = missing_ack.outcome(&req);
+        assert!(!out.complete);
+        assert!(!out.counts_confirmed);
+
+        let missing_retry = AckResult {
+            ack_count: Some(1),
+            retry_count: None,
+            warnings: HashMap::new(),
+        };
+        assert!(!missing_retry.outcome(&req).complete);
+
+        // Oversized counts must also be rejected
+        let oversized_ack = AckResult {
+            ack_count: Some(2),
+            retry_count: Some(1),
+            warnings: HashMap::new(),
+        };
+        assert!(!oversized_ack.outcome(&req).complete);
+
+        let oversized_retry = AckResult {
+            ack_count: Some(1),
+            retry_count: Some(2),
+            warnings: HashMap::new(),
+        };
+        assert!(!oversized_retry.outcome(&req).complete);
+
+        // Attempt-aware transport backoff scales and caps at 300s
+        assert_eq!(retry_delay_for_attempt(1, false, 15), 15);
+        assert_eq!(retry_delay_for_attempt(4, false, 15), 15);
+        assert_eq!(retry_delay_for_attempt(1, true, 15), 15);
+        assert_eq!(retry_delay_for_attempt(2, true, 15), 30);
+        assert_eq!(retry_delay_for_attempt(3, true, 15), 60);
+        assert_eq!(retry_delay_for_attempt(4, true, 15), 120);
+        assert_eq!(retry_delay_for_attempt(5, true, 15), 240);
+        assert_eq!(retry_delay_for_attempt(6, true, 15), 300);
+
+        // Transport error classification
+        assert!(is_transport_connect_error(&anyhow::anyhow!(
+            "client error (Connect): tls handshake eof"
+        )));
+        assert!(is_transport_connect_error(&anyhow::Error::from(
+            std::io::Error::from(std::io::ErrorKind::UnexpectedEof)
+        )));
+        assert!(!is_transport_connect_error(&anyhow::anyhow!(
+            "libvips convert failed: Could not decode image"
+        )));
+    }
+
+    #[tokio::test]
+    async fn delete_source_verified_reconciles_condition_not_match_when_absent_and_protects_newer() {
+        let s3 = MockS3Server::start("my-bucket").await;
+        let op = s3.operator();
+        let src = "Album/by Coser - photo 1";
+        let dst = "Album/by Coser - photo 1.webp";
+
+        let png = make_png(10, 8, [30, 60, 90]);
+        let etag = s3.put_raw(src, png.clone()).await;
+        let src_meta = op.stat(src).await.unwrap();
+        let src_id = SourceIdentity::from_meta(&src_meta);
+
+        // Publish matching destination WebP
+        let webp = convert_checked(&png).unwrap();
+        op.write_with(dst, webp)
+            .user_metadata([
+                ("source-key".to_string(), src.to_string()),
+                ("source-etag".to_string(), etag),
+            ])
+            .await
+            .unwrap();
+
+        // Simulate source already deleted on server (e.g., earlier DELETE committed before retry):
+        // Conditional DELETE with If-Match gets 404 -> OpenDAL maps to ConditionNotMatch ->
+        // delete_source_verified must reconcile via stat(src)=404 + stat(dst) owned and return Ok!
+        s3.state.lock().await.objects.remove(src);
+        delete_source_verified(&op, &op, src, dst, &src_id)
+            .await
+            .expect("already-absent source with intact destination must reconcile cleanly");
+
+        // Now simulate a newer upload replacing the source (different ETag):
+        // Conditional DELETE gets 412 -> ConditionNotMatch -> stat(src) sees new ETag -> must refuse!
+        let newer_png = make_png(16, 12, [90, 60, 30]);
+        s3.put_raw(src, newer_png.clone()).await;
+        let err = delete_source_verified(&op, &op, src, dst, &src_id)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("changed during conversion"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            op.exists(src).await.unwrap(),
+            "newer source upload must remain intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_source_recovery_uses_two_heads_coalesces_duplicates_and_rejects_corrupt_legacy() {
+        let s3 = MockS3Server::start("my-bucket").await;
+        let op = s3.operator();
+        let key = "Album/by Coser - photo 42";
+        let dst = "Album/by Coser - photo 42.webp";
+
+        let webp = convert_checked(&make_png(14, 10, [10, 80, 120])).unwrap();
+        op.write_with(dst, webp)
+            .user_metadata([
+                ("source-key".to_string(), key.to_string()),
+                ("webp-width".to_string(), "14".to_string()),
+                ("webp-height".to_string(), "10".to_string()),
+            ])
+            .await
+            .unwrap();
+        s3.reset_counts().await;
+
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&serde_json::json!({ "key": key })).unwrap());
+        let batch = serde_json::json!([
+            {
+                "id": "dup-1",
+                "lease_id": "lease-dup-1",
+                "attempts": 2,
+                "metadata": { "CF-Content-Type": "json" },
+                "body": b64
+            },
+            {
+                "id": "dup-2",
+                "lease_id": "lease-dup-2",
+                "attempts": 2,
+                "metadata": { "CF-Content-Type": "json" },
+                "body": b64
+            }
+        ]);
+
+        let q = MockQueueServer::start(vec![batch], None, None).await;
+        let jdir = TestDir::new("coalesce");
+        let jfile = jdir.path().join("coalesce.json");
+        let cfg = QueueConfig {
+            account_id: "acct".into(),
+            queue_id: "q1".into(),
+            api_token: "tok".into(),
+            batch_size: 32,
+            visibility_timeout_ms: 60_000,
+            daemon: false,
+            poll_interval: Duration::from_secs(1),
+            concurrency: 4,
+        };
+        let metas = pull_convert_inner(
+            op.clone(),
+            op.clone(),
+            cfg,
+            true,
+            &q.base_url,
+            Some(&jfile),
+            CancellationToken::new(),
+            Ok,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(metas.len(), 1);
+        let st = s3.state.lock().await;
+        assert_eq!(
+            st.head_src_count, 1,
+            "duplicate keys in batch must coalesce into a single source HEAD"
+        );
+        assert_eq!(
+            st.head_dst_count, 1,
+            "deleted-source queue recovery must only do 1 destination HEAD (2 HEADs total)"
+        );
+        assert_eq!(st.get_count, 0);
+        assert_eq!(st.put_count, 0);
+        drop(st);
+
+        let acked: HashSet<String> = q
+            .state
+            .lock()
+            .await
+            .received_acks
+            .iter()
+            .flat_map(|r| r.acks.iter().map(|a| a.lease_id.clone()))
+            .collect();
+        assert_eq!(acked.len(), 2, "both coalesced leases must be acked");
+
+        // Legacy unlabeled corrupt destination must NOT allow silent recovery even in daemon mode
+        let corrupt_key = "Album/corrupt-legacy";
+        let corrupt_dst = "Album/corrupt-legacy.webp";
+        s3.put_raw(corrupt_dst, b"not-a-webp".to_vec()).await;
+        let err = convert_object(
+            &op,
+            &op,
+            corrupt_key,
+            None,
+            true,
+            false,
+            2,
+            &Arc::new(Semaphore::new(SOURCE_BYTE_BUDGET)),
+            &Arc::new(Semaphore::new(1)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("valid webp dimensions"),
+            "unexpected error: {err}"
+        );
+    }
+
+    enum ScriptedPullResp {
+        Ok {
+            messages: serde_json::Value,
+            backlog_count: Option<u64>,
+        },
+        Status(u16, &'static str),
+    }
+
+    struct ScriptedQueueServer {
+        base_url: String,
+        received_acks: Arc<tokio::sync::Mutex<Vec<RecordedAckReq>>>,
+        pull_count: Arc<AtomicUsize>,
+        _task: AbortOnDrop,
+    }
+
+    impl ScriptedQueueServer {
+        async fn start(pulls: Vec<ScriptedPullResp>) -> Self {
+            let queue = Arc::new(tokio::sync::Mutex::new(
+                std::collections::VecDeque::from(pulls),
+            ));
+            let received_acks = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            let pull_count = Arc::new(AtomicUsize::new(0));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let base_url = format!("http://{addr}");
+
+            let q_loop = Arc::clone(&queue);
+            let a_loop = Arc::clone(&received_acks);
+            let p_loop = Arc::clone(&pull_count);
+            let handle = tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let q = Arc::clone(&q_loop);
+                    let a = Arc::clone(&a_loop);
+                    let p = Arc::clone(&p_loop);
+                    tokio::spawn(async move {
+                        let (r, mut w) = stream.into_split();
+                        let mut reader = tokio::io::BufReader::new(r);
+                        while let Ok(Some(req)) = read_http_req(&mut reader).await {
+                            if req.target.ends_with("/messages/pull") {
+                                p.fetch_add(1, Ordering::SeqCst);
+                                let next = q.lock().await.pop_front().unwrap_or(
+                                    ScriptedPullResp::Ok {
+                                        messages: serde_json::json!([]),
+                                        backlog_count: Some(0),
+                                    },
+                                );
+                                match next {
+                                    ScriptedPullResp::Ok {
+                                        messages,
+                                        backlog_count,
+                                    } => {
+                                        let mut result = serde_json::json!({ "messages": messages });
+                                        if let Some(bc) = backlog_count {
+                                            result["message_backlog_count"] = serde_json::json!(bc);
+                                        }
+                                        let body = serde_json::to_vec(&serde_json::json!({
+                                            "success": true,
+                                            "errors": [],
+                                            "result": result,
+                                        }))
+                                        .unwrap();
+                                        if write_http_resp(
+                                            &mut w,
+                                            200,
+                                            "OK",
+                                            &[("Content-Type".into(), "application/json".into())],
+                                            &body,
+                                            None,
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    ScriptedPullResp::Status(code, body) => {
+                                        if write_http_resp(
+                                            &mut w,
+                                            code,
+                                            "Error",
+                                            &[("Retry-After".into(), "1".into())],
+                                            body.as_bytes(),
+                                            None,
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else if req.target.ends_with("/messages/ack") {
+                                let parsed: RecordedAckReq =
+                                    serde_json::from_slice(&req.body).unwrap();
+                                let ack_len = parsed.acks.len();
+                                let retry_len = parsed.retries.len();
+                                a.lock().await.push(parsed);
+                                let body = serde_json::to_vec(&serde_json::json!({
+                                    "success": true,
+                                    "errors": [],
+                                    "result": {
+                                        "ackCount": ack_len,
+                                        "retryCount": retry_len,
+                                        "warnings": {}
+                                    }
+                                }))
+                                .unwrap();
+                                if write_http_resp(
+                                    &mut w,
+                                    200,
+                                    "OK",
+                                    &[("Content-Type".into(), "application/json".into())],
+                                    &body,
+                                    None,
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+
+            Self {
+                base_url,
+                received_acks,
+                pull_count,
+                _task: AbortOnDrop(handle),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oneshot_waits_past_premature_empty_polls_and_retains_journal_if_unresolved() {
+        let s3 = MockS3Server::start("my-bucket").await;
+        let op = s3.operator();
+        let good_key = "Album/good";
+        let delayed_key = "Album/delayed";
+        s3.put_raw(good_key, make_png(8, 6, [10, 20, 30])).await;
+        // `delayed_key` is missing on attempt 1 (fails & retries), then its `.webp` is already
+        // present with original deleted when redelivered on attempt 2!
+
+        let b64 = |k: &str| {
+            base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&serde_json::json!({ "key": k })).unwrap())
+        };
+
+        // Case 1: Retried message does NOT appear on first empty poll after wait,
+        // appears on confirm poll -> must NOT exit prematurely; must recover and delete journal!
+        let sq = ScriptedQueueServer::start(vec![
+            ScriptedPullResp::Ok {
+                messages: serde_json::json!([
+                    {
+                        "id": "id-good",
+                        "lease_id": "lease-good",
+                        "attempts": 1,
+                        "metadata": { "CF-Content-Type": "json" },
+                        "body": b64(good_key)
+                    },
+                    {
+                        "id": "id-delayed",
+                        "lease_id": "lease-delayed-1",
+                        "attempts": 1,
+                        "metadata": { "CF-Content-Type": "json" },
+                        "body": b64(delayed_key)
+                    }
+                ]),
+                backlog_count: Some(2),
+            },
+            // First empty poll -> triggers settle wait
+            ScriptedPullResp::Ok {
+                messages: serde_json::json!([]),
+                backlog_count: Some(1),
+            },
+            // Premature empty poll right after settle wait -> previously caused silent exit 0!
+            ScriptedPullResp::Ok {
+                messages: serde_json::json!([]),
+                backlog_count: Some(1),
+            },
+            // Delayed redelivery arrives on confirm poll at attempts=2
+            ScriptedPullResp::Ok {
+                messages: serde_json::json!([
+                    {
+                        "id": "id-delayed",
+                        "lease_id": "lease-delayed-2",
+                        "attempts": 2,
+                        "metadata": { "CF-Content-Type": "json" },
+                        "body": b64(delayed_key)
+                    }
+                ]),
+                backlog_count: Some(1),
+            },
+            // Finally truly drained
+            ScriptedPullResp::Ok {
+                messages: serde_json::json!([]),
+                backlog_count: Some(0),
+            },
+        ])
+        .await;
+
+        // Publish `.webp` for `delayed_key` once the first batch has been acked
+        let op_bg = op.clone();
+        let acks_bg = Arc::clone(&sq.received_acks);
+        let publisher = tokio::spawn(async move {
+            for _ in 0..200 {
+                if !acks_bg.lock().await.is_empty() {
+                    let webp = convert_checked(&make_png(12, 9, [50, 100, 150])).unwrap();
+                    op_bg
+                        .write_with("Album/delayed.webp", webp)
+                        .user_metadata([
+                            ("source-key".to_string(), delayed_key.to_string()),
+                            ("webp-width".to_string(), "12".to_string()),
+                            ("webp-height".to_string(), "9".to_string()),
+                        ])
+                        .await
+                        .unwrap();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let jdir = TestDir::new("oneshot-delayed");
+        let jfile = jdir.path().join("delayed.json");
+        let cfg = QueueConfig {
+            account_id: "acct".into(),
+            queue_id: "q1".into(),
+            api_token: "tok".into(),
+            batch_size: 32,
+            visibility_timeout_ms: 10_000,
+            daemon: false,
+            poll_interval: Duration::from_secs(1),
+            concurrency: 2,
+        };
+        let fast_opts = PullRuntimeOpts {
+            empty_confirm_delay: Duration::from_millis(30),
+            retry_delay_base_secs: 0,
+            uncertain_pull_grace: Duration::from_millis(50),
+        };
+        let metas = pull_convert_inner_with_opts(
+            op.clone(),
+            op.clone(),
+            cfg.clone(),
+            true,
+            &sq.base_url,
+            Some(&jfile),
+            CancellationToken::new(),
+            fast_opts,
+            Ok,
+        )
+        .await
+        .unwrap();
+        publisher.await.unwrap();
+
+        assert!(!jfile.exists(), "journal removed after full recovery");
+        let album = metas.iter().find(|m| m.title == "Album").unwrap();
+        assert_eq!(album.images.len(), 2);
+
+        // Case 2: Retried message never surfaces across settle + confirm polls ->
+        // MUST fail nonzero and retain the metadata journal!
+        let missing_key = "Album/never-returns";
+        s3.put_raw("Album/ok-before-loss", make_png(6, 6, [1, 2, 3]))
+            .await;
+        let sq2 = ScriptedQueueServer::start(vec![
+            ScriptedPullResp::Ok {
+                messages: serde_json::json!([
+                    {
+                        "id": "id-ok2",
+                        "lease_id": "lease-ok2",
+                        "attempts": 1,
+                        "metadata": { "CF-Content-Type": "json" },
+                        "body": b64("Album/ok-before-loss")
+                    },
+                    {
+                        "id": "id-stuck",
+                        "lease_id": "lease-stuck-1",
+                        "attempts": 1,
+                        "metadata": { "CF-Content-Type": "json" },
+                        "body": b64(missing_key)
+                    }
+                ]),
+                backlog_count: Some(2),
+            },
+            ScriptedPullResp::Ok {
+                messages: serde_json::json!([]),
+                backlog_count: Some(1),
+            },
+            ScriptedPullResp::Ok {
+                messages: serde_json::json!([]),
+                backlog_count: Some(1),
+            },
+            ScriptedPullResp::Ok {
+                messages: serde_json::json!([]),
+                backlog_count: Some(1),
+            },
+        ])
+        .await;
+        let jfile2 = jdir.path().join("unresolved.json");
+        let err = pull_convert_inner_with_opts(
+            op.clone(),
+            op.clone(),
+            cfg,
+            true,
+            &sq2.base_url,
+            Some(&jfile2),
+            CancellationToken::new(),
+            fast_opts,
+            Ok,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unresolved_retries=1"),
+            "expected unresolved retries error, got: {err}"
+        );
+        assert!(
+            jfile2.exists(),
+            "journal must be retained when unresolved retries never resurfaced"
+        );
+        assert!(load_journal(&jfile2).unwrap().contains_key("Album"));
+
+        // Case 3: Transient pull error (uncertain pull — server may have leased messages) ->
+        // must wait past visibility_timeout + grace before confirming empty & completing!
+        let uncertain_key = "Album/uncertain-ok";
+        s3.put_raw(uncertain_key, make_png(8, 8, [11, 22, 33])).await;
+        let sq3 = ScriptedQueueServer::start(vec![
+            ScriptedPullResp::Status(503, "temporary outage"),
+            ScriptedPullResp::Ok {
+                messages: serde_json::json!([]),
+                backlog_count: Some(1),
+            },
+            ScriptedPullResp::Ok {
+                messages: serde_json::json!([
+                    {
+                        "id": "id-uncertain",
+                        "lease_id": "lease-uncertain-2",
+                        "attempts": 2,
+                        "metadata": { "CF-Content-Type": "json" },
+                        "body": b64(uncertain_key)
+                    }
+                ]),
+                backlog_count: Some(1),
+            },
+            ScriptedPullResp::Ok {
+                messages: serde_json::json!([]),
+                backlog_count: Some(0),
+            },
+        ])
+        .await;
+        let jfile3 = jdir.path().join("uncertain.json");
+        let cfg_uncertain = QueueConfig {
+            account_id: "acct".into(),
+            queue_id: "q1".into(),
+            api_token: "tok".into(),
+            batch_size: 32,
+            visibility_timeout_ms: 1_000,
+            daemon: false,
+            poll_interval: Duration::from_secs(1),
+            concurrency: 2,
+        };
+        let metas3 = pull_convert_inner_with_opts(
+            op.clone(),
+            op.clone(),
+            cfg_uncertain,
+            true,
+            &sq3.base_url,
+            Some(&jfile3),
+            CancellationToken::new(),
+            fast_opts,
+            Ok,
+        )
+        .await
+        .unwrap();
+        assert!(!jfile3.exists());
+        assert!(metas3.iter().any(|m| m.title == "Album"));
+    }
+
+    #[tokio::test]
+    async fn transport_outage_trips_circuit_breaker_and_stops_burning_queue_retries() {
+        // TCP listener that accepts and immediately drops connections (EOF during request/connect)
+        let eof_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let eof_addr = eof_listener.local_addr().unwrap();
+        let _eof_task = AbortOnDrop(tokio::spawn(async move {
+            while let Ok((stream, _)) = eof_listener.accept().await {
+                drop(stream);
+            }
+        }));
+
+        let bad_op = Operator::new(
+            S3::default()
+                .endpoint(&format!("http://{eof_addr}"))
+                .bucket("my-bucket")
+                .region("us-east-1")
+                .access_key_id("test-key")
+                .secret_access_key("test-secret")
+                .disable_config_load()
+                .disable_ec2_metadata(),
+        )
+        .unwrap();
+
+        let mut msgs = Vec::new();
+        for i in 0..8 {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(
+                serde_json::to_vec(&serde_json::json!({ "key": format!("Album/photo {i}") }))
+                    .unwrap(),
+            );
+            msgs.push(serde_json::json!({
+                "id": format!("msg-{i}"),
+                "lease_id": format!("lease-{i}"),
+                "attempts": 2,
+                "metadata": { "CF-Content-Type": "json" },
+                "body": b64
+            }));
+        }
+
+        let sq = ScriptedQueueServer::start(vec![
+            ScriptedPullResp::Ok {
+                messages: serde_json::Value::Array(msgs),
+                backlog_count: Some(8),
+            },
+            // Second batch must never be pulled because circuit breaker aborts one-shot run!
+            ScriptedPullResp::Ok {
+                messages: serde_json::json!([]),
+                backlog_count: Some(8),
+            },
+        ])
+        .await;
+
+        let jdir = TestDir::new("circuit-breaker");
+        let jfile = jdir.path().join("cb.json");
+        let cfg = QueueConfig {
+            account_id: "acct".into(),
+            queue_id: "q1".into(),
+            api_token: "tok".into(),
+            batch_size: 32,
+            visibility_timeout_ms: 60_000,
+            daemon: false,
+            poll_interval: Duration::from_secs(1),
+            concurrency: 1,
+        };
+        let err = pull_convert_inner(
+            bad_op.clone(),
+            bad_op,
+            cfg,
+            true,
+            &sq.base_url,
+            Some(&jfile),
+            CancellationToken::new(),
+            Ok,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("storage endpoint appears unreachable"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            sq.pull_count.load(Ordering::SeqCst),
+            1,
+            "circuit breaker must stop before pulling another batch"
+        );
+        let acks = sq.received_acks.lock().await;
+        let all_retries: Vec<&RecordedRetryLease> =
+            acks.iter().flat_map(|r| r.retries.iter()).collect();
+        assert_eq!(all_retries.len(), 8, "every lease in batch must be released");
+        // First 3 attempted items at attempts=2 get 30s transport backoff; remaining 5 unstarted get 0s!
+        let backoff_30 = all_retries.iter().filter(|r| r.delay_seconds == 30).count();
+        let immediate_0 = all_retries.iter().filter(|r| r.delay_seconds == 0).count();
+        assert_eq!(backoff_30, TRANSPORT_CIRCUIT_THRESHOLD);
+        assert_eq!(immediate_0, 8 - TRANSPORT_CIRCUIT_THRESHOLD);
     }
 }

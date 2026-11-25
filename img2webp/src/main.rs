@@ -75,7 +75,8 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| "img2webp=info".parse().unwrap()),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "img2webp=info,opendal::layers::retry=warn".parse().unwrap()),
         )
         .init();
 

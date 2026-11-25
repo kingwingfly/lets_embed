@@ -2876,6 +2876,7 @@ dependencies = [
  "libvips",
  "mime_guess",
  "opendal",
+ "opendal-http-transport-reqwest",
  "reqwest",
  "serde",
  "serde_json",
