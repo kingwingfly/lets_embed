@@ -857,7 +857,7 @@ pub async fn link_identity_atomic(
         if msg.contains("constraint") || msg.contains("unique") {
             return Err(api_err(
                 StatusCode::CONFLICT,
-                "this identity or wallet is already linked to an account",
+                "This wallet or identity is already registered to another account. Use \"Link or Merge Sign-in Method\" below to fuse both accounts into one.",
             ));
         }
         worker::console_error!("link_identity_atomic failed: {e:?}");

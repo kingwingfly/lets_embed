@@ -13,6 +13,7 @@ pub mod do_client;
 pub mod handoff;
 pub mod identity;
 pub mod likes;
+pub mod merge;
 pub mod pages;
 pub mod payments;
 pub mod policy_do;
@@ -389,6 +390,12 @@ async fn router(env: Env, _ctx: Context) -> Result<Router> {
             "/user/api/identities/link/wallet",
             post(safety_api::identity_link_wallet),
         )
+        .route(
+            "/user/api/account/merge/start/wallet",
+            post(merge::start_wallet),
+        )
+        .route("/user/api/account/merge/preview", post(merge::preview))
+        .route("/user/api/account/merge/confirm", post(merge::confirm))
         .route(
             "/user/api/sessions/revoke_all",
             post(safety_api::revoke_all_sessions),
