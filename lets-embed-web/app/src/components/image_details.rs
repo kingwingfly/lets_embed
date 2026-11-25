@@ -1059,7 +1059,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                 </div>
 
                 <div class="web-details-sidebar w-full md:w-96 lg:w-[28rem] xl:w-[32rem] md:shrink-0
-                            md:h-full flex flex-col gap-3 md:min-h-0">
+                            md:h-full flex flex-col gap-3 md:gap-2.5 md:min-h-0">
                     {
                         post.map(|p| view! {
                             <button
@@ -1148,7 +1148,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                         </div>
                     </div>
 
-                    <div class="web-details-tags-card min-h-0 shrink flex flex-col gap-1.5 p-2.5 bg-white/75 ring-1 ring-sky-100 rounded-2xl">
+                    <div class="web-details-tags-card min-h-0 shrink flex flex-col gap-1.5 md:gap-1 p-2.5 md:p-2 bg-white/75 ring-1 ring-sky-100 rounded-2xl">
                         {(tag_count > 0).then(|| view! {
                             <div class="flex items-center justify-between gap-2 px-0.5 text-[11px] text-sky-600/80">
                                 <span>
@@ -1184,7 +1184,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                             let tags_store = StoredValue::new(tags);
                             move || if show_inline_aliases.get() {
                                 view! {
-                                    <div class="max-h-40 md:max-h-44 lg:max-h-48 min-h-0 overflow-y-auto overscroll-contain flex flex-col gap-1.5 pr-0.5">
+                                    <div class="max-h-40 md:max-h-24 lg:max-h-28 min-h-0 overflow-y-auto overscroll-contain flex flex-col gap-1.5 pr-0.5">
                                         {authors_store.with_value(|list| {
                                             (!list.is_empty()).then(|| view! {
                                                 <div class="flex flex-wrap gap-1.5">
@@ -1200,7 +1200,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                             } else {
                                 view! {
                                     <div
-                                        class="max-h-24 md:max-h-32 overflow-y-auto flex flex-wrap content-start gap-1.5"
+                                        class="max-h-24 md:max-h-16 overflow-y-auto flex flex-wrap content-start gap-1.5"
                                         on:scroll=move |_| {
                                             if !pointer_in_tip.get_value() && !focus_in_tip.get_value() {
                                                 close_tip_now();
@@ -1219,7 +1219,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                         }
                     </div>
 
-                    <div class="flex-1 min-h-0 md:min-h-[8.5rem] flex flex-row gap-2">
+                    <div class="flex-1 min-h-0 md:min-h-[13.5rem] flex flex-row gap-2">
                         <Transition fallback=move || view! { <div class="flex-1 min-h-0" /> }>
                             {
                                 let open_thumb = open_zoom_thumb.clone();
