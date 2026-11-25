@@ -57,7 +57,10 @@ fn account_age_badge(
 }
 
 fn account_plan_label(plan: Option<&str>, live_status: Option<&DoStatusResp>) -> String {
-    match plan.map(str::trim).filter(|s| !s.is_empty()) {
+    match plan
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none") && !s.eq_ignore_ascii_case("payg"))
+    {
         Some(p) => {
             let mut chars = p.chars();
             match chars.next() {
@@ -345,7 +348,7 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                         <option value="paid">"Paid only"</option>
                         <option value="pro">"Pro"</option>
                         <option value="basic">"Basic"</option>
-                        <option value="none">"PAYG"</option>
+                        <option value="none">"Free / PAYG"</option>
                     </select>
                     <select
                         prop:value=move || status_filter.get()
@@ -632,7 +635,7 @@ pub fn AccountsTab(on_mutated: Callback<()>) -> impl IntoView {
                                         >
                                             <option value="basic">"Basic"</option>
                                             <option value="pro">"Pro"</option>
-                                            <option value="none">"Revoke plan (PAYG)"</option>
+                                            <option value="none">"Revoke plan (Free / PAYG)"</option>
                                         </select>
                                     </label>
                                     <label class="adm-field">
