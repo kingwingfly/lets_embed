@@ -14,7 +14,9 @@ use crate::types::{
 use crate::{
     config,
     do_client::{
-        AgeConfirmReq, BillingPrefsReq, BillingPrefsResp, DoPrefsConflictResp, PrefsUpdateReq,
+        AgeConfirmReq, BillingPrefsReq, BillingPrefsResp, DoPrefsConflictResp,
+        MergeCreditBreakdown, MergeDrainDoReq, MergeDrainDoResp, MergePreviewDoReq,
+        MergePreviewDoResp, MergeReceiveDoReq, MergeReceiveDoResp, PrefsUpdateReq,
         PreviewBudgetReq, PreviewBudgetResp, SessionContextReq, SessionInfoResp, SessionIssueReq,
         SessionIssueResp, SessionRevokeAllReq, SessionRevokeAllResp, SessionRevokeReq,
         TermsAcceptReq,
@@ -152,6 +154,130 @@ fn window_reset(active: bool, win_start: Option<u64>, now: u64) -> u64 {
 /// Epoch secs of the next UTC midnight when daily free counters reset.
 fn next_utc_day_reset(now: u64) -> u64 {
     (now / 86_400).saturating_add(1).saturating_mul(86_400)
+}
+
+/// Deduct `cost` from `balance`, consuming `free_balance` first so genuinely paid
+/// credits remain preserved for account merges while free signup points cannot be farmed.
+fn spend_free_first(balance: i64, free_balance: i64, cost: i64) -> (i64, i64) {
+    let cost = cost.max(0);
+    let clamped_free = free_balance.clamp(0, balance.max(0));
+    let new_balance = balance.saturating_sub(cost).max(0);
+    let new_free = clamped_free.saturating_sub(cost).min(new_balance);
+    (new_balance, new_free)
+}
+
+/// Split funding for a subscription purchase/switch of `target_price` given existing
+/// `(balance, free_balance)` and an incoming prorated plan refund `(prev_refund_total, prev_refund_paid)`.
+/// Uses paid funds first so free signup credits can NEVER be laundered into transferable
+/// paid subscription refunds during account merges.
+/// Returns `(new_balance, new_free_balance, new_plan_paid_real)`.
+fn subscribe_split_funding(
+    balance: i64,
+    free_balance: i64,
+    prev_refund_total: i64,
+    prev_refund_paid: i64,
+    target_price: i64,
+) -> (i64, i64, i64) {
+    let target = target_price.max(0);
+    let prev_total = prev_refund_total.max(0);
+    let prev_paid = prev_refund_paid.clamp(0, prev_total);
+    let prev_free = prev_total.saturating_sub(prev_paid);
+
+    let clamped_free = free_balance.clamp(0, balance.max(0));
+    let paid_bal = balance.saturating_sub(clamped_free).max(0);
+
+    let total_paid_avail = paid_bal.saturating_add(prev_paid);
+    let total_free_avail = clamped_free.saturating_add(prev_free);
+
+    let plan_paid_real = target.min(total_paid_avail);
+    let plan_free_used = target.saturating_sub(plan_paid_real).min(total_free_avail);
+
+    let new_paid_bal = total_paid_avail.saturating_sub(plan_paid_real);
+    let new_free_bal = total_free_avail.saturating_sub(plan_free_used);
+    let new_balance = new_paid_bal.saturating_add(new_free_bal);
+    (new_balance, new_free_bal, plan_paid_real)
+}
+
+/// Pure, host-testable computation of paid vs. free credit breakdown for merging/abandoning
+/// an account. Handles BOTH tracked accounts (`tracked_free_balance: Some(...)`) AND legacy
+/// pre-upgrade accounts (`tracked_free_balance: None`) capped against D1 `legacy_paid_deposits`
+/// plus any prior `merged_paid_in`.
+#[allow(clippy::too_many_arguments)]
+fn compute_merge_credit_breakdown(
+    initialized: bool,
+    balance: i64,
+    tracked_free_balance: Option<i64>,
+    signup_points: i64,
+    legacy_paid_in: i64,
+    plan_active: bool,
+    plan_paid: i64,
+    tracked_plan_paid_real: Option<i64>,
+    plan_period_secs: u64,
+    plan_remaining_secs: u64,
+) -> MergeCreditBreakdown {
+    let balance = balance.max(0);
+    let signup_points = signup_points.max(0);
+    let legacy_paid_in = legacy_paid_in.max(0);
+    let plan_paid = if plan_active { plan_paid.max(0) } else { 0 };
+    let plan_refund_total = if plan_active {
+        prorated_refund(plan_paid, plan_period_secs, plan_remaining_secs)
+    } else {
+        0
+    };
+
+    let (paid_balance_transfer, plan_paid_real) = match tracked_free_balance {
+        Some(fb) => {
+            let clamped_free = fb.clamp(0, balance);
+            let paid_bal = balance.saturating_sub(clamped_free);
+            let real_plan = if plan_active {
+                tracked_plan_paid_real
+                    .unwrap_or_else(|| plan_paid.min(legacy_paid_in))
+                    .clamp(0, plan_paid)
+            } else {
+                0
+            };
+            (paid_bal, real_plan)
+        }
+        None => {
+            if legacy_paid_in == 0 {
+                (0, 0)
+            } else {
+                let free_grant = if initialized { signup_points } else { 0 };
+                let current_assets = balance.saturating_add(plan_paid);
+                let total_in = free_grant.saturating_add(legacy_paid_in);
+                let spent = total_in.saturating_sub(current_assets);
+                let est_free_remaining = free_grant.saturating_sub(spent).clamp(0, balance);
+                let paid_bal = balance
+                    .saturating_sub(est_free_remaining)
+                    .min(legacy_paid_in);
+                let remaining_paid_cap = legacy_paid_in.saturating_sub(paid_bal);
+                let real_plan = plan_paid.min(remaining_paid_cap);
+                (paid_bal, real_plan)
+            }
+        }
+    };
+
+    let plan_refund_paid = if plan_active {
+        prorated_refund(plan_paid_real, plan_period_secs, plan_remaining_secs)
+            .min(plan_refund_total)
+    } else {
+        0
+    };
+    let free_balance_forfeited = balance.saturating_sub(paid_balance_transfer);
+    let plan_free_forfeited = plan_refund_total.saturating_sub(plan_refund_paid);
+    let total_transferable = paid_balance_transfer.saturating_add(plan_refund_paid);
+    let total_free_forfeited = free_balance_forfeited.saturating_add(plan_free_forfeited);
+
+    MergeCreditBreakdown {
+        balance,
+        paid_balance_transfer,
+        free_balance_forfeited,
+        plan_refund_total,
+        plan_refund_paid,
+        plan_free_forfeited,
+        total_transferable,
+        total_free_forfeited,
+    }
 }
 
 /// Pure refund math for a released `Window`-sourced hold.
@@ -631,8 +757,8 @@ impl DurableObject for UserAccount {
             }
             (Method::Get, "/status") => json(&self.status_resp(&policy).await?, 200),
             (Method::Post, "/check-active") => {
-                if self.get_or("banned", false).await? {
-                    Response::error("banned", 403)
+                if self.get_or("banned", false).await? || self.get_or("suspended", false).await? {
+                    Response::error("banned or suspended", 403)
                 } else {
                     Response::ok("")
                 }
@@ -644,6 +770,9 @@ impl DurableObject for UserAccount {
             (Method::Post, "/reserve-guest") => self.reserve_guest(req.json().await?, &policy).await,
             (Method::Post, "/preview-budget") => self.preview_budget(req.json().await?, &policy).await,
             (Method::Post, "/admin-plan") => self.admin_plan(req.json().await?, &policy).await,
+            (Method::Post, "/merge-preview") => self.merge_preview(req.json().await?, &policy).await,
+            (Method::Post, "/merge-drain") => self.merge_drain(req.json().await?, &policy).await,
+            (Method::Post, "/merge-receive") => self.merge_receive(req.json().await?, &policy).await,
             _ => Response::error("not found", 404),
         }
     }
@@ -749,6 +878,15 @@ impl UserAccount {
         };
         let paid = self.get_or("plan_paid", plan.price_points).await?;
         Ok(prorated_refund(paid, plan.period_secs, end - now))
+    }
+
+    async fn refund_paid_only(&self, id: Option<&str>, end: u64, now: u64) -> Result<i64> {
+        let Some(plan) = id.and_then(config::plan).filter(|_| end > now) else {
+            return Ok(0);
+        };
+        let paid = self.get_or("plan_paid", plan.price_points).await?;
+        let paid_real: i64 = self.get_or("plan_paid_real", paid).await?.clamp(0, paid);
+        Ok(prorated_refund(paid_real, plan.period_secs, end - now))
     }
 
     fn ensure_holds_table(&self) -> Result<worker::SqlStorage> {
@@ -1456,7 +1594,7 @@ impl UserAccount {
         let refund = self.refund(current.as_deref(), previous_end, now).await?;
         let balance: i64 = self.get_or("balance", 0).await?;
         self.write_plan(
-            serde_json::json!({"plan":id,"plan_paid":0,"balance":balance.saturating_add(refund),(marker):true}),
+            serde_json::json!({"plan":id,"plan_paid":0,"plan_paid_real":0,"balance":balance.saturating_add(refund),(marker):true}),
             end, now,
         )
         .await?;
@@ -1472,8 +1610,13 @@ impl UserAccount {
         let storage = self.state.storage();
         if storage.get::<bool>("init").await?.is_none() {
             let existing: i64 = self.get_or("balance", 0).await?;
-            self.write_fields(serde_json::json!({"init":true, "balance": existing.saturating_add(policy.signup_points)}))
-                .await?;
+            let existing_free: i64 = self.get_or("free_balance", 0).await?;
+            self.write_fields(serde_json::json!({
+                "init": true,
+                "balance": existing.saturating_add(policy.signup_points),
+                "free_balance": existing_free.saturating_add(policy.signup_points),
+            }))
+            .await?;
         }
         Ok(())
     }
@@ -1559,8 +1702,8 @@ impl UserAccount {
         if !check_only {
             self.ensure_init(policy).await?;
         }
-        if self.get_or("banned", false).await? {
-            return Response::error("banned", 403);
+        if self.get_or("banned", false).await? || self.get_or("suspended", false).await? {
+            return Response::error("banned or suspended", 403);
         }
         let storage = self.state.storage();
         let now = now_secs();
@@ -1708,6 +1851,7 @@ impl UserAccount {
         if check_only {
             return Response::ok("");
         }
+        let mut next_free_balance: Option<i64> = None;
         match source {
             ChargeSource::FreeUnlimited => {} // pro media view: deduct nothing
             ChargeSource::Window => {
@@ -1719,7 +1863,15 @@ impl UserAccount {
                 }
                 window_dirty = true;
             }
-            ChargeSource::Balance => balance -= cost,
+            ChargeSource::Balance => {
+                if let Some(fb) = storage.get::<i64>("free_balance").await? {
+                    let (nb, nf) = spend_free_first(balance, fb, cost);
+                    balance = nb;
+                    next_free_balance = Some(nf);
+                } else {
+                    balance -= cost;
+                }
+            }
             ChargeSource::Refuse => unreachable!("handled above"),
         }
 
@@ -1730,6 +1882,9 @@ impl UserAccount {
         today_map.insert(req.path, now);
         let total_views: i64 = self.get_or("total_views", 0).await? + 1;
         let mut fields = serde_json::json!({(today_key): today_map, "balance":balance, "total_views":total_views});
+        if let Some(nf) = next_free_balance {
+            fields["free_balance"] = nf.into();
+        }
         if window_dirty {
             fields["win_start"] = win_start.expect("active window has a start").into();
             fields["win_views"] = win_views.into();
@@ -1755,8 +1910,8 @@ impl UserAccount {
 
     async fn reserve(&self, req: ChargeReq, policy: &Policy) -> Result<Response> {
         self.ensure_init(policy).await?;
-        if self.get_or("banned", false).await? {
-            return Response::error("banned", 403);
+        if self.get_or("banned", false).await? || self.get_or("suspended", false).await? {
+            return Response::error("banned or suspended", 403);
         }
         let storage = self.state.storage();
         let now = now_secs();
@@ -2024,11 +2179,19 @@ impl UserAccount {
         }
         day_map.insert(hold.path, now);
         let total_views: i64 = self.get_or("total_views", 0).await? + 1;
-        self.write_fields(serde_json::json!({
+        let mut fields = serde_json::json!({
             (day_key): day_map,
             "total_views": total_views,
-        }))
-        .await?;
+        });
+        if hold.source == "balance"
+            && hold.cost > 0
+            && let Some(fb) = storage.get::<i64>("free_balance").await?
+        {
+            let cur_bal: i64 = self.get_or("balance", 0).await?;
+            let next_fb = fb.saturating_sub(hold.cost).clamp(0, cur_bal.max(0));
+            fields["free_balance"] = next_fb.into();
+        }
+        self.write_fields(fields).await?;
         let _ = self.reclaim_expired_holds(now as i64, false).await;
         Response::ok("")
     }
@@ -2102,8 +2265,8 @@ impl UserAccount {
     /// days — and switching (upgrade/downgrade/renew) only charges the
     /// difference net of the refund. A pure renew (same plan) costs ~0 net.
     async fn subscribe(&self, req: SubscribeReq, policy: &Policy) -> Result<Response> {
-        if self.get_or("banned", false).await? {
-            return Response::error("account banned", 403);
+        if self.get_or("banned", false).await? || self.get_or("suspended", false).await? {
+            return Response::error("account banned or suspended", 403);
         }
         let Some(target) = policy.plan(&req.plan) else {
             return Response::error("unknown plan", 400);
@@ -2126,6 +2289,9 @@ impl UserAccount {
         let period_end: u64 = self.get_or("period_end", 0).await?;
 
         let refund = self.refund(current.as_deref(), period_end, now).await?;
+        let refund_paid = self
+            .refund_paid_only(current.as_deref(), period_end, now)
+            .await?;
 
         let balance: i64 = self.get_or("balance", 0).await?;
         // Net cost of the switch: full target price offset by the refund. May be
@@ -2134,17 +2300,30 @@ impl UserAccount {
         if net_cost > 0 && balance < net_cost {
             return Response::error("insufficient balance", 402);
         }
-        let new_balance = balance.saturating_sub(net_cost).max(0);
+        let tracked_free: Option<i64> = storage.get("free_balance").await?;
+        let (new_balance, next_free, new_plan_paid_real) = match tracked_free {
+            Some(fb) => {
+                let (nb, nf, pr) =
+                    subscribe_split_funding(balance, fb, refund, refund_paid, target.price_points);
+                (nb, Some(nf), Some(pr))
+            }
+            None => (balance.saturating_sub(net_cost).max(0), None, None),
+        };
         // Always a fresh full period from now — never stacks past one period.
         let new_end = now + target.period_secs;
 
-        self.write_plan(
-            serde_json::json!({"balance":new_balance, "plan":target.id,
-            "plan_paid":target.price_points}),
-            new_end,
-            now,
-        )
-        .await?;
+        let mut fields = serde_json::json!({
+            "balance": new_balance,
+            "plan": target.id,
+            "plan_paid": target.price_points,
+        });
+        if let Some(nf) = next_free {
+            fields["free_balance"] = nf.into();
+        }
+        if let Some(pr) = new_plan_paid_real {
+            fields["plan_paid_real"] = pr.into();
+        }
+        self.write_plan(fields, new_end, now).await?;
         json(&self.status_resp(policy).await?, 200)
     }
 
@@ -2152,6 +2331,9 @@ impl UserAccount {
     /// PAYG balance and lapsing to pay-as-you-go immediately. Idempotent: with
     /// no active plan it just clears any stale state and returns 200.
     async fn unsubscribe(&self, policy: &Policy) -> Result<Response> {
+        if self.get_or("banned", false).await? || self.get_or("suspended", false).await? {
+            return Response::error("account banned or suspended", 403);
+        }
         let storage = self.state.storage();
         let now = now_secs();
         // Force-reclaim any expired uncommitted holds so the returned balance is up to date.
@@ -2160,14 +2342,192 @@ impl UserAccount {
         let period_end: u64 = self.get_or("period_end", 0).await?;
 
         let refund = self.refund(current.as_deref(), period_end, now).await?;
+        let refund_paid = self
+            .refund_paid_only(current.as_deref(), period_end, now)
+            .await?;
         let balance: i64 = self.get_or("balance", 0).await?;
-        self.write_plan(
-            serde_json::json!({"balance":balance.saturating_add(refund), "plan_paid":0}),
-            0,
-            now,
-        )
-        .await?;
+        let new_balance = balance.saturating_add(refund);
+        let mut fields = serde_json::json!({
+            "balance": new_balance,
+            "plan_paid": 0,
+            "plan_paid_real": 0,
+        });
+        if let Some(fb) = storage.get::<i64>("free_balance").await? {
+            let refund_free = refund.saturating_sub(refund_paid).max(0);
+            fields["free_balance"] = fb.saturating_add(refund_free).min(new_balance).into();
+        }
+        self.write_plan(fields, 0, now).await?;
         json(&self.status_resp(policy).await?, 200)
+    }
+
+    async fn compute_account_credit_breakdown(
+        &self,
+        policy: &Policy,
+        legacy_paid_deposits: i64,
+        now: u64,
+    ) -> Result<(Option<String>, u64, MergeCreditBreakdown)> {
+        let storage = self.state.storage();
+        let initialized = storage.get::<bool>("init").await?.is_some();
+        let balance: i64 = self.get_or("balance", 0).await?;
+        let tracked_free: Option<i64> = storage.get("free_balance").await?;
+        let merged_paid_in: i64 = self.get_or("merged_paid_in", 0).await?;
+        let plan_id: Option<String> = storage.get("plan").await?;
+        let period_end: u64 = self.get_or("period_end", 0).await?;
+        let active_plan = plan_id
+            .as_deref()
+            .filter(|_| period_end > now)
+            .and_then(|id| config::plan(id));
+        let (plan_active, plan_paid, tracked_plan_paid_real, period_secs, remaining_secs) =
+            if let Some(plan) = active_plan {
+                let paid: i64 = self.get_or("plan_paid", plan.price_points).await?;
+                let paid_real: Option<i64> = storage.get("plan_paid_real").await?;
+                (
+                    true,
+                    paid,
+                    paid_real,
+                    plan.period_secs,
+                    period_end.saturating_sub(now),
+                )
+            } else {
+                (false, 0, None, 0, 0)
+            };
+        let legacy_paid_total = legacy_paid_deposits.max(0).saturating_add(merged_paid_in.max(0));
+        let credits = compute_merge_credit_breakdown(
+            initialized,
+            balance,
+            tracked_free,
+            policy.signup_points,
+            legacy_paid_total,
+            plan_active,
+            plan_paid,
+            tracked_plan_paid_real,
+            period_secs,
+            remaining_secs,
+        );
+        Ok((
+            plan_id.filter(|_| period_end > now),
+            if period_end > now { period_end } else { 0 },
+            credits,
+        ))
+    }
+
+    async fn merge_preview(&self, req: MergePreviewDoReq, policy: &Policy) -> Result<Response> {
+        let now = now_secs();
+        let _ = self.reclaim_expired_holds(now as i64, false).await;
+        let banned = self.get_or("banned", false).await?;
+        let suspended = self.get_or("suspended", false).await?;
+        let merged_into: Option<String> = self.state.storage().get("merged_into").await?;
+        let total_views: i64 = self.get_or("total_views", 0).await?;
+        let (plan, period_end, credits) = self
+            .compute_account_credit_breakdown(policy, req.legacy_paid_deposits, now)
+            .await?;
+        json(
+            &MergePreviewDoResp {
+                balance: credits.balance,
+                plan,
+                period_end,
+                total_views,
+                banned,
+                suspended,
+                merged_into,
+                credits,
+            },
+            200,
+        )
+    }
+
+    /// Atomically freeze & drain an abandoned account during fusion.
+    /// Idempotent per `merge_id` so crash/retry can safely finish crediting the preserved DO.
+    async fn merge_drain(&self, req: MergeDrainDoReq, policy: &Policy) -> Result<Response> {
+        let storage = self.state.storage();
+        if let Some(prev) = storage.get::<MergeDrainDoResp>("merge_drain").await? {
+            if prev.merge_id == req.merge_id {
+                return json(&prev, 200);
+            }
+            return Response::error("account was already merged", 409);
+        }
+        if self.get_or("banned", false).await? {
+            return Response::error("banned account cannot be merged", 403);
+        }
+        if self.get_or("suspended", false).await?
+            || storage.get::<String>("merged_into").await?.is_some()
+        {
+            return Response::error("suspended or merged account cannot be merged", 409);
+        }
+
+        let now = now_secs();
+        self.reclaim_expired_holds(now as i64, true).await?;
+        let total_views: i64 = self.get_or("total_views", 0).await?;
+        let (_, _, credits) = self
+            .compute_account_credit_breakdown(policy, req.legacy_paid_deposits, now)
+            .await?;
+
+        let resp = MergeDrainDoResp {
+            merge_id: req.merge_id.clone(),
+            credits,
+            total_views_transferred: total_views.max(0),
+        };
+        self.write_fields(serde_json::json!({
+            "balance": 0,
+            "free_balance": 0,
+            "period_end": 0,
+            "plan_paid": 0,
+            "plan_paid_real": 0,
+            "suspended": true,
+            "merged_into": req.preserved_do_key,
+            "merge_drain": resp,
+        }))
+        .await?;
+        let _ = storage.delete("plan").await;
+        let _ = storage.delete_alarm().await;
+        // Immediately revoke ALL active revocable sessions AND legacy cutover cookies.
+        let _ = self.revoke_all_sessions_internal(&SessionRevokeAllReq {
+            invalidate_legacy: true,
+            ..SessionRevokeAllReq::default()
+        })?;
+        json(&resp, 200)
+    }
+
+    /// Idempotently credit paid points + total views from a drained account into the preserved account.
+    async fn merge_receive(&self, req: MergeReceiveDoReq, policy: &Policy) -> Result<Response> {
+        if self.get_or("banned", false).await? || self.get_or("suspended", false).await? {
+            return Response::error("preserved account is banned or suspended", 403);
+        }
+        self.ensure_init(policy).await?;
+        let storage = self.state.storage();
+        let marker = format!("merge_in:{}", req.merge_id);
+        let balance: i64 = self.get_or("balance", 0).await?;
+        let total_views: i64 = self.get_or("total_views", 0).await?;
+        if storage.get::<bool>(&marker).await?.is_some() {
+            return json(
+                &MergeReceiveDoResp {
+                    balance,
+                    total_views,
+                    applied: false,
+                },
+                200,
+            );
+        }
+        let add_points = req.paid_points.max(0);
+        let add_views = req.total_views.max(0);
+        let next_balance = balance.saturating_add(add_points);
+        let next_views = total_views.saturating_add(add_views);
+        let merged_paid_in: i64 = self.get_or("merged_paid_in", 0).await?;
+        self.write_fields(serde_json::json!({
+            "balance": next_balance,
+            "total_views": next_views,
+            "merged_paid_in": merged_paid_in.saturating_add(add_points),
+            (marker): true,
+        }))
+        .await?;
+        json(
+            &MergeReceiveDoResp {
+                balance: next_balance,
+                total_views: next_views,
+                applied: true,
+            },
+            200,
+        )
     }
 
     async fn ban(&self, req: BanReq, policy: &Policy) -> Result<Response> {
@@ -3850,5 +4210,136 @@ mod tests {
         assert_eq!(next_utc_day_reset(86_400), 172_800);
         // 2026-01-01T12:30:00Z = 1_767_270_600 -> 2026-01-02T00:00:00Z = 1_767_312_000
         assert_eq!(next_utc_day_reset(1_767_270_600), 1_767_312_000);
+    }
+
+    #[test]
+    fn merge_credit_accounting_forfeits_free_credits_and_preserves_paid_and_prorated_plans() {
+        const PERIOD: u64 = 30 * 86_400;
+        const HALF: u64 = 15 * 86_400;
+
+        // 1. Free-only tracked account -> 0 transferable, all 3,000 free forfeited.
+        let free_only = compute_merge_credit_breakdown(
+            true,
+            3_000,
+            Some(3_000),
+            3_000,
+            0,
+            false,
+            0,
+            None,
+            0,
+            0,
+        );
+        assert_eq!(free_only.total_transferable, 0);
+        assert_eq!(free_only.total_free_forfeited, 3_000);
+
+        // 2. Paid deposit (20,000) + untouched free (3,000) -> 20,000 transferred, 3,000 forfeited.
+        let paid_untouched = compute_merge_credit_breakdown(
+            true,
+            23_000,
+            Some(3_000),
+            3_000,
+            20_000,
+            false,
+            0,
+            None,
+            0,
+            0,
+        );
+        assert_eq!(paid_untouched.paid_balance_transfer, 20_000);
+        assert_eq!(paid_untouched.total_free_forfeited, 3_000);
+        assert_eq!(paid_untouched.total_transferable, 20_000);
+
+        // 3. PAYG spending consumes free balance first.
+        let (bal_after, free_after) = spend_free_first(23_000, 3_000, 2_000);
+        assert_eq!((bal_after, free_after), (21_000, 1_000));
+        let after_payg = compute_merge_credit_breakdown(
+            true,
+            bal_after,
+            Some(free_after),
+            3_000,
+            20_000,
+            false,
+            0,
+            None,
+            0,
+            0,
+        );
+        assert_eq!(after_payg.total_transferable, 20_000);
+        assert_eq!(after_payg.total_free_forfeited, 1_000);
+
+        // 4. Subscription uses paid funds first so free signup credits cannot be laundered!
+        let (sub_bal, sub_free, sub_plan_real) =
+            subscribe_split_funding(23_000, 3_000, 0, 0, 20_000);
+        assert_eq!((sub_bal, sub_free, sub_plan_real), (3_000, 3_000, 20_000));
+        let sub_half = compute_merge_credit_breakdown(
+            true,
+            sub_bal,
+            Some(sub_free),
+            3_000,
+            20_000,
+            true,
+            20_000,
+            Some(sub_plan_real),
+            PERIOD,
+            HALF,
+        );
+        assert_eq!(sub_half.paid_balance_transfer, 0);
+        assert_eq!(sub_half.plan_refund_paid, 10_000);
+        assert_eq!(sub_half.total_transferable, 10_000);
+        assert_eq!(sub_half.total_free_forfeited, 3_000);
+
+        // 5. Subscription funded with mix of 17,000 paid + 3,000 free -> only paid portion prorates!
+        let (mix_bal, mix_free, mix_plan_real) =
+            subscribe_split_funding(20_000, 3_000, 0, 0, 20_000);
+        assert_eq!((mix_bal, mix_free, mix_plan_real), (0, 0, 17_000));
+        let mix_half = compute_merge_credit_breakdown(
+            true,
+            mix_bal,
+            Some(mix_free),
+            3_000,
+            17_000,
+            true,
+            20_000,
+            Some(mix_plan_real),
+            PERIOD,
+            HALF,
+        );
+        assert_eq!(mix_half.plan_refund_total, 10_000);
+        assert_eq!(mix_half.plan_refund_paid, 8_500);
+        assert_eq!(mix_half.plan_free_forfeited, 1_500);
+        assert_eq!(mix_half.total_transferable, 8_500);
+
+        // 6. Admin-granted plan (`plan_paid = 0`) on free-only account -> 0 transferred!
+        let admin_plan = compute_merge_credit_breakdown(
+            true,
+            3_000,
+            Some(3_000),
+            3_000,
+            0,
+            true,
+            0,
+            Some(0),
+            PERIOD,
+            HALF,
+        );
+        assert_eq!(admin_plan.total_transferable, 0);
+
+        // 7. Legacy untracked accounts (`tracked_free_balance: None`) with D1 deposit history.
+        let legacy_free = compute_merge_credit_breakdown(
+            true, 3_000, None, 3_000, 0, false, 0, None, 0, 0,
+        );
+        assert_eq!(legacy_free.total_transferable, 0);
+        let legacy_paid_spent = compute_merge_credit_breakdown(
+            true, 18_000, None, 3_000, 20_000, false, 0, None, 0, 0,
+        );
+        assert_eq!(legacy_paid_spent.total_transferable, 18_000);
+        let legacy_sub = compute_merge_credit_breakdown(
+            true, 3_000, None, 3_000, 20_000, true, 20_000, None, PERIOD, HALF,
+        );
+        assert_eq!(legacy_sub.paid_balance_transfer, 0);
+        assert_eq!(legacy_sub.plan_refund_paid, 10_000);
+        assert_eq!(legacy_sub.total_transferable, 10_000);
+        assert_eq!(legacy_sub.total_free_forfeited, 3_000);
     }
 }

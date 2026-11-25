@@ -17,8 +17,9 @@ use site_access::{
 use crate::{
     api::{
         self, AcceptTermsConflictResp, AcceptTermsOkResp, AgeConfirmResp, BillingPreferencesResp,
-        BootstrapResp, LinkStartResp, MeResp, NonceResp, PaymentRow, PreferencesConflictResp,
-        PreferencesResp, PrepareCheckoutResp, RatesResp, TopupResp, TransferCreateResp,
+        BootstrapResp, ConfirmMergeResp, LinkStartResp, MeResp, MergePreviewResp, NonceResp,
+        PaymentRow, PreferencesConflictResp, PreferencesResp, PrepareCheckoutResp, RatesResp,
+        StartWalletMergeResp, TopupResp, TransferCreateResp,
     },
     wallet,
 };
@@ -386,6 +387,13 @@ pub fn AccountPage() -> impl IntoView {
     // Device transfer state
     let transfer = RwSignal::new(None::<TransferCreateResp>);
 
+    // Account fusion / merge modal state
+    let merge_preview = RwSignal::new(None::<MergePreviewResp>);
+    let merge_preserve = RwSignal::new("current".to_string());
+    let merge_favorites = RwSignal::new("both".to_string());
+    let merge_submitting = RwSignal::new(false);
+    let merge_error = RwSignal::new(None::<String>);
+
     let reload_me = Callback::new(move |()| {
         spawn_local(async move {
             match api::get_json::<MeResp>("/user/api/me").await {
@@ -457,11 +465,14 @@ pub fn AccountPage() -> impl IntoView {
             "#billing-prefs" => {
                 api::scroll_to_element("billing-prefs");
             }
+            "#linked-identities" => {
+                api::scroll_to_element("linked-identities");
+            }
             _ => {}
         }
     });
 
-    // Trigger deep-link hash handling (`#age-confirm`, `#terms`, `#content-safety`, `#topup`)
+    // Trigger deep-link hash handling (`#age-confirm`, `#terms`, `#content-safety`, `#topup`, `#linked-identities`)
     // once initial account data renders into the DOM.
     Effect::new(move |_| {
         if let Some(data) = me.get()
@@ -482,12 +493,17 @@ pub fn AccountPage() -> impl IntoView {
         }
     });
 
-    // Escape closes the Terms modal cleanly (AgeGateModal handles its own Escape).
+    // Escape closes open Terms or Fuse Accounts modals cleanly (AgeGateModal handles its own Escape).
     use_window_keydown(false, move |ev: ev::KeyboardEvent| {
-        if ev.key() == "Escape" && show_terms_modal.get_untracked() && !age_gate_open.get_untracked()
-        {
-            ev.prevent_default();
-            show_terms_modal.set(false);
+        if ev.key() == "Escape" {
+            if merge_preview.get_untracked().is_some() && !merge_submitting.get_untracked() {
+                ev.prevent_default();
+                merge_preview.set(None);
+                merge_error.set(None);
+            } else if show_terms_modal.get_untracked() && !age_gate_open.get_untracked() {
+                ev.prevent_default();
+                show_terms_modal.set(false);
+            }
         }
     });
 
@@ -504,13 +520,38 @@ pub fn AccountPage() -> impl IntoView {
     Effect::new(move |_| {
         if let Some(err) = api::current_search_param("error") {
             toasts.error("Account action failed", Some(err));
+            api::clear_search_param("error");
         }
         if api::current_search_param("linked").is_some() {
             toasts.success(
                 "Sign-in method linked",
                 Some("Your new sign-in identity is now linked to this account.".into()),
             );
+            api::clear_search_param("linked");
             api::broadcast_safety_invalidation("account_change");
+        }
+        if let Some(ticket) = api::current_search_param("merge_ticket") {
+            api::clear_search_param("merge_ticket");
+            busy.set(true);
+            spawn_local(async move {
+                match api::post_json::<_, MergePreviewResp>(
+                    "/user/api/account/merge/preview",
+                    &json!({ "merge_ticket": ticket }),
+                )
+                .await
+                {
+                    Ok(preview) => {
+                        merge_preserve.set("current".to_string());
+                        merge_favorites.set("both".to_string());
+                        merge_error.set(None);
+                        merge_preview.set(Some(preview));
+                    }
+                    Err(e) => {
+                        toasts.error("Could not prepare account merge", Some(e.display()));
+                    }
+                }
+                busy.set(false);
+            });
         }
         reload_me.run(());
         spawn_local(async move {
@@ -830,7 +871,7 @@ pub fn AccountPage() -> impl IntoView {
         });
     });
 
-    // Link OAuth/OIDC identity
+    // Link OAuth/OIDC identity (automatically transitions to Fuse Accounts modal if already registered)
     let link_oauth_provider = Callback::new(move |provider_id: String| {
         busy.set(true);
         spawn_local(async move {
@@ -846,6 +887,195 @@ pub fn AccountPage() -> impl IntoView {
                 }
             }
             busy.set(false);
+        });
+    });
+
+    // Link Ethereum (SIWE) wallet as login method — or open Fuse Accounts modal if registered to another account!
+    let on_link_or_merge_eth = Callback::new(move |()| {
+        let Some(b) = boot.get_untracked() else {
+            return;
+        };
+        let Some(m) = me.get_untracked() else {
+            return;
+        };
+        busy.set(true);
+        spawn_local(async move {
+            let nonce =
+                match api::get_json::<NonceResp>("/user/api/nonce?purpose=merge_account").await {
+                    Ok(n) => n.nonce,
+                    Err(e) => {
+                        toasts.error("Could not verify Ethereum wallet", Some(e.display()));
+                        busy.set(false);
+                        return;
+                    }
+                };
+            let statement = format!(
+                "Link or merge Ethereum wallet with account {}.",
+                m.user_id
+            );
+            match wallet::connect_and_sign_siwe(
+                "",
+                &b.siwe_domain,
+                b.chain_id,
+                &nonce,
+                &statement,
+                None,
+            )
+            .await
+            {
+                Ok(sig) => {
+                    match api::post_json::<_, StartWalletMergeResp>(
+                        "/user/api/account/merge/start/wallet",
+                        &json!({
+                            "provider_id": "siwe",
+                            "message": sig.message,
+                            "signature": sig.signature,
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(StartWalletMergeResp::Linked { subject, .. }) => {
+                            api::broadcast_safety_invalidation("account_change");
+                            toasts.success(
+                                "Ethereum wallet linked",
+                                Some(format!("You can now sign in with {subject}.")),
+                            );
+                            reload_me.run(());
+                        }
+                        Ok(StartWalletMergeResp::MergeRequired { preview, .. }) => {
+                            merge_preserve.set("current".to_string());
+                            merge_favorites.set("both".to_string());
+                            merge_error.set(None);
+                            merge_preview.set(Some(*preview));
+                        }
+                        Err(e) => {
+                            toasts.error("Wallet link or merge failed", Some(e.display()));
+                        }
+                    }
+                }
+                Err(msg) => {
+                    toasts.error("Wallet signature failed", Some(msg));
+                }
+            }
+            busy.set(false);
+        });
+    });
+
+    // Link Solana (SIWS) wallet as login method — or open Fuse Accounts modal if registered to another account!
+    let on_link_or_merge_sol = Callback::new(move |()| {
+        let Some(m) = me.get_untracked() else {
+            return;
+        };
+        busy.set(true);
+        spawn_local(async move {
+            let nonce =
+                match api::get_json::<NonceResp>("/user/api/nonce?purpose=merge_account").await {
+                    Ok(n) => n.nonce,
+                    Err(e) => {
+                        toasts.error("Could not verify Solana wallet", Some(e.display()));
+                        busy.set(false);
+                        return;
+                    }
+                };
+            let challenge = format!(
+                "Link or merge Solana wallet with {}\nNonce: {}",
+                m.user_id, nonce
+            );
+            match wallet::connect_and_sign_sol_message("", &challenge).await {
+                Ok(sig) => {
+                    match api::post_json::<_, StartWalletMergeResp>(
+                        "/user/api/account/merge/start/wallet",
+                        &json!({
+                            "provider_id": "siws",
+                            "solana_address": sig.address,
+                            "signature": sig.signature,
+                            "nonce": nonce,
+                            "signed_message": sig.signed_message,
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(StartWalletMergeResp::Linked { subject, .. }) => {
+                            api::broadcast_safety_invalidation("account_change");
+                            toasts.success(
+                                "Solana wallet linked",
+                                Some(format!("You can now sign in with {subject}.")),
+                            );
+                            reload_me.run(());
+                        }
+                        Ok(StartWalletMergeResp::MergeRequired { preview, .. }) => {
+                            merge_preserve.set("current".to_string());
+                            merge_favorites.set("both".to_string());
+                            merge_error.set(None);
+                            merge_preview.set(Some(*preview));
+                        }
+                        Err(e) => {
+                            toasts.error("Wallet link or merge failed", Some(e.display()));
+                        }
+                    }
+                }
+                Err(msg) => {
+                    toasts.error("Wallet signature failed", Some(msg));
+                }
+            }
+            busy.set(false);
+        });
+    });
+
+    // Confirm and execute account fusion
+    let on_confirm_merge = Callback::new(move |()| {
+        if merge_submitting.get_untracked() {
+            return;
+        }
+        let Some(prev) = merge_preview.get_untracked() else {
+            return;
+        };
+        let preserve = merge_preserve.get_untracked();
+        let favorites = merge_favorites.get_untracked();
+        merge_submitting.set(true);
+        merge_error.set(None);
+        busy.set(true);
+        spawn_local(async move {
+            match api::post_json::<_, ConfirmMergeResp>(
+                "/user/api/account/merge/confirm",
+                &json!({
+                    "merge_ticket": prev.merge_ticket,
+                    "preserve": preserve,
+                    "favorites": favorites,
+                }),
+            )
+            .await
+            {
+                Ok(resp) => {
+                    merge_preview.set(None);
+                    merge_submitting.set(false);
+                    merge_error.set(None);
+                    busy.set(false);
+                    api::broadcast_safety_invalidation("account_change");
+                    let detail = if resp.total_credits_added > 0 {
+                        format!(
+                            "Combined {} sign-in methods, {} favorites, and added {} in paid credits (new balance: {}).",
+                            resp.identities_count,
+                            api::format_number(resp.favorites_count),
+                            api::format_points(resp.total_credits_added),
+                            api::format_points(resp.new_balance),
+                        )
+                    } else {
+                        format!(
+                            "Combined {} sign-in methods and {} favorites into one account.",
+                            resp.identities_count,
+                            api::format_number(resp.favorites_count),
+                        )
+                    };
+                    toasts.success("Accounts fused", Some(detail));
+                    reload_me.run(());
+                }
+                Err(e) => {
+                    merge_error.set(Some(e.display()));
+                    merge_submitting.set(false);
+                    busy.set(false);
+                }
+            }
         });
     });
 
@@ -1321,19 +1551,32 @@ pub fn AccountPage() -> impl IntoView {
                             data.strict_age_ok,
                         );
                         let current_terms_version = data.policy.legal.terms_version;
+                        let can_link_siwe = data
+                            .available_providers
+                            .iter()
+                            .any(|p| p.enabled && p.id == AuthProviderId::Siwe);
+                        let can_link_siws = data
+                            .available_providers
+                            .iter()
+                            .any(|p| p.enabled && p.id == AuthProviderId::Siws);
                         let linkable_oauth: Vec<_> = data
                             .available_providers
                             .iter()
-                            .filter(|p| matches!(
-                                p.id,
-                                AuthProviderId::OidcAgeAssurance
-                                    | AuthProviderId::Google
-                                    | AuthProviderId::GitHub
-                                    | AuthProviderId::X
-                                    | AuthProviderId::Discord
-                            ))
+                            .filter(|p| {
+                                p.enabled
+                                    && matches!(
+                                        p.id,
+                                        AuthProviderId::OidcAgeAssurance
+                                            | AuthProviderId::Google
+                                            | AuthProviderId::GitHub
+                                            | AuthProviderId::X
+                                            | AuthProviderId::Discord
+                                    )
+                            })
                             .cloned()
                             .collect();
+                        let has_any_linkable_login =
+                            can_link_siwe || can_link_siws || !linkable_oauth.is_empty();
                         let identities = data.identities.clone();
                         let plans = data.pricing.plans.clone();
                         let items = data.pricing.items.clone();
@@ -1933,15 +2176,39 @@ pub fn AccountPage() -> impl IntoView {
                                         </button>
                                     </div>
 
-                                    {(!linkable_oauth.is_empty()).then(|| view! {
+                                    {has_any_linkable_login.then(|| view! {
                                         <div>
-                                            <div class="u-divider">"Link Additional Sign-in Method"</div>
+                                            <div class="u-divider">"Link Sign-in Method or Fuse Accounts"</div>
+                                            <p class="u-sub">
+                                                "Add another wallet or OAuth provider to sign in here. If that wallet or provider is already registered to a separate account, you\u{2019}ll be prompted to fuse both accounts into one (choosing which account & favorites to keep)."
+                                            </p>
                                             {(!can_link).then(|| view! {
-                                                <p class="u-sub">
-                                                    "For security, linking a new sign-in provider requires a fresh sign-in within the last 10 minutes."
-                                                </p>
+                                                <div class="u-quota-hint u-quota-hint--warn" style="margin-bottom:10px;">
+                                                    <span>"For security, linking or fusing sign-in methods requires a fresh sign-in within the last 10 minutes. "</span>
+                                                    <a href="/user/login?next=%2Fuser%2Faccount%23linked-identities">"Sign in again to unlock"</a>
+                                                </div>
                                             })}
                                             <div class="u-row">
+                                                {can_link_siwe.then(|| view! {
+                                                    <button
+                                                        type="button"
+                                                        class="u-btn u-btn--secondary u-btn--small"
+                                                        disabled=move || busy.get() || !can_link
+                                                        on:click=move |_| on_link_or_merge_eth.run(())
+                                                    >
+                                                        "Link / Merge Ethereum (SIWE)"
+                                                    </button>
+                                                })}
+                                                {can_link_siws.then(|| view! {
+                                                    <button
+                                                        type="button"
+                                                        class="u-btn u-btn--secondary u-btn--small"
+                                                        disabled=move || busy.get() || !can_link
+                                                        on:click=move |_| on_link_or_merge_sol.run(())
+                                                    >
+                                                        "Link / Merge Solana (SIWS)"
+                                                    </button>
+                                                })}
                                                 {linkable_oauth.into_iter().map(|prov| {
                                                     let slug = prov.id.as_str().to_string();
                                                     let title = prov.display_name.unwrap_or_else(|| slug.clone());
@@ -1952,7 +2219,7 @@ pub fn AccountPage() -> impl IntoView {
                                                             disabled=move || busy.get() || !can_link
                                                             on:click=move |_| link_oauth_provider.run(slug.clone())
                                                         >
-                                                            {format!("Link {title}")}
+                                                            {format!("Link / Merge {title}")}
                                                         </button>
                                                     }
                                                 }).collect_view()}
@@ -2360,6 +2627,261 @@ pub fn AccountPage() -> impl IntoView {
                         </div>
                     </div>
                 }.into_any()
+            })}
+
+            // Fuse Accounts Modal: choose kept account, favorites preservation, and inspect
+            // exact paid credit + prorated subscription transfer before confirming.
+            {move || merge_preview.get().map(|prev| {
+                let cur = prev.current_account.clone();
+                let oth = prev.other_account.clone();
+                let keep_cur = prev.keep_current.clone();
+                let keep_oth = prev.keep_other.clone();
+                let cur_fav = cur.favorites_count;
+                let oth_fav = oth.favorites_count;
+                let cur_plan_label = cur.plan.as_deref().map(|p| plan_display_label(Some(p), false)).unwrap_or_else(|| "Free / None".into());
+                let oth_plan_label = oth.plan.as_deref().map(|p| plan_display_label(Some(p), false)).unwrap_or_else(|| "Free / None".into());
+                let cur_end = (cur.plan.is_some() && cur.period_end > 0)
+                    .then(|| format!("ends {}", api::format_epoch_date(cur.period_end)));
+                let oth_end = (oth.plan.is_some() && oth.period_end > 0)
+                    .then(|| format!("ends {}", api::format_epoch_date(oth.period_end)));
+                let cur_idents = cur.identities.clone();
+                let oth_idents = oth.identities.clone();
+                let cur_has_plan = cur.plan.is_some();
+                let oth_has_plan = oth.plan.is_some();
+                let cur_plan_name = cur_plan_label.clone();
+                let oth_plan_name = oth_plan_label.clone();
+
+                view! {
+                    <div
+                        class="u-modal-backdrop"
+                        role="presentation"
+                        on:click=move |_| {
+                            if !merge_submitting.get_untracked() {
+                                merge_preview.set(None);
+                                merge_error.set(None);
+                            }
+                        }
+                    >
+                        <div
+                            class="u-modal u-modal--wide"
+                            role="dialog"
+                            aria-modal="true"
+                            aria-labelledby="u-merge-modal-title"
+                            on:click=move |ev: ev::MouseEvent| ev.stop_propagation()
+                        >
+                            <div class="u-modal-header">
+                                <h2 id="u-merge-modal-title">"Fuse Two Accounts"</h2>
+                                <span class="u-badge u-badge--ok">"\u{2713} Both accounts verified"</span>
+                            </div>
+                            <div class="u-modal-body u-merge-body">
+                                <div class="u-merge-section">
+                                    <div class="u-merge-step-title">"1. Choose which account to keep"</div>
+                                    <p class="u-sub" style="margin:0;">
+                                        "All sign-in methods from both accounts will be combined onto the account you keep. Keeping an account preserves its active subscription, safety settings, and Terms status."
+                                    </p>
+                                    <div class="u-merge-accounts-grid">
+                                        <button
+                                            type="button"
+                                            class=move || if merge_preserve.get() == "current" {
+                                                "u-merge-acct-card is-selected"
+                                            } else {
+                                                "u-merge-acct-card"
+                                            }
+                                            disabled=move || merge_submitting.get()
+                                            on:click=move |_| merge_preserve.set("current".to_string())
+                                        >
+                                            <div class="u-merge-acct-top">
+                                                <span class="u-merge-radio">
+                                                    {move || if merge_preserve.get() == "current" { "\u{25C9}" } else { "\u{25CB}" }}
+                                                </span>
+                                                <strong>"Current Account"</strong>
+                                                <span class="u-badge">{move || if merge_preserve.get() == "current" { "Keep" } else { "Abandon" }}</span>
+                                            </div>
+                                            <div class="u-mono u-sub u-merge-acct-addr">{cur.display_address.clone()}</div>
+                                            <div class="u-merge-ident-list">
+                                                {cur_idents.into_iter().map(|i| view! {
+                                                    <span class="u-badge">{i.provider_id}</span>
+                                                }).collect_view()}
+                                            </div>
+                                            <div class="u-merge-acct-stats">
+                                                <div><span>"Balance"</span><strong>{api::format_points(cur.balance)}</strong></div>
+                                                <div><span>"Paid portion"</span><strong>{api::format_points(cur.paid_balance)}</strong></div>
+                                                <div>
+                                                    <span>"Plan"</span>
+                                                    <strong>
+                                                        {match cur_end.as_deref() {
+                                                            Some(end) => format!("{cur_plan_label} ({end})"),
+                                                            None => cur_plan_label.clone(),
+                                                        }}
+                                                    </strong>
+                                                </div>
+                                                <div><span>"Favorites"</span><strong>{api::format_number(cur_fav)}</strong></div>
+                                            </div>
+                                        </button>
+
+                                        <button
+                                            type="button"
+                                            class=move || if merge_preserve.get() == "other" {
+                                                "u-merge-acct-card is-selected"
+                                            } else {
+                                                "u-merge-acct-card"
+                                            }
+                                            disabled=move || merge_submitting.get()
+                                            on:click=move |_| merge_preserve.set("other".to_string())
+                                        >
+                                            <div class="u-merge-acct-top">
+                                                <span class="u-merge-radio">
+                                                    {move || if merge_preserve.get() == "other" { "\u{25C9}" } else { "\u{25CB}" }}
+                                                </span>
+                                                <strong>"Other Account"</strong>
+                                                <span class="u-badge">{move || if merge_preserve.get() == "other" { "Keep" } else { "Abandon" }}</span>
+                                            </div>
+                                            <div class="u-mono u-sub u-merge-acct-addr">{oth.display_address.clone()}</div>
+                                            <div class="u-merge-ident-list">
+                                                {oth_idents.into_iter().map(|i| view! {
+                                                    <span class="u-badge">{i.provider_id}</span>
+                                                }).collect_view()}
+                                            </div>
+                                            <div class="u-merge-acct-stats">
+                                                <div><span>"Balance"</span><strong>{api::format_points(oth.balance)}</strong></div>
+                                                <div><span>"Paid portion"</span><strong>{api::format_points(oth.paid_balance)}</strong></div>
+                                                <div>
+                                                    <span>"Plan"</span>
+                                                    <strong>
+                                                        {match oth_end.as_deref() {
+                                                            Some(end) => format!("{oth_plan_label} ({end})"),
+                                                            None => oth_plan_label.clone(),
+                                                        }}
+                                                    </strong>
+                                                </div>
+                                                <div><span>"Favorites"</span><strong>{api::format_number(oth_fav)}</strong></div>
+                                            </div>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="u-merge-section">
+                                    <div class="u-merge-step-title">"2. Choose which favorites to preserve"</div>
+                                    <div class="u-merge-fav-options">
+                                        <button
+                                            type="button"
+                                            class=move || if merge_favorites.get() == "both" {
+                                                "u-merge-fav-opt is-selected"
+                                            } else {
+                                                "u-merge-fav-opt"
+                                            }
+                                            disabled=move || merge_submitting.get()
+                                            on:click=move |_| merge_favorites.set("both".to_string())
+                                        >
+                                            <strong>"Combine both (Recommended)"</strong>
+                                            <span>{format!("Keep all unique favorites from both accounts ({} + {})", api::format_number(cur_fav), api::format_number(oth_fav))}</span>
+                                        </button>
+                                        <button
+                                            type="button"
+                                            class=move || if merge_favorites.get() == "keep_current" {
+                                                "u-merge-fav-opt is-selected"
+                                            } else {
+                                                "u-merge-fav-opt"
+                                            }
+                                            disabled=move || merge_submitting.get()
+                                            on:click=move |_| merge_favorites.set("keep_current".to_string())
+                                        >
+                                            <strong>"Current Account\u{2019}s favorites only"</strong>
+                                            <span>{format!("Keep {} saved item(s); discard Other Account\u{2019}s", api::format_number(cur_fav))}</span>
+                                        </button>
+                                        <button
+                                            type="button"
+                                            class=move || if merge_favorites.get() == "keep_other" {
+                                                "u-merge-fav-opt is-selected"
+                                            } else {
+                                                "u-merge-fav-opt"
+                                            }
+                                            disabled=move || merge_submitting.get()
+                                            on:click=move |_| merge_favorites.set("keep_other".to_string())
+                                        >
+                                            <strong>"Other Account\u{2019}s favorites only"</strong>
+                                            <span>{format!("Keep {} saved item(s); discard Current Account\u{2019}s", api::format_number(oth_fav))}</span>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div class="u-merge-section">
+                                    <div class="u-merge-step-title">"3. Credit & subscription transfer summary"</div>
+                                    {move || {
+                                        let keep_c = merge_preserve.get() == "current";
+                                        let tr = if keep_c { &keep_cur } else { &keep_oth };
+                                        let abandoned_has_plan = if keep_c { oth_has_plan } else { cur_has_plan };
+                                        let abandoned_plan_label = if keep_c { &oth_plan_name } else { &cur_plan_name };
+                                        view! {
+                                            <div class="u-merge-summary">
+                                                <div class="u-merge-summary-row">
+                                                    <span>"Paid credits moved from abandoned account"</span>
+                                                    <strong class="u-merge-val--pos">{format!("+{}", api::format_points(tr.paid_balance_moved))}</strong>
+                                                </div>
+                                                {(abandoned_has_plan || tr.plan_refund_moved > 0).then(|| view! {
+                                                    <div class="u-merge-summary-row">
+                                                        <span>{format!("Abandoned {abandoned_plan_label} plan converted to credits (prorated paid remainder)")}</span>
+                                                        <strong class="u-merge-val--pos">{format!("+{}", api::format_points(tr.plan_refund_moved))}</strong>
+                                                    </div>
+                                                })}
+                                                {(tr.free_credits_forfeited > 0).then(|| view! {
+                                                    <div class="u-merge-summary-row">
+                                                        <span>"Abandoned free signup credits forfeited"</span>
+                                                        <strong class="u-merge-val--neg">{format!("-{}", api::format_points(tr.free_credits_forfeited))}</strong>
+                                                    </div>
+                                                })}
+                                                <div class="u-merge-summary-row u-merge-summary-row--total">
+                                                    <span>"New kept-account balance"</span>
+                                                    <strong>
+                                                        {format!(
+                                                            "{} (+{} added)",
+                                                            api::format_points(tr.resulting_balance),
+                                                            api::format_points(tr.total_credits_added)
+                                                        )}
+                                                    </strong>
+                                                </div>
+                                            </div>
+                                        }
+                                    }}
+                                </div>
+
+                                <div class="u-merge-warn">
+                                    "Fusing accounts is permanent. The abandoned account will be closed immediately, all of its active sessions signed out, and its unused free signup credits forfeited."
+                                </div>
+
+                                {move || merge_error.get().map(|err| view! {
+                                    <NoticeBanner
+                                        content=NoticeContent::Text(err)
+                                        tone=NoticeTone::Danger
+                                        title="Could not fuse accounts"
+                                        dismissible=false
+                                    />
+                                })}
+                            </div>
+                            <div class="u-modal-footer">
+                                <button
+                                    type="button"
+                                    class="u-btn u-btn--secondary"
+                                    disabled=move || merge_submitting.get()
+                                    on:click=move |_| {
+                                        merge_preview.set(None);
+                                        merge_error.set(None);
+                                    }
+                                >
+                                    "Cancel"
+                                </button>
+                                <button
+                                    type="button"
+                                    class="u-btn"
+                                    disabled=move || merge_submitting.get()
+                                    on:click=move |_| on_confirm_merge.run(())
+                                >
+                                    {move || if merge_submitting.get() { "Fusing accounts..." } else { "Confirm & Fuse Accounts" }}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                }
             })}
         </div>
     }

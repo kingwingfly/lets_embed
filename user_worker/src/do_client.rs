@@ -140,6 +140,63 @@ pub struct PreviewBudgetResp {
     pub retry_after_secs: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeCreditBreakdown {
+    pub balance: i64,
+    pub paid_balance_transfer: i64,
+    pub free_balance_forfeited: i64,
+    pub plan_refund_total: i64,
+    pub plan_refund_paid: i64,
+    pub plan_free_forfeited: i64,
+    pub total_transferable: i64,
+    pub total_free_forfeited: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergePreviewDoReq {
+    pub legacy_paid_deposits: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergePreviewDoResp {
+    pub balance: i64,
+    pub plan: Option<String>,
+    pub period_end: u64,
+    pub total_views: i64,
+    pub banned: bool,
+    pub suspended: bool,
+    pub merged_into: Option<String>,
+    pub credits: MergeCreditBreakdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeDrainDoReq {
+    pub merge_id: String,
+    pub preserved_do_key: String,
+    pub legacy_paid_deposits: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeDrainDoResp {
+    pub merge_id: String,
+    pub credits: MergeCreditBreakdown,
+    pub total_views_transferred: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeReceiveDoReq {
+    pub merge_id: String,
+    pub paid_points: i64,
+    pub total_views: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeReceiveDoResp {
+    pub balance: i64,
+    pub total_views: i64,
+    pub applied: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Low-level & Typed DO Clients
 // ---------------------------------------------------------------------------
@@ -295,4 +352,51 @@ pub async fn do_billing_prefs(
     let mut resp = call_do(env, do_key, Method::Post, "/billing-prefs", Some(&req)).await?;
     expect_ok(&resp, "do billing-prefs")?;
     resp.json().await
+}
+
+pub async fn do_merge_preview(
+    env: &Env,
+    do_key: &str,
+    legacy_paid_deposits: i64,
+) -> Result<MergePreviewDoResp> {
+    let req = MergePreviewDoReq {
+        legacy_paid_deposits,
+    };
+    let mut resp = call_do(env, do_key, Method::Post, "/merge-preview", Some(&req)).await?;
+    expect_ok(&resp, "do merge-preview")?;
+    resp.json().await
+}
+
+pub async fn do_merge_drain(
+    env: &Env,
+    do_key: &str,
+    req: &MergeDrainDoReq,
+) -> Result<MergeDrainDoResp> {
+    let mut resp = call_do(env, do_key, Method::Post, "/merge-drain", Some(req)).await?;
+    match resp.status_code() {
+        200 => resp.json().await,
+        code => {
+            let msg = resp.text().await.unwrap_or_default();
+            Err(worker::Error::RustError(format!(
+                "do merge-drain failed ({code}): {msg}"
+            )))
+        }
+    }
+}
+
+pub async fn do_merge_receive(
+    env: &Env,
+    do_key: &str,
+    req: &MergeReceiveDoReq,
+) -> Result<MergeReceiveDoResp> {
+    let mut resp = call_do(env, do_key, Method::Post, "/merge-receive", Some(req)).await?;
+    match resp.status_code() {
+        200 => resp.json().await,
+        code => {
+            let msg = resp.text().await.unwrap_or_default();
+            Err(worker::Error::RustError(format!(
+                "do merge-receive failed ({code}): {msg}"
+            )))
+        }
+    }
 }

@@ -456,6 +456,70 @@ pub struct LinkStartResp {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+pub struct MergeAccountSummary {
+    pub user_id: String,
+    pub display_address: String,
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+    pub identities: Vec<IdentityView>,
+    pub balance: i64,
+    pub paid_balance: i64,
+    pub free_balance: i64,
+    pub plan: Option<String>,
+    pub period_end: u64,
+    pub plan_refund_paid: i64,
+    pub favorites_count: i64,
+    pub payments_count: i64,
+    pub total_views: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct MergeTransferPreview {
+    pub paid_balance_moved: i64,
+    pub plan_refund_moved: i64,
+    pub total_credits_added: i64,
+    pub free_credits_forfeited: i64,
+    pub resulting_balance: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct MergePreviewResp {
+    pub merge_ticket: String,
+    pub expires_at: u64,
+    pub current_account: MergeAccountSummary,
+    pub other_account: MergeAccountSummary,
+    pub keep_current: MergeTransferPreview,
+    pub keep_other: MergeTransferPreview,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum StartWalletMergeResp {
+    Linked {
+        provider_id: String,
+        subject: String,
+    },
+    MergeRequired {
+        merge_ticket: String,
+        preview: Box<MergePreviewResp>,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ConfirmMergeResp {
+    pub merge_id: String,
+    pub preserved_user_id: String,
+    pub abandoned_user_id: String,
+    pub paid_balance_moved: i64,
+    pub plan_refund_moved: i64,
+    pub total_credits_added: i64,
+    pub free_credits_forfeited: i64,
+    pub new_balance: i64,
+    pub favorites_count: i64,
+    pub identities_count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct PaymentRow {
     pub tx_hash: String,
     pub chain: String,

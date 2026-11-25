@@ -156,6 +156,36 @@ pub struct JwksCacheEntry {
     pub expires_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeTicketIssueReq {
+    pub ticket: String,
+    pub initiator_user_id: String,
+    pub other_user_id: String,
+    pub verified_provider: String,
+    pub verified_identity_key: String,
+    pub verified_assurance: String,
+    pub verified_strict_age_ok: bool,
+    pub ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeTicketLookupReq {
+    pub ticket: String,
+    pub initiator_user_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeTicketRecord {
+    pub ticket: String,
+    pub initiator_user_id: String,
+    pub other_user_id: String,
+    pub verified_provider: String,
+    pub verified_identity_key: String,
+    pub verified_assurance: String,
+    pub verified_strict_age_ok: bool,
+    pub expires_at: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Pure Helpers (host-testable)
 // ---------------------------------------------------------------------------
@@ -238,6 +268,13 @@ impl DurableObject for AuthChallengeDO {
             (Method::Post, "/rate-limit/hit") => self.rate_limit_hit_endpoint(req.json().await?),
             (Method::Post, "/jwks/get") => self.jwks_get(req.json().await?),
             (Method::Post, "/jwks/put") => self.jwks_put(req.json().await?),
+            (Method::Post, "/merge-ticket/issue") => self.merge_ticket_issue(req.json().await?),
+            (Method::Post, "/merge-ticket/peek") => {
+                self.merge_ticket_lookup(req.json().await?, false)
+            }
+            (Method::Post, "/merge-ticket/consume") => {
+                self.merge_ticket_lookup(req.json().await?, true)
+            }
             _ => Response::error("not found", 404),
         }
     }
@@ -310,6 +347,19 @@ impl AuthChallengeDO {
                 )",
                 None,
             )?;
+            db.exec(
+                "CREATE TABLE IF NOT EXISTS merge_tickets (\
+                    ticket TEXT PRIMARY KEY,\
+                    initiator_user_id TEXT NOT NULL,\
+                    other_user_id TEXT NOT NULL,\
+                    verified_provider TEXT NOT NULL,\
+                    verified_identity_key TEXT NOT NULL,\
+                    verified_assurance TEXT NOT NULL,\
+                    verified_strict_age_ok INTEGER NOT NULL DEFAULT 0,\
+                    expires_at INTEGER NOT NULL\
+                )",
+                None,
+            )?;
             self.schema_ready.set(true);
         }
 
@@ -327,6 +377,10 @@ impl AuthChallengeDO {
             );
             let _ = db.exec(
                 "DELETE FROM jwks_cache WHERE expires_at <= ?1",
+                vec![now.into()],
+            );
+            let _ = db.exec(
+                "DELETE FROM merge_tickets WHERE expires_at <= ?1",
                 vec![now.into()],
             );
             self.last_purge.set(now);
@@ -708,6 +762,83 @@ impl AuthChallengeDO {
         )?;
         Response::ok("")
     }
+
+    fn merge_ticket_issue(&self, req: MergeTicketIssueReq) -> Result<Response> {
+        let now = now_secs() as i64;
+        let db = self.ensure_schema(now)?;
+        let ttl = req.ttl_secs.clamp(60, 900) as i64;
+        db.exec(
+            "INSERT OR REPLACE INTO merge_tickets \
+             (ticket, initiator_user_id, other_user_id, verified_provider, verified_identity_key, verified_assurance, verified_strict_age_ok, expires_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            vec![
+                req.ticket.into(),
+                req.initiator_user_id.into(),
+                req.other_user_id.into(),
+                req.verified_provider.into(),
+                req.verified_identity_key.into(),
+                req.verified_assurance.into(),
+                i64::from(req.verified_strict_age_ok).into(),
+                (now + ttl).into(),
+            ],
+        )?;
+        Response::ok("")
+    }
+
+    fn merge_ticket_lookup(&self, req: MergeTicketLookupReq, consume: bool) -> Result<Response> {
+        let now = now_secs() as i64;
+        let db = self.ensure_schema(now)?;
+        #[derive(Deserialize)]
+        struct Row {
+            ticket: String,
+            initiator_user_id: String,
+            other_user_id: String,
+            verified_provider: String,
+            verified_identity_key: String,
+            verified_assurance: String,
+            verified_strict_age_ok: i64,
+            expires_at: i64,
+        }
+        let rows: Vec<Row> = db
+            .exec(
+                "SELECT ticket, initiator_user_id, other_user_id, verified_provider, \
+                 verified_identity_key, verified_assurance, verified_strict_age_ok, expires_at \
+                 FROM merge_tickets WHERE ticket = ?1",
+                vec![req.ticket.clone().into()],
+            )?
+            .to_array()?;
+        let Some(row) = rows.into_iter().next() else {
+            return Response::error("merge session expired or not found", 401);
+        };
+        if row.expires_at <= now || !ct_eq_str(&row.initiator_user_id, &req.initiator_user_id) {
+            if row.expires_at <= now {
+                let _ = db.exec(
+                    "DELETE FROM merge_tickets WHERE ticket = ?1",
+                    vec![req.ticket.into()],
+                );
+            }
+            return Response::error("merge session expired or invalid", 401);
+        }
+        if consume {
+            db.exec(
+                "DELETE FROM merge_tickets WHERE ticket = ?1",
+                vec![req.ticket.into()],
+            )?;
+        }
+        json_resp(
+            &MergeTicketRecord {
+                ticket: row.ticket,
+                initiator_user_id: row.initiator_user_id,
+                other_user_id: row.other_user_id,
+                verified_provider: row.verified_provider,
+                verified_identity_key: row.verified_identity_key,
+                verified_assurance: row.verified_assurance,
+                verified_strict_age_ok: row.verified_strict_age_ok != 0,
+                expires_at: row.expires_at.max(0) as u64,
+            },
+            200,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -854,6 +985,75 @@ pub async fn consume_telegram_digest(env: &Env, digest: &str, expires_at: u64) -
         409 => Ok(false),
         _ => Err(worker::Error::RustError(format!(
             "telegram consume failed ({status}): {msg}"
+        ))),
+    }
+}
+
+pub async fn issue_merge_ticket(env: &Env, req: &MergeTicketIssueReq) -> Result<()> {
+    let (status, msg) = call_challenge_do(
+        env,
+        &format!("merge:{}", req.ticket),
+        "/merge-ticket/issue",
+        req,
+    )
+    .await?;
+    if status == 200 {
+        Ok(())
+    } else {
+        Err(worker::Error::RustError(format!(
+            "merge ticket issue failed ({status}): {msg}"
+        )))
+    }
+}
+
+pub async fn peek_merge_ticket(
+    env: &Env,
+    ticket: &str,
+    initiator_user_id: &str,
+) -> Result<Option<MergeTicketRecord>> {
+    let (status, text) = call_challenge_do(
+        env,
+        &format!("merge:{ticket}"),
+        "/merge-ticket/peek",
+        &MergeTicketLookupReq {
+            ticket: ticket.to_string(),
+            initiator_user_id: initiator_user_id.to_string(),
+        },
+    )
+    .await?;
+    match status {
+        200 => serde_json::from_str::<MergeTicketRecord>(&text)
+            .map(Some)
+            .map_err(|e| worker::Error::RustError(e.to_string())),
+        401 => Ok(None),
+        _ => Err(worker::Error::RustError(format!(
+            "merge ticket peek failed ({status}): {text}"
+        ))),
+    }
+}
+
+pub async fn consume_merge_ticket(
+    env: &Env,
+    ticket: &str,
+    initiator_user_id: &str,
+) -> Result<Option<MergeTicketRecord>> {
+    let (status, text) = call_challenge_do(
+        env,
+        &format!("merge:{ticket}"),
+        "/merge-ticket/consume",
+        &MergeTicketLookupReq {
+            ticket: ticket.to_string(),
+            initiator_user_id: initiator_user_id.to_string(),
+        },
+    )
+    .await?;
+    match status {
+        200 => serde_json::from_str::<MergeTicketRecord>(&text)
+            .map(Some)
+            .map_err(|e| worker::Error::RustError(e.to_string())),
+        401 => Ok(None),
+        _ => Err(worker::Error::RustError(format!(
+            "merge ticket consume failed ({status}): {text}"
         ))),
     }
 }

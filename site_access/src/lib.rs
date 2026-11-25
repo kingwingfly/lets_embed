@@ -87,9 +87,9 @@ impl ChargeKind {
         match self {
             Self::Image => "Image views",
             Self::Video => "Video views",
-            Self::EmbedSearch => "Similar-image searches",
-            Self::Search => "Uploaded-image searches",
-            Self::Description => "Description searches",
+            Self::EmbedSearch => "Similar gallery searches",
+            Self::Search => "Reverse image searches",
+            Self::Description => "Text description searches",
         }
     }
 }
@@ -1090,5 +1090,14 @@ mod tests {
 
         legal.notice_banner_enabled = false;
         assert_eq!(legal.effective_notice_banner_md(), None);
+    }
+
+    #[test]
+    fn charge_kind_labels_match_expected_copy() {
+        assert_eq!(ChargeKind::Image.label(), "Image views");
+        assert_eq!(ChargeKind::Video.label(), "Video views");
+        assert_eq!(ChargeKind::EmbedSearch.label(), "Similar gallery searches");
+        assert_eq!(ChargeKind::Search.label(), "Reverse image searches");
+        assert_eq!(ChargeKind::Description.label(), "Text description searches");
     }
 }

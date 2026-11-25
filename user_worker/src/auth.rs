@@ -97,6 +97,7 @@ pub(crate) fn require_same_origin(st: &AppState, headers: &HeaderMap) -> Result<
 pub(crate) const NONCE_PURPOSE_LOGIN: &str = "wallet_login";
 pub(crate) const NONCE_PURPOSE_LINK_PAYMENT: &str = "wallet_link_payment";
 pub(crate) const NONCE_PURPOSE_LINK_LOGIN: &str = "wallet_link_login";
+pub(crate) const NONCE_PURPOSE_MERGE_ACCOUNT: &str = "wallet_merge_account";
 
 #[derive(Debug, Default, Deserialize)]
 pub struct NonceQuery {
@@ -109,6 +110,7 @@ fn resolve_nonce_purpose(raw: Option<&str>) -> Option<&'static str> {
         None | Some("login") => Some(NONCE_PURPOSE_LOGIN),
         Some("link_payment") => Some(NONCE_PURPOSE_LINK_PAYMENT),
         Some("link_login") => Some(NONCE_PURPOSE_LINK_LOGIN),
+        Some("merge_account") => Some(NONCE_PURPOSE_MERGE_ACCOUNT),
         _ => None,
     }
 }

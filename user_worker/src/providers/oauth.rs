@@ -468,9 +468,48 @@ pub async fn callback(
             .await
             .is_err()
         {
+            // If this verified OAuth/OIDC identity already belongs to a DIFFERENT active account
+            // as a login identity, seamlessly initiate the dual-proof Account Fusion flow!
+            if let Ok(Some((other_user_id, purpose))) = crate::merge::find_identity_owner(
+                &st,
+                ident.provider_id.as_str(),
+                &ident.issuer,
+                &ident.subject,
+            )
+            .await
+            {
+                if other_user_id == active.user_id {
+                    return redirect_with_error(
+                        "/user/account",
+                        "That sign-in method is already linked to your current account",
+                    );
+                }
+                if purpose == "login"
+                    && let Ok((ticket, _)) = crate::merge::issue_ticket_for_verified_identity(
+                        &st,
+                        &active,
+                        &other_user_id,
+                        &ident,
+                    )
+                    .await
+                {
+                    let loc = format!(
+                        "/user/account?merge_ticket={}#linked-identities",
+                        urlencoding::encode(&ticket)
+                    );
+                    return (
+                        StatusCode::FOUND,
+                        [
+                            (header::LOCATION, loc),
+                            (header::CACHE_CONTROL, "private, no-store".to_string()),
+                        ],
+                    )
+                        .into_response();
+                }
+            }
             return redirect_with_error(
                 "/user/account",
-                "That identity is already linked to an account",
+                "That identity is already linked to an account that cannot be merged",
             );
         }
 
