@@ -266,6 +266,10 @@ pub struct MeResp {
     pub total_views: i64,
     #[serde(default)]
     pub allow_paid_media: bool,
+    #[serde(default)]
+    pub daily_free_used: std::collections::HashMap<String, i64>,
+    #[serde(default)]
+    pub daily_free_reset: u64,
     pub user_id: String,
     pub account_do_key: String,
     pub display_name: Option<String>,

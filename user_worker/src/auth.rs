@@ -441,6 +441,8 @@ struct MeResp {
     banned: bool,
     total_views: i64,
     allow_paid_media: bool,
+    daily_free_used: std::collections::HashMap<String, i64>,
+    daily_free_reset: u64,
     // Unified multi-auth + safety fields
     user_id: String,
     account_do_key: String,
@@ -602,6 +604,8 @@ pub async fn me(State(st): State<AppState>, headers: HeaderMap, cookies: Cookies
             banned: status.banned,
             total_views: status.total_views,
             allow_paid_media: status.allow_paid_media,
+            daily_free_used: status.daily_free_used,
+            daily_free_reset: status.daily_free_reset,
             user_id: active.user_id,
             account_do_key: active.do_key,
             display_name: account.as_ref().and_then(|a| a.display_name.clone()),

@@ -103,6 +103,13 @@ pub struct StatusResp {
     /// the PAYG points balance after daily free quota & plan windows run out.
     #[serde(default)]
     pub allow_paid_media: bool,
+    /// Number of daily free items consumed today (UTC) per `ChargeKind` name
+    /// (e.g. `"image"`, `"video"`, `"similar"`, `"upload"`, `"description"`).
+    #[serde(default)]
+    pub daily_free_used: std::collections::HashMap<String, i64>,
+    /// Epoch secs of the next UTC midnight when daily free counters reset.
+    #[serde(default)]
+    pub daily_free_reset: u64,
 }
 
 // ---------------------------------------------------------------------------
