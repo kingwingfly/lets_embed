@@ -3,9 +3,7 @@
 //! cross-device QR handoff, and transfer code claiming.
 
 use leptos::{ev, prelude::*, task::spawn_local};
-use lets_embed_ui::{
-    FloatingHeader, HeaderVariant, NoticeBanner, NoticeContent, NoticeTone, use_toast_store,
-};
+use lets_embed_ui::{NoticeBanner, NoticeContent, NoticeTone, use_toast_store};
 use serde_json::json;
 use site_access::{AgeVerificationPolicy, AuthProviderId, AuthProviderPublicConfig};
 
@@ -17,21 +15,39 @@ use crate::{
     wallet,
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CrossDeviceTab {
+    Closed,
+    Qr,
+    Transfer,
+}
+
 fn provider_slug(id: AuthProviderId) -> &'static str {
     id.as_str()
 }
 
 fn default_provider_label(id: AuthProviderId) -> &'static str {
     match id {
-        AuthProviderId::OidcAgeAssurance => "18+ Verified Identity (OIDC)",
+        AuthProviderId::OidcAgeAssurance => "18+ Verified Identity",
         AuthProviderId::Google => "Google",
         AuthProviderId::GitHub => "GitHub",
-        AuthProviderId::X => "X (Twitter)",
+        AuthProviderId::X => "X",
         AuthProviderId::Discord => "Discord",
         AuthProviderId::EmailOtp => "Email Code / Magic Link",
         AuthProviderId::Telegram => "Telegram",
-        AuthProviderId::Siwe => "Ethereum Wallet (SIWE)",
-        AuthProviderId::Siws => "Solana Wallet (SIWS)",
+        AuthProviderId::Siwe => "Ethereum",
+        AuthProviderId::Siws => "Solana",
+    }
+}
+
+fn provider_btn_class(id: AuthProviderId) -> &'static str {
+    match id {
+        AuthProviderId::OidcAgeAssurance => "u-provider-btn u-provider-btn--oidc",
+        AuthProviderId::Google => "u-provider-btn u-provider-btn--google",
+        AuthProviderId::GitHub => "u-provider-btn u-provider-btn--github",
+        AuthProviderId::X => "u-provider-btn u-provider-btn--x",
+        AuthProviderId::Discord => "u-provider-btn u-provider-btn--discord",
+        _ => "u-provider-btn",
     }
 }
 
@@ -46,12 +62,58 @@ fn is_oauth_redirect_provider(id: AuthProviderId) -> bool {
     )
 }
 
+fn render_provider_icon(id: AuthProviderId) -> AnyView {
+    match id {
+        AuthProviderId::Google => view! {
+            <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+                <path fill="#4285F4" d="M23.49 12.27c0-.79-.07-1.54-.2-2.27H12v4.51h6.44a5.51 5.51 0 0 1-2.39 3.62v3h3.87c2.26-2.08 3.57-5.15 3.57-8.86z"/>
+                <path fill="#34A853" d="M12 24c3.24 0 5.95-1.07 7.93-2.9l-3.87-3c-1.07.72-2.44 1.15-4.06 1.15-3.12 0-5.77-2.11-6.72-4.95H1.29v3.1A12 12 0 0 0 12 24z"/>
+                <path fill="#FBBC05" d="M5.28 14.3a7.18 7.18 0 0 1 0-4.6V6.6H1.29a12 12 0 0 0 0 10.8l3.99-3.1z"/>
+                <path fill="#EA4335" d="M12 4.75c1.76 0 3.34.61 4.58 1.8l3.44-3.44C17.95 1.19 15.24 0 12 0A12 12 0 0 0 1.29 6.6l3.99 3.1c.95-2.84 3.6-4.95 6.72-4.95z"/>
+            </svg>
+        }
+        .into_any(),
+        AuthProviderId::GitHub => view! {
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true">
+                <path d="M12 .5A11.5 11.5 0 0 0 .5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.55 0-.27-.01-1-.02-1.96-3.2.7-3.87-1.54-3.87-1.54-.52-1.33-1.28-1.69-1.28-1.69-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.76 2.69 1.25 3.35.96.1-.74.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.46.11-3.04 0 0 .97-.31 3.16 1.18a10.95 10.95 0 0 1 5.76 0c2.2-1.49 3.16-1.18 3.16-1.18.63 1.58.23 2.75.11 3.04.74.81 1.19 1.83 1.19 3.09 0 4.42-2.69 5.39-5.26 5.68.41.36.78 1.06.78 2.13 0 1.54-.01 2.78-.01 3.16 0 .31.21.67.8.55A11.5 11.5 0 0 0 23.5 12 11.5 11.5 0 0 0 12 .5z"/>
+            </svg>
+        }
+        .into_any(),
+        AuthProviderId::X => view! {
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" aria-hidden="true">
+                <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
+            </svg>
+        }
+        .into_any(),
+        AuthProviderId::Discord => view! {
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor" aria-hidden="true">
+                <path d="M20.317 4.37a19.79 19.79 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/>
+            </svg>
+        }
+        .into_any(),
+        AuthProviderId::OidcAgeAssurance => view! {
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                <path d="m9 12 2 2 4-4"/>
+            </svg>
+        }
+        .into_any(),
+        _ => view! {
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="9"/>
+                <path d="M9 12h6"/>
+            </svg>
+        }
+        .into_any(),
+    }
+}
+
 #[component]
 pub fn LoginPage() -> impl IntoView {
     view! {
         <LoginView
             heading="Sign in"
-            intro="Choose an authentication method to open your gallery account."
+            intro="Access your saved favorites, content preferences, and gallery account."
             default_next="/"
         />
     }
@@ -79,8 +141,12 @@ pub fn LoginView(
     let otp_input = RwSignal::new(String::new());
     let email_code_sent = RwSignal::new(false);
 
+    // Cross-device drawer state (Mobile QR / Transfer Code)
+    let cross_device = RwSignal::new(CrossDeviceTab::Closed);
+
     // QR Handoff state
     let handoff = RwSignal::new(None::<HandoffStartResp>);
+    let handoff_starting = RwSignal::new(false);
     let handoff_polling = RwSignal::new(false);
 
     // Transfer code state
@@ -93,6 +159,9 @@ pub fn LoginView(
 
     // Initial bootstrap + stage magic link (`?email_token=`) or `#transfer=` for confirmation.
     Effect::new(move |_| {
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            doc.set_title(&format!("{heading} — Let\u{2019}s Embed"));
+        }
         if let Some(err) = api::current_search_param("error") {
             toasts.error("Sign-in failed", Some(err));
         }
@@ -205,6 +274,12 @@ pub fn LoginView(
                         );
                     }
                     Err(e) => {
+                        if let Some(el) = web_sys::window()
+                            .and_then(|w| w.document())
+                            .and_then(|d| d.get_element_by_id("le-telegram-login-mount"))
+                        {
+                            let _ = el.set_attribute("data-tg-state", "unavailable");
+                        }
                         toasts.error("Could not initialize Telegram login", Some(e.display()));
                     }
                 }
@@ -276,7 +351,8 @@ pub fn LoginView(
         busy.set(true);
         let dest = next_url.get_value();
         spawn_local(async move {
-            let nonce_resp = match api::get_json::<NonceResp>("/user/api/nonce?purpose=login").await {
+            let nonce_resp = match api::get_json::<NonceResp>("/user/api/nonce?purpose=login").await
+            {
                 Ok(n) => n,
                 Err(e) => {
                     toasts.error("Sign-in failed", Some(e.display()));
@@ -326,7 +402,8 @@ pub fn LoginView(
         busy.set(true);
         let dest = next_url.get_value();
         spawn_local(async move {
-            let nonce_resp = match api::get_json::<NonceResp>("/user/api/nonce?purpose=login").await {
+            let nonce_resp = match api::get_json::<NonceResp>("/user/api/nonce?purpose=login").await
+            {
                 Ok(n) => n,
                 Err(e) => {
                     toasts.error("Sign-in failed", Some(e.display()));
@@ -369,8 +446,11 @@ pub fn LoginView(
     };
 
     // Start QR handoff & poll
-    let on_start_handoff = move |_| {
-        busy.set(true);
+    let start_handoff = Callback::new(move |()| {
+        if handoff_starting.get_untracked() || handoff.get_untracked().is_some() {
+            return;
+        }
+        handoff_starting.set(true);
         let dest = next_url.get_value();
         spawn_local(async move {
             match api::post_json::<_, HandoffStartResp>("/user/api/handoff/start", &json!({})).await
@@ -379,8 +459,8 @@ pub fn LoginView(
                     let sid = h.session_id.clone();
                     let secret = h.poll_secret.clone();
                     handoff.set(Some(h));
+                    handoff_starting.set(false);
                     handoff_polling.set(true);
-                    busy.set(false);
 
                     // Poll up to 150 iterations (~5 minutes at 2s intervals)
                     for _ in 0..150 {
@@ -414,6 +494,7 @@ pub fn LoginView(
                             Ok(_) => {
                                 handoff_polling.set(false);
                                 handoff.set(None);
+                                cross_device.set(CrossDeviceTab::Closed);
                                 toasts.warning(
                                     "QR sign-in expired",
                                     Some("Please start a new QR sign-in.".into()),
@@ -422,6 +503,8 @@ pub fn LoginView(
                             }
                             Err(e) => {
                                 handoff_polling.set(false);
+                                handoff.set(None);
+                                cross_device.set(CrossDeviceTab::Closed);
                                 toasts.error("QR handoff failed", Some(e.display()));
                                 return;
                             }
@@ -429,12 +512,13 @@ pub fn LoginView(
                     }
                 }
                 Err(e) => {
+                    handoff_starting.set(false);
+                    cross_device.set(CrossDeviceTab::Closed);
                     toasts.error("Could not start QR sign-in", Some(e.display()));
-                    busy.set(false);
                 }
             }
         });
-    };
+    });
 
     // Claim 8-char transfer code
     let on_claim_transfer = move |ev: ev::SubmitEvent| {
@@ -477,10 +561,23 @@ pub fn LoginView(
         });
         let has_siwe = effective.iter().any(|p| p.id == AuthProviderId::Siwe);
         let has_siws = effective.iter().any(|p| p.id == AuthProviderId::Siws);
+        let has_wallets = has_siwe || has_siws;
+        let has_primary_social = !oauth_list.is_empty() || has_telegram;
         let next_encoded = urlencoding::encode(&next_url.get_value()).into_owned();
 
+        let wallet_grid_cls = if has_siwe && has_siws {
+            "u-wallet-grid"
+        } else {
+            "u-wallet-grid u-wallet-grid--single"
+        };
+        let alt_actions_cls = if has_wallets {
+            "u-alt-actions"
+        } else {
+            "u-alt-actions u-alt-actions--single"
+        };
+
         view! {
-            <div class="u-stack">
+            <div class="u-login-body">
                 {strict_18.then(|| view! {
                     <NoticeBanner
                         content=NoticeContent::Text(
@@ -502,8 +599,8 @@ pub fn LoginView(
                     />
                 })}
 
-                {(!oauth_list.is_empty()).then(|| view! {
-                    <div class="u-list">
+                {has_primary_social.then(|| view! {
+                    <div class="u-provider-list">
                         {oauth_list.into_iter().map(|p| {
                             let label = p.display_name
                                 .as_deref()
@@ -516,62 +613,79 @@ pub fn LoginView(
                                 next_encoded
                             );
                             let is_verified = p.id == AuthProviderId::OidcAgeAssurance;
+                            let btn_cls = provider_btn_class(p.id);
+                            let icon = render_provider_icon(p.id);
                             view! {
-                                <a class="u-btn u-btn--full" href=href>
-                                    {format!("Continue with {label}")}
-                                    {is_verified.then(|| view! {
-                                        <span class="u-badge u-badge--ok">"18+ Verified"</span>
-                                    })}
+                                <a class=btn_cls href=href>
+                                    <span class="u-provider-icon">{icon}</span>
+                                    <span class="u-provider-label">
+                                        {format!("Continue with {label}")}
+                                        {is_verified.then(|| view! {
+                                            <span class="u-badge u-badge--ok">"18+"</span>
+                                        })}
+                                    </span>
+                                    <svg class="u-provider-chevron" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                        <path d="m7.5 5 5 5-5 5"/>
+                                    </svg>
                                 </a>
                             }
                         }).collect_view()}
-                    </div>
-                })}
 
-                {has_telegram.then(|| view! {
-                    <div>
-                        <div class="u-divider">"Telegram"</div>
-                        <div id="le-telegram-login-mount" class="u-row"></div>
+                        {has_telegram.then(|| view! {
+                            <div class="u-login-tg-slot">
+                                <div id="le-telegram-login-mount" class="u-login-tg-mount" data-tg-state="loading"></div>
+                            </div>
+                        })}
                     </div>
                 })}
 
                 {has_email.then(|| view! {
                     <div>
-                        <div class="u-divider">"Email Magic Link or 6-Digit Code"</div>
-                        <form on:submit=on_email_start>
-                            <div class="u-field">
+                        {has_primary_social.then(|| view! {
+                            <div class="u-login-divider">"or with email"</div>
+                        })}
+                        <form class="u-login-email-form" on:submit=on_email_start>
+                            <div class="u-field" style="margin-bottom: 0;">
                                 <label class="u-label" for="le-email-input">"Email address"</label>
-                                <input
-                                    id="le-email-input"
-                                    type="email"
-                                    class="u-input"
-                                    placeholder="you@example.com"
-                                    required=true
-                                    prop:value=move || email_input.get()
-                                    on:input=move |ev| email_input.set(event_target_value(&ev))
-                                />
+                                <div class="u-input-wrap">
+                                    <svg class="u-input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                        <rect x="2" y="4" width="20" height="16" rx="2"/>
+                                        <path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/>
+                                    </svg>
+                                    <input
+                                        id="le-email-input"
+                                        type="email"
+                                        class="u-input u-input--with-icon"
+                                        placeholder="you@example.com"
+                                        autocomplete="email"
+                                        required=true
+                                        prop:value=move || email_input.get()
+                                        on:input=move |ev| email_input.set(event_target_value(&ev))
+                                    />
+                                </div>
                             </div>
-                            <button type="submit" class="u-btn u-btn--secondary u-btn--full" disabled=move || busy.get()>
+                            <button type="submit" class="u-btn u-btn--gradient u-btn--full" disabled=move || busy.get()>
                                 "Send sign-in link & code"
                             </button>
                         </form>
                         {move || email_code_sent.get().then(|| view! {
-                            <form class="u-stack" on:submit=on_email_verify>
-                                <div class="u-field">
-                                    <label class="u-label" for="le-otp-input">"6-digit code"</label>
+                            <form class="u-login-drawer" style="margin-top: 12px;" on:submit=on_email_verify>
+                                <div class="u-field" style="margin-bottom: 0;">
+                                    <label class="u-label" for="le-otp-input">"Enter 6-digit verification code"</label>
                                     <input
                                         id="le-otp-input"
                                         type="text"
                                         inputmode="numeric"
                                         maxlength="6"
-                                        class="u-input"
+                                        class="u-input u-input--code"
                                         placeholder="123456"
+                                        autocomplete="one-time-code"
                                         required=true
                                         prop:value=move || otp_input.get()
                                         on:input=move |ev| otp_input.set(event_target_value(&ev))
                                     />
                                 </div>
-                                <button type="submit" class="u-btn u-btn--full" disabled=move || busy.get()>
+                                <button type="submit" class="u-btn u-btn--gradient u-btn--full" disabled=move || busy.get()>
                                     "Verify code & sign in"
                                 </button>
                             </form>
@@ -579,87 +693,188 @@ pub fn LoginView(
                     </div>
                 })}
 
-                {(has_siwe || has_siws).then(|| view! {
+                {has_wallets.then(|| view! {
                     <div>
-                        <div class="u-divider">"Crypto Wallets"</div>
-                        <div class="u-list">
+                        {(has_primary_social || has_email).then(|| view! {
+                            <div class="u-login-divider">"Web3 Wallets"</div>
+                        })}
+                        <div class=wallet_grid_cls style="margin-top: 10px;">
                             {has_siwe.then(|| view! {
                                 <button
                                     type="button"
-                                    class="u-btn u-btn--secondary u-btn--full"
+                                    class="u-wallet-btn"
                                     disabled=move || busy.get()
                                     on:click=on_siwe_login
                                 >
-                                    "Sign in with Ethereum (SIWE)"
+                                    <span class="u-wallet-chip u-wallet-chip--eth" aria-hidden="true">
+                                        <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+                                            <path d="M12 2 5.5 12.2 12 16l6.5-3.8L12 2zm0 15.6L5.5 13.8 12 22l6.5-8.2L12 17.6z"/>
+                                        </svg>
+                                    </span>
+                                    <span class="u-wallet-meta">
+                                        <span class="u-wallet-name">"Ethereum"</span>
+                                        <span class="u-wallet-tag">"Sign in (SIWE)"</span>
+                                    </span>
                                 </button>
                             })}
                             {has_siws.then(|| view! {
                                 <button
                                     type="button"
-                                    class="u-btn u-btn--secondary u-btn--full"
+                                    class="u-wallet-btn"
                                     disabled=move || busy.get()
                                     on:click=on_siws_login
                                 >
-                                    "Sign in with Solana (SIWS)"
+                                    <span class="u-wallet-chip u-wallet-chip--sol" aria-hidden="true">
+                                        <svg viewBox="0 0 24 24" width="18" height="18" fill="none">
+                                            <path d="M5.5 7.5h11.8l1.7-2H7.2l-1.7 2z" fill="#9945FF"/>
+                                            <path d="M18.5 13H6.7L5 11h11.8l1.7 2z" fill="#2DD4BF"/>
+                                            <path d="M5.5 18.5h11.8l1.7-2H7.2l-1.7 2z" fill="#14F195"/>
+                                        </svg>
+                                    </span>
+                                    <span class="u-wallet-meta">
+                                        <span class="u-wallet-name">"Solana"</span>
+                                        <span class="u-wallet-tag">"Sign in (SIWS)"</span>
+                                    </span>
                                 </button>
                             })}
-                        </div>
-
-                        <div class="u-divider">"Mobile Wallet QR"</div>
-                        <div class="u-stack">
-                            {move || match handoff.get() {
-                                None => view! {
-                                    <button
-                                        type="button"
-                                        class="u-btn u-btn--secondary u-btn--full"
-                                        disabled=move || busy.get()
-                                        on:click=on_start_handoff
-                                    >
-                                        "Sign in with mobile wallet QR code"
-                                    </button>
-                                }.into_any(),
-                                Some(h) => {
-                                    let svg = h.qr.as_ref().map(|q| q.to_svg()).unwrap_or_default();
-                                    let code = h.verify_code.clone();
-                                    view! {
-                                        <div class="u-qr-box">
-                                            <div class="u-qr-svg" inner_html=svg />
-                                            <div class="u-verify-code">{code}</div>
-                                            <p class="u-sub">"Scan with your phone and verify this code matches."</p>
-                                            <button
-                                                type="button"
-                                                class="u-btn u-btn--secondary u-btn--small"
-                                                on:click=move |_| {
-                                                    handoff_polling.set(false);
-                                                    handoff.set(None);
-                                                }
-                                            >
-                                                "Cancel"
-                                            </button>
-                                        </div>
-                                    }.into_any()
-                                }
-                            }}
                         </div>
                     </div>
                 })}
 
                 {(!effective.is_empty()).then(|| view! {
-                    <div>
-                        <div class="u-divider">"Other Device Transfer Code"</div>
-                        <form on:submit=on_claim_transfer class="u-row">
-                            <input
-                                type="text"
-                                class="u-input"
-                                style="flex: 1;"
-                                placeholder="8-character transfer code (e.g. ABCD-EFGH)"
-                                prop:value=move || transfer_code.get()
-                                on:input=move |ev| transfer_code.set(event_target_value(&ev))
-                            />
-                            <button type="submit" class="u-btn u-btn--secondary" disabled=move || busy.get()>
-                                "Claim"
+                    <div class="u-alt-section">
+                        <div class="u-alt-heading">"Signing in from another device?"</div>
+                        <div class=alt_actions_cls>
+                            {has_wallets.then(|| view! {
+                                <button
+                                    type="button"
+                                    class=move || if cross_device.get() == CrossDeviceTab::Qr {
+                                        "u-alt-pill is-active"
+                                    } else {
+                                        "u-alt-pill"
+                                    }
+                                    disabled=move || busy.get()
+                                    on:click=move |_| {
+                                        if cross_device.get_untracked() == CrossDeviceTab::Qr {
+                                            handoff_polling.set(false);
+                                            handoff.set(None);
+                                            cross_device.set(CrossDeviceTab::Closed);
+                                        } else {
+                                            cross_device.set(CrossDeviceTab::Qr);
+                                            start_handoff.run(());
+                                        }
+                                    }
+                                >
+                                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                        <rect x="3" y="3" width="7" height="7" rx="1"/>
+                                        <rect x="14" y="3" width="7" height="7" rx="1"/>
+                                        <rect x="3" y="14" width="7" height="7" rx="1"/>
+                                        <path d="M14 14h3v3h-3zm4 4h3v3h-3zm-4 2h2m4-6h1"/>
+                                    </svg>
+                                    "Mobile Wallet QR"
+                                </button>
+                            })}
+                            <button
+                                type="button"
+                                class=move || if cross_device.get() == CrossDeviceTab::Transfer {
+                                    "u-alt-pill is-active"
+                                } else {
+                                    "u-alt-pill"
+                                }
+                                disabled=move || busy.get()
+                                on:click=move |_| {
+                                    if cross_device.get_untracked() == CrossDeviceTab::Transfer {
+                                        cross_device.set(CrossDeviceTab::Closed);
+                                    } else {
+                                        handoff_polling.set(false);
+                                        handoff.set(None);
+                                        cross_device.set(CrossDeviceTab::Transfer);
+                                    }
+                                }
+                            >
+                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                    <path d="M17 1l4 4-4 4"/>
+                                    <path d="M3 11V9a4 4 0 0 1 4-4h14"/>
+                                    <path d="M7 23l-4-4 4-4"/>
+                                    <path d="M21 13v2a4 4 0 0 1-4 4H3"/>
+                                </svg>
+                                "Transfer Code"
                             </button>
-                        </form>
+                        </div>
+
+                        {move || match cross_device.get() {
+                            CrossDeviceTab::Closed => ().into_any(),
+                            CrossDeviceTab::Qr => view! {
+                                <div class="u-login-drawer">
+                                    <div class="u-login-drawer-head">
+                                        <h3 class="u-login-drawer-title">"Mobile wallet QR sign-in"</h3>
+                                        <button
+                                            type="button"
+                                            class="u-btn u-btn--secondary u-btn--small"
+                                            on:click=move |_| {
+                                                handoff_polling.set(false);
+                                                handoff.set(None);
+                                                cross_device.set(CrossDeviceTab::Closed);
+                                            }
+                                        >
+                                            "Cancel"
+                                        </button>
+                                    </div>
+                                    {move || match handoff.get() {
+                                        None => view! {
+                                            <div class="u-login-qr-frame">
+                                                <span class="u-login-qr-status">
+                                                    <span class="u-login-pulse-dot"></span>
+                                                    "Generating QR code\u{2026}"
+                                                </span>
+                                            </div>
+                                        }.into_any(),
+                                        Some(h) => {
+                                            let svg = h.qr.as_ref().map(|q| q.to_svg()).unwrap_or_default();
+                                            let code = h.verify_code.clone();
+                                            view! {
+                                                <div class="u-login-qr-frame">
+                                                    <div class="u-qr-svg" inner_html=svg />
+                                                    <div class="u-verify-code">{code}</div>
+                                                    <span class="u-login-qr-status">
+                                                        <span class="u-login-pulse-dot"></span>
+                                                        "Scan on mobile and confirm this code"
+                                                    </span>
+                                                </div>
+                                            }.into_any()
+                                        }
+                                    }}
+                                </div>
+                            }.into_any(),
+                            CrossDeviceTab::Transfer => view! {
+                                <form class="u-login-drawer" on:submit=on_claim_transfer>
+                                    <div>
+                                        <h3 class="u-login-drawer-title">"Device transfer code"</h3>
+                                        <p class="u-login-drawer-desc">
+                                            "Enter the 8-character code created from Account Settings on your signed-in device."
+                                        </p>
+                                    </div>
+                                    <div class="u-login-transfer-row">
+                                        <input
+                                            type="text"
+                                            class="u-input u-input--code"
+                                            placeholder="ABCD-EFGH"
+                                            autocomplete="off"
+                                            spellcheck="false"
+                                            prop:value=move || transfer_code.get()
+                                            on:input=move |ev| transfer_code.set(event_target_value(&ev))
+                                        />
+                                        <button
+                                            type="submit"
+                                            class="u-btn u-btn--gradient"
+                                            disabled=move || busy.get()
+                                        >
+                                            "Claim"
+                                        </button>
+                                    </div>
+                                </form>
+                            }.into_any(),
+                        }}
                     </div>
                 })}
             </div>
@@ -667,25 +882,22 @@ pub fn LoginView(
     };
 
     view! {
-        <div class="u-shell u-shell--narrow">
-            <FloatingHeader
-                variant=HeaderVariant::Nav
-                left=move || view! {
-                    <nav class="u-nav-links">
-                        <a class="u-nav-link" href="/">"Gallery"</a>
-                        <a class="u-nav-link is-active" href="/user/login">"Sign in"</a>
-                    </nav>
-                }.into_any()
-                right=move || view! {
-                    <a class="u-nav-link" href="/terms">"Terms"</a>
-                }.into_any()
-            />
+        <div class="u-login-page">
+            <header class="u-login-topbar">
+                <a class="u-login-brand" href="/">"Let\u{2019}s Embed \u{2728}"</a>
+                <a class="u-login-back" href="/">
+                    <svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M12.5 15 7.5 10l5-5"/>
+                    </svg>
+                    "Gallery"
+                </a>
+            </header>
 
-            <div class="u-stack">
+            <main class="u-login-main">
                 {extra_header.map(|f| f.run())}
 
                 {move || pending_email_link.get().map(|(email, _)| view! {
-                    <section class="u-card">
+                    <section class="u-login-card u-login-card--confirm">
                         <h2>"Confirm email sign-in"</h2>
                         <p class="u-sub">
                             {format!(
@@ -695,7 +907,7 @@ pub fn LoginView(
                         <div class="u-row">
                             <button
                                 type="button"
-                                class="u-btn"
+                                class="u-btn u-btn--gradient"
                                 disabled=move || busy.get()
                                 on:click=on_confirm_email_link
                             >
@@ -725,7 +937,7 @@ pub fn LoginView(
                 })}
 
                 {move || pending_transfer_token.get().map(|_| view! {
-                    <section class="u-card">
+                    <section class="u-login-card u-login-card--confirm">
                         <h2>"Confirm device transfer sign-in"</h2>
                         <p class="u-sub">
                             "You opened a cross-device sign-in transfer link. Confirm below only if you generated this QR code on your own signed-in device — claiming it will switch this browser to that account."
@@ -733,7 +945,7 @@ pub fn LoginView(
                         <div class="u-row">
                             <button
                                 type="button"
-                                class="u-btn"
+                                class="u-btn u-btn--gradient"
                                 disabled=move || busy.get()
                                 on:click=on_confirm_transfer_link
                             >
@@ -762,15 +974,38 @@ pub fn LoginView(
                     </section>
                 })}
 
-                <section class="u-card">
-                    <h1>{heading}</h1>
-                    <p class="u-sub">{intro}</p>
+                <section class="u-login-card">
+                    <div class="u-login-hero">
+                        <div class="u-login-emblem" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3z"/>
+                                <path d="m12 12 8-4.5M12 12v9M12 12 4 7.5"/>
+                            </svg>
+                        </div>
+                        <h1 class="u-login-title">{heading}</h1>
+                        <p class="u-login-subtitle">{intro}</p>
+                    </div>
+
                     {move || match boot.get() {
-                        None => view! { <p class="u-sub">"Loading available sign-in methods..."</p> }.into_any(),
+                        None => view! {
+                            <div class="u-login-skeleton" aria-label="Loading available sign-in methods">
+                                <div class="u-login-skeleton-bar"></div>
+                                <div class="u-login-skeleton-bar"></div>
+                                <div class="u-login-skeleton-bar u-login-skeleton-bar--short"></div>
+                            </div>
+                        }.into_any(),
                         Some(b) => render_providers(b).into_any(),
                     }}
                 </section>
-            </div>
+            </main>
+
+            <footer class="u-login-footer">
+                <a href="/terms">"Terms"</a>
+                <span class="u-login-footer-sep">"\u{00B7}"</span>
+                <a href="/privacy">"Privacy"</a>
+                <span class="u-login-footer-sep">"\u{00B7}"</span>
+                <a href="/content-policy">"Content Policy"</a>
+            </footer>
         </div>
     }
 }
