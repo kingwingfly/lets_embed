@@ -16,9 +16,9 @@ pub const IMAGE_CHANNEL: usize = 3;
 pub const IMAGE_WIDTH: usize = 256;
 pub const IMAGE_HEIGHT: usize = 256;
 
-pub const MAX_IMAGE_DIMENSION: u32 = 8192;
-pub const MAX_IMAGE_PIXELS: u64 = 16_777_216;
-pub const MAX_DECODE_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_IMAGE_DIMENSION: u32 = 32_768;
+pub const MAX_IMAGE_PIXELS: u64 = 100_000_000;
+pub const MAX_DECODE_ALLOC_BYTES: u64 = 512 * 1024 * 1024;
 
 pub const MEAN: [f64; 3] = [0.485, 0.456, 0.406];
 pub const STD: [f64; 3] = [0.229, 0.224, 0.225];
@@ -222,20 +222,20 @@ mod tests {
 
     #[test]
     fn convert_image_rejects_huge_png_dimensions_without_allocating() {
-        let huge_dim = png_header_only(10_000, 10_000);
+        let huge_dim = png_header_only(40_000, 40_000);
         let err = convert_image(Cursor::new(huge_dim)).unwrap_err();
         let msg = err.to_string();
         assert!(
             !msg.contains("Format error")
                 && (msg.contains("exceed") || msg.contains("limit") || msg.contains("dimension")),
-            "unexpected error for 10000x10000 PNG: {msg}"
+            "unexpected error for 40000x40000 PNG: {msg}"
         );
 
-        let huge_pixels = png_header_only(5_000, 5_000);
+        let huge_pixels = png_header_only(12_000, 12_000);
         let err_px = convert_image(Cursor::new(huge_pixels)).unwrap_err();
         assert!(
-            err_px.to_string().contains("5000x5000"),
-            "expected pixel limit rejection for 5000x5000 PNG, got: {err_px}"
+            err_px.to_string().contains("12000x12000"),
+            "expected pixel limit rejection for 12000x12000 PNG, got: {err_px}"
         );
     }
 
