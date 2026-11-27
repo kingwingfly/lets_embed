@@ -273,8 +273,53 @@ pub fn trap_dialog_tab(ev: &leptos::ev::KeyboardEvent, dialog: Option<web_sys::H
     }
 }
 
+#[cfg(any(feature = "hydrate", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModalNavPlan<S> {
+    replace: bool,
+    unwind_delta: Option<i32>,
+    restore_scroll_restoration: Option<S>,
+}
+
+/// Compute how `modal_history::navigate` should unwind stacked synthetic modal
+/// entries and which pre-modal `history.scrollRestoration` mode to restore on the
+/// destination entry once navigation settles.
+#[cfg(any(feature = "hydrate", test))]
+fn plan_modal_navigation<S: Copy>(
+    entries: impl IntoIterator<Item = (bool, Option<S>)>,
+) -> ModalNavPlan<S> {
+    let mut pushed_count = 0usize;
+    let mut bottom_sr = None;
+    for (pushed, prev_sr) in entries {
+        if pushed {
+            if pushed_count == 0 {
+                bottom_sr = prev_sr;
+            }
+            pushed_count += 1;
+        }
+    }
+    match pushed_count {
+        0 => ModalNavPlan {
+            replace: false,
+            unwind_delta: None,
+            restore_scroll_restoration: None,
+        },
+        1 => ModalNavPlan {
+            replace: true,
+            unwind_delta: None,
+            restore_scroll_restoration: bottom_sr,
+        },
+        k => ModalNavPlan {
+            replace: true,
+            unwind_delta: Some(-((k - 1) as i32)),
+            restore_scroll_restoration: bottom_sr,
+        },
+    }
+}
+
 #[cfg(feature = "hydrate")]
 mod modal_history {
+    use super::ModalNavPlan;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use wasm_bindgen::{JsCast, JsValue, closure::Closure};
@@ -285,6 +330,7 @@ mod modal_history {
     struct ModalEntry {
         token: u64,
         pushed: bool,
+        prev_scroll_restoration: Option<web_sys::ScrollRestoration>,
         close_fn: Rc<dyn Fn()>,
         prev_focus: Option<web_sys::HtmlElement>,
     }
@@ -295,6 +341,10 @@ mod modal_history {
         static PENDING_BACKS: Cell<usize> = const { Cell::new(0) };
         static DEFERRED: RefCell<Vec<DeferredAction>> = const { RefCell::new(Vec::new()) };
         static INSTALLED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn no_pushed_modals() -> bool {
+        STACK.with(|s| s.borrow().iter().all(|e| !e.pushed))
     }
 
     fn state_token(state: &JsValue) -> Option<u64> {
@@ -366,6 +416,7 @@ mod modal_history {
         let Ok(href) = win.location().href() else {
             return;
         };
+        let prev_sr = history.scroll_restoration().ok();
         let state = js_sys::Object::new();
         let _ = js_sys::Reflect::set(
             &state,
@@ -381,7 +432,51 @@ mod modal_history {
                     e.pushed = false;
                 }
             });
+        } else {
+            STACK.with(|s| {
+                if let Some(e) = s.borrow_mut().iter_mut().find(|e| e.token == token) {
+                    e.prev_scroll_restoration = prev_sr;
+                }
+            });
+            // Mark synthetic modal entries `manual` so unwinding stacked modals via
+            // `history.go(-(k - 1))` does not trigger browser scroll restoration right
+            // after `popstate` and overwrite the router's `window.scrollTo(0, 0)`.
+            let _ = history.set_scroll_restoration(web_sys::ScrollRestoration::Manual);
         }
+    }
+
+    fn finish_modal_navigation(
+        dest: &str,
+        replace: bool,
+        restore_sr: Option<web_sys::ScrollRestoration>,
+        do_nav: impl FnOnce(&str, bool),
+    ) {
+        do_nav(dest, replace);
+        let expected_url = current_relative_url();
+        let has_hash = web_sys::window()
+            .and_then(|w| w.location().hash().ok())
+            .is_some_and(|h| !h.is_empty());
+
+        // Defer one animation frame so any post-`popstate` scroll restoration and
+        // reactive modal cleanup (`body.modal-open` removal) have flushed, then
+        // restore `history.scrollRestoration` and ensure the new page starts at y=0.
+        leptos::prelude::request_animation_frame(move || {
+            let Some(win) = web_sys::window() else {
+                return;
+            };
+            if let Some(prev_sr) = restore_sr
+                && no_pushed_modals()
+                && let Ok(hist) = win.history()
+            {
+                let _ = hist.set_scroll_restoration(prev_sr);
+            }
+            if !has_hash
+                && current_relative_url() == expected_url
+                && (win.scroll_y().unwrap_or(0.0) != 0.0 || win.scroll_x().unwrap_or(0.0) != 0.0)
+            {
+                win.scroll_to_with_x_and_y(0.0, 0.0);
+            }
+        });
     }
 
     fn ensure_listener() {
@@ -410,20 +505,33 @@ mod modal_history {
                     // Synchronize `STACK` with the history state we actually landed on
                     // (handles single Back, multi-step `history.go(-k)`, and route exits).
                     let landed = state_token(&ev.state());
-                    let to_close: Vec<ModalEntry> = STACK.with(|s| {
+                    let (to_close, stack_cleared) = STACK.with(|s| {
                         let mut stack = s.borrow_mut();
                         if stack.is_empty() {
-                            return Vec::new();
+                            return (Vec::new(), true);
                         }
-                        match landed.and_then(|t| stack.iter().position(|e| e.token == t)) {
-                            Some(idx) => stack.drain((idx + 1)..).rev().collect(),
-                            None => stack.drain(..).rev().collect(),
-                        }
+                        let drained: Vec<ModalEntry> =
+                            match landed.and_then(|t| stack.iter().position(|e| e.token == t)) {
+                                Some(idx) => stack.drain((idx + 1)..).rev().collect(),
+                                None => stack.drain(..).rev().collect(),
+                            };
+                        let cleared = stack.iter().all(|e| !e.pushed);
+                        (drained, cleared)
                     });
                     let mut restore = None;
+                    let mut restore_sr = None;
                     for entry in to_close {
                         (entry.close_fn)();
                         restore = entry.prev_focus;
+                        if entry.pushed {
+                            restore_sr = entry.prev_scroll_restoration;
+                        }
+                    }
+                    if stack_cleared
+                        && let Some(prev_sr) = restore_sr
+                        && let Some(hist) = web_sys::window().and_then(|w| w.history().ok())
+                    {
+                        let _ = hist.set_scroll_restoration(prev_sr);
                     }
                     restore_focus(restore);
                 },
@@ -454,6 +562,7 @@ mod modal_history {
             s.borrow_mut().push(ModalEntry {
                 token,
                 pushed: false,
+                prev_scroll_restoration: None,
                 close_fn: Rc::new(on_back),
                 prev_focus,
             });
@@ -469,12 +578,13 @@ mod modal_history {
         }
 
         leptos::prelude::on_cleanup(move || {
-            let removed = STACK.with(|s| {
+            let (removed, stack_cleared) = STACK.with(|s| {
                 let mut stack = s.borrow_mut();
-                stack
+                let removed = stack
                     .iter()
                     .position(|e| e.token == token)
-                    .map(|pos| stack.remove(pos))
+                    .map(|pos| stack.remove(pos));
+                (removed, stack.iter().all(|e| !e.pushed))
             });
             let Some(entry) = removed else {
                 return;
@@ -485,6 +595,17 @@ mod modal_history {
                 && state_token(&hist.state().unwrap_or(JsValue::NULL)) == Some(token)
             {
                 PENDING_BACKS.with(|c| c.set(c.get().saturating_add(1)));
+                if stack_cleared && let Some(prev_sr) = entry.prev_scroll_restoration {
+                    DEFERRED.with(|q| {
+                        q.borrow_mut().push(Box::new(move || {
+                            if no_pushed_modals()
+                                && let Some(h) = web_sys::window().and_then(|w| w.history().ok())
+                            {
+                                let _ = h.set_scroll_restoration(prev_sr);
+                            }
+                        }));
+                    });
+                }
                 let _ = hist.back();
             }
         });
@@ -503,50 +624,58 @@ mod modal_history {
             return;
         }
 
-        let pushed_count = STACK.with(|s| s.borrow_mut().drain(..).filter(|e| e.pushed).count());
+        let plan = STACK.with(|s| {
+            super::plan_modal_navigation(
+                s.borrow_mut()
+                    .drain(..)
+                    .map(|e| (e.pushed, e.prev_scroll_restoration)),
+            )
+        });
         close_modals();
 
-        if pushed_count == 0 {
+        let ModalNavPlan {
+            replace,
+            unwind_delta,
+            restore_scroll_restoration,
+        } = plan;
+
+        if let Some(unwind) = unwind_delta {
+            // Stacked modals (`k > 1`, e.g. Lightbox -> Viewer): unwind `k - 1`
+            // entries via a single `history.go(-(k - 1))`, then replace the bottom
+            // modal entry with `dest` so ZERO orphan entries remain in history.
+            let run_unwind = move || {
+                if let Some(hist) = web_sys::window().and_then(|w| w.history().ok()) {
+                    PENDING_BACKS.with(|c| c.set(c.get().saturating_add(1)));
+                    DEFERRED.with(|q| {
+                        q.borrow_mut().push(Box::new(move || {
+                            finish_modal_navigation(
+                                &dest,
+                                replace,
+                                restore_scroll_restoration,
+                                do_nav,
+                            );
+                        }));
+                    });
+                    let _ = hist.go_with_delta(unwind);
+                } else {
+                    finish_modal_navigation(&dest, replace, restore_scroll_restoration, do_nav);
+                }
+            };
             if PENDING_BACKS.with(|c| c.get() > 0) {
-                DEFERRED.with(|q| {
-                    q.borrow_mut().push(Box::new(move || do_nav(&dest, false)));
-                });
+                DEFERRED.with(|q| q.borrow_mut().push(Box::new(run_unwind)));
             } else {
-                do_nav(&dest, false);
+                run_unwind();
             }
             return;
         }
 
-        if pushed_count == 1 {
-            if PENDING_BACKS.with(|c| c.get() > 0) {
-                DEFERRED.with(|q| {
-                    q.borrow_mut().push(Box::new(move || do_nav(&dest, true)));
-                });
-            } else {
-                do_nav(&dest, true);
-            }
-            return;
-        }
-
-        // Stacked modals (`k > 1`, e.g. Lightbox -> Viewer): unwind `k - 1`
-        // entries via a single `history.go(-(k - 1))`, then replace the bottom
-        // modal entry with `dest` so ZERO orphan entries remain in history.
-        let unwind = -((pushed_count - 1) as i32);
-        let run_unwind = move || {
-            if let Some(hist) = web_sys::window().and_then(|w| w.history().ok()) {
-                PENDING_BACKS.with(|c| c.set(c.get().saturating_add(1)));
-                DEFERRED.with(|q| {
-                    q.borrow_mut().push(Box::new(move || do_nav(&dest, true)));
-                });
-                let _ = hist.go_with_delta(unwind);
-            } else {
-                do_nav(&dest, true);
-            }
+        let run_nav = move || {
+            finish_modal_navigation(&dest, replace, restore_scroll_restoration, do_nav);
         };
         if PENDING_BACKS.with(|c| c.get() > 0) {
-            DEFERRED.with(|q| q.borrow_mut().push(Box::new(run_unwind)));
+            DEFERRED.with(|q| q.borrow_mut().push(Box::new(run_nav)));
         } else {
-            run_unwind();
+            run_nav();
         }
     }
 }
@@ -614,8 +743,65 @@ pub fn layout_image_masonry(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_duration, layout_image_masonry, normalize_public_origin};
+    use super::{
+        ModalNavPlan, format_duration, layout_image_masonry, normalize_public_origin,
+        plan_modal_navigation,
+    };
     use search_types::ProjectedImage;
+
+    #[test]
+    fn plan_modal_navigation_computes_unwind_and_preserves_bottom_scroll_restoration() {
+        assert_eq!(
+            plan_modal_navigation::<&str>([]),
+            ModalNavPlan {
+                replace: false,
+                unwind_delta: None,
+                restore_scroll_restoration: None,
+            }
+        );
+        assert_eq!(
+            plan_modal_navigation([(false, Some("auto"))]),
+            ModalNavPlan {
+                replace: false,
+                unwind_delta: None,
+                restore_scroll_restoration: None,
+            }
+        );
+        // Single modal (e.g. Lightbox -> Details): replace entry and restore pre-modal mode.
+        assert_eq!(
+            plan_modal_navigation([(true, Some("auto"))]),
+            ModalNavPlan {
+                replace: true,
+                unwind_delta: None,
+                restore_scroll_restoration: Some("auto"),
+            }
+        );
+        // Stacked modals (Lightbox -> Viewer -> Details): unwind 1 entry and restore
+        // the bottom-most modal's pre-modal scrollRestoration ("auto"), not the inner
+        // modal's observed "manual".
+        assert_eq!(
+            plan_modal_navigation([(true, Some("auto")), (true, Some("manual"))]),
+            ModalNavPlan {
+                replace: true,
+                unwind_delta: Some(-1),
+                restore_scroll_restoration: Some("auto"),
+            }
+        );
+        // 3 stacked modals with an unpushed entry mixed in.
+        assert_eq!(
+            plan_modal_navigation([
+                (false, None),
+                (true, Some("auto")),
+                (true, Some("manual")),
+                (true, Some("manual")),
+            ]),
+            ModalNavPlan {
+                replace: true,
+                unwind_delta: Some(-2),
+                restore_scroll_restoration: Some("auto"),
+            }
+        );
+    }
 
     #[test]
     fn normalizes_valid_public_origins_and_rejects_malformed_values() {
