@@ -12,5 +12,8 @@ node_modules
 .wrangler
 gateway_worker/build
 user_worker/build
+admin_dashboard_worker/build
+admin_dashboard_worker/assets/pkg
+user_worker/assets/pkg
 .claude
 cloudbuild-lets-embed-web-cpu.yaml
