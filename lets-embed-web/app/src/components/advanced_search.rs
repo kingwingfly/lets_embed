@@ -11,7 +11,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[cfg(feature = "hydrate")]
-use crate::components::search_bar::encode_image_file;
+use crate::components::search_bar::{encode_image_file, fetch_suggestions};
 use crate::components::search_bar::{DEFAULT_LIMIT, UrlSearchState};
 use crate::types::{
     AdvancedUploads, AdvancedUploadsPayload, ImageQuery, Mode, SafetyUiState, UploadedImageSlot,
@@ -27,7 +27,7 @@ use leptos_router::{NavigateOptions, hooks::use_navigate};
 use leptos_use_event_listener::use_event_listener;
 use lets_embed_ui::{
     QueryBuilder, QueryBuilderDraft, QueryBuilderMode, QueryBuilderNode, QueryCondition,
-    QueryConnector, QueryFieldKind, QueryThresholdDefaults,
+    QueryConnector, QueryFieldKind, QuerySuggestion, QueryThresholdDefaults,
 };
 use search_types::query::{
     AdvancedSort, QueryExpr, QueryPlan, ResultKind, SearchField, VectorTier, parse_and_compile,
@@ -694,6 +694,41 @@ pub fn AdvancedSearchPanel(
         .into_any()
     });
 
+    let on_suggest = Callback::new(
+        move |(field, query, reply): (QueryFieldKind, String, Callback<Vec<QuerySuggestion>>)| {
+            let search_field = match field {
+                QueryFieldKind::TitleAndAuthor => SearchField::All,
+                QueryFieldKind::Title => SearchField::Title,
+                QueryFieldKind::Author => SearchField::Author,
+                QueryFieldKind::Tag => SearchField::Tag,
+                _ => {
+                    reply.run(Vec::new());
+                    return;
+                }
+            };
+            #[cfg(feature = "hydrate")]
+            {
+                spawn_local(async move {
+                    let items = fetch_suggestions(search_field, query)
+                        .await
+                        .into_iter()
+                        .map(|s| QuerySuggestion {
+                            value: s.value,
+                            kind: s.kind,
+                            aliases: s.aliases,
+                        })
+                        .collect();
+                    reply.run(items);
+                });
+            }
+            #[cfg(not(feature = "hydrate"))]
+            {
+                let _ = (search_field, query);
+                reply.run(Vec::new());
+            }
+        },
+    );
+
     let on_submit = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
         let d = draft.get_untracked();
@@ -838,6 +873,7 @@ pub fn AdvancedSearchPanel(
                         threshold_defaults=threshold_defaults
                         validation_error=validation_error
                         render_upload_slot=render_upload_slot
+                        on_suggest=on_suggest
                         show_raw_editor=true
                     />
 

@@ -26,7 +26,10 @@ use clap::Parser;
 use leptos::prelude::*;
 use leptos_axum::{AxumRouteListing, LeptosRoutes, generate_route_list};
 use middleware::{MetadataRateLimiter, MiddlewareState};
-use site_access::decode_active_policy_v3;
+use site_access::{
+    ActorBinding, GATEWAY_ASSERTION_AUDIENCE, GATEWAY_ASSERTION_VERSION, GatewayAssertion,
+    decode_active_policy_v3,
+};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::{
     EnvFilter, Registry, layer::SubscriberExt as _, util::SubscriberInitExt as _,
@@ -118,8 +121,60 @@ fn build_app_router(
         .with_state(app_state)
 }
 
+/// Maximum wall-clock time the non-blocking startup warm-up may spend establishing
+/// DNS/TLS/HTTP2 connectivity to `POLICY_URL` before giving up and releasing the lock.
+const POLICY_STARTUP_WARMUP_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Kicks off a non-blocking, fail-closed background warm-up against `POLICY_URL`
+/// in Managed Mode while the search engine initializes.
+///
+/// Uses an impossible probe assertion (`rev = u64::MAX`, empty digest) so `PolicyStore`
+/// NEVER stores an unverified policy snapshot, while still warming DNS, TLS, HTTP/2
+/// keep-alive pooling, and the upstream `SITE_POLICY` DO before `:3000` serves traffic.
+fn spawn_managed_policy_warmup(policy_store: Arc<PolicyStore>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let probe = GatewayAssertion {
+            v: GATEWAY_ASSERTION_VERSION,
+            aud: GATEWAY_ASSERTION_AUDIENCE.to_string(),
+            actor: ActorBinding::Anon,
+            rev: u64::MAX,
+            min_enforce_rev: u64::MAX,
+            digest: String::new(),
+            direct_grants: Vec::new(),
+            click_eligible: Vec::new(),
+            is_billing_waived: false,
+            caller_age_verified: false,
+            caller_terms_accepted: false,
+            exp: u64::MAX,
+        };
+        let started = std::time::Instant::now();
+        match tokio::time::timeout(
+            POLICY_STARTUP_WARMUP_TIMEOUT,
+            policy_store.resolve_for_assertion_with(&probe, |_| {
+                unreachable!("probe assertion has empty digest and can never match")
+            }),
+        )
+        .await
+        {
+            Ok(_) => {
+                tracing::debug!(
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "managed policy endpoint pre-warm completed"
+                );
+            }
+            Err(_) => {
+                tracing::debug!(
+                    timeout_ms = POLICY_STARTUP_WARMUP_TIMEOUT.as_millis(),
+                    "managed policy endpoint pre-warm timed out; continuing startup"
+                );
+            }
+        }
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let startup_t0 = std::time::Instant::now();
     // Load `.env` (e.g. Cloud Run secret mounted at `/app/.env`) before reading
     // `RUST_LOG` or validating Managed Mode env vars like `SITE_SECRET`.
     // Existing process environment variables always take precedence over `.env`.
@@ -161,19 +216,43 @@ async fn main() -> anyhow::Result<()> {
     let mut leptos_options = conf.leptos_options;
     leptos_options.site_addr = format!("{}:{}", args.host, args.port).parse()?;
 
-    let engine = Arc::new(
-        search_engine::Engine::new(
-            args.clip_text_model.as_ref(),
-            args.tokenizer.as_ref(),
-            args.dinov3_model.as_ref(),
-            args.idle_timeout.map(Duration::from_secs),
-        )
-        .await?,
-    );
-    tracing::info!(mode = runtime.mode.as_str(), "search engine loaded");
+    // In Managed Mode, construct `PolicyStore` and start non-blocking HTTP/TLS pre-warm
+    // BEFORE `Engine::new` so it overlaps with DB pool connect and tokenizer loading.
+    let managed_policy_store = if runtime.mode == DeploymentMode::Managed {
+        let sync_cfg = runtime
+            .managed_policy_sync
+            .clone()
+            .expect("managed mode requires policy sync config");
+        let store = Arc::new(PolicyStore::managed(sync_cfg)?);
+        let _warmup_task = spawn_managed_policy_warmup(Arc::clone(&store));
+        Some(store)
+    } else {
+        None
+    };
 
-    let policy_store = match runtime.mode {
-        DeploymentMode::Standalone => {
+    // Overlap `Engine::new` (DB connect + tokenizer load) with Leptos route list generation.
+    let engine_fut = search_engine::Engine::new(
+        args.clip_text_model.as_ref(),
+        args.tokenizer.as_ref(),
+        args.dinov3_model.as_ref(),
+        args.idle_timeout.map(Duration::from_secs),
+    );
+    let routes_fut = async {
+        tokio::task::spawn_blocking(|| generate_route_list(App))
+            .await
+            .context("failed generating Leptos route list")
+    };
+    let (engine, routes) = tokio::try_join!(engine_fut, routes_fut)?;
+    let engine = Arc::new(engine);
+    tracing::info!(
+        mode = runtime.mode.as_str(),
+        elapsed_ms = startup_t0.elapsed().as_millis(),
+        "search engine loaded"
+    );
+
+    let policy_store = match managed_policy_store {
+        Some(store) => store,
+        None => {
             let compiled = if let Some(path) = runtime.standalone_policy_file.as_ref() {
                 let raw = std::fs::read_to_string(path).with_context(|| {
                     format!("failed reading --policy-file {}", path.display())
@@ -196,13 +275,6 @@ async fn main() -> anyhow::Result<()> {
             };
             Arc::new(PolicyStore::standalone(compiled))
         }
-        DeploymentMode::Managed => {
-            let sync_cfg = runtime
-                .managed_policy_sync
-                .clone()
-                .expect("managed mode requires policy sync config");
-            Arc::new(PolicyStore::managed(sync_cfg)?)
-        }
     };
 
     let app_state = AppState {
@@ -218,7 +290,6 @@ async fn main() -> anyhow::Result<()> {
         internal_api_secret: runtime.internal_api_secret.map(Arc::new),
     };
 
-    let routes = generate_route_list(App);
     let app = build_app_router(
         app_state,
         runtime.serve_media_prefix,
@@ -227,7 +298,11 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let addr = leptos_options.site_addr;
-    tracing::info!(mode = runtime.mode.as_str(), "listening on http://{addr}");
+    tracing::info!(
+        mode = runtime.mode.as_str(),
+        elapsed_ms = startup_t0.elapsed().as_millis(),
+        "listening on http://{addr}"
+    );
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(
         listener,
@@ -1057,5 +1132,79 @@ mod tests {
             .unwrap();
         assert_eq!(non_webp.status(), StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn managed_policy_warmup_touches_endpoint_without_mutating_snapshot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut policy = PublicSitePolicy {
+            revision: 3,
+            min_enforce_rev: 2,
+            ..PublicSitePolicy::default()
+        };
+        policy.refresh_policy_digest();
+        let body = serde_json::json!({
+            "policy": policy,
+            "digest": compute_policy_digest(&policy),
+        })
+        .to_string();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_srv = Arc::clone(&hits);
+        let router = Router::new().route(
+            "/policy",
+            get(move || {
+                let hits = Arc::clone(&hits_for_srv);
+                let body = body.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    ([("content-type", "application/json")], body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let store = Arc::new(
+            PolicyStore::managed(PolicySyncConfig {
+                policy_url: format!("http://{addr}/policy"),
+                cf_access_client_id: None,
+                cf_access_client_secret: None,
+                max_staleness: Duration::from_secs(60),
+            })
+            .unwrap(),
+        );
+
+        spawn_managed_policy_warmup(Arc::clone(&store))
+            .await
+            .expect("warmup task should not panic");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // Snapshot MUST remain uninitialized/fail-closed after probe warmup, while a real
+        // matching assertion succeeds cleanly on the warm HTTP client.
+        let engine = test_engine();
+        let real_assertion = GatewayAssertion {
+            v: GATEWAY_ASSERTION_VERSION,
+            aud: GATEWAY_ASSERTION_AUDIENCE.to_string(),
+            actor: ActorBinding::Anon,
+            rev: policy.revision,
+            min_enforce_rev: policy.min_enforce_rev,
+            digest: compute_policy_digest(&policy),
+            direct_grants: vec![],
+            click_eligible: vec![],
+            is_billing_waived: false,
+            caller_age_verified: false,
+            caller_terms_accepted: false,
+            exp: now_secs() + 30,
+        };
+        let compiled = store
+            .resolve_for_assertion(&real_assertion, &engine)
+            .await
+            .expect("real assertion sync succeeds after warmup");
+        assert_eq!(compiled.policy.revision, 3);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 }

@@ -58,13 +58,15 @@ use crate::auth::{
 use crate::http_util::{
     CookieLookup, GALLERY_ALLOWED_METHODS, MAX_ADMIN_BODY_BYTES, MAX_GATEWAY_BODY_BYTES,
     MAX_REVEAL_BODY_BYTES, MEDIA_ALLOWED_METHODS, USER_ALLOWED_METHODS, Upstreams, browse_route,
-    build_api_upstream_target, build_sitemap_cache_key, cache_control_allows_edge_cache,
-    checked_gallery_method, checked_media_method, checked_user_method, extract_single_cookie,
-    guest_id, has_reveal_csrf_header, if_none_match_matches, is_always_public_path,
-    is_canonical_path, is_hop_by_hop, is_https_request, is_public_cacheable_path, is_same_origin,
-    is_segment_prefix, is_sitemap_path, login_response, metered_item, method_not_allowed,
-    payment_required, private_no_store, request_host, sanitize_origin_cookie,
-    sanitize_user_worker_cookie, should_strip_api_request_header, strip_cf_access_set_cookies,
+    build_api_healthz_target, build_api_upstream_target, build_sitemap_cache_key,
+    cache_control_allows_edge_cache, checked_gallery_method, checked_media_method,
+    checked_user_method, extract_single_cookie, guest_id, has_reveal_csrf_header,
+    if_none_match_matches, is_always_public_path, is_canonical_path, is_hop_by_hop,
+    is_https_request, is_public_cacheable_path, is_same_origin, is_segment_prefix,
+    is_sitemap_path, is_transient_cold_start_status, login_response, metered_item,
+    method_not_allowed, payment_required, private_no_store, request_host, sanitize_origin_cookie,
+    sanitize_user_worker_cookie, should_serve_waking_interstitial, should_strip_api_request_header,
+    strip_cf_access_set_cookies, waking_interstitial_response,
 };
 use crate::media::{
     PreviewBlurConfig, PreviewBudgetReq, build_facts_rev_target, build_media_upstream_target,
@@ -171,6 +173,16 @@ const MAX_CACHED_SITEMAP_BYTES: usize = 16 * 1024 * 1024;
 /// Internal header preserving the origin's client-facing `Cache-Control` while the
 /// Workers Cache API stores the entry with `public, max-age=300` for edge TTL.
 const SITEMAP_CACHE_CLIENT_CC_HEADER: &str = "x-gw-client-cache-control";
+/// Edge wait budget (ms) before serving the 503 waking interstitial to interactive
+/// browser HTML navigations while GCP Cloud Run cold-starts.
+const COLD_START_TIMEOUT_MS: u64 = 2_000;
+/// Per-poll timeout (ms) for `/_gw/ready` probing `{API_UPSTREAM}/healthz`.
+const READY_PROBE_TIMEOUT_MS: u64 = 3_500;
+
+enum UpstreamFetchOutcome {
+    Response(Response),
+    TimedOut,
+}
 
 #[derive(Debug, Clone)]
 struct CachedSitemapEntry {
@@ -263,6 +275,12 @@ trait GatewayBackend {
         &self,
         req: UpstreamFetchReq,
     ) -> std::result::Result<Response, BackendError>;
+    async fn fetch_upstream_with_timeout(
+        &self,
+        req: UpstreamFetchReq,
+        timeout_ms: u64,
+    ) -> std::result::Result<UpstreamFetchOutcome, BackendError>;
+    fn spawn_origin_wakeup(&self, req: UpstreamFetchReq);
     async fn fetch_facts_rev(
         &self,
         req: UpstreamFetchReq,
@@ -531,6 +549,42 @@ impl GatewayBackend for WorkerBackend<'_> {
         let worker_req = build_worker_upstream_request(req)?;
         let resp = Fetch::Request(worker_req).send().await?;
         Ok(Response::from(resp))
+    }
+
+    async fn fetch_upstream_with_timeout(
+        &self,
+        req: UpstreamFetchReq,
+        timeout_ms: u64,
+    ) -> std::result::Result<UpstreamFetchOutcome, BackendError> {
+        let worker_req = build_worker_upstream_request(req)?;
+        let controller = worker::AbortController::default();
+        let signal = controller.signal();
+        let fetch = Fetch::Request(worker_req);
+        let fetch_fut = std::pin::pin!(fetch.send_with_signal(&signal));
+        let delay_fut = std::pin::pin!(worker::Delay::from(std::time::Duration::from_millis(
+            timeout_ms
+        )));
+        match futures::future::select(fetch_fut, delay_fut).await {
+            futures::future::Either::Left((res, _)) => {
+                let resp = res?;
+                Ok(UpstreamFetchOutcome::Response(Response::from(resp)))
+            }
+            futures::future::Either::Right(((), _)) => {
+                controller.abort();
+                Ok(UpstreamFetchOutcome::TimedOut)
+            }
+        }
+    }
+
+    fn spawn_origin_wakeup(&self, req: UpstreamFetchReq) {
+        let Ok(worker_req) = build_worker_upstream_request(req) else {
+            return;
+        };
+        self.ctx.wait_until(async move {
+            if let Err(err) = Fetch::Request(worker_req).send().await {
+                worker::console_error!("origin wakeup /healthz failed: {err:?}");
+            }
+        });
     }
 
     async fn fetch_facts_rev(
@@ -1013,6 +1067,69 @@ fn assertion_sign_error_response() -> Response {
     )
 }
 
+fn build_healthz_request(cfg: &GatewayConfig) -> Option<UpstreamFetchReq> {
+    let url = build_api_healthz_target(&cfg.upstreams).ok()?;
+    let mut headers = Vec::with_capacity(3);
+    headers.push(("accept".to_string(), "text/plain".to_string()));
+    append_cf_access_service_headers(&mut headers, cfg);
+    Some(UpstreamFetchReq {
+        url,
+        method: worker::Method::Get,
+        headers,
+        body: Bytes::new(),
+        no_cache: true,
+        preview_blur: None,
+    })
+}
+
+fn trigger_origin_wakeup(backend: &impl GatewayBackend, cfg: &GatewayConfig) {
+    if let Some(req) = build_healthz_request(cfg) {
+        backend.spawn_origin_wakeup(req);
+    }
+}
+
+async fn handle_ready_probe(
+    backend: &impl GatewayBackend,
+    cfg: &GatewayConfig,
+    is_head: bool,
+) -> Response {
+    let ready = match build_healthz_request(cfg) {
+        Some(req) => match backend
+            .fetch_upstream_with_timeout(req, READY_PROBE_TIMEOUT_MS)
+            .await
+        {
+            Ok(UpstreamFetchOutcome::Response(resp)) => resp.status() == StatusCode::OK,
+            Ok(UpstreamFetchOutcome::TimedOut) => false,
+            Err(err) => {
+                log_backend_error("origin /healthz readiness probe failed", &err);
+                false
+            }
+        },
+        None => false,
+    };
+
+    let (status, json_body) = if ready {
+        (StatusCode::OK, r#"{"ready":true}"#)
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, r#"{"ready":false}"#)
+    };
+
+    let mut resp = if is_head {
+        (status, Bytes::new()).into_response()
+    } else {
+        (status, json_body).into_response()
+    };
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    if let Ok(len) = HeaderValue::from_str(&json_body.len().to_string()) {
+        h.insert(header::CONTENT_LENGTH, len);
+    }
+    private_no_store(resp)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_api(
     backend: &impl GatewayBackend,
@@ -1023,6 +1140,7 @@ async fn proxy_to_api(
     body: Bytes,
     signed_assertion: &str,
     allow_public_cache: bool,
+    allow_waking_interstitial: bool,
 ) -> Response {
     let Ok(target_url) = build_api_upstream_target(uri, &cfg.upstreams) else {
         return private_no_store((StatusCode::BAD_REQUEST, "invalid request URI").into_response());
@@ -1042,9 +1160,23 @@ async fn proxy_to_api(
         no_cache: !allow_public_cache,
         preview_blur: None,
     };
-    match backend.fetch_upstream(req).await {
-        Ok(mut resp) => {
+    let outcome = if allow_waking_interstitial {
+        backend
+            .fetch_upstream_with_timeout(req, COLD_START_TIMEOUT_MS)
+            .await
+    } else {
+        backend
+            .fetch_upstream(req)
+            .await
+            .map(UpstreamFetchOutcome::Response)
+    };
+    match outcome {
+        Ok(UpstreamFetchOutcome::Response(mut resp)) => {
             strip_cf_access_set_cookies(resp.headers_mut());
+            if allow_waking_interstitial && is_transient_cold_start_status(resp.status()) {
+                trigger_origin_wakeup(backend, cfg);
+                return waking_interstitial_response();
+            }
             if allow_public_cache
                 && (resp.status().is_success() || resp.status() == StatusCode::NOT_MODIFIED)
                 && !resp.headers().contains_key("set-cookie")
@@ -1054,9 +1186,18 @@ async fn proxy_to_api(
                 private_no_store(resp)
             }
         }
+        Ok(UpstreamFetchOutcome::TimedOut) => {
+            trigger_origin_wakeup(backend, cfg);
+            waking_interstitial_response()
+        }
         Err(err) => {
             log_backend_error("upstream API fetch failed", &err);
-            private_no_store((StatusCode::BAD_GATEWAY, "upstream fetch failed").into_response())
+            if allow_waking_interstitial {
+                trigger_origin_wakeup(backend, cfg);
+                waking_interstitial_response()
+            } else {
+                private_no_store((StatusCode::BAD_GATEWAY, "upstream fetch failed").into_response())
+            }
         }
     }
 }
@@ -1730,6 +1871,9 @@ async fn forward_gallery_request(
         return assertion_sign_error_response();
     };
 
+    let allow_waking_interstitial = worker_method == worker::Method::Get
+        && should_serve_waking_interstitial(&Method::GET, uri.path(), headers);
+
     let mut resp = proxy_to_api(
         backend,
         cfg,
@@ -1739,6 +1883,7 @@ async fn forward_gallery_request(
         body,
         &signed_assertion,
         allow_public_cache && minted_guest_cookie.is_none(),
+        allow_waking_interstitial,
     )
     .await;
 
@@ -1867,6 +2012,17 @@ async fn handle_gateway_request(
         );
     }
 
+    // Edge origin readiness endpoint polled by the 503 waking interstitial.
+    // Runs after canonical path + Step 0 geo checks and before auth so public
+    // legal pages also work when `login_required=true`, while exposing only a
+    // boolean readiness bit from `{API_UPSTREAM}/healthz`.
+    if path == "/_gw/ready" {
+        if !matches!(method, Method::GET | Method::HEAD) {
+            return method_not_allowed("GET, HEAD");
+        }
+        return handle_ready_probe(backend, cfg, method == Method::HEAD).await;
+    }
+
     // `/user/admin` & `/user/admin/*` retired unconditionally -> 404.
     if is_segment_prefix(path, "/user") {
         if is_segment_prefix(path, "/user/admin") {
@@ -1968,6 +2124,7 @@ async fn handle_gateway_request(
             return assertion_sign_error_response();
         };
         let allow_public_cache = is_public_cacheable_path(path, true);
+        let allow_waking_interstitial = should_serve_waking_interstitial(&method, path, &headers);
         return proxy_to_api(
             backend,
             cfg,
@@ -1977,6 +2134,7 @@ async fn handle_gateway_request(
             body,
             &signed,
             allow_public_cache,
+            allow_waking_interstitial,
         )
         .await;
     }
@@ -2155,6 +2313,7 @@ async fn handle_gateway_request(
                     body,
                     &signed_assertion,
                     false,
+                    false,
                 )
                 .await;
                 // Never forward an upstream 3xx response (and its body) alongside a
@@ -2304,7 +2463,8 @@ mod tests {
     use super::*;
     use crate::auth::ResolvedGatewaySecrets;
     use crate::http_util::{
-        MeterError, form_field, parse_upstream_origin, require_form_urlencoded, sha256_hex,
+        MeterError, form_field, is_crawler_user_agent, is_html_navigation,
+        is_waking_interstitial_path, parse_upstream_origin, require_form_urlencoded, sha256_hex,
     };
     use crate::media::{LOCKED_PREVIEW_BLUR, encode_canonical_cap_path};
 
@@ -2455,11 +2615,18 @@ mod tests {
         upstream_set_cookie: Option<&'static str>,
         upstream_set_cookies: Vec<&'static str>,
         upstream_cf_resized: Option<&'static str>,
+        upstream_error: Option<&'static str>,
+        upstream_timed_out: bool,
+        healthz_status: Option<StatusCode>,
+        healthz_timed_out: bool,
+        healthz_error: Option<&'static str>,
         sitemap_cache: RefCell<HashMap<String, CachedSitemapEntry>>,
         account_calls: RefCell<Vec<RecordedAccountCall>>,
         session_calls: RefCell<Vec<(String, Option<String>)>>,
         service_calls: RefCell<Vec<RecordedServiceCall>>,
         upstream_calls: RefCell<Vec<RecordedUpstreamCall>>,
+        timeout_calls: RefCell<Vec<(String, u64)>>,
+        wakeup_calls: RefCell<Vec<RecordedUpstreamCall>>,
     }
 
     impl MockBackend {
@@ -2486,11 +2653,18 @@ mod tests {
                 upstream_set_cookie: None,
                 upstream_set_cookies: Vec::new(),
                 upstream_cf_resized: Some("internal=ok/q=30 t=0.05"),
+                upstream_error: None,
+                upstream_timed_out: false,
+                healthz_status: None,
+                healthz_timed_out: false,
+                healthz_error: None,
                 sitemap_cache: RefCell::new(HashMap::new()),
                 account_calls: RefCell::new(Vec::new()),
                 session_calls: RefCell::new(Vec::new()),
                 service_calls: RefCell::new(Vec::new()),
                 upstream_calls: RefCell::new(Vec::new()),
+                timeout_calls: RefCell::new(Vec::new()),
+                wakeup_calls: RefCell::new(Vec::new()),
             }
         }
     }
@@ -2604,6 +2778,9 @@ mod tests {
                 no_cache: req.no_cache,
                 preview_blur: req.preview_blur,
             });
+            if let Some(err) = self.upstream_error {
+                return Err(BackendError(err.to_string()));
+            }
             let mut resp = (self.upstream_status, self.upstream_body).into_response();
             if let Some(ct) = self.upstream_content_type {
                 resp.headers_mut()
@@ -2631,6 +2808,60 @@ mod tests {
                     .insert("cf-resized", cf_resized.parse().unwrap());
             }
             Ok(resp)
+        }
+
+        async fn fetch_upstream_with_timeout(
+            &self,
+            req: UpstreamFetchReq,
+            timeout_ms: u64,
+        ) -> std::result::Result<UpstreamFetchOutcome, BackendError> {
+            let url_str = req.url.to_string();
+            let is_healthz = req.url.path() == "/healthz";
+            self.timeout_calls.borrow_mut().push((url_str.clone(), timeout_ms));
+            if is_healthz {
+                self.upstream_calls.borrow_mut().push(RecordedUpstreamCall {
+                    url: url_str,
+                    method: req.method,
+                    headers: req.headers,
+                    no_cache: req.no_cache,
+                    preview_blur: req.preview_blur,
+                });
+                if self.healthz_timed_out {
+                    return Ok(UpstreamFetchOutcome::TimedOut);
+                }
+                if let Some(err) = self.healthz_error {
+                    return Err(BackendError(err.to_string()));
+                }
+                let status = self.healthz_status.unwrap_or(self.upstream_status);
+                let mut resp = (status, "ok").into_response();
+                if let Some(sc) = self.upstream_set_cookie {
+                    resp.headers_mut().append("set-cookie", sc.parse().unwrap());
+                }
+                return Ok(UpstreamFetchOutcome::Response(resp));
+            }
+            if self.upstream_timed_out {
+                self.upstream_calls.borrow_mut().push(RecordedUpstreamCall {
+                    url: url_str,
+                    method: req.method,
+                    headers: req.headers,
+                    no_cache: req.no_cache,
+                    preview_blur: req.preview_blur,
+                });
+                return Ok(UpstreamFetchOutcome::TimedOut);
+            }
+            self.fetch_upstream(req)
+                .await
+                .map(UpstreamFetchOutcome::Response)
+        }
+
+        fn spawn_origin_wakeup(&self, req: UpstreamFetchReq) {
+            self.wakeup_calls.borrow_mut().push(RecordedUpstreamCall {
+                url: req.url.to_string(),
+                method: req.method,
+                headers: req.headers,
+                no_cache: req.no_cache,
+                preview_blur: req.preview_blur,
+            });
         }
 
         async fn fetch_facts_rev(
@@ -5116,5 +5347,530 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("out of points")
         );
+    }
+
+    #[test]
+    fn cold_start_waking_interstitial_helpers_gate_strictly() {
+        // Path allowlist: only interactive gallery & legal HTML routes.
+        for allowed in [
+            "/",
+            "/details/42",
+            "/details/post/99",
+            "/terms",
+            "/privacy",
+            "/dmca",
+            "/content-policy",
+        ] {
+            assert!(
+                is_waking_interstitial_path(allowed),
+                "expected waking path: {allowed}"
+            );
+        }
+        for denied in [
+            "/details",
+            "/details/",
+            "/api/search_by_desc",
+            "/api/site_config",
+            "/media/image/42",
+            "/pkg/lets-embed-web.js",
+            "/robots.txt",
+            "/favicon.ico",
+            "/sitemap.xml",
+            "/sitemap/1.xml",
+            "/user/login",
+            "/admin",
+            "/_gw/ready",
+        ] {
+            assert!(
+                !is_waking_interstitial_path(denied),
+                "unexpected waking path: {denied}"
+            );
+        }
+
+        // HTML navigation detection: Sec-Fetch-* takes precedence over Accept.
+        let mut nav = HeaderMap::new();
+        nav.insert("sec-fetch-mode", "navigate".parse().unwrap());
+        assert!(is_html_navigation(&nav));
+
+        let mut xhr_with_html_accept = HeaderMap::new();
+        xhr_with_html_accept.insert("sec-fetch-mode", "cors".parse().unwrap());
+        xhr_with_html_accept.insert("sec-fetch-dest", "empty".parse().unwrap());
+        xhr_with_html_accept.insert("accept", "text/html,application/json".parse().unwrap());
+        assert!(!is_html_navigation(&xhr_with_html_accept));
+
+        let mut accept_html = HeaderMap::new();
+        accept_html.insert(
+            "accept",
+            "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
+                .parse()
+                .unwrap(),
+        );
+        assert!(is_html_navigation(&accept_html));
+
+        let mut accept_zero_q = HeaderMap::new();
+        accept_zero_q.insert("accept", "text/html;q=0, application/json".parse().unwrap());
+        assert!(!is_html_navigation(&accept_zero_q));
+
+        // Crawler UA exclusion (all known bots, case-insensitive).
+        for bot in [
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+            "Mozilla/5.0 (compatible; bingbot/2.0)",
+            "Mozilla/5.0 (compatible; Yahoo! Slurp)",
+            "DuckDuckBot/1.0",
+            "Baiduspider/2.0",
+            "YandexBot/3.0",
+            "Twitterbot/1.0",
+            "facebookexternalhit/1.1",
+            "Mozilla/5.0 (compatible; Discordbot/2.0)",
+            "Slackbot-LinkExpanding 1.0",
+        ] {
+            let mut h = accept_html.clone();
+            h.insert("user-agent", bot.parse().unwrap());
+            assert!(is_crawler_user_agent(&h), "expected crawler UA: {bot}");
+            assert!(!should_serve_waking_interstitial(&Method::GET, "/", &h));
+        }
+
+        let mut browser = accept_html.clone();
+        browser.insert(
+            "user-agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36"
+                .parse()
+                .unwrap(),
+        );
+        assert!(!is_crawler_user_agent(&browser));
+        assert!(should_serve_waking_interstitial(&Method::GET, "/", &browser));
+        assert!(!should_serve_waking_interstitial(
+            &Method::HEAD,
+            "/",
+            &browser
+        ));
+        assert!(!should_serve_waking_interstitial(
+            &Method::POST,
+            "/",
+            &browser
+        ));
+    }
+
+    #[test]
+    fn cold_start_waking_interstitial_and_ready_probe_end_to_end() {
+        let html_nav_headers = || {
+            let mut h = HeaderMap::new();
+            h.insert("sec-fetch-mode", "navigate".parse().unwrap());
+            h.insert("sec-fetch-dest", "document".parse().unwrap());
+            h.insert("accept", "text/html,application/xhtml+xml".parse().unwrap());
+            h.insert(
+                "user-agent",
+                "Mozilla/5.0 (X11; Linux x86_64) Chrome/130.0".parse().unwrap(),
+            );
+            h
+        };
+
+        let policy = sample_safety_policy();
+        let cfg = test_cfg();
+        let mut backend = MockBackend::with_policy(policy.clone());
+        backend.upstream_body = "<html><body>Warm Gallery</body></html>";
+
+        // 1. Warm HTML navigation passes through directly with 0 wakeup calls.
+        let warm = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/",
+            html_nav_headers(),
+            Bytes::new(),
+        );
+        assert_eq!(warm.status(), StatusCode::OK);
+        assert!(backend.wakeup_calls.borrow().is_empty());
+        assert_eq!(
+            backend.timeout_calls.borrow().last().unwrap(),
+            &("https://api.gallery.test/".to_string(), COLD_START_TIMEOUT_MS)
+        );
+        let warm_body = block_on(axum::body::to_bytes(warm.into_body(), 4096)).unwrap();
+        assert_eq!(&warm_body[..], b"<html><body>Warm Gallery</body></html>");
+
+        // 2. Cold timeout on `/`, `/details/42`, and `/terms` returns 503 waking HTML
+        //    AND triggers background `/healthz` wakeup with CF-Access headers only.
+        backend.upstream_timed_out = true;
+        for path in ["/", "/details/42", "/terms"] {
+            backend.wakeup_calls.borrow_mut().clear();
+            let resp = dispatch(
+                &backend,
+                &cfg,
+                Method::GET,
+                &format!("https://gallery.test{path}"),
+                html_nav_headers(),
+                Bytes::new(),
+            );
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "expected 503 waking screen on {path}"
+            );
+            assert_eq!(
+                resp.headers().get("content-type").unwrap(),
+                "text/html; charset=utf-8"
+            );
+            assert_eq!(resp.headers().get("retry-after").unwrap(), "3");
+            assert_eq!(
+                resp.headers().get("cache-control").unwrap(),
+                "private, no-store"
+            );
+            assert!(
+                resp.headers().get("content-security-policy").is_none(),
+                "interstitial must not emit a CSP blocking inline style/script"
+            );
+            let body_bytes = block_on(axum::body::to_bytes(resp.into_body(), 65536)).unwrap();
+            let html = std::str::from_utf8(&body_bytes).unwrap();
+            assert!(html.contains("/_gw/ready"));
+            assert!(html.contains(r#"<meta http-equiv="refresh" content="6">"#));
+            assert!(html.contains("Retry now"));
+
+            let wakeups = backend.wakeup_calls.borrow();
+            assert_eq!(wakeups.len(), 1, "expected 1 wakeup call on {path}");
+            assert_eq!(wakeups[0].url, "https://api.gallery.test/healthz");
+            assert_eq!(wakeups[0].method, worker::Method::Get);
+            assert!(wakeups[0].no_cache);
+            assert!(
+                wakeups[0]
+                    .headers
+                    .iter()
+                    .any(|(k, v)| k == "CF-Access-Client-Id" && v == "svc-id")
+            );
+            assert!(
+                wakeups[0]
+                    .headers
+                    .iter()
+                    .any(|(k, v)| k == "CF-Access-Client-Secret" && v == "svc-secret")
+            );
+            assert!(
+                !wakeups[0]
+                    .headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case(GATEWAY_ASSERTION_HEADER)
+                        || k.eq_ignore_ascii_case("cookie"))
+            );
+        }
+
+        // 3. Stale session cookie is STILL cleared on a 503 waking interstitial response.
+        let mut stale_cookie_headers = html_nav_headers();
+        stale_cookie_headers.insert(
+            "cookie",
+            format!("{SESSION_COOKIE}=invalid.token").parse().unwrap(),
+        );
+        let stale_resp = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/",
+            stale_cookie_headers,
+            Bytes::new(),
+        );
+        assert_eq!(stale_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            stale_resp
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .any(|v| v.to_str().unwrap_or("").contains("Max-Age=0"))
+        );
+
+        // 4. Transient upstream 502 / 503 / 504 and BackendError also serve waking screen.
+        backend.upstream_timed_out = false;
+        for status in [
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            backend.wakeup_calls.borrow_mut().clear();
+            backend.upstream_status = status;
+            let resp = dispatch(
+                &backend,
+                &cfg,
+                Method::GET,
+                "https://gallery.test/",
+                html_nav_headers(),
+                Bytes::new(),
+            );
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                resp.headers().get("content-type").unwrap(),
+                "text/html; charset=utf-8"
+            );
+            assert_eq!(backend.wakeup_calls.borrow().len(), 1);
+        }
+        backend.upstream_status = StatusCode::OK;
+        backend.upstream_error = Some("tcp connection reset");
+        backend.wakeup_calls.borrow_mut().clear();
+        let err_nav = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/",
+            html_nav_headers(),
+            Bytes::new(),
+        );
+        assert_eq!(err_nav.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            err_nav.headers().get("content-type").unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(backend.wakeup_calls.borrow().len(), 1);
+
+        // 5. Non-HTML, XHR, crawler UA, HEAD, POST /api/*, /pkg/*, /robots.txt, /sitemap.xml
+        //    NEVER get the waking interstitial.
+        backend.upstream_error = None;
+        backend.upstream_status = StatusCode::BAD_GATEWAY;
+        backend.upstream_body = "origin 502";
+        backend.wakeup_calls.borrow_mut().clear();
+
+        let mut crawler_headers = html_nav_headers();
+        crawler_headers.insert("user-agent", "Googlebot/2.1".parse().unwrap());
+        let crawler_resp = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/",
+            crawler_headers,
+            Bytes::new(),
+        );
+        assert_eq!(crawler_resp.status(), StatusCode::BAD_GATEWAY);
+
+        let mut xhr_headers = HeaderMap::new();
+        xhr_headers.insert("sec-fetch-mode", "cors".parse().unwrap());
+        xhr_headers.insert("sec-fetch-dest", "empty".parse().unwrap());
+        xhr_headers.insert("accept", "text/html".parse().unwrap());
+        let xhr_resp = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/",
+            xhr_headers,
+            Bytes::new(),
+        );
+        assert_eq!(xhr_resp.status(), StatusCode::BAD_GATEWAY);
+
+        let head_resp = dispatch(
+            &backend,
+            &cfg,
+            Method::HEAD,
+            "https://gallery.test/",
+            html_nav_headers(),
+            Bytes::new(),
+        );
+        assert_eq!(head_resp.status(), StatusCode::BAD_GATEWAY);
+
+        for non_interstitial in ["/pkg/app.js", "/robots.txt", "/sitemap.xml"] {
+            let resp = dispatch(
+                &backend,
+                &cfg,
+                Method::GET,
+                &format!("https://gallery.test{non_interstitial}"),
+                html_nav_headers(),
+                Bytes::new(),
+            );
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_GATEWAY,
+                "{non_interstitial} must bypass waking interstitial"
+            );
+        }
+
+        let mut post_headers = form_headers();
+        post_headers.insert("origin", "https://gallery.test".parse().unwrap());
+        post_headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        post_headers.insert("accept", "text/html".parse().unwrap());
+        let post_resp = dispatch(
+            &backend,
+            &cfg,
+            Method::POST,
+            "https://gallery.test/api/search_by_desc",
+            post_headers,
+            Bytes::from_static(b"q=sky"),
+        );
+        assert_eq!(post_resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(backend.wakeup_calls.borrow().is_empty());
+
+        // 6. Precedence: Step 0 geo-block (451), banned user (403), and login_required (303)
+        //    ALL run BEFORE upstream / waking screen (0 upstream & 0 wakeup calls).
+        backend.upstream_timed_out = true;
+        backend.upstream_calls.borrow_mut().clear();
+        backend.wakeup_calls.borrow_mut().clear();
+
+        let mut geo_cfg = test_cfg();
+        geo_cfg.visitor_country = Some("KP".to_string());
+        let geo_home = dispatch(
+            &backend,
+            &geo_cfg,
+            Method::GET,
+            "https://gallery.test/",
+            html_nav_headers(),
+            Bytes::new(),
+        );
+        assert_eq!(geo_home.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        let geo_ready = dispatch(
+            &backend,
+            &geo_cfg,
+            Method::GET,
+            "https://gallery.test/_gw/ready",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(
+            geo_ready.status(),
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS
+        );
+        assert!(backend.upstream_calls.borrow().is_empty());
+        assert!(backend.wakeup_calls.borrow().is_empty());
+
+        // login_required (guest DO returns 401) redirects 303 -> /user/login before waking screen.
+        backend.account_statuses.insert("guest".to_string(), 401);
+        let login_redir = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/",
+            html_nav_headers(),
+            Bytes::new(),
+        );
+        assert_eq!(login_redir.status(), StatusCode::SEE_OTHER);
+        assert!(
+            login_redir
+                .headers()
+                .get("location")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("/user/login?")
+        );
+        assert!(backend.upstream_calls.borrow().is_empty());
+        assert!(backend.wakeup_calls.borrow().is_empty());
+
+        // 7. `/_gw/ready` endpoint: works even while `login_required = true`,
+        //    rejects POST with 405, strips upstream Set-Cookie, and never leaks errors.
+        backend.account_calls.borrow_mut().clear();
+        backend.upstream_calls.borrow_mut().clear();
+        backend.timeout_calls.borrow_mut().clear();
+        backend.upstream_set_cookie = Some("CF_Authorization=secret-jwt; Path=/; Secure");
+        backend.healthz_status = Some(StatusCode::OK);
+
+        let ready_post = dispatch(
+            &backend,
+            &cfg,
+            Method::POST,
+            "https://gallery.test/_gw/ready",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(ready_post.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(ready_post.headers().get("allow").unwrap(), "GET, HEAD");
+        assert!(backend.upstream_calls.borrow().is_empty());
+
+        let ready_ok = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/_gw/ready",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(ready_ok.status(), StatusCode::OK);
+        assert_eq!(
+            ready_ok.headers().get("cache-control").unwrap(),
+            "private, no-store"
+        );
+        assert_eq!(
+            ready_ok.headers().get("content-type").unwrap(),
+            "application/json; charset=utf-8"
+        );
+        assert!(ready_ok.headers().get("set-cookie").is_none());
+        let ok_body = block_on(axum::body::to_bytes(ready_ok.into_body(), 1024)).unwrap();
+        assert_eq!(&ok_body[..], br#"{"ready":true}"#);
+        assert!(backend.account_calls.borrow().is_empty());
+        assert_eq!(
+            backend.timeout_calls.borrow().last().unwrap(),
+            &(
+                "https://api.gallery.test/healthz".to_string(),
+                READY_PROBE_TIMEOUT_MS
+            )
+        );
+        let probe_call = backend.upstream_calls.borrow().last().unwrap().clone();
+        assert_eq!(probe_call.url, "https://api.gallery.test/healthz");
+        assert!(
+            probe_call
+                .headers
+                .iter()
+                .any(|(k, v)| k == "CF-Access-Client-Id" && v == "svc-id")
+        );
+        assert!(
+            probe_call
+                .headers
+                .iter()
+                .any(|(k, v)| k == "CF-Access-Client-Secret" && v == "svc-secret")
+        );
+        assert!(
+            !probe_call
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case(GATEWAY_ASSERTION_HEADER)
+                    || k.eq_ignore_ascii_case("cookie"))
+        );
+
+        let ready_head = dispatch(
+            &backend,
+            &cfg,
+            Method::HEAD,
+            "https://gallery.test/_gw/ready",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(ready_head.status(), StatusCode::OK);
+        assert_eq!(
+            ready_head.headers().get("content-length").unwrap(),
+            &br#"{"ready":true}"#.len().to_string()
+        );
+        let head_body = block_on(axum::body::to_bytes(ready_head.into_body(), 1024)).unwrap();
+        assert!(head_body.is_empty());
+
+        // Non-200, timeout, and BackendError on `/healthz` all return 503 `{"ready":false}`.
+        backend.healthz_status = Some(StatusCode::SERVICE_UNAVAILABLE);
+        let ready_503 = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/_gw/ready",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(ready_503.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body_503 = block_on(axum::body::to_bytes(ready_503.into_body(), 1024)).unwrap();
+        assert_eq!(&body_503[..], br#"{"ready":false}"#);
+
+        backend.healthz_status = Some(StatusCode::OK);
+        backend.healthz_timed_out = true;
+        let ready_timeout = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/_gw/ready",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(ready_timeout.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body_to = block_on(axum::body::to_bytes(ready_timeout.into_body(), 1024)).unwrap();
+        assert_eq!(&body_to[..], br#"{"ready":false}"#);
+
+        backend.healthz_timed_out = false;
+        backend.healthz_error = Some("secret-internal-host-error");
+        let ready_err = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/_gw/ready",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(ready_err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body_err = block_on(axum::body::to_bytes(ready_err.into_body(), 1024)).unwrap();
+        assert_eq!(&body_err[..], br#"{"ready":false}"#);
     }
 }

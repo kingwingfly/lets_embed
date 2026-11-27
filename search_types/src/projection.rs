@@ -227,6 +227,25 @@ pub enum ProjectedImage {
     },
 }
 
+fn extract_clear_name(name: Option<&String>) -> Option<&str> {
+    name.map(|s| s.trim()).filter(|s| !s.is_empty())
+}
+
+fn extract_display_name(name: Option<&String>) -> Option<&str> {
+    let trimmed = extract_clear_name(name)?;
+    match trimmed.rsplit_once('/') {
+        Some((_, tail)) => {
+            let tail = tail.trim();
+            if tail.is_empty() {
+                Some(trimmed)
+            } else {
+                Some(tail)
+            }
+        }
+        None => Some(trimmed),
+    }
+}
+
 impl ProjectedImage {
     pub const fn id(&self) -> i64 {
         match self {
@@ -260,6 +279,25 @@ impl ProjectedImage {
 
     pub const fn is_placeholder(&self) -> bool {
         matches!(self, Self::Placeholder { .. })
+    }
+
+    /// Returns the trimmed canonical name when `Clear` has a non-empty `name`,
+    /// or `None` for empty/missing names, `Blurred`, and `Placeholder`.
+    pub fn clear_name(&self) -> Option<&str> {
+        match self {
+            Self::Clear { name, .. } => extract_clear_name(name.as_ref()),
+            Self::Blurred { .. } | Self::Placeholder { .. } => None,
+        }
+    }
+
+    /// Returns the display basename (the trimmed segment after the last `/`,
+    /// falling back to the full trimmed name) when `Clear` has a non-empty `name`,
+    /// or `None` for empty/missing names, `Blurred`, and `Placeholder`.
+    pub fn display_name(&self) -> Option<&str> {
+        match self {
+            Self::Clear { name, .. } => extract_display_name(name.as_ref()),
+            Self::Blurred { .. } | Self::Placeholder { .. } => None,
+        }
     }
 
     /// Returns `true` when the item is either `Clear` or restricted ONLY by
@@ -361,6 +399,25 @@ impl ProjectedVideo {
 
     pub const fn is_placeholder(&self) -> bool {
         matches!(self, Self::Placeholder { .. })
+    }
+
+    /// Returns the trimmed canonical name when `Clear` has a non-empty `name`,
+    /// or `None` for empty/missing names, `Blurred`, and `Placeholder`.
+    pub fn clear_name(&self) -> Option<&str> {
+        match self {
+            Self::Clear { name, .. } => extract_clear_name(name.as_ref()),
+            Self::Blurred { .. } | Self::Placeholder { .. } => None,
+        }
+    }
+
+    /// Returns the display basename (the trimmed segment after the last `/`,
+    /// falling back to the full trimmed name) when `Clear` has a non-empty `name`,
+    /// or `None` for empty/missing names, `Blurred`, and `Placeholder`.
+    pub fn display_name(&self) -> Option<&str> {
+        match self {
+            Self::Clear { name, .. } => extract_display_name(name.as_ref()),
+            Self::Blurred { .. } | Self::Placeholder { .. } => None,
+        }
     }
 
     /// Returns `true` when the item is either `Clear` or restricted ONLY by
@@ -738,5 +795,125 @@ mod tests {
             },
         };
         assert!(!unclassified.is_bypassable_or_clear());
+    }
+
+    #[test]
+    fn projected_image_and_video_name_helpers_handle_clear_paths_and_restricted_variants() {
+        let mk_img = |name: Option<&str>| ProjectedImage::Clear {
+            id: 1,
+            url: "/media/image/1?cap=mc3.test".to_string(),
+            name: name.map(str::to_string),
+            width: 800,
+            height: 600,
+        };
+        let mk_vid = |name: Option<&str>| ProjectedVideo::Clear {
+            id: 2,
+            url: "/media/video/2?cap=mc3.test".to_string(),
+            name: name.map(str::to_string),
+            width: 1920,
+            height: 1080,
+            duration: 30,
+        };
+
+        // Path with folder prefix -> basename after last `/`
+        let img_nested = mk_img(Some("Title A/by Author - photo 1"));
+        assert_eq!(img_nested.clear_name(), Some("Title A/by Author - photo 1"));
+        assert_eq!(img_nested.display_name(), Some("by Author - photo 1"));
+        let vid_nested = mk_vid(Some("Title A/by Author - photo 1"));
+        assert_eq!(vid_nested.clear_name(), Some("Title A/by Author - photo 1"));
+        assert_eq!(vid_nested.display_name(), Some("by Author - photo 1"));
+
+        // Simple name without `/`
+        let img_simple = mk_img(Some("simple_name"));
+        assert_eq!(img_simple.clear_name(), Some("simple_name"));
+        assert_eq!(img_simple.display_name(), Some("simple_name"));
+        let vid_simple = mk_vid(Some("simple_name"));
+        assert_eq!(vid_simple.clear_name(), Some("simple_name"));
+        assert_eq!(vid_simple.display_name(), Some("simple_name"));
+
+        // Trailing slash -> falls back to full trimmed name
+        let img_dir = mk_img(Some("dir/"));
+        assert_eq!(img_dir.clear_name(), Some("dir/"));
+        assert_eq!(img_dir.display_name(), Some("dir/"));
+        let vid_dir = mk_vid(Some("dir/"));
+        assert_eq!(vid_dir.clear_name(), Some("dir/"));
+        assert_eq!(vid_dir.display_name(), Some("dir/"));
+
+        // Whitespace-only -> None
+        let img_blank = mk_img(Some("   "));
+        assert_eq!(img_blank.clear_name(), None);
+        assert_eq!(img_blank.display_name(), None);
+        let vid_blank = mk_vid(Some("   "));
+        assert_eq!(vid_blank.clear_name(), None);
+        assert_eq!(vid_blank.display_name(), None);
+
+        // None -> None
+        let img_none = mk_img(None);
+        assert_eq!(img_none.clear_name(), None);
+        assert_eq!(img_none.display_name(), None);
+        let vid_none = mk_vid(None);
+        assert_eq!(vid_none.clear_name(), None);
+        assert_eq!(vid_none.display_name(), None);
+
+        // Blurred -> always None
+        let img_blurred = ProjectedImage::Blurred {
+            id: 10,
+            preview_url: Some("/media/preview/10?cap=mc3.test".to_string()),
+            can_click_reveal: true,
+            policy_rev: 1,
+            matched_policy_ids: vec!["sensitive".to_string()],
+            label: "Sensitive".to_string(),
+            preset: PlaceholderPreset::Sensitive,
+            width: 800,
+            height: 600,
+        };
+        assert_eq!(img_blurred.clear_name(), None);
+        assert_eq!(img_blurred.display_name(), None);
+
+        let vid_blurred = ProjectedVideo::Blurred {
+            id: 11,
+            preview_url: None,
+            can_click_reveal: true,
+            policy_rev: 1,
+            matched_policy_ids: vec!["sensitive".to_string()],
+            label: "Sensitive".to_string(),
+            preset: PlaceholderPreset::Sensitive,
+            width: 1920,
+            height: 1080,
+            duration: 15,
+        };
+        assert_eq!(vid_blurred.clear_name(), None);
+        assert_eq!(vid_blurred.display_name(), None);
+
+        // Placeholder -> always None
+        let mask = MaskMetadata {
+            policy_id: "r18".to_string(),
+            matched_policy_ids: vec!["r18".to_string()],
+            label: "NSFW".to_string(),
+            preset: PlaceholderPreset::R18,
+            requires_login: true,
+            requires_age: true,
+            requires_terms: true,
+        };
+        let img_placeholder = ProjectedImage::Placeholder {
+            id: 20,
+            policy_rev: 1,
+            width: 800,
+            height: 600,
+            mask: mask.clone(),
+        };
+        assert_eq!(img_placeholder.clear_name(), None);
+        assert_eq!(img_placeholder.display_name(), None);
+
+        let vid_placeholder = ProjectedVideo::Placeholder {
+            id: 21,
+            policy_rev: 1,
+            width: 1920,
+            height: 1080,
+            duration: 15,
+            mask,
+        };
+        assert_eq!(vid_placeholder.clear_name(), None);
+        assert_eq!(vid_placeholder.display_name(), None);
     }
 }

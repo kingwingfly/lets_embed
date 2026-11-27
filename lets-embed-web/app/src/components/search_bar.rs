@@ -2,8 +2,8 @@ use crate::components::{
     AccountWidget, AdvancedSearchPanel, BackToTop, SelectOption, SelectVariant, SkySelect,
 };
 use crate::types::{
-    DEFAULT_SEARCH_LIMIT, GalleryDensityState, Mode, SafetyUiState, parse_url_limit,
-    parse_url_min_similarity,
+    DEFAULT_SEARCH_LIMIT, GalleryDensityState, Mode, SafetyUiState, SearchStatusState,
+    parse_url_limit, parse_url_min_similarity,
 };
 #[cfg(feature = "hydrate")]
 use js_sys::futures::JsFuture;
@@ -580,6 +580,7 @@ pub fn SearchBar() -> impl IntoView {
     let dropdown_open = move || input_focused.get() && !suggestions.with(Vec::is_empty);
 
     let density = use_context::<GalleryDensityState>().unwrap_or_default().0;
+    let search_busy = use_context::<SearchStatusState>().unwrap_or_default().0;
     let safety = expect_context::<SafetyUiState>();
 
     // Retain cross-tab `BroadcastChannel("lets_embed_safety")` & `storage` invalidation
@@ -881,11 +882,18 @@ pub fn SearchBar() -> impl IntoView {
                             // Primary Search button inside right edge of WoS pill
                             <button
                                 type="submit"
-                                class="web-search-submit-btn shrink-0 m-0.5 bg-gradient-to-r from-sky-400 to-blue-500 text-white text-xs sm:text-sm font-medium
+                                aria-busy=move || search_busy.get().to_string()
+                                class="web-search-submit-btn shrink-0 m-0.5 inline-flex items-center gap-1.5 bg-gradient-to-r from-sky-400 to-blue-500 text-white text-xs sm:text-sm font-medium
                                        rounded-full py-1.5 sm:py-2 px-3.5 sm:px-4 shadow-sm shadow-sky-300/60
                                        hover:from-sky-500 hover:to-blue-600 active:scale-95 transition-all cursor-pointer"
                             >
-                                "Search"
+                                {move || search_busy.get().then(|| view! {
+                                    <span
+                                        class="web-search-spinner inline-block w-3.5 h-3.5 rounded-full border-2 border-white/35 border-t-white animate-spin"
+                                        aria-hidden="true"
+                                    />
+                                })}
+                                <span>{move || if search_busy.get() { "Searching\u{2026}" } else { "Search" }}</span>
                             </button>
 
                             // Autocomplete dropdown anchored to the full pill width
@@ -1147,6 +1155,16 @@ pub fn SearchBar() -> impl IntoView {
                             }
                         })
                 }}
+                {move || search_busy.get().then(|| view! {
+                    <div
+                        class="web-nav-progress"
+                        role="progressbar"
+                        aria-label="Searching gallery"
+                        aria-busy="true"
+                    >
+                        <div class="web-nav-progress-bar" />
+                    </div>
+                })}
             </div>
         </header>
 

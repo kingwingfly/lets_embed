@@ -6,8 +6,9 @@ use crate::{
     components::{BlurredMediaCard, LikeButton, LikeVariant, lightbox::Lightbox, viewer::Viewer},
     types::{
         AdvancedUploads, DEFAULT_SEARCH_LIMIT, GalleryDensity as Density, GalleryDensityState,
-        ImageQuery, Mode, PostItem, SafetyUiState, SearchResponse, UploadedImageSlot,
-        handle_mask_unlock, mask_to_ui, parse_url_limit, parse_url_min_similarity,
+        ImageQuery, Mode, PostItem, SafetyUiState, SearchResponse, SearchStatusState,
+        UploadedImageSlot, handle_mask_unlock, image_card_label, image_card_tooltip,
+        image_display_name, mask_to_ui, parse_url_limit, parse_url_min_similarity,
     },
     util::{public_origin, set_document_title},
 };
@@ -259,10 +260,13 @@ struct GalleryLoadCtx {
     embedded_min_sim: Option<(RwSignal<f32>, RwSignal<bool>)>,
     images: StoredValue<Vec<ProjectedImage>>,
     next_order: StoredValue<usize>,
+    offset: RwSignal<i64>,
     has_more: RwSignal<bool>,
     loading: RwSignal<bool>,
+    querying: RwSignal<bool>,
     loaded_first: RwSignal<bool>,
     error: RwSignal<Option<String>>,
+    last_failed_replace: RwSignal<bool>,
     req_id: StoredValue<u64>,
 }
 
@@ -483,14 +487,27 @@ pub fn Results(
     let offset = RwSignal::new(0i64);
     let has_more = RwSignal::new(true);
     let loading = RwSignal::new(false);
+    let querying = RwSignal::new(false);
     let loaded_first = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
+    let last_failed_replace = RwSignal::new(false);
     let lightbox: RwSignal<Option<PostItem>> = RwSignal::new(None);
     let viewer: RwSignal<Option<usize>> = RwSignal::new(None);
     let images: StoredValue<Vec<ProjectedImage>> = StoredValue::new(Vec::new());
     let next_order: StoredValue<usize> = StoredValue::new(0);
 
     let viewer_open = Memo::new(move |_| viewer.get().is_some());
+
+    // Mirror main gallery querying state into app-root SearchStatusState so SearchBar
+    // can show an indeterminate progress bar and busy Search button indicator.
+    if !embedded && let Some(status) = use_context::<SearchStatusState>() {
+        Effect::new(move |_| {
+            status.0.set(querying.get());
+        });
+        on_cleanup(move || {
+            let _ = status.0.try_set(false);
+        });
+    }
 
     let img_query = expect_context::<ImageQuery>();
     let adv_uploads = expect_context::<AdvancedUploads>();
@@ -509,37 +526,15 @@ pub fn Results(
         embedded_min_sim: embedded.then_some((sim_slider, sim_slider_touched)),
         images,
         next_order,
+        offset,
         has_more,
         loading,
+        querying,
         loaded_first,
         error,
+        last_failed_replace,
         req_id,
     };
-
-    // Invalidation epoch watcher: immediately discard in-flight fetches, close modals, and clear media.
-    if let Some(s) = safety {
-        let last_inv = StoredValue::new(s.invalidation_epoch.get_untracked());
-        Effect::new(move |_| {
-            let cur = s.invalidation_epoch.get();
-            if cur != last_inv.get_value() {
-                last_inv.set_value(cur);
-                req_id.set_value(req_id.get_value().wrapping_add(1));
-                lets_embed_ui::browser::wipe_media_elements_in(None);
-                viewer.set(None);
-                lightbox.set(None);
-                columns.update(|cs| {
-                    cs.iter_mut().for_each(|c| {
-                        c.items.clear();
-                        c.height = 0;
-                    })
-                });
-                images.update_value(|v| v.clear());
-                next_order.set_value(0);
-                offset.set(0);
-                loading.set(false);
-            }
-        });
-    }
 
     let initial_is_default_home = !embedded
         && pathname.with_untracked(|p| p == "/")
@@ -556,7 +551,26 @@ pub fn Results(
                 .ok()
         })
     });
-    let ssr_consumed: StoredValue<bool> = StoredValue::new(false);
+    let ssr_fallback_active = RwSignal::new(initial_is_default_home);
+
+    // Invalidation epoch watcher: immediately discard in-flight fetches, close modals, and clear media.
+    if let Some(s) = safety {
+        let last_inv = StoredValue::new(s.invalidation_epoch.get_untracked());
+        Effect::new(move |_| {
+            let cur = s.invalidation_epoch.get();
+            if cur != last_inv.get_value() {
+                last_inv.set_value(cur);
+                req_id.set_value(req_id.get_value().wrapping_add(1));
+                lets_embed_ui::browser::wipe_media_elements_in(None);
+                ssr_fallback_active.set(false);
+                viewer.set(None);
+                lightbox.set(None);
+                clear_gallery_items(load_ctx);
+                querying.set(false);
+                loading.set(false);
+            }
+        });
+    }
 
     Effect::new(move |_| {
         let p = params.get();
@@ -575,7 +589,7 @@ pub fn Results(
             && p.adv.trim().is_empty()
             && p.limit == DEFAULT_SEARCH_LIMIT;
         if is_default_home
-            && !ssr_consumed.get_value()
+            && ssr_fallback_active.get_untracked()
             && let Some(res) = ssr_home
         {
             match res.get() {
@@ -584,47 +598,35 @@ pub fn Results(
                     return;
                 }
                 Some(Some(resp)) if !resp.posts.is_empty() => {
-                    ssr_consumed.set_value(true);
+                    ssr_fallback_active.set(false);
                     viewer.set(None);
                     lightbox.set(None);
-                    columns.update(|cs| {
-                        cs.iter_mut().for_each(|c| {
-                            c.items.clear();
-                            c.height = 0;
-                        })
-                    });
-                    images.update_value(|v| v.clear());
-                    next_order.set_value(0);
-                    offset.set(0);
                     error.set(None);
-                    apply_page_response(resp, load_ctx);
+                    last_failed_replace.set(false);
+                    apply_page_response(resp, true, load_ctx);
                     loaded_first.set(true);
+                    querying.set(false);
                     loading.set(false);
                     return;
                 }
                 Some(_) => {
-                    ssr_consumed.set_value(true);
+                    ssr_fallback_active.set(false);
                 }
             }
-        } else if ssr_home.is_some() {
-            ssr_consumed.set_value(true);
+        } else if ssr_fallback_active.get_untracked() {
+            ssr_fallback_active.set(false);
         }
 
+        // Stale-while-revalidate: keep previous results visible (dimmed with a top
+        // querying indicator) until the new page-0 response commits atomically.
         viewer.set(None);
         lightbox.set(None);
-        columns.update(|cs| {
-            cs.iter_mut().for_each(|c| {
-                c.items.clear();
-                c.height = 0;
-            })
-        });
-        images.update_value(|v| v.clear());
-        next_order.set_value(0);
-        offset.set(0);
-        has_more.set(true);
-        loaded_first.set(false);
         error.set(None);
-        load_page(0, load_ctx);
+        last_failed_replace.set(false);
+        has_more.set(false);
+        querying.set(true);
+        loading.set(true);
+        load_page(0, true, load_ctx);
     });
 
     let sentinel = NodeRef::<leptos::html::Div>::new();
@@ -639,10 +641,11 @@ pub fn Results(
     Effect::new(move |_| {
         let intersecting = is_intersecting.get();
         let is_loading = loading.get();
+        let is_querying = querying.get();
         let more = has_more.get();
         let first_done = loaded_first.get();
 
-        if intersecting && !is_loading && more && first_done {
+        if intersecting && !is_loading && !is_querying && more && first_done {
             #[cfg(feature = "hydrate")]
             if !sentinel_near_viewport(sentinel) {
                 is_intersecting.set(false);
@@ -651,7 +654,7 @@ pub fn Results(
             let limit = params.with_untracked(|p| p.limit);
             offset.update(|old| *old += limit);
             let next = offset.get_untracked();
-            load_page(next, load_ctx);
+            load_page(next, false, load_ctx);
         }
     });
 
@@ -899,20 +902,37 @@ pub fn Results(
             }
             Item::Image(im) => {
                 let id = im.id();
+                let is_clear = im.is_clear();
+                let is_placeholder = im.is_placeholder();
                 let show_details_link = im.is_bypassable_or_clear();
+                let card_label = image_card_label(&im);
+                let card_tooltip = image_card_tooltip(&im);
+                let zoom_aria = match image_display_name(&im) {
+                    Some(name) => format!("Zoom image: {name}"),
+                    None => format!("Zoom image #{id}"),
+                };
+                let report_label = match image_display_name(&im) {
+                    Some(name) => format!("{name} (#{id})"),
+                    None => format!("Image #{id}"),
+                };
                 let href = format!("/details/{id}");
                 let click_href = href.clone();
                 let nav = use_navigate();
+                let tile_cls = if is_clear {
+                    "gallery-tile gallery-image-clear group"
+                } else {
+                    "gallery-tile group"
+                };
 
                 let media_view = match im {
-                    ProjectedImage::Clear { url, name, .. } => {
-                        let alt = name
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or_else(|| format!("Image #{id}"));
+                    ProjectedImage::Clear { url, .. } => {
+                        let alt = card_label.clone();
+                        let btn_title = card_tooltip.clone();
                         view! {
                             <button
                                 type="button"
-                                aria-label=format!("Zoom image #{id}")
+                                aria-label=zoom_aria
+                                title=btn_title
                                 class="block w-full p-0 border-0 bg-transparent cursor-zoom-in focus-visible:outline-2 focus-visible:outline-sky-500"
                                 on:click=move |_| {
                                     if let Some(i) = images.with_value(|v| v.iter().position(|x| x.id() == id)) {
@@ -986,7 +1006,7 @@ pub fn Results(
                 };
 
                 view! {
-                    <article class="gallery-tile group">
+                    <article class=tile_cls>
                         <div class="gallery-frame" style=cv>
                             {media_view}
                             <div class="gallery-top-right">
@@ -996,44 +1016,52 @@ pub fn Results(
                                     variant=LikeVariant::Card
                                 />
                             </div>
-                            <div class="gallery-overlay">
-                                <span class="gallery-overlay-meta">{format!("#{id}")}</span>
-                                <div class="flex items-center gap-1">
-                                    {move || safety.filter(|s| s.is_managed.get()).map(|s| view! {
-                                        <button
-                                            type="button"
-                                            title="Report image"
-                                            class="gallery-overlay-link bg-slate-900/60 hover:bg-rose-500 cursor-pointer"
-                                            on:click=move |ev: ev::MouseEvent| {
-                                                ev.stop_propagation();
-                                                s.open_report(
-                                                    ReportTargetKind::Image,
-                                                    id,
-                                                    format!("Image #{id}"),
-                                                );
-                                            }
-                                        >
-                                            "Report"
-                                        </button>
-                                    })}
-                                    {show_details_link.then(|| view! {
-                                        <a
-                                            href=href
-                                            title="Open image details & similar"
-                                            class="gallery-overlay-link"
-                                            on:click=move |ev: ev::MouseEvent| {
-                                                ev.stop_propagation();
-                                                if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
-                                                    ev.prevent_default();
-                                                    nav(&click_href, NavigateOptions::default());
+                            {(!is_placeholder).then(|| {
+                                let report_label = report_label.clone();
+                                view! {
+                                    <div class="gallery-overlay">
+                                        <span class="gallery-overlay-meta" title=card_tooltip>{card_label}</span>
+                                        <div class="flex items-center gap-1 shrink-0">
+                                            {move || safety.filter(|s| s.is_managed.get()).map(|s| {
+                                                let report_label = report_label.clone();
+                                                view! {
+                                                    <button
+                                                        type="button"
+                                                        title="Report image"
+                                                        class="gallery-overlay-link bg-slate-900/60 hover:bg-rose-500 cursor-pointer"
+                                                        on:click=move |ev: ev::MouseEvent| {
+                                                            ev.stop_propagation();
+                                                            s.open_report(
+                                                                ReportTargetKind::Image,
+                                                                id,
+                                                                report_label.clone(),
+                                                            );
+                                                        }
+                                                    >
+                                                        "Report"
+                                                    </button>
                                                 }
-                                            }
-                                        >
-                                            "Details \u{2197}"
-                                        </a>
-                                    })}
-                                </div>
-                            </div>
+                                            })}
+                                            {show_details_link.then(|| view! {
+                                                <a
+                                                    href=href
+                                                    title="Open image details & similar"
+                                                    class="gallery-overlay-link"
+                                                    on:click=move |ev: ev::MouseEvent| {
+                                                        ev.stop_propagation();
+                                                        if !(ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() || ev.button() != 0) {
+                                                            ev.prevent_default();
+                                                            nav(&click_href, NavigateOptions::default());
+                                                        }
+                                                    }
+                                                >
+                                                    "Details \u{2197}"
+                                                </a>
+                                            })}
+                                        </div>
+                                    </div>
+                                }
+                            })}
                         </div>
                     </article>
                 }
@@ -1093,8 +1121,9 @@ pub fn Results(
                                bg-white text-rose-600 ring-1 ring-rose-300 hover:bg-rose-100/70
                                active:scale-95 transition-all cursor-pointer"
                         on:click=move |_| {
-                            let cur_offset = offset.get_untracked();
-                            load_page(cur_offset, load_ctx);
+                            let replace = last_failed_replace.get_untracked();
+                            let target_offset = if replace { 0 } else { offset.get_untracked() };
+                            load_page(target_offset, replace, load_ctx);
                         }
                     >
                         "Retry"
@@ -1105,16 +1134,20 @@ pub fn Results(
         })
     };
 
+    let top_error_view = move || last_failed_replace.get().then(error_view);
+    let bottom_error_view = move || (!last_failed_replace.get()).then(error_view);
+
     let loading_view = move || {
-        loading.get().then(|| {
+        (loading.get() && !querying.get()).then(|| {
             view! {
-                <div class="web-results-loading w-full text-sky-500 p-4 text-center animate-pulse">"Loading\u{2026} \u{1f4ab}"</div>
+                <div class="web-results-loading w-full text-sky-500 p-4 text-center animate-pulse">"Loading more\u{2026} \u{1f4ab}"</div>
             }
         })
     };
 
     let empty_view = move || {
         let is_empty = !loading.get()
+            && !querying.get()
             && !has_more.get()
             && error.get().is_none()
             && columns.with(|cs| cs.iter().all(|c| c.items.is_empty()));
@@ -1249,6 +1282,7 @@ pub fn Results(
 
     let end_view = move || {
         (!loading.get()
+            && !querying.get()
             && !has_more.get()
             && error.get().is_none()
             && columns.with(|cs| cs.iter().any(|c| !c.items.is_empty())))
@@ -1286,11 +1320,63 @@ pub fn Results(
         .then(|| public_origin().map(|o| format!("{o}/")))
         .flatten();
 
+    let querying_banner_view = move || {
+        querying.get().then(|| {
+            let label = params.with(querying_status_label);
+            view! {
+                <div
+                    role="status"
+                    aria-live="polite"
+                    class="web-results-querying sticky top-[var(--floating-nav-bottom,80px)] z-[25] flex justify-center mb-3 pointer-events-none"
+                >
+                    <div class="web-results-querying-pill inline-flex items-center gap-2 px-4 py-1.5 rounded-full
+                                bg-white/92 backdrop-blur-md text-sky-700 text-xs sm:text-sm font-semibold
+                                ring-1 ring-sky-200 shadow-md shadow-sky-200/50 max-w-full">
+                        <span
+                            class="inline-block w-3.5 h-3.5 rounded-full border-2 border-sky-200 border-t-sky-500 animate-spin shrink-0"
+                            aria-hidden="true"
+                        />
+                        <span class="truncate">{label}</span>
+                    </div>
+                </div>
+            }
+        })
+    };
+
+    let skeleton_view = move || {
+        (querying.get() && !has_masonry_items.get() && !ssr_fallback_active.get()).then(|| {
+            let cols = col_count.get().max(2).min(6);
+            let aspects = ["aspect-[3/4]", "aspect-[4/3]", "aspect-square", "aspect-[4/5]"];
+            view! {
+                <div class="web-results-skeleton gallery-masonry" aria-hidden="true">
+                    {(0..cols).map(|col_idx| {
+                        view! {
+                            <div class="gallery-col">
+                                {(0..3).map(|row_idx| {
+                                    let aspect = aspects[(col_idx + row_idx) % aspects.len()];
+                                    view! {
+                                        <div class=format!(
+                                            "web-skeleton-card w-full {aspect} rounded-2xl bg-gradient-to-br from-sky-100/90 via-white to-sky-100/70 \
+                                             border border-sky-200/70 animate-pulse"
+                                        ) />
+                                    }
+                                }).collect_view()}
+                            </div>
+                        }
+                    }).collect_view()}
+                </div>
+            }
+        })
+    };
+
     let ssr_fallback_view = ssr_home.map(|res| {
         view! {
             <Transition fallback=|| ()>
                 {move || {
-                    if has_masonry_items.get() {
+                    if !ssr_fallback_active.get()
+                        || has_masonry_items.get()
+                        || is_ephemeral_search.get()
+                    {
                         return None;
                     }
                     let resp = res.get().flatten()?;
@@ -1486,8 +1572,18 @@ pub fn Results(
                     </div>
                 </div>
             })}
+            {querying_banner_view}
+            {top_error_view}
             {ssr_fallback_view}
-            <div class="web-results-masonry gallery-masonry">
+            {skeleton_view}
+            <div
+                aria-busy=move || querying.get().to_string()
+                class=move || if querying.get() && has_masonry_items.get() {
+                    "web-results-masonry gallery-masonry is-refreshing opacity-50 pointer-events-none transition-opacity duration-200"
+                } else {
+                    "web-results-masonry gallery-masonry transition-opacity duration-200"
+                }
+            >
                 <For
                     each=move || 0..col_count.get()
                     key=|i| *i
@@ -1519,7 +1615,7 @@ pub fn Results(
             <div node_ref=sentinel class="web-results-sentinel w-full min-h-10"></div>
 
             {loading_view}
-            {error_view}
+            {bottom_error_view}
             {empty_view}
             {end_view}
             {lightbox_view}
@@ -1567,15 +1663,76 @@ fn place_item(columns: &mut [Column], item: Item, order: usize, gap: u32) {
     column.items.push(Placed { item, w, h, order });
 }
 
-fn load_page(offset_val: i64, ctx: GalleryLoadCtx) {
+fn querying_status_label(p: &ResultsParams) -> String {
+    match p.mode {
+        Mode::Advanced => {
+            let trimmed = p.adv.trim();
+            if trimmed.is_empty() {
+                return "Searching\u{2026}".to_string();
+            }
+            match parse_and_compile(trimmed) {
+                Ok((_, plan)) if plan.has_clip() && plan.has_dino() => {
+                    "Querying CLIP & visual embeddings\u{2026}".to_string()
+                }
+                Ok((_, plan)) if plan.has_clip() => "Querying CLIP semantic search\u{2026}".to_string(),
+                Ok((_, plan)) if plan.has_dino() => "Querying visual similarity\u{2026}".to_string(),
+                _ => "Searching\u{2026}".to_string(),
+            }
+        }
+        Mode::Clip => "Querying CLIP semantic search\u{2026}".to_string(),
+        Mode::Similar | Mode::SearchImage => "Finding visually similar images\u{2026}".to_string(),
+        Mode::Random => "Shuffling random gallery\u{2026}".to_string(),
+        Mode::All | Mode::Author | Mode::Title | Mode::Tag => {
+            let trimmed = p.q.trim();
+            if trimmed.is_empty() {
+                "Loading gallery\u{2026}".to_string()
+            } else {
+                format!("Searching for \u{201c}{trimmed}\u{201d}\u{2026}")
+            }
+        }
+    }
+}
+
+fn clear_gallery_items(ctx: GalleryLoadCtx) {
+    ctx.columns.update(|cs| {
+        cs.iter_mut().for_each(|c| {
+            c.items.clear();
+            c.height = 0;
+        });
+    });
+    ctx.images.update_value(|v| v.clear());
+    ctx.next_order.set_value(0);
+    ctx.offset.set(0);
+}
+
+#[cfg(feature = "hydrate")]
+fn scroll_window_to_top_if_needed() {
+    if let Some(win) = web_sys::window()
+        && win.scroll_y().unwrap_or(0.0) > 24.0
+    {
+        let opts = web_sys::ScrollToOptions::new();
+        opts.set_top(0.0);
+        opts.set_behavior(web_sys::ScrollBehavior::Smooth);
+        win.scroll_to_with_scroll_to_options(&opts);
+    }
+}
+
+#[cfg(not(feature = "hydrate"))]
+fn scroll_window_to_top_if_needed() {}
+
+fn load_page(offset_val: i64, replace: bool, ctx: GalleryLoadCtx) {
     let p = ctx.params.get_untracked();
     let min_sim = ctx.effective_min_similarity(&p);
 
     let this_id = ctx.req_id.get_value() + 1;
     ctx.req_id.set_value(this_id);
 
+    if replace {
+        ctx.querying.set(true);
+    }
     ctx.loading.set(true);
     ctx.error.set(None);
+    ctx.last_failed_replace.set(false);
 
     spawn_local(async move {
         let result = match p.mode {
@@ -1583,8 +1740,12 @@ fn load_page(offset_val: i64, ctx: GalleryLoadCtx) {
                 let trimmed = p.adv.trim();
                 if trimmed.is_empty() {
                     if ctx.req_id.try_get_value() == Some(this_id) {
+                        if replace {
+                            clear_gallery_items(ctx);
+                        }
                         ctx.has_more.set(false);
                         ctx.loaded_first.set(true);
+                        ctx.querying.set(false);
                         ctx.loading.set(false);
                     }
                     return;
@@ -1594,8 +1755,10 @@ fn load_page(offset_val: i64, ctx: GalleryLoadCtx) {
                     Err(e) => {
                         if ctx.req_id.try_get_value() == Some(this_id) {
                             ctx.error.set(Some(e.to_string()));
+                            ctx.last_failed_replace.set(replace);
                             ctx.has_more.set(false);
                             ctx.loaded_first.set(true);
+                            ctx.querying.set(false);
                             ctx.loading.set(false);
                         }
                         return;
@@ -1617,8 +1780,12 @@ fn load_page(offset_val: i64, ctx: GalleryLoadCtx) {
                         match resolve_advanced_upload_csv(&plan, &p.img_nonce, ctx.adv_uploads) {
                             None => {
                                 if ctx.req_id.try_get_value() == Some(this_id) {
+                                    if replace {
+                                        clear_gallery_items(ctx);
+                                    }
                                     ctx.has_more.set(false);
                                     ctx.loaded_first.set(true);
+                                    ctx.querying.set(false);
                                     ctx.loading.set(false);
                                 }
                                 return;
@@ -1647,8 +1814,12 @@ fn load_page(offset_val: i64, ctx: GalleryLoadCtx) {
                 match matching_b64 {
                     None => {
                         if ctx.req_id.try_get_value() == Some(this_id) {
+                            if replace {
+                                clear_gallery_items(ctx);
+                            }
                             ctx.has_more.set(false);
                             ctx.loaded_first.set(true);
+                            ctx.querying.set(false);
                             ctx.loading.set(false);
                         }
                         return;
@@ -1676,22 +1847,39 @@ fn load_page(offset_val: i64, ctx: GalleryLoadCtx) {
 
         match result {
             Ok(resp) => {
-                apply_page_response(resp, ctx);
+                apply_page_response(resp, replace, ctx);
+                if replace && !ctx.embedded {
+                    scroll_window_to_top_if_needed();
+                }
             }
             Err(e) => {
                 ctx.error.set(Some(e.to_string()));
+                ctx.last_failed_replace.set(replace);
                 ctx.has_more.set(false);
             }
         }
         ctx.loaded_first.set(true);
+        ctx.querying.set(false);
         ctx.loading.set(false);
     });
 }
 
-fn apply_page_response(resp: SearchResponse, ctx: GalleryLoadCtx) {
-    ctx.images
-        .update_value(|v| v.extend(resp.images.iter().cloned()));
+fn apply_page_response(resp: SearchResponse, replace: bool, ctx: GalleryLoadCtx) {
+    if replace {
+        ctx.images.set_value(resp.images.clone());
+        ctx.next_order.set_value(0);
+        ctx.offset.set(0);
+    } else {
+        ctx.images
+            .update_value(|v| v.extend(resp.images.iter().cloned()));
+    }
     ctx.columns.update(|cs| {
+        if replace {
+            cs.iter_mut().for_each(|c| {
+                c.items.clear();
+                c.height = 0;
+            });
+        }
         let vp_w = {
             let v = ctx.viewport_w.get_untracked();
             #[cfg(feature = "hydrate")]
@@ -2515,4 +2703,47 @@ fn parse_results_params_defaults_and_clamps() {
     );
     assert_eq!(embedded_crop.mode, Mode::SearchImage);
     assert_eq!(embedded_crop.q, "nonce1");
+}
+
+#[test]
+fn querying_status_label_describes_active_search_mode() {
+    let home = parse_results_params(|_| None);
+    assert_eq!(querying_status_label(&home), "Loading gallery\u{2026}");
+
+    let text_q = parse_results_params(|k| match k {
+        "mode" => Some("all".into()),
+        "q" => Some("starlight".into()),
+        _ => None,
+    });
+    assert_eq!(
+        querying_status_label(&text_q),
+        "Searching for \u{201c}starlight\u{201d}\u{2026}"
+    );
+
+    let adv_clip = parse_results_params(|k| match k {
+        "mode" => Some("advanced".into()),
+        "adv" => Some("clip:\"sunset\"".into()),
+        _ => None,
+    });
+    assert_eq!(
+        querying_status_label(&adv_clip),
+        "Querying CLIP semantic search\u{2026}"
+    );
+
+    let adv_both = parse_results_params(|k| match k {
+        "mode" => Some("advanced".into()),
+        "adv" => Some("clip:\"sunset\" AND dino:42".into()),
+        _ => None,
+    });
+    assert_eq!(
+        querying_status_label(&adv_both),
+        "Querying CLIP & visual embeddings\u{2026}"
+    );
+
+    let adv_tag = parse_results_params(|k| match k {
+        "mode" => Some("advanced".into()),
+        "adv" => Some("tag:maid".into()),
+        _ => None,
+    });
+    assert_eq!(querying_status_label(&adv_tag), "Searching\u{2026}");
 }

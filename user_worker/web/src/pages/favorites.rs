@@ -69,6 +69,43 @@ fn parse_reveal_rule_id(rule_id: &str) -> Option<(&'static str, i64, u64)> {
     Some((kind, asset_id, policy_rev))
 }
 
+fn display_name_from_raw(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.rsplit_once('/') {
+        Some((_, tail)) => {
+            let tail = tail.trim();
+            if tail.is_empty() {
+                Some(trimmed)
+            } else {
+                Some(tail)
+            }
+        }
+        None => Some(trimmed),
+    }
+}
+
+/// Extract display title for a preview JSON item: prefer non-empty `"title"`,
+/// then fall back to `"name"` (display basename after last `/` if non-empty,
+/// else full trimmed name), or empty string so `MediaTile` falls back to `#{id}`.
+fn extract_media_title(val: &Value) -> String {
+    if let Some(title) = val
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return title.to_string();
+    }
+    val.get("name")
+        .and_then(Value::as_str)
+        .and_then(display_name_from_raw)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Parse a flexible `/api/like_previews` or `/api/post_images` JSON item into
 /// a `lets_embed_ui::GalleryMedia`, supporting Policy v3 (`clear` / `blurred` /
 /// `placeholder`) as well as legacy (`locked` / `spoiler`) shapes.
@@ -257,6 +294,13 @@ fn parse_media_value(val: &Value, fallback_id: i64, fallback_kind: GalleryMediaK
                     .get("alt")
                     .or_else(|| val.get("title"))
                     .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        val.get("name")
+                            .and_then(Value::as_str)
+                            .and_then(display_name_from_raw)
+                    })
                     .unwrap_or_default()
                     .to_string(),
                 duration_secs,
@@ -349,11 +393,7 @@ fn build_cards_from_previews(likes: &[LikeRow], previews: &Value) -> Vec<Gallery
                     continue;
                 };
                 let media = parse_media_value(vv, row.target_id, GalleryMediaKind::Video);
-                let title = vv
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
+                let title = extract_media_title(vv);
                 cards.push(GalleryCard {
                     key: format!("video:{}", row.target_id),
                     id: row.target_id,
@@ -381,11 +421,7 @@ fn build_cards_from_previews(likes: &[LikeRow], previews: &Value) -> Vec<Gallery
                     key: format!("image:{}", row.target_id),
                     id: row.target_id,
                     kind: GalleryCardKind::Image,
-                    title: iv
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
+                    title: extract_media_title(iv),
                     subtitle: None,
                     media,
                     image_count: 0,
@@ -563,7 +599,7 @@ pub fn FavoritesPage() -> impl IntoView {
                                     key: format!("img:{id}"),
                                     id,
                                     kind: GalleryCardKind::Image,
-                                    title: String::new(),
+                                    title: extract_media_title(val),
                                     subtitle: None,
                                     media,
                                     image_count: 0,
@@ -896,5 +932,56 @@ pub fn FavoritesPage() -> impl IntoView {
                 </div>
             })}
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_media_title_prefers_title_then_name_basename_then_empty() {
+        assert_eq!(
+            extract_media_title(&json!({
+                "title": "Explicit Title",
+                "name": "Album/photo_1"
+            })),
+            "Explicit Title"
+        );
+        assert_eq!(
+            extract_media_title(&json!({
+                "title": "   ",
+                "name": "Title A/by Author - photo 1"
+            })),
+            "by Author - photo 1"
+        );
+        assert_eq!(
+            extract_media_title(&json!({
+                "state": "clear",
+                "name": "simple_name"
+            })),
+            "simple_name"
+        );
+        assert_eq!(
+            extract_media_title(&json!({
+                "state": "clear",
+                "name": "dir/"
+            })),
+            "dir/"
+        );
+        assert_eq!(
+            extract_media_title(&json!({
+                "state": "clear",
+                "name": "   "
+            })),
+            ""
+        );
+        assert_eq!(
+            extract_media_title(&json!({
+                "state": "placeholder",
+                "id": 42
+            })),
+            ""
+        );
     }
 }

@@ -25,7 +25,7 @@ pub fn BackToTop(#[prop(default = 300.0)] threshold: f64) -> impl IntoView {
             aria-label="back to top"
             title="back to top"
             class=move || {
-                let base = "web-back-to-top fixed right-6 bottom-6 z-30 flex h-11 w-11 items-center justify-center \
+                let base = "web-back-to-top fixed right-4 sm:right-6 bottom-[calc(var(--web-footer-height,40px)+0.85rem+env(safe-area-inset-bottom,0px))] z-[36] flex h-11 w-11 items-center justify-center \
                             rounded-full bg-gradient-to-br from-sky-400 to-blue-500 text-xl text-white \
                             shadow-lg shadow-sky-400/40 cursor-pointer \
                             transition-all duration-300 ease-out hover:from-sky-500 hover:to-blue-600 hover:scale-110 \

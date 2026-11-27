@@ -228,7 +228,43 @@ trap 'on_signal 130' INT
 if (( sig_code )); then
     exit "$sig_code"
 fi
+probe_web_healthz() {
+    (
+        exec 3<>/dev/tcp/127.0.0.1/3000
+        printf 'GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:3000\r\nConnection: close\r\n\r\n' >&3
+        IFS= read -r -t 1 status_line <&3 || exit 1
+        [[ "$status_line" == *" 200 "* ]]
+    ) 2>/dev/null
+}
 lets-embed-web "$@" &
+web_pid=$!
+deadline=$((SECONDS + 20))
+web_ready=0
+while (( SECONDS < deadline )); do
+    if (( sig_code )); then
+        break
+    fi
+    if ! kill -0 "$web_pid" 2>/dev/null; then
+        break
+    fi
+    if probe_web_healthz; then
+        web_ready=1
+        break
+    fi
+    sleep 0.2
+done
+if (( sig_code )); then
+    cleanup
+    wait
+    exit "$sig_code"
+fi
+if ! kill -0 "$web_pid" 2>/dev/null; then
+    wait "$web_pid"
+    exit $?
+fi
+if (( ! web_ready )); then
+    echo "start.sh: lets-embed-web not ready on 127.0.0.1:3000/healthz after 20s; starting gateway anyway" >&2
+fi
 gateway &
 if (( sig_code )); then
     cleanup
@@ -324,7 +360,43 @@ fi
 if (( sig_code )); then
     exit "$sig_code"
 fi
+probe_web_healthz() {
+    (
+        exec 3<>/dev/tcp/127.0.0.1/3000
+        printf 'GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:3000\r\nConnection: close\r\n\r\n' >&3
+        IFS= read -r -t 1 status_line <&3 || exit 1
+        [[ "$status_line" == *" 200 "* ]]
+    ) 2>/dev/null
+}
 lets-embed-web "$@" &
+web_pid=$!
+deadline=$((SECONDS + 20))
+web_ready=0
+while (( SECONDS < deadline )); do
+    if (( sig_code )); then
+        break
+    fi
+    if ! kill -0 "$web_pid" 2>/dev/null; then
+        break
+    fi
+    if probe_web_healthz; then
+        web_ready=1
+        break
+    fi
+    sleep 0.2
+done
+if (( sig_code )); then
+    cleanup
+    wait
+    exit "$sig_code"
+fi
+if ! kill -0 "$web_pid" 2>/dev/null; then
+    wait "$web_pid"
+    exit $?
+fi
+if (( ! web_ready )); then
+    echo "start.sh: lets-embed-web not ready on 127.0.0.1:3000/healthz after 20s; starting gateway anyway" >&2
+fi
 gateway &
 if (( sig_code )); then
     cleanup
@@ -383,7 +455,43 @@ trap 'on_signal 130' INT
 if (( sig_code )); then
     exit "$sig_code"
 fi
+probe_web_healthz() {
+    (
+        exec 3<>/dev/tcp/127.0.0.1/3000
+        printf 'GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:3000\r\nConnection: close\r\n\r\n' >&3
+        IFS= read -r -t 1 status_line <&3 || exit 1
+        [[ "$status_line" == *" 200 "* ]]
+    ) 2>/dev/null
+}
 lets-embed-web "$@" &
+web_pid=$!
+deadline=$((SECONDS + 20))
+web_ready=0
+while (( SECONDS < deadline )); do
+    if (( sig_code )); then
+        break
+    fi
+    if ! kill -0 "$web_pid" 2>/dev/null; then
+        break
+    fi
+    if probe_web_healthz; then
+        web_ready=1
+        break
+    fi
+    sleep 0.2
+done
+if (( sig_code )); then
+    cleanup
+    wait
+    exit "$sig_code"
+fi
+if ! kill -0 "$web_pid" 2>/dev/null; then
+    wait "$web_pid"
+    exit $?
+fi
+if (( ! web_ready )); then
+    echo "start.sh: lets-embed-web not ready on 127.0.0.1:3000/healthz after 20s; starting gateway anyway" >&2
+fi
 gateway &
 if (( sig_code )); then
     cleanup
