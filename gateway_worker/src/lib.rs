@@ -58,16 +58,16 @@ use crate::auth::{
 use crate::http_util::{
     CookieLookup, GALLERY_ALLOWED_METHODS, MAX_ADMIN_BODY_BYTES, MAX_GATEWAY_BODY_BYTES,
     MAX_REVEAL_BODY_BYTES, MEDIA_ALLOWED_METHODS, USER_ALLOWED_METHODS, Upstreams, browse_route,
-    build_api_healthz_target, build_api_upstream_target, build_sitemap_cache_key,
+    build_api_health_target, build_api_upstream_target, build_sitemap_cache_key,
     cache_control_allows_edge_cache, checked_gallery_method, checked_media_method,
     checked_user_method, extract_single_cookie, guest_id, has_reveal_csrf_header, has_wake_cookie,
     if_none_match_matches, is_always_public_path, is_canonical_path, is_hop_by_hop,
     is_https_request, is_public_cacheable_path, is_same_origin, is_segment_prefix,
     is_sitemap_path, is_transient_cold_start_status, login_response, metered_item,
     method_not_allowed, payment_required, private_no_store, request_host, sanitize_origin_cookie,
-    sanitize_user_worker_cookie, should_serve_waking_interstitial, should_strip_api_request_header,
-    strip_cf_access_set_cookies, wake_clear_cookie_header, wake_set_cookie_header,
-    waking_interstitial_response,
+    sanitize_user_worker_cookie, select_health_probe_user_agent, should_serve_waking_interstitial,
+    should_strip_api_request_header, strip_cf_access_set_cookies, wake_clear_cookie_header,
+    wake_set_cookie_header, waking_interstitial_response,
 };
 use crate::media::{
     PreviewBlurConfig, PreviewBudgetReq, build_facts_rev_target, build_media_upstream_target,
@@ -186,7 +186,7 @@ const MIN_COLD_START_UPSTREAM_TIMEOUT_MS: u64 = 800;
 /// Generous upstream timeout (ms) for post-ready HTML reloads carrying the
 /// `__le_gw_wake=1` cookie so cold PolicyStore sync + first SSR completes cleanly.
 const POST_WAKE_TIMEOUT_MS: u64 = 15_000;
-/// Per-poll timeout (ms) for `/_gw/ready` probing `{API_UPSTREAM}/healthz`.
+/// Per-poll timeout (ms) for `/_gw/ready` probing `{API_UPSTREAM}/health`.
 const READY_PROBE_TIMEOUT_MS: u64 = 3_500;
 
 fn compute_cold_start_upstream_timeout_ms(elapsed_ms: u64) -> u64 {
@@ -297,7 +297,7 @@ trait GatewayBackend {
         req: UpstreamFetchReq,
         timeout_ms: u64,
     ) -> std::result::Result<UpstreamFetchOutcome, BackendError>;
-    /// Probes an upstream endpoint (e.g. `/healthz`) with a timeout, draining/cancelling
+    /// Probes an upstream endpoint (e.g. `/health`) with a timeout, draining/cancelling
     /// its response body cleanly before returning its status code (or `None` on timeout).
     async fn probe_upstream_status_with_timeout(
         &self,
@@ -645,9 +645,18 @@ impl GatewayBackend for WorkerBackend<'_> {
         };
         self.ctx.wait_until(async move {
             match Fetch::Request(worker_req).send().await {
-                Ok(resp) => cancel_worker_response_body(resp).await,
-                Err(err) => {
-                    worker::console_error!("origin wakeup /healthz failed: {err:?}");
+                Ok(resp) => {
+                    let status = resp.status_code();
+                    cancel_worker_response_body(resp).await;
+                    if status != 200 {
+                        log_health_probe_issue(
+                            "origin wakeup /health non-200",
+                            &status.to_string(),
+                        );
+                    }
+                }
+                Err(_) => {
+                    log_health_probe_issue("origin wakeup /health", "error");
                 }
             }
         });
@@ -927,6 +936,13 @@ fn log_backend_error(context: &str, err: &BackendError) {
     let _ = (context, err.0.as_str());
 }
 
+fn log_health_probe_issue(context: &str, detail: &str) {
+    #[cfg(target_arch = "wasm32")]
+    worker::console_error!("{context}: {detail}");
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (context, detail);
+}
+
 fn append_cf_access_service_headers(out: &mut Vec<(String, String)>, cfg: &GatewayConfig) {
     if let Some((client_id, client_secret)) = cfg.cf_access_service_token.as_deref() {
         out.push(("CF-Access-Client-Id".to_string(), client_id.clone()));
@@ -1133,10 +1149,17 @@ fn assertion_sign_error_response() -> Response {
     )
 }
 
-fn build_healthz_request(cfg: &GatewayConfig) -> Option<UpstreamFetchReq> {
-    let url = build_api_healthz_target(&cfg.upstreams).ok()?;
-    let mut headers = Vec::with_capacity(3);
+fn build_health_request(
+    cfg: &GatewayConfig,
+    incoming_headers: &HeaderMap,
+) -> Option<UpstreamFetchReq> {
+    let url = build_api_health_target(&cfg.upstreams).ok()?;
+    let mut headers = Vec::with_capacity(4);
     headers.push(("accept".to_string(), "text/plain".to_string()));
+    headers.push((
+        "user-agent".to_string(),
+        select_health_probe_user_agent(incoming_headers),
+    ));
     append_cf_access_service_headers(&mut headers, cfg);
     Some(UpstreamFetchReq {
         url,
@@ -1148,8 +1171,12 @@ fn build_healthz_request(cfg: &GatewayConfig) -> Option<UpstreamFetchReq> {
     })
 }
 
-fn trigger_origin_wakeup(backend: &impl GatewayBackend, cfg: &GatewayConfig) {
-    if let Some(req) = build_healthz_request(cfg) {
+fn trigger_origin_wakeup(
+    backend: &impl GatewayBackend,
+    cfg: &GatewayConfig,
+    headers: &HeaderMap,
+) {
+    if let Some(req) = build_health_request(cfg, headers) {
         backend.spawn_origin_wakeup(req);
     }
 }
@@ -1158,17 +1185,28 @@ async fn handle_ready_probe(
     backend: &impl GatewayBackend,
     cfg: &GatewayConfig,
     uri: &Uri,
+    headers: &HeaderMap,
     is_head: bool,
 ) -> Response {
-    let ready = match build_healthz_request(cfg) {
+    let ready = match build_health_request(cfg, headers) {
         Some(req) => match backend
             .probe_upstream_status_with_timeout(req, READY_PROBE_TIMEOUT_MS)
             .await
         {
-            Ok(Some(status)) => status == StatusCode::OK,
-            Ok(None) => false,
-            Err(err) => {
-                log_backend_error("origin /healthz readiness probe failed", &err);
+            Ok(Some(StatusCode::OK)) => true,
+            Ok(Some(status)) => {
+                log_health_probe_issue(
+                    "origin /health readiness probe non-200",
+                    &status.as_u16().to_string(),
+                );
+                false
+            }
+            Ok(None) => {
+                log_health_probe_issue("origin /health readiness probe", "timeout");
+                false
+            }
+            Err(_) => {
+                log_health_probe_issue("origin /health readiness probe", "error");
                 false
             }
         },
@@ -1253,7 +1291,7 @@ async fn proxy_to_api(
         Ok(UpstreamFetchOutcome::Response(mut resp)) => {
             strip_cf_access_set_cookies(resp.headers_mut());
             if allow_waking_interstitial && is_transient_cold_start_status(resp.status()) {
-                trigger_origin_wakeup(backend, cfg);
+                trigger_origin_wakeup(backend, cfg, headers);
                 return waking_interstitial_response();
             }
             if has_wake && !resp.status().is_server_error() {
@@ -1272,13 +1310,13 @@ async fn proxy_to_api(
             }
         }
         Ok(UpstreamFetchOutcome::TimedOut) => {
-            trigger_origin_wakeup(backend, cfg);
+            trigger_origin_wakeup(backend, cfg, headers);
             waking_interstitial_response()
         }
         Err(err) => {
             log_backend_error("upstream API fetch failed", &err);
             if allow_waking_interstitial {
-                trigger_origin_wakeup(backend, cfg);
+                trigger_origin_wakeup(backend, cfg, headers);
                 waking_interstitial_response()
             } else {
                 private_no_store((StatusCode::BAD_GATEWAY, "upstream fetch failed").into_response())
@@ -2128,12 +2166,12 @@ async fn handle_gateway_request(
     // Edge origin readiness endpoint polled by the 503 waking interstitial.
     // Runs after canonical path + Step 0 geo checks and before auth so public
     // legal pages also work when `login_required=true`, while exposing only a
-    // boolean readiness bit from `{API_UPSTREAM}/healthz`.
+    // boolean readiness bit from `{API_UPSTREAM}/health`.
     if path == "/_gw/ready" {
         if !matches!(method, Method::GET | Method::HEAD) {
             return method_not_allowed("GET, HEAD");
         }
-        return handle_ready_probe(backend, cfg, &uri, method == Method::HEAD).await;
+        return handle_ready_probe(backend, cfg, &uri, &headers, method == Method::HEAD).await;
     }
 
     // `/user/admin` & `/user/admin/*` retired unconditionally -> 404.
@@ -2584,8 +2622,9 @@ mod tests {
     use super::*;
     use crate::auth::ResolvedGatewaySecrets;
     use crate::http_util::{
-        MeterError, form_field, is_crawler_user_agent, is_html_navigation,
-        is_waking_interstitial_path, parse_upstream_origin, require_form_urlencoded, sha256_hex,
+        HEALTH_PROBE_FALLBACK_USER_AGENT, MeterError, form_field, is_crawler_user_agent,
+        is_html_navigation, is_waking_interstitial_path, parse_upstream_origin,
+        require_form_urlencoded, sha256_hex,
     };
     use crate::media::{LOCKED_PREVIEW_BLUR, encode_canonical_cap_path};
 
@@ -2742,10 +2781,10 @@ mod tests {
         upstream_cf_resized: Option<&'static str>,
         upstream_error: Option<&'static str>,
         upstream_timed_out: bool,
-        healthz_status: Option<StatusCode>,
-        healthz_timed_out: bool,
-        healthz_error: Option<&'static str>,
-        healthz_body_drained: Cell<usize>,
+        health_status: Option<StatusCode>,
+        health_timed_out: bool,
+        health_error: Option<&'static str>,
+        health_body_drained: Cell<usize>,
         sitemap_cache: RefCell<HashMap<String, CachedSitemapEntry>>,
         account_calls: RefCell<Vec<RecordedAccountCall>>,
         session_calls: RefCell<Vec<(String, Option<String>)>>,
@@ -2785,10 +2824,10 @@ mod tests {
                 upstream_cf_resized: Some("internal=ok/q=30 t=0.05"),
                 upstream_error: None,
                 upstream_timed_out: false,
-                healthz_status: None,
-                healthz_timed_out: false,
-                healthz_error: None,
-                healthz_body_drained: Cell::new(0),
+                health_status: None,
+                health_timed_out: false,
+                health_error: None,
+                health_body_drained: Cell::new(0),
                 sitemap_cache: RefCell::new(HashMap::new()),
                 account_calls: RefCell::new(Vec::new()),
                 session_calls: RefCell::new(Vec::new()),
@@ -2959,9 +2998,9 @@ mod tests {
             timeout_ms: u64,
         ) -> std::result::Result<UpstreamFetchOutcome, BackendError> {
             let url_str = req.url.to_string();
-            let is_healthz = req.url.path() == "/healthz";
+            let is_health = req.url.path() == "/health";
             self.timeout_calls.borrow_mut().push((url_str.clone(), timeout_ms));
-            if is_healthz {
+            if is_health {
                 self.upstream_calls.borrow_mut().push(RecordedUpstreamCall {
                     url: url_str,
                     method: req.method,
@@ -2969,13 +3008,13 @@ mod tests {
                     no_cache: req.no_cache,
                     preview_blur: req.preview_blur,
                 });
-                if self.healthz_timed_out {
+                if self.health_timed_out {
                     return Ok(UpstreamFetchOutcome::TimedOut);
                 }
-                if let Some(err) = self.healthz_error {
+                if let Some(err) = self.health_error {
                     return Err(BackendError(err.to_string()));
                 }
-                let status = self.healthz_status.unwrap_or(self.upstream_status);
+                let status = self.health_status.unwrap_or(self.upstream_status);
                 let mut resp = (status, "ok").into_response();
                 if let Some(sc) = self.upstream_set_cookie {
                     resp.headers_mut().append("set-cookie", sc.parse().unwrap());
@@ -3006,8 +3045,8 @@ mod tests {
                 UpstreamFetchOutcome::Response(resp) => {
                     let status = resp.status();
                     let _ = axum::body::to_bytes(resp.into_body(), 4096).await;
-                    self.healthz_body_drained
-                        .set(self.healthz_body_drained.get() + 1);
+                    self.health_body_drained
+                        .set(self.health_body_drained.get() + 1);
                     Ok(Some(status))
                 }
                 UpstreamFetchOutcome::TimedOut => Ok(None),
@@ -5649,7 +5688,7 @@ mod tests {
         assert_eq!(&warm_body[..], b"<html><body>Warm Gallery</body></html>");
 
         // 2. Cold timeout on `/`, `/details/42`, and `/terms` returns 503 waking HTML
-        //    AND triggers background `/healthz` wakeup with CF-Access headers only.
+        //    AND triggers background `/health` wakeup with BIC-safe User-Agent + CF-Access headers only.
         backend.upstream_timed_out = true;
         for path in ["/", "/details/42", "/terms"] {
             backend.wakeup_calls.borrow_mut().clear();
@@ -5687,9 +5726,13 @@ mod tests {
 
             let wakeups = backend.wakeup_calls.borrow();
             assert_eq!(wakeups.len(), 1, "expected 1 wakeup call on {path}");
-            assert_eq!(wakeups[0].url, "https://api.gallery.test/healthz");
+            assert_eq!(wakeups[0].url, "https://api.gallery.test/health");
             assert_eq!(wakeups[0].method, worker::Method::Get);
             assert!(wakeups[0].no_cache);
+            assert_eq!(
+                header_value(&wakeups[0].headers, "user-agent"),
+                Some("Mozilla/5.0 (X11; Linux x86_64) Chrome/130.0")
+            );
             assert!(
                 wakeups[0]
                     .headers
@@ -5911,7 +5954,7 @@ mod tests {
         backend.upstream_calls.borrow_mut().clear();
         backend.timeout_calls.borrow_mut().clear();
         backend.upstream_set_cookie = Some("CF_Authorization=secret-jwt; Path=/; Secure");
-        backend.healthz_status = Some(StatusCode::OK);
+        backend.health_status = Some(StatusCode::OK);
 
         let ready_post = dispatch(
             &backend,
@@ -5952,19 +5995,23 @@ mod tests {
             ready_set_cookies,
             vec!["__le_gw_wake=1; Path=/; Max-Age=30; SameSite=Lax; HttpOnly; Secure"]
         );
-        assert!(backend.healthz_body_drained.get() >= 1);
+        assert!(backend.health_body_drained.get() >= 1);
         let ok_body = block_on(axum::body::to_bytes(ready_ok.into_body(), 1024)).unwrap();
         assert_eq!(&ok_body[..], br#"{"ready":true}"#);
         assert!(backend.account_calls.borrow().is_empty());
         assert_eq!(
             backend.timeout_calls.borrow().last().unwrap(),
             &(
-                "https://api.gallery.test/healthz".to_string(),
+                "https://api.gallery.test/health".to_string(),
                 READY_PROBE_TIMEOUT_MS
             )
         );
         let probe_call = backend.upstream_calls.borrow().last().unwrap().clone();
-        assert_eq!(probe_call.url, "https://api.gallery.test/healthz");
+        assert_eq!(probe_call.url, "https://api.gallery.test/health");
+        assert_eq!(
+            header_value(&probe_call.headers, "user-agent"),
+            Some(HEALTH_PROBE_FALLBACK_USER_AGENT)
+        );
         assert!(
             probe_call
                 .headers
@@ -5985,6 +6032,47 @@ mod tests {
                     || k.eq_ignore_ascii_case("cookie"))
         );
 
+        // Browser Mozilla UA is forwarded to `/health`; curl UA falls back to BIC-safe gateway UA.
+        let mut browser_ready_hdrs = HeaderMap::new();
+        browser_ready_hdrs.insert(
+            "user-agent",
+            "  Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15  "
+                .parse()
+                .unwrap(),
+        );
+        let ready_browser = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/_gw/ready",
+            browser_ready_hdrs,
+            Bytes::new(),
+        );
+        assert_eq!(ready_browser.status(), StatusCode::OK);
+        let browser_probe_call = backend.upstream_calls.borrow().last().unwrap().clone();
+        assert_eq!(browser_probe_call.url, "https://api.gallery.test/health");
+        assert_eq!(
+            header_value(&browser_probe_call.headers, "user-agent"),
+            Some("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15")
+        );
+
+        let mut curl_ready_hdrs = HeaderMap::new();
+        curl_ready_hdrs.insert("user-agent", "curl/8.7.1".parse().unwrap());
+        let ready_curl = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/_gw/ready",
+            curl_ready_hdrs,
+            Bytes::new(),
+        );
+        assert_eq!(ready_curl.status(), StatusCode::OK);
+        let curl_probe_call = backend.upstream_calls.borrow().last().unwrap().clone();
+        assert_eq!(
+            header_value(&curl_probe_call.headers, "user-agent"),
+            Some(HEALTH_PROBE_FALLBACK_USER_AGENT)
+        );
+
         let ready_head = dispatch(
             &backend,
             &cfg,
@@ -6001,24 +6089,30 @@ mod tests {
         let head_body = block_on(axum::body::to_bytes(ready_head.into_body(), 1024)).unwrap();
         assert!(head_body.is_empty());
 
-        // Non-200, timeout, and BackendError on `/healthz` all return 503 `{"ready":false}`
+        // Non-200 (403/404/503), timeout, and BackendError on `/health` all return 503 `{"ready":false}`
         // and MUST NOT set the `__le_gw_wake` cookie.
-        backend.healthz_status = Some(StatusCode::SERVICE_UNAVAILABLE);
-        let ready_503 = dispatch(
-            &backend,
-            &cfg,
-            Method::GET,
-            "https://gallery.test/_gw/ready",
-            HeaderMap::new(),
-            Bytes::new(),
-        );
-        assert_eq!(ready_503.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(ready_503.headers().get("set-cookie").is_none());
-        let body_503 = block_on(axum::body::to_bytes(ready_503.into_body(), 1024)).unwrap();
-        assert_eq!(&body_503[..], br#"{"ready":false}"#);
+        for non_ok in [
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            backend.health_status = Some(non_ok);
+            let ready_fail = dispatch(
+                &backend,
+                &cfg,
+                Method::GET,
+                "https://gallery.test/_gw/ready",
+                HeaderMap::new(),
+                Bytes::new(),
+            );
+            assert_eq!(ready_fail.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(ready_fail.headers().get("set-cookie").is_none());
+            let body_fail = block_on(axum::body::to_bytes(ready_fail.into_body(), 1024)).unwrap();
+            assert_eq!(&body_fail[..], br#"{"ready":false}"#);
+        }
 
-        backend.healthz_status = Some(StatusCode::OK);
-        backend.healthz_timed_out = true;
+        backend.health_status = Some(StatusCode::OK);
+        backend.health_timed_out = true;
         let ready_timeout = dispatch(
             &backend,
             &cfg,
@@ -6032,8 +6126,8 @@ mod tests {
         let body_to = block_on(axum::body::to_bytes(ready_timeout.into_body(), 1024)).unwrap();
         assert_eq!(&body_to[..], br#"{"ready":false}"#);
 
-        backend.healthz_timed_out = false;
-        backend.healthz_error = Some("secret-internal-host-error");
+        backend.health_timed_out = false;
+        backend.health_error = Some("secret-internal-host-error");
         let ready_err = dispatch(
             &backend,
             &cfg,
@@ -6046,6 +6140,108 @@ mod tests {
         assert!(ready_err.headers().get("set-cookie").is_none());
         let body_err = block_on(axum::body::to_bytes(ready_err.into_body(), 1024)).unwrap();
         assert_eq!(&body_err[..], br#"{"ready":false}"#);
+    }
+
+    #[test]
+    fn health_probe_target_and_bic_safe_user_agent_selection() {
+        let upstreams = test_upstreams();
+        let target = build_api_health_target(&upstreams).expect("valid /health target");
+        assert_eq!(target.as_str(), "https://api.gallery.test/health");
+        assert_eq!(target.path(), "/health");
+
+        let bad_upstreams = Upstreams {
+            api: "http://insecure.example".into(),
+            ..upstreams
+        };
+        assert!(build_api_health_target(&bad_upstreams).is_err());
+
+        // Missing, empty, curl, lowercase, over-length, control-char, and duplicate UAs all use fallback.
+        assert_eq!(
+            select_health_probe_user_agent(&HeaderMap::new()),
+            HEALTH_PROBE_FALLBACK_USER_AGENT
+        );
+        for fallback_ua in [
+            "",
+            "   ",
+            "curl/8.7.1",
+            "mozilla/5.0 (Linux)",
+            "CustomBot/1.0",
+            "Mozilla/5.0\twith-tab",
+            &format!("Mozilla/{}", "a".repeat(505)), // 513 chars > 512
+        ] {
+            let mut h = HeaderMap::new();
+            h.insert("user-agent", fallback_ua.parse().unwrap());
+            assert_eq!(
+                select_health_probe_user_agent(&h),
+                HEALTH_PROBE_FALLBACK_USER_AGENT,
+                "expected fallback UA for {fallback_ua:?}"
+            );
+        }
+
+        let mut dup = HeaderMap::new();
+        dup.append("user-agent", "Mozilla/5.0 First".parse().unwrap());
+        dup.append("user-agent", "Mozilla/5.0 Second".parse().unwrap());
+        assert_eq!(
+            select_health_probe_user_agent(&dup),
+            HEALTH_PROBE_FALLBACK_USER_AGENT
+        );
+
+        // Valid Mozilla/ browser UAs (including trimmed and exact 512-char boundary) are forwarded.
+        let max_valid = format!("Mozilla/{}", "a".repeat(504)); // exact 512 chars
+        assert_eq!(max_valid.len(), 512);
+        let mut h_max = HeaderMap::new();
+        h_max.insert("user-agent", max_valid.parse().unwrap());
+        assert_eq!(select_health_probe_user_agent(&h_max), max_valid);
+
+        let mut h_trim = HeaderMap::new();
+        h_trim.insert(
+            "user-agent",
+            "  Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/131.0  "
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            select_health_probe_user_agent(&h_trim),
+            "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/131.0"
+        );
+
+        // `build_health_request` (and `spawn_origin_wakeup` for non-Mozilla HTML nav) always hits `/health`
+        // with a non-empty BIC-safe User-Agent.
+        let cfg = test_cfg();
+        let req_curl = build_health_request(&cfg, &{
+            let mut h = HeaderMap::new();
+            h.insert("user-agent", "curl/8.7.1".parse().unwrap());
+            h
+        })
+        .expect("health request");
+        assert_eq!(req_curl.url.as_str(), "https://api.gallery.test/health");
+        assert_eq!(
+            header_value(&req_curl.headers, "user-agent"),
+            Some(HEALTH_PROBE_FALLBACK_USER_AGENT)
+        );
+
+        let policy = sample_safety_policy();
+        let mut backend = MockBackend::with_policy(policy);
+        backend.upstream_timed_out = true;
+        let mut non_mozilla_nav = HeaderMap::new();
+        non_mozilla_nav.insert("accept", "text/html".parse().unwrap());
+        non_mozilla_nav.insert("user-agent", "CustomClient/2.0".parse().unwrap());
+        let resp = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/",
+            non_mozilla_nav,
+            Bytes::new(),
+        );
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let wakeups = backend.wakeup_calls.borrow();
+        assert_eq!(wakeups.len(), 1);
+        assert_eq!(wakeups[0].url, "https://api.gallery.test/health");
+        assert_eq!(
+            header_value(&wakeups[0].headers, "user-agent"),
+            Some(HEALTH_PROBE_FALLBACK_USER_AGENT)
+        );
     }
 
     #[test]
@@ -6154,7 +6350,7 @@ mod tests {
         let policy = sample_safety_policy();
         let cfg = test_cfg();
         let mut backend = MockBackend::with_policy(policy);
-        backend.healthz_status = Some(StatusCode::OK);
+        backend.health_status = Some(StatusCode::OK);
         backend.upstream_set_cookie = Some("CF_Authorization=should-not-leak; Path=/; HttpOnly");
 
         let ready_http = dispatch(
