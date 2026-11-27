@@ -1986,3 +1986,198 @@ a:hover { text-decoration: underline; }
     grid-template-columns: 1fr;
   }
 }
+
+/* ==========================================================================
+   Favorites Page Loading Skeleton, Error & Empty States (`.u-fav-*`)
+   ========================================================================== */
+
+@keyframes u-spin {
+  to { transform: rotate(360deg); }
+}
+
+.u-spinner {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 2.5px solid rgba(2, 132, 199, 0.22);
+  border-top-color: var(--u-accent);
+  animation: u-spin 0.78s linear infinite;
+  flex: none;
+}
+
+.u-spinner--sm {
+  width: 14px;
+  height: 14px;
+  border-width: 2px;
+}
+
+.u-fav-loading {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.u-fav-loading-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 11px;
+  padding: 14px 18px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, rgba(240, 249, 255, 0.94) 0%, rgba(255, 255, 255, 0.92) 100%);
+  border: 1px solid rgba(14, 165, 233, 0.24);
+  box-shadow: 0 8px 24px rgba(12, 74, 110, 0.06);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  color: var(--u-text);
+  font-size: 0.94rem;
+  font-weight: 650;
+}
+
+.u-fav-skeleton-grid {
+  columns: 2;
+  column-gap: 8px;
+  width: 100%;
+}
+
+.u-fav-skeleton-grid[data-density="compact"] {
+  columns: 3;
+}
+
+.u-fav-skeleton-grid[data-density="medium"] {
+  columns: 2;
+}
+
+.u-fav-skeleton-grid[data-density="large"] {
+  columns: 1;
+}
+
+.u-fav-skeleton-card {
+  width: 100%;
+  break-inside: avoid;
+  margin-bottom: 8px;
+  border-radius: 14px;
+  border: 1px solid rgba(14, 165, 233, 0.18);
+  background: linear-gradient(90deg, #e6f4fd 22%, #f6fbff 50%, #e6f4fd 78%);
+  background-size: 200% 100%;
+  animation: u-shimmer 1.4s ease-in-out infinite;
+  box-shadow: 0 4px 14px rgba(12, 74, 110, 0.05);
+}
+
+@media (min-width: 641px) {
+  .u-fav-skeleton-grid {
+    column-gap: 12px;
+  }
+  .u-fav-skeleton-grid[data-density="compact"] {
+    columns: 4;
+  }
+  .u-fav-skeleton-grid[data-density="medium"] {
+    columns: 3;
+  }
+  .u-fav-skeleton-grid[data-density="large"] {
+    columns: 2;
+  }
+  .u-fav-skeleton-card {
+    margin-bottom: 12px;
+  }
+}
+
+@media (min-width: 1024px) {
+  .u-fav-skeleton-grid[data-density="compact"] {
+    columns: 5;
+  }
+  .u-fav-skeleton-grid[data-density="medium"] {
+    columns: 4;
+  }
+  .u-fav-skeleton-grid[data-density="large"] {
+    columns: 3;
+  }
+}
+
+@media (min-width: 1400px) {
+  .u-fav-skeleton-grid[data-density="compact"] {
+    columns: 6;
+  }
+  .u-fav-skeleton-grid[data-density="medium"] {
+    columns: 5;
+  }
+  .u-fav-skeleton-grid[data-density="large"] {
+    columns: 3;
+  }
+}
+
+.u-fav-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 10px;
+  padding: 40px 24px;
+}
+
+.u-fav-state-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: 15px;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(135deg, #e0f2fe 0%, #eff6ff 100%);
+  border: 1px solid rgba(14, 165, 233, 0.25);
+  color: var(--u-accent);
+}
+
+.u-fav-state--error {
+  border-color: rgba(220, 38, 38, 0.26);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.96) 0%, rgba(254, 242, 242, 0.55) 100%);
+}
+
+.u-fav-state--error .u-fav-state-icon {
+  background: #fee2e2;
+  border-color: #fecaca;
+  color: var(--u-danger);
+}
+
+.u-fav-state-title {
+  margin: 0;
+  font-size: 1.08rem;
+  font-weight: 750;
+  color: var(--u-text);
+}
+
+.u-fav-state-body {
+  margin: 0;
+  max-width: 46ch;
+  color: var(--u-muted);
+  font-size: 0.92rem;
+  line-height: 1.5;
+}
+
+.u-fav-state-detail {
+  margin: 2px 0 4px;
+  max-width: 54ch;
+  padding: 6px 12px;
+  border-radius: 10px;
+  background: rgba(254, 226, 226, 0.55);
+  border: 1px solid rgba(220, 38, 38, 0.2);
+  color: #991b1b;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.u-fav-state-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .u-spinner,
+  .u-fav-skeleton-card {
+    animation: none;
+  }
+}

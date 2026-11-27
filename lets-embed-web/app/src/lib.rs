@@ -158,7 +158,7 @@ fn save_guest_age_splash_ack() {
     }
 }
 
-fn broadcast_safety_invalidation(reason: &str) {
+pub(crate) fn broadcast_safety_invalidation(reason: &str) {
     #[cfg(feature = "hydrate")]
     {
         use wasm_bindgen::JsValue;
@@ -593,6 +593,16 @@ mod tests {
         assert!(body.contains(r#"href="/privacy""#));
         assert!(body.contains(r#"href="/dmca""#));
         assert!(body.contains(r#"href="/content-policy""#));
+        // Account menu shell renders deterministically with accessible disclosure attributes.
+        assert!(body.contains("web-account-widget"));
+        assert!(body.contains("web-account-trigger"));
+        assert!(body.contains(r#"aria-haspopup="true""#));
+        assert!(body.contains(r#"aria-controls="account-menu-panel""#));
+        assert!(body.contains(r#"id="account-menu-panel""#));
+        assert!(body.contains("web-account-menu-card relative rounded-2xl bg-white"));
+        assert!(body.contains("w-[min(320px,calc(100vw-1.5rem))]"));
+        assert!(body.contains("border-sky-200/80"));
+        assert!(body.contains("web-account-loading"));
     }
 
     #[tokio::test]

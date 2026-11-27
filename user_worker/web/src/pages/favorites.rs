@@ -20,7 +20,7 @@ use crate::api::{self, LikeRow, LikesResp, RevealResponse};
 
 const REVEAL_SENTINEL_PREFIX: &str = "__reveal__:";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FavFilter {
     All,
     Post,
@@ -45,6 +45,189 @@ impl FavFilter {
             Self::Image => "Images",
             Self::Video => "Videos",
         }
+    }
+}
+
+const SKELETON_ASPECTS: [&str; 10] = [
+    "aspect-ratio: 4 / 5;",
+    "aspect-ratio: 1 / 1;",
+    "aspect-ratio: 4 / 3;",
+    "aspect-ratio: 3 / 4;",
+    "aspect-ratio: 5 / 4;",
+    "aspect-ratio: 3 / 4;",
+    "aspect-ratio: 1 / 1;",
+    "aspect-ratio: 4 / 5;",
+    "aspect-ratio: 4 / 3;",
+    "aspect-ratio: 5 / 6;",
+];
+
+/// Exclusive display state for the Favorites gallery region.
+///
+/// Guarantees that `Empty` is NEVER rendered before an initial or tab-switch
+/// load has completed cleanly (both `/user/api/likes` and `/api/like_previews`)
+/// with zero errors and zero remaining items.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FavoritesViewState {
+    Loading,
+    Error(String),
+    Empty,
+    Ready,
+}
+
+/// Pure, atomic lifecycle state for `/user/favorites` loading, multi-step
+/// preview hydration, pagination, filter tabs, and stale-response cancellation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FavoritesLoadState {
+    filter: FavFilter,
+    request_seq: u64,
+    has_loaded: bool,
+    loading: bool,
+    previews_pending: bool,
+    loading_more: bool,
+    error: Option<String>,
+}
+
+impl FavoritesLoadState {
+    /// Initial frame-0 state before `Effect` / `spawn_local` runs:
+    /// `loading = true` and `has_loaded = false` so `Empty` is impossible on mount.
+    fn initial() -> Self {
+        Self {
+            filter: FavFilter::All,
+            request_seq: 0,
+            has_loaded: false,
+            loading: true,
+            previews_pending: false,
+            loading_more: false,
+            error: None,
+        }
+    }
+
+    fn begin_full_load(&mut self, filter: FavFilter) -> u64 {
+        self.request_seq = self.request_seq.wrapping_add(1);
+        self.filter = filter;
+        self.has_loaded = false;
+        self.loading = true;
+        self.previews_pending = false;
+        self.loading_more = false;
+        self.error = None;
+        self.request_seq
+    }
+
+    fn begin_append_load(&mut self) -> Option<u64> {
+        if self.loading || self.loading_more || self.previews_pending {
+            return None;
+        }
+        self.request_seq = self.request_seq.wrapping_add(1);
+        self.loading_more = true;
+        Some(self.request_seq)
+    }
+
+    fn mark_previews_pending(&mut self, seq: u64, append: bool) -> bool {
+        if self.request_seq != seq {
+            return false;
+        }
+        if !append {
+            self.previews_pending = true;
+        }
+        true
+    }
+
+    fn finish_full_load_ok(&mut self, seq: u64) -> bool {
+        if self.request_seq != seq {
+            return false;
+        }
+        self.has_loaded = true;
+        self.loading = false;
+        self.previews_pending = false;
+        self.loading_more = false;
+        self.error = None;
+        true
+    }
+
+    fn finish_append_load_ok(&mut self, seq: u64) -> bool {
+        if self.request_seq != seq {
+            return false;
+        }
+        self.loading_more = false;
+        true
+    }
+
+    fn finish_load_err(&mut self, seq: u64, append: bool, message: String) -> bool {
+        if self.request_seq != seq {
+            return false;
+        }
+        if append {
+            self.loading_more = false;
+        } else {
+            self.error = Some(message);
+            self.has_loaded = false;
+            self.previews_pending = false;
+            self.loading = false;
+            self.loading_more = false;
+        }
+        true
+    }
+
+    fn begin_logout_redirect(&mut self) {
+        self.request_seq = self.request_seq.wrapping_add(1);
+        self.has_loaded = false;
+        self.loading = true;
+        self.previews_pending = false;
+        self.loading_more = false;
+        self.error = None;
+    }
+
+    fn is_current_request(&self, seq: u64) -> bool {
+        self.request_seq == seq
+    }
+
+    fn view_state(&self, card_count: usize, has_next_cursor: bool) -> FavoritesViewState {
+        if self.loading || self.previews_pending {
+            return FavoritesViewState::Loading;
+        }
+        if let Some(err) = &self.error
+            && card_count == 0
+        {
+            return FavoritesViewState::Error(err.clone());
+        }
+        if !self.has_loaded {
+            return FavoritesViewState::Loading;
+        }
+        if card_count > 0 || has_next_cursor {
+            FavoritesViewState::Ready
+        } else {
+            FavoritesViewState::Empty
+        }
+    }
+}
+
+const fn loading_label(filter: FavFilter) -> &'static str {
+    match filter {
+        FavFilter::All => "Loading your favorites\u{2026}",
+        FavFilter::Post => "Loading your favorite posts\u{2026}",
+        FavFilter::Image => "Loading your favorite images\u{2026}",
+        FavFilter::Video => "Loading your favorite videos\u{2026}",
+    }
+}
+
+const fn empty_state_copy(filter: FavFilter) -> (&'static str, &'static str) {
+    match filter {
+        FavFilter::All => (
+            "No favorites saved yet",
+            "Click the heart on any post, image, or video in the gallery to save it here.",
+        ),
+        FavFilter::Post => (
+            "No favorite posts yet",
+            "You haven\u{2019}t saved any posts yet. Switch back to All or explore the gallery to bookmark posts.",
+        ),
+        FavFilter::Image => (
+            "No favorite images yet",
+            "You haven\u{2019}t saved any images yet. Switch back to All or explore the gallery to bookmark images.",
+        ),
+        FavFilter::Video => (
+            "No favorite videos yet",
+            "You haven\u{2019}t saved any videos yet. Switch back to All or explore the gallery to bookmark videos.",
+        ),
     }
 }
 
@@ -451,13 +634,19 @@ struct PostDetailResp {
 pub fn FavoritesPage() -> impl IntoView {
     let toasts = use_toast_store();
 
-    let filter = RwSignal::new(FavFilter::All);
+    let load_state = RwSignal::new(FavoritesLoadState::initial());
+    let active_filter = Memo::new(move |_| load_state.with(|s| s.filter));
     let density = RwSignal::new(Density::Medium);
     let invalidation_epoch = RwSignal::new(0u64);
 
     let cards = RwSignal::new(Vec::<GalleryCard>::new());
     let next_cursor = RwSignal::new(None::<i64>);
-    let loading = RwSignal::new(false);
+
+    let view_state = Memo::new(move |_| {
+        let card_count = cards.with(Vec::len);
+        let has_next_cursor = next_cursor.with(Option::is_some);
+        load_state.with(|st| st.view_state(card_count, has_next_cursor))
+    });
 
     // Undo bar after unliking an item
     let undo_item = RwSignal::new(None::<(LikeTargetKind, i64)>);
@@ -475,70 +664,156 @@ pub fn FavoritesPage() -> impl IntoView {
     let report_err = RwSignal::new(None::<String>);
     let report_ok = RwSignal::new(None::<String>);
 
-    let load_page = Callback::new(move |(append, cursor): (bool, Option<i64>)| {
-        loading.set(true);
-        let cur_filter = filter.get_untracked();
-        spawn_local(async move {
-            let mut url = String::from("/user/api/likes?limit=48");
-            if let Some(k) = cur_filter.as_query() {
-                url.push_str("&kind=");
-                url.push_str(k);
-            }
-            if let Some(c) = cursor {
-                url.push_str(&format!("&cursor={c}"));
-            }
-            let likes_resp = match api::get_json::<LikesResp>(&url).await {
-                Ok(r) => r,
-                Err(e) if e.status == 401 => {
-                    api::navigate_hard("/user/login?next=/user/favorites&reason=session_expired");
-                    return;
+    let load_page = Callback::new(
+        move |(next_filter, append, cursor): (Option<FavFilter>, bool, Option<i64>)| {
+            let mut started_seq = None;
+            let mut cur_filter = FavFilter::All;
+
+            load_state.update(|st| {
+                if append {
+                    if let Some(seq) = st.begin_append_load() {
+                        started_seq = Some(seq);
+                        cur_filter = st.filter;
+                    }
+                } else {
+                    let target_filter = next_filter.unwrap_or(st.filter);
+                    started_seq = Some(st.begin_full_load(target_filter));
+                    cur_filter = target_filter;
                 }
-                Err(e) => {
-                    toasts.error("Could not load favorites", Some(e.display()));
-                    loading.set(false);
-                    return;
-                }
-            };
-            next_cursor.set(likes_resp.next_cursor);
-            if likes_resp.items.is_empty() {
-                if !append {
-                    cards.set(Vec::new());
-                }
-                loading.set(false);
+            });
+
+            let Some(seq) = started_seq else {
                 return;
+            };
+
+            if !append {
+                cards.set(Vec::new());
+                next_cursor.set(None);
             }
 
-            let mut posts = Vec::new();
-            let mut images = Vec::new();
-            let mut videos = Vec::new();
-            for row in &likes_resp.items {
-                match row.kind.as_str() {
-                    "post" => posts.push(row.target_id),
-                    "video" => videos.push(row.target_id),
-                    _ => images.push(row.target_id),
+            spawn_local(async move {
+                let mut url = String::from("/user/api/likes?limit=48");
+                if let Some(k) = cur_filter.as_query() {
+                    url.push_str("&kind=");
+                    url.push_str(k);
                 }
-            }
-            match api::post_json::<_, Value>(
-                "/api/like_previews",
-                &json!({ "posts": posts, "images": images, "videos": videos }),
-            )
-            .await
-            {
-                Ok(previews) => {
-                    let batch = build_cards_from_previews(&likes_resp.items, &previews);
+                if let Some(c) = cursor {
+                    url.push_str(&format!("&cursor={c}"));
+                }
+
+                let likes_resp = match api::get_json::<LikesResp>(&url).await {
+                    Ok(r) => r,
+                    Err(e) if e.status == 401 => {
+                        if load_state.with_untracked(|s| s.is_current_request(seq)) {
+                            // Keep loading state active while navigating to login so
+                            // the empty state never flashes during session redirect.
+                            api::navigate_hard(
+                                "/user/login?next=/user/favorites&reason=session_expired",
+                            );
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        if !load_state.with_untracked(|s| s.is_current_request(seq)) {
+                            return;
+                        }
+                        let msg = e.display();
+                        let mut applied = false;
+                        load_state.update(|st| {
+                            applied = st.finish_load_err(seq, append, msg.clone());
+                        });
+                        if applied {
+                            toasts.error("Could not load favorites", Some(msg));
+                        }
+                        return;
+                    }
+                };
+
+                if !load_state.with_untracked(|s| s.is_current_request(seq)) {
+                    return;
+                }
+
+                if likes_resp.items.is_empty() {
+                    next_cursor.set(likes_resp.next_cursor);
                     if append {
-                        cards.update(|list| list.extend(batch));
+                        load_state.update(|st| {
+                            st.finish_append_load_ok(seq);
+                        });
                     } else {
-                        cards.set(batch);
+                        cards.set(Vec::new());
+                        load_state.update(|st| {
+                            st.finish_full_load_ok(seq);
+                        });
+                    }
+                    return;
+                }
+
+                let mut marked = false;
+                load_state.update(|st| {
+                    marked = st.mark_previews_pending(seq, append);
+                });
+                if !marked {
+                    return;
+                }
+
+                let mut posts = Vec::new();
+                let mut images = Vec::new();
+                let mut videos = Vec::new();
+                for row in &likes_resp.items {
+                    match row.kind.as_str() {
+                        "post" => posts.push(row.target_id),
+                        "video" => videos.push(row.target_id),
+                        _ => images.push(row.target_id),
                     }
                 }
-                Err(e) => {
-                    toasts.error("Could not load media previews", Some(e.display()));
+                match api::post_json::<_, Value>(
+                    "/api/like_previews",
+                    &json!({ "posts": posts, "images": images, "videos": videos }),
+                )
+                .await
+                {
+                    Ok(previews) => {
+                        if !load_state.with_untracked(|s| s.is_current_request(seq)) {
+                            return;
+                        }
+                        let batch = build_cards_from_previews(&likes_resp.items, &previews);
+                        next_cursor.set(likes_resp.next_cursor);
+                        if append {
+                            cards.update(|list| list.extend(batch));
+                            load_state.update(|st| {
+                                st.finish_append_load_ok(seq);
+                            });
+                        } else {
+                            cards.set(batch);
+                            load_state.update(|st| {
+                                st.finish_full_load_ok(seq);
+                            });
+                        }
+                    }
+                    Err(e) if e.status == 401 => {
+                        if load_state.with_untracked(|s| s.is_current_request(seq)) {
+                            api::navigate_hard(
+                                "/user/login?next=/user/favorites&reason=session_expired",
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        if !load_state.with_untracked(|s| s.is_current_request(seq)) {
+                            return;
+                        }
+                        let msg = e.display();
+                        let mut applied = false;
+                        load_state.update(|st| {
+                            applied = st.finish_load_err(seq, append, msg.clone());
+                        });
+                        if applied {
+                            toasts.error("Could not load media previews", Some(msg));
+                        }
+                    }
                 }
-            }
-            loading.set(false);
-        });
-    });
+            });
+        },
+    );
 
     // Cross-tab BroadcastChannel / storage invalidation on logout, opt-out, account or policy change:
     // immediately evicts DOM media sources, closes open modals/viewers, and reloads projected previews!
@@ -548,14 +823,19 @@ pub fn FavoritesPage() -> impl IntoView {
         active_album.set(None);
         viewer_index.set(None);
         if reason == "logout" {
+            load_state.update(|st| st.begin_logout_redirect());
+            cards.set(Vec::new());
+            next_cursor.set(None);
             api::navigate_hard("/user/login");
         } else {
-            load_page.run((false, None));
+            load_page.run((None, false, None));
         }
     });
 
     Effect::new(move |_| {
-        load_page.run((false, None));
+        if load_state.with_untracked(|s| s.request_seq == 0) {
+            load_page.run((None, false, None));
+        }
     });
 
     // Open card -> Post Lightbox or Image/Video Viewer
@@ -678,7 +958,7 @@ pub fn FavoritesPage() -> impl IntoView {
                         } else {
                             undo_item.set(None);
                             toasts.success("Restored to favorites", None);
-                            load_page.run((false, None));
+                            load_page.run((None, false, None));
                         }
                     }
                     Err(e) => {
@@ -836,10 +1116,15 @@ pub fn FavoritesPage() -> impl IntoView {
                                 view! {
                                     <button
                                         type="button"
-                                        class=move || if filter.get() == f { "u-tab is-active" } else { "u-tab" }
+                                        role="tab"
+                                        aria-selected=move || if active_filter.get() == f { "true" } else { "false" }
+                                        class=move || if active_filter.get() == f { "u-tab is-active" } else { "u-tab" }
                                         on:click=move |_| {
-                                            filter.set(f);
-                                            load_page.run((false, None));
+                                            let skip = load_state.with_untracked(|s| s.filter == f && s.error.is_none());
+                                            if skip {
+                                                return;
+                                            }
+                                            load_page.run((Some(f), false, None));
                                         }
                                     >
                                         {f.label()}
@@ -857,29 +1142,160 @@ pub fn FavoritesPage() -> impl IntoView {
             />
 
             <div class="u-stack">
-                <MasonryGallery
-                    cards=cards.into()
-                    density=density.into()
-                    panic_epoch=invalidation_epoch.into()
-                    empty_message="No favorites saved yet. Click the heart on any post or image in the gallery to save it here."
-                    on_open=on_open_card
-                    on_unlock_click=on_unlock_click
-                    on_like_toggle=on_like_toggle
-                    on_report_click=on_report_click
-                />
+                {move || match view_state.get() {
+                    FavoritesViewState::Loading => {
+                        let status_text = move || loading_label(active_filter.get());
+                        view! {
+                            <section
+                                class="u-fav-loading"
+                                role="status"
+                                aria-live="polite"
+                                aria-busy="true"
+                            >
+                                <div class="u-fav-loading-banner">
+                                    <span class="u-spinner" aria-hidden="true"></span>
+                                    <span>{status_text}</span>
+                                </div>
+                                <div
+                                    class="u-fav-skeleton-grid"
+                                    data-density=move || density.get().as_str()
+                                    aria-hidden="true"
+                                >
+                                    {SKELETON_ASPECTS
+                                        .into_iter()
+                                        .map(|style| {
+                                            view! {
+                                                <div class="u-fav-skeleton-card" style=style></div>
+                                            }
+                                        })
+                                        .collect_view()}
+                                </div>
+                            </section>
+                        }
+                        .into_any()
+                    }
+                    FavoritesViewState::Error(err_msg) => view! {
+                        <section class="u-card u-fav-state u-fav-state--error" role="alert">
+                            <span class="u-fav-state-icon" aria-hidden="true">
+                                <svg
+                                    viewBox="0 0 24 24"
+                                    width="22"
+                                    height="22"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    stroke-width="2"
+                                    stroke-linecap="round"
+                                    stroke-linejoin="round"
+                                >
+                                    <circle cx="12" cy="12" r="10" />
+                                    <line x1="12" y1="8" x2="12" y2="12" />
+                                    <line x1="12" y1="16" x2="12.01" y2="16" />
+                                </svg>
+                            </span>
+                            <h2 class="u-fav-state-title">"Couldn\u{2019}t load your favorites"</h2>
+                            <p class="u-fav-state-body">
+                                "Your saved favorites are safe \u{2014} we ran into a problem loading them right now."
+                            </p>
+                            {(!err_msg.is_empty()).then(|| view! {
+                                <p class="u-fav-state-detail">{err_msg}</p>
+                            })}
+                            <div class="u-fav-state-actions">
+                                <button
+                                    type="button"
+                                    class="u-btn"
+                                    on:click=move |_| load_page.run((None, false, None))
+                                >
+                                    "Try again"
+                                </button>
+                            </div>
+                        </section>
+                    }
+                    .into_any(),
+                    FavoritesViewState::Empty => {
+                        let cur_filter = active_filter.get();
+                        let (title, body) = empty_state_copy(cur_filter);
+                        view! {
+                            <section class="u-card u-fav-state u-fav-state--empty">
+                                <span class="u-fav-state-icon" aria-hidden="true">
+                                    <svg
+                                        viewBox="0 0 24 24"
+                                        width="22"
+                                        height="22"
+                                        fill="none"
+                                        stroke="currentColor"
+                                        stroke-width="2"
+                                        stroke-linecap="round"
+                                        stroke-linejoin="round"
+                                    >
+                                        <path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z" />
+                                    </svg>
+                                </span>
+                                <h2 class="u-fav-state-title">{title}</h2>
+                                <p class="u-fav-state-body">{body}</p>
+                                <div class="u-fav-state-actions">
+                                    {(cur_filter != FavFilter::All).then(|| view! {
+                                        <button
+                                            type="button"
+                                            class="u-btn"
+                                            on:click=move |_| load_page.run((Some(FavFilter::All), false, None))
+                                        >
+                                            "Show all favorites"
+                                        </button>
+                                    })}
+                                    <a class="u-btn u-btn--secondary" href="/">"Browse gallery"</a>
+                                </div>
+                            </section>
+                        }
+                        .into_any()
+                    }
+                    FavoritesViewState::Ready => view! {
+                        <>
+                            {move || cards.with(Vec::is_empty).then(|| view! {
+                                <section class="u-card u-fav-state">
+                                    <p class="u-fav-state-body">
+                                        "No items left on this page \u{2014} load the next page to see more favorites."
+                                    </p>
+                                </section>
+                            })}
 
-                {move || next_cursor.get().map(|cur| view! {
-                    <div class="u-row" style="justify-content:center;">
-                        <button
-                            type="button"
-                            class="u-btn u-btn--secondary"
-                            disabled=move || loading.get()
-                            on:click=move |_| load_page.run((true, Some(cur)))
-                        >
-                            {move || if loading.get() { "Loading..." } else { "Load more" }}
-                        </button>
-                    </div>
-                })}
+                            <MasonryGallery
+                                cards=cards.into()
+                                density=density.into()
+                                panic_epoch=invalidation_epoch.into()
+                                on_open=on_open_card
+                                on_unlock_click=on_unlock_click
+                                on_like_toggle=on_like_toggle
+                                on_report_click=on_report_click
+                            />
+
+                            {move || next_cursor.get().map(|cur| {
+                                let is_loading_more = move || {
+                                    load_state.with(|s| s.loading_more || s.loading)
+                                };
+                                view! {
+                                    <div class="u-row" style="justify-content:center;">
+                                        <button
+                                            type="button"
+                                            class="u-btn u-btn--secondary"
+                                            disabled=is_loading_more
+                                            on:click=move |_| load_page.run((None, true, Some(cur)))
+                                        >
+                                            {move || if is_loading_more() {
+                                                view! {
+                                                    <span class="u-spinner u-spinner--sm" aria-hidden="true"></span>
+                                                    <span>"Loading more\u{2026}"</span>
+                                                }.into_any()
+                                            } else {
+                                                view! { <span>"Load more"</span> }.into_any()
+                                            }}
+                                        </button>
+                                    </div>
+                                }
+                            })}
+                        </>
+                    }
+                    .into_any(),
+                }}
             </div>
 
             <Lightbox
@@ -983,5 +1399,178 @@ mod tests {
             })),
             ""
         );
+    }
+
+    #[test]
+    fn initial_mount_before_fetch_starts_is_loading_never_empty() {
+        let state = FavoritesLoadState::initial();
+        assert!(state.loading);
+        assert!(!state.has_loaded);
+        assert_eq!(state.view_state(0, false), FavoritesViewState::Loading);
+
+        // Even if `loading` were somehow false before any clean load completes,
+        // `has_loaded == false` still prevents a premature Empty state.
+        let defensive = FavoritesLoadState {
+            loading: false,
+            ..FavoritesLoadState::initial()
+        };
+        assert_eq!(defensive.view_state(0, false), FavoritesViewState::Loading);
+    }
+
+    #[test]
+    fn in_flight_initial_load_and_pending_previews_stay_loading() {
+        let mut state = FavoritesLoadState::initial();
+        let seq = state.begin_full_load(FavFilter::All);
+        assert_eq!(seq, 1);
+        assert_eq!(state.view_state(0, false), FavoritesViewState::Loading);
+
+        // Step 1 (`/user/api/likes`) returned rows; Step 2 (`/api/like_previews`) is in flight.
+        assert!(state.mark_previews_pending(seq, false));
+        assert!(state.previews_pending);
+        assert_eq!(state.view_state(0, false), FavoritesViewState::Loading);
+
+        // Even if `loading` were cleared prematurely while `previews_pending` is true,
+        // view state remains Loading.
+        let mut mid = state.clone();
+        mid.loading = false;
+        assert_eq!(mid.view_state(0, false), FavoritesViewState::Loading);
+    }
+
+    #[test]
+    fn likes_or_previews_error_renders_error_never_empty() {
+        // Error on `/user/api/likes`
+        let mut state = FavoritesLoadState::initial();
+        let seq = state.begin_full_load(FavFilter::All);
+        assert!(state.finish_load_err(seq, false, "Network error".into()));
+        assert_eq!(
+            state.view_state(0, false),
+            FavoritesViewState::Error("Network error".into())
+        );
+
+        // Retry enters Loading cleanly and clears error
+        let retry_seq = state.begin_full_load(FavFilter::All);
+        assert_eq!(state.view_state(0, false), FavoritesViewState::Loading);
+
+        // Error on `/api/like_previews` after likes succeeded
+        assert!(state.mark_previews_pending(retry_seq, false));
+        assert!(state.finish_load_err(retry_seq, false, "HTTP 503".into()));
+        assert_eq!(
+            state.view_state(0, false),
+            FavoritesViewState::Error("HTTP 503".into())
+        );
+    }
+
+    #[test]
+    fn clean_empty_and_non_empty_loads_select_exact_states() {
+        // Loaded 0 items, no cursor -> Empty
+        let mut state = FavoritesLoadState::initial();
+        let seq = state.begin_full_load(FavFilter::All);
+        assert!(state.finish_full_load_ok(seq));
+        assert_eq!(state.view_state(0, false), FavoritesViewState::Empty);
+
+        // Loaded 0 items on current page but another page exists -> Ready (never falsely Empty)
+        assert_eq!(state.view_state(0, true), FavoritesViewState::Ready);
+
+        // Loaded N > 0 items -> Ready
+        let seq2 = state.begin_full_load(FavFilter::Image);
+        assert!(state.mark_previews_pending(seq2, false));
+        assert!(state.finish_full_load_ok(seq2));
+        assert_eq!(state.view_state(12, false), FavoritesViewState::Ready);
+
+        // Unliking last visible item when no cursor remains -> Empty
+        assert_eq!(state.view_state(0, false), FavoritesViewState::Empty);
+    }
+
+    #[test]
+    fn tab_switching_resets_to_loading_and_ignores_stale_responses() {
+        let mut state = FavoritesLoadState::initial();
+        let seq_all = state.begin_full_load(FavFilter::All);
+        assert!(state.finish_full_load_ok(seq_all));
+        assert_eq!(state.view_state(8, false), FavoritesViewState::Ready);
+
+        // Switch to Videos -> immediately Loading
+        let seq_videos = state.begin_full_load(FavFilter::Video);
+        assert_eq!(state.filter, FavFilter::Video);
+        assert_eq!(state.view_state(0, false), FavoritesViewState::Loading);
+
+        // Before Videos finishes, user switches to Posts
+        let seq_posts = state.begin_full_load(FavFilter::Post);
+        assert_eq!(state.filter, FavFilter::Post);
+        assert_eq!(state.view_state(0, false), FavoritesViewState::Loading);
+
+        // Stale Videos empty response arrives late -> MUST be ignored so Posts never flashes Empty
+        assert!(!state.finish_full_load_ok(seq_videos));
+        assert!(!state.mark_previews_pending(seq_videos, false));
+        assert!(!state.finish_load_err(seq_videos, false, "stale".into()));
+        assert_eq!(state.view_state(0, false), FavoritesViewState::Loading);
+
+        // Posts response completes with items -> Ready
+        assert!(state.mark_previews_pending(seq_posts, false));
+        assert!(state.finish_full_load_ok(seq_posts));
+        assert_eq!(state.view_state(3, true), FavoritesViewState::Ready);
+
+        // Switch from an Empty tab to another tab -> immediately Loading
+        let seq_empty = state.begin_full_load(FavFilter::Video);
+        assert!(state.finish_full_load_ok(seq_empty));
+        assert_eq!(state.view_state(0, false), FavoritesViewState::Empty);
+
+        let _seq_back = state.begin_full_load(FavFilter::All);
+        assert_eq!(state.view_state(0, false), FavoritesViewState::Loading);
+    }
+
+    #[test]
+    fn pagination_append_preserves_ready_state_and_guards_errors() {
+        let mut state = FavoritesLoadState::initial();
+        let seq1 = state.begin_full_load(FavFilter::All);
+        assert!(state.finish_full_load_ok(seq1));
+        assert_eq!(state.view_state(48, true), FavoritesViewState::Ready);
+
+        // Start "Load more": stays Ready while loading_more is true; duplicate click rejected
+        let seq_more = state.begin_append_load().expect("append starts");
+        assert!(state.loading_more);
+        assert!(state.begin_append_load().is_none());
+        assert_eq!(state.view_state(48, true), FavoritesViewState::Ready);
+
+        // Previews pending on append does NOT replace gallery with skeleton
+        assert!(state.mark_previews_pending(seq_more, true));
+        assert!(!state.previews_pending);
+        assert_eq!(state.view_state(48, true), FavoritesViewState::Ready);
+
+        // Error during append keeps already-loaded items visible in Ready state
+        assert!(state.finish_load_err(seq_more, true, "timeout".into()));
+        assert!(!state.loading_more);
+        assert_eq!(state.view_state(48, true), FavoritesViewState::Ready);
+
+        // Retry append succeeds
+        let seq_more_2 = state.begin_append_load().expect("retry append starts");
+        assert!(state.finish_append_load_ok(seq_more_2));
+        assert!(!state.loading_more);
+        assert_eq!(state.view_state(96, false), FavoritesViewState::Ready);
+    }
+
+    #[test]
+    fn logout_invalidation_stays_loading_and_cancels_inflight_requests() {
+        let mut state = FavoritesLoadState::initial();
+        let seq = state.begin_full_load(FavFilter::All);
+        state.begin_logout_redirect();
+        assert!(!state.is_current_request(seq));
+        assert!(!state.finish_full_load_ok(seq));
+        assert_eq!(state.view_state(0, false), FavoritesViewState::Loading);
+    }
+
+    #[test]
+    fn loading_and_empty_copy_are_non_empty_for_all_filters() {
+        for filter in [
+            FavFilter::All,
+            FavFilter::Post,
+            FavFilter::Image,
+            FavFilter::Video,
+        ] {
+            assert!(!loading_label(filter).is_empty());
+            let (title, body) = empty_state_copy(filter);
+            assert!(!title.is_empty());
+            assert!(!body.is_empty());
+        }
+        assert_eq!(loading_label(FavFilter::All), "Loading your favorites\u{2026}");
     }
 }
