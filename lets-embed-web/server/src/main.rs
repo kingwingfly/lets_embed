@@ -43,10 +43,12 @@ async fn healthz() -> impl IntoResponse {
     )
 }
 
-/// Build the core non-Leptos HTTP router (healthz, optional Standalone media ServeDir,
+/// Build the core non-Leptos HTTP router (health/healthz, optional Standalone media ServeDir,
 /// SEO, legal Markdown routes, `/api/like_previews`, and `/api/post_images`).
 fn build_core_router(app_state: &AppState, serve_media_prefix: Option<PathBuf>) -> Router<AppState> {
-    let mut router = Router::new().route("/healthz", get(healthz));
+    let mut router = Router::new()
+        .route("/health", get(healthz))
+        .route("/healthz", get(healthz));
 
     // HARD INVARIANT:
     // - Managed Mode unconditionally refuses raw media mounts on `/images` and `/videos`.
@@ -643,22 +645,28 @@ mod tests {
         // Even if someone passes `Some(tmp)` to `build_core_router`, Managed Mode MUST refuse `/images` mount!
         let app = test_router(state, Some(tmp.clone()));
 
-        // 1. `/healthz` works WITHOUT X-Gateway-Assertion and returns `private, no-store`.
-        let health = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/healthz")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(health.status(), StatusCode::OK);
-        assert_eq!(
-            health.headers().get(header::CACHE_CONTROL).unwrap(),
-            "private, no-store"
-        );
+        // 1. Both `/health` (unreserved on Cloud Run / GFE) and `/healthz` (legacy)
+        // work WITHOUT X-Gateway-Assertion and return `200 OK` `"ok"` with `private, no-store`.
+        for health_path in ["/health", "/healthz"] {
+            let health = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(health_path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(health.status(), StatusCode::OK, "{health_path} status");
+            assert_eq!(
+                health.headers().get(header::CACHE_CONTROL).unwrap(),
+                "private, no-store",
+                "{health_path} cache-control"
+            );
+            let body = to_bytes(health.into_body(), 1024).await.unwrap();
+            assert_eq!(&body[..], b"ok", "{health_path} body");
+        }
 
         // 2. Missing assertion -> 403 Forbidden + `Cache-Control: private, no-store`.
         let missing = app
@@ -1271,5 +1279,57 @@ mod tests {
         spawn_db_pool_warmup(engine)
             .await
             .expect("db warmup task should complete without panicking");
+    }
+
+    #[tokio::test]
+    async fn managed_health_endpoints_bypass_assertion_rate_limit_and_policy_store() {
+        // Deliberately point PolicyStore at an unreachable endpoint, omit secrets, and set
+        // 0/0 metadata rate limits so any accidental auth, rate-limit, or PolicyStore call fails.
+        let store = PolicyStore::managed(PolicySyncConfig {
+            policy_url: "http://127.0.0.1:1/unreachable-policy".to_string(),
+            cf_access_client_id: None,
+            cf_access_client_secret: None,
+            max_staleness: Duration::from_secs(60),
+        })
+        .unwrap();
+
+        let state = AppState {
+            leptos_options: test_leptos_opts(),
+            engine: test_engine(),
+            prefix: Arc::new(None),
+            public_url: Arc::new(Some("https://gallery.example.com".to_string())),
+            mode: DeploymentMode::Managed,
+            trust_proxy: false,
+            policy_store: Arc::new(store),
+            gateway_assertion_secret: None,
+            media_cap_secret: None,
+            internal_api_secret: None,
+        };
+
+        let app = test_router_with_limits(
+            state,
+            None,
+            MetadataRateLimitConfig {
+                per_subject_limit: 0,
+                global_limit: 0,
+                window: Duration::from_secs(60),
+            },
+        );
+
+        for path in ["/health", "/healthz"] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path} must return 200 OK");
+            assert_eq!(
+                resp.headers().get(header::CACHE_CONTROL).unwrap(),
+                "private, no-store",
+                "{path} must set private, no-store"
+            );
+            let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+            assert_eq!(&body[..], b"ok", "{path} body must be ok");
+        }
     }
 }

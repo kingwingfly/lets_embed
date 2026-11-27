@@ -5,7 +5,7 @@
 //!     `X-Policy-Revision`, `X-Gallery-Switchers`, `CF-IPCountry`, etc.).
 //!   - Pins `RequestSafetyContext::standalone(...)` onto request extensions.
 //! - **Managed Mode**:
-//!   - Exempts ONLY `/healthz` from assertion authentication.
+//!   - Exempts ONLY `/health` and `/healthz` from assertion authentication.
 //!   - Verifies `X-Gateway-Assertion` via `site_access::verify_gateway_assertion` on EVERY
 //!     other route, rejecting missing/invalid/expired assertions with `403 Forbidden`
 //!     (`Cache-Control: private, no-store`).
@@ -214,6 +214,10 @@ fn is_safe_pkg_path(path: &str) -> bool {
         .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
+fn is_health_path(path: &str) -> bool {
+    matches!(path, "/health" | "/healthz")
+}
+
 fn is_sitemap_path(path: &str) -> bool {
     path == "/sitemap.xml" || (path.starts_with("/sitemap/") && path.ends_with(".xml"))
 }
@@ -405,8 +409,9 @@ pub async fn safety_and_auth_middleware(
         return next.run(req).await;
     }
 
-    // Managed Mode: ONLY `/healthz` is exempted from authentication.
-    if path == "/healthz" {
+    // Managed Mode: ONLY `/health` and `/healthz` are exempted from authentication,
+    // rate limiting, and PolicyStore resolution.
+    if is_health_path(&path) {
         strip_privileged_headers(req.headers_mut());
         let mut resp = next.run(req).await;
         resp.headers_mut().insert(
@@ -596,5 +601,22 @@ mod tests {
             extract_client_ip(&hdrs, Some(peer), true, false),
             Some("198.51.100.99".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn health_path_exemption_matches_only_exact_health_and_healthz() {
+        assert!(is_health_path("/health"));
+        assert!(is_health_path("/healthz"));
+        for denied in [
+            "/",
+            "/health/",
+            "/healthz/",
+            "/health/live",
+            "/healthcheck",
+            "/healthz2",
+            "/api/health",
+        ] {
+            assert!(!is_health_path(denied), "unexpected health exemption: {denied}");
+        }
     }
 }

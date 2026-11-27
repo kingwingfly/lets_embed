@@ -1493,8 +1493,8 @@ test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in wor
     pendingTimers.clear();
   });
 
-  const healthzCalls = [];
-  let healthzHandler = () => {
+  const healthCalls = [];
+  let healthHandler = () => {
     const h = new Headers({ 'content-type': 'text/plain; charset=utf-8' });
     h.append('set-cookie', 'CF_Authorization=should-never-leak; Path=/; Secure; HttpOnly');
     return new Response('ok', { status: 200, headers: h });
@@ -1503,15 +1503,24 @@ test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in wor
   let apiHits = 0;
 
   const outbound = (request, target) => {
-    if (target.host === new URL(apiUpstream).host && target.pathname === '/healthz') {
-      healthzCalls.push({
+    if (target.host === new URL(apiUpstream).host) {
+      assert.notEqual(
+        target.pathname,
+        '/healthz',
+        'gateway must probe unreserved /health, never GFE-reserved /healthz'
+      );
+    }
+    if (target.host === new URL(apiUpstream).host && target.pathname === '/health') {
+      healthCalls.push({
         method: request.method,
+        path: target.pathname,
+        userAgent: request.headers.get('user-agent'),
         clientId: request.headers.get('cf-access-client-id'),
         clientSecret: request.headers.get('cf-access-client-secret'),
         assertion: request.headers.get('x-gateway-assertion'),
         cookie: request.headers.get('cookie'),
       });
-      return healthzHandler(request, target);
+      return healthHandler(request, target);
     }
     apiHits += 1;
     if (nextApiHandler) {
@@ -1582,14 +1591,14 @@ test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in wor
     'sec-fetch-dest': 'document',
     'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36',
   };
-  const waitForHealthzCount = async (expected) => {
+  const waitForHealthCount = async (expected) => {
     const start = Date.now();
-    while (healthzCalls.length < expected && Date.now() - start < 1500) {
+    while (healthCalls.length < expected && Date.now() - start < 1500) {
       await new Promise((r) => setTimeout(r, 20));
     }
     assert.ok(
-      healthzCalls.length >= expected,
-      `expected >= ${expected} /healthz calls, got ${healthzCalls.length}`
+      healthCalls.length >= expected,
+      `expected >= ${expected} /health calls, got ${healthCalls.length}`
     );
   };
 
@@ -1610,9 +1619,10 @@ test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in wor
     451
   );
   assert.equal(apiHits, 0);
-  assert.equal(healthzCalls.length, 0);
+  assert.equal(healthCalls.length, 0);
 
-  // `/_gw/ready` works under login_required=true, strips upstream CF_Authorization,
+  // `/_gw/ready` works under login_required=true, hits `/health` (NOT `/healthz`),
+  // ALWAYS sends a non-empty BIC-safe User-Agent, strips upstream CF_Authorization,
   // sets the short-lived `__le_gw_wake=1` cookie ONLY when ready, and sends CF-Access headers only.
   const readyOk = await site('/_gw/ready');
   assert.equal(readyOk.status, 200);
@@ -1624,14 +1634,31 @@ test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in wor
   );
   assert.doesNotMatch(readySetCookie, /CF_Authorization/i);
   assert.deepEqual(await readyOk.json(), { ready: true });
-  assert.equal(healthzCalls.length, 1);
-  assert.deepEqual(healthzCalls[0], {
+  assert.equal(healthCalls.length, 1);
+  assert.deepEqual(healthCalls[0], {
     method: 'GET',
+    path: '/health',
+    userAgent: 'LetsEmbedGateway/1.0',
     clientId: 'local-svc-id',
     clientSecret: 'local-svc-secret',
     assertion: null,
     cookie: null,
   });
+
+  // `curl` UA falls back to BIC-safe `LetsEmbedGateway/1.0`, while browser `Mozilla/` UA is forwarded.
+  const readyCurl = await site('/_gw/ready', { headers: { 'user-agent': 'curl/8.7.1' } });
+  assert.equal(readyCurl.status, 200);
+  assert.deepEqual(await readyCurl.json(), { ready: true });
+  assert.equal(healthCalls.at(-1).path, '/health');
+  assert.equal(healthCalls.at(-1).userAgent, 'LetsEmbedGateway/1.0');
+
+  const readyBrowser = await site('/_gw/ready', {
+    headers: { 'user-agent': browserNavHeaders['user-agent'] },
+  });
+  assert.equal(readyBrowser.status, 200);
+  assert.deepEqual(await readyBrowser.json(), { ready: true });
+  assert.equal(healthCalls.at(-1).path, '/health');
+  assert.equal(healthCalls.at(-1).userAgent, browserNavHeaders['user-agent']);
 
   // Plain http `/_gw/ready` omits `; Secure` so local localhost/Miniflare workflows work.
   const readyHttp = await mf.dispatchFetch('http://' + appHost + '/_gw/ready', {
@@ -1651,28 +1678,31 @@ test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in wor
   assert.equal(readyPost.status, 405);
   assert.equal(readyPost.headers.get('allow'), 'GET, HEAD');
 
-  healthzHandler = () => new Response('starting', { status: 503 });
-  const ready503 = await site('/_gw/ready');
-  assert.equal(ready503.status, 503);
-  assert.equal(ready503.headers.get('cache-control'), 'private, no-store');
-  assert.equal(ready503.headers.get('set-cookie'), null);
-  assert.deepEqual(await ready503.json(), { ready: false });
+  for (const failStatus of [403, 404, 503]) {
+    healthHandler = () => new Response('not ready', { status: failStatus });
+    const readyFail = await site('/_gw/ready');
+    assert.equal(readyFail.status, 503);
+    assert.equal(readyFail.headers.get('cache-control'), 'private, no-store');
+    assert.equal(readyFail.headers.get('set-cookie'), null);
+    assert.deepEqual(await readyFail.json(), { ready: false });
+  }
 
   // `/_gw/ready` timeout (>3500ms) -> 503 {"ready":false} without setting wake cookie
-  healthzHandler = () => delayedResponse(3800, () => new Response('late ok', { status: 200 }));
+  healthHandler = () => delayedResponse(3800, () => new Response('late ok', { status: 200 }));
   const readyTimeout = await site('/_gw/ready');
   assert.equal(readyTimeout.status, 503);
   assert.equal(readyTimeout.headers.get('set-cookie'), null);
   assert.deepEqual(await readyTimeout.json(), { ready: false });
-  healthzHandler = () => {
+  healthHandler = () => {
     const h = new Headers({ 'content-type': 'text/plain; charset=utf-8' });
     h.append('set-cookie', 'CF_Authorization=should-never-leak; Path=/; Secure; HttpOnly');
     return new Response('ok', { status: 200, headers: h });
   };
 
-  // Public legal route `/terms` under login_required=true still renders waking interstitial on 503.
+  // Public legal route `/terms` under login_required=true still renders waking interstitial on 503
+  // and triggers background `/health` wakeup with forwarded Mozilla User-Agent.
   nextApiHandler = () => new Response('cold', { status: 503 });
-  const prevHealthz = healthzCalls.length;
+  const prevHealth = healthCalls.length;
   const termsWake = await site('/terms', { headers: browserNavHeaders });
   assert.equal(termsWake.status, 503);
   assert.equal(termsWake.headers.get('content-type'), 'text/html; charset=utf-8');
@@ -1682,7 +1712,21 @@ test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in wor
   const termsHtml = await termsWake.text();
   assert.match(termsHtml, /\/_gw\/ready/);
   assert.match(termsHtml, /<meta http-equiv="refresh" content="6">/);
-  await waitForHealthzCount(prevHealthz + 1);
+  await waitForHealthCount(prevHealth + 1);
+  assert.equal(healthCalls.at(-1).path, '/health');
+  assert.equal(healthCalls.at(-1).userAgent, browserNavHeaders['user-agent']);
+
+  // Non-Mozilla HTML nav wakeup falls back to BIC-safe `LetsEmbedGateway/1.0`.
+  nextApiHandler = () => new Response('cold', { status: 503 });
+  const prevFallbackWakeHealth = healthCalls.length;
+  const fallbackWake = await site('/terms', {
+    headers: { ...browserNavHeaders, 'user-agent': 'curl/8.7.1' },
+  });
+  assert.equal(fallbackWake.status, 503);
+  assert.equal(fallbackWake.headers.get('content-type'), 'text/html; charset=utf-8');
+  await waitForHealthCount(prevFallbackWakeHealth + 1);
+  assert.equal(healthCalls.at(-1).path, '/health');
+  assert.equal(healthCalls.at(-1).userAgent, 'LetsEmbedGateway/1.0');
 
   // 2. Warm path & Cold timeout (>2000ms) on gallery HTML navigation.
   await setLoginRequired(false);
@@ -1690,7 +1734,7 @@ test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in wor
   assert.equal(warm.status, 200);
   assert.equal(await warm.text(), '<html><body>Warm Gallery</body></html>');
 
-  const beforeTimeoutHealthz = healthzCalls.length;
+  const beforeTimeoutHealth = healthCalls.length;
   nextApiHandler = () =>
     delayedResponse(2400, () => new Response('<html><body>Late</body></html>', { status: 200 }));
   const coldTimeout = await site('/details/42', { headers: browserNavHeaders });
@@ -1702,16 +1746,20 @@ test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in wor
   const coldHtml = await coldTimeout.text();
   assert.match(coldHtml, /\/_gw\/ready/);
   assert.match(coldHtml, /Retry now/);
-  await waitForHealthzCount(beforeTimeoutHealthz + 1);
+  await waitForHealthCount(beforeTimeoutHealth + 1);
+  assert.equal(healthCalls.at(-1).path, '/health');
+  assert.equal(healthCalls.at(-1).userAgent, browserNavHeaders['user-agent']);
 
   // 3. Transient 502/504 -> waking interstitial for browser HTML nav.
   for (const status of [502, 504]) {
-    const hBefore = healthzCalls.length;
+    const hBefore = healthCalls.length;
     nextApiHandler = () => new Response('bad gateway', { status });
     const r = await site('/', { headers: browserNavHeaders });
     assert.equal(r.status, 503);
     assert.equal(r.headers.get('content-type'), 'text/html; charset=utf-8');
-    await waitForHealthzCount(hBefore + 1);
+    await waitForHealthCount(hBefore + 1);
+    assert.equal(healthCalls.at(-1).path, '/health');
+    assert.ok(healthCalls.at(-1).userAgent, 'wakeup must always send non-empty User-Agent');
   }
 
   // 4. Non-HTML, XHR, crawler UA, HEAD, POST /api/*, /pkg/*, /robots.txt, /sitemap.xml
@@ -1738,15 +1786,15 @@ test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in wor
       },
     ],
   ];
-  const healthzBeforeBypass = healthzCalls.length;
+  const healthBeforeBypass = healthCalls.length;
   for (const [label, url, opts] of bypassCases) {
     nextApiHandler = () => new Response('raw-502', { status: 502 });
     const resp = await site(url, opts);
     assert.equal(resp.status, 502, `${label} must not receive waking interstitial`);
   }
-  assert.equal(healthzCalls.length, healthzBeforeBypass);
+  assert.equal(healthCalls.length, healthBeforeBypass);
 
-  // 5. Production regression: `/healthz` returns 200 immediately while first `GET /` takes 2800ms
+  // 5. Production regression: `/health` returns 200 immediately while first `GET /` takes 2800ms
   //    (simulating cold PolicyStore sync + Postgres SSR).
   //    - Initial `GET /` fast-aborts at ~2s into the 503 waking screen.
   //    - `GET /_gw/ready` returns 200 `{"ready":true}` with `Set-Cookie: __le_gw_wake=1...`
@@ -1754,14 +1802,14 @@ test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in wor
   //    - Reloaded `GET /` with `Cookie: __le_gw_wake=1; theme=dark` waits past 2s (`POST_WAKE_TIMEOUT_MS`)
   //      and returns 200, stripping `__le_gw_wake` before upstream and clearing the cookie in response!
   let observedUpstreamCookie = null;
-  const regHealthzBefore = healthzCalls.length;
+  const regHealthBefore = healthCalls.length;
   nextApiHandler = () =>
     delayedResponse(2800, () => new Response('<html><body>Slow Cold SSR</body></html>', { status: 200 }));
   const regInitial = await site('/', { headers: browserNavHeaders });
   assert.equal(regInitial.status, 503);
   assert.equal(regInitial.headers.get('content-type'), 'text/html; charset=utf-8');
   const regWakingHtml = await regInitial.text();
-  await waitForHealthzCount(regHealthzBefore + 1);
+  await waitForHealthCount(regHealthBefore + 1);
 
   const regReady = await site('/_gw/ready');
   assert.equal(regReady.status, 200);
@@ -2120,4 +2168,73 @@ test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in wor
   assert.equal(readyRetryStorage.has('le_wake_retries'), false);
   assert.equal(readyRetryHarness.getReloadCount(), 1);
   assert.equal(readyRetryFetches, 1, 'already-ready Retry now should reload without extra probe');
+
+  // (e) Resilient fallback auto-reload: if `/_gw/ready` stays 503 `{"ready":false}` past 20s,
+  //     status switches to "Checking gallery directly…" and `triggerReload()` fires at 20s and
+  //     every 15s + bounded backoff thereafter without tight-looping!
+  let fallbackPollCount = 0;
+  const fallbackStorage = new Map();
+  const fallbackHarness = createWakingVmHarness({
+    initialNow: 1_700_000_600_000,
+    storageMap: fallbackStorage,
+    fetchImpl: async () => {
+      fallbackPollCount += 1;
+      return { ok: false, status: 503, json: async () => ({ ready: false }) };
+    },
+  });
+  await fallbackHarness.advanceBy(19_999);
+  assert.equal(fallbackHarness.getReloadCount(), 0, 'fallback must not fire before 20s');
+  assert.equal(fallbackPollCount, 10, 'primary /_gw/ready polling runs every 2s before 20s');
+  await fallbackHarness.advanceBy(1); // exact 20_000ms!
+  assert.equal(fallbackHarness.getReloadCount(), 1, 'fallback must fire at 20s elapsed');
+  assert.equal(fallbackHarness.statusEl.textContent, 'Checking gallery directly…');
+
+  // While still on the waking screen, subsequent fallback reloads respect 15s + bounded backoff:
+  // +17s (15+2), +19s (15+4), +23s (15+8), +27s (15+12 cap), +27s (15+12 cap) — never tight-looping!
+  const expectedRepeatIntervals = [17_000, 19_000, 23_000, 27_000, 27_000];
+  let expectedReloads = 1;
+  for (const interval of expectedRepeatIntervals) {
+    await fallbackHarness.advanceBy(interval - 1);
+    assert.equal(
+      fallbackHarness.getReloadCount(),
+      expectedReloads,
+      `must not tight-loop before +${interval}ms`
+    );
+    await fallbackHarness.advanceBy(1);
+    expectedReloads += 1;
+    assert.equal(
+      fallbackHarness.getReloadCount(),
+      expectedReloads,
+      `fallback must fire again after +${interval}ms`
+    );
+    assert.equal(fallbackHarness.statusEl.textContent, 'Checking gallery directly…');
+  }
+
+  // Clicking `Retry now` during a stalled fallback cooldown still resets backoff & reloads cleanly.
+  await fallbackHarness.advanceBy(5_000);
+  await fallbackHarness.clickRetry();
+  assert.equal(fallbackStorage.has('le_wake_retries'), false);
+  assert.equal(fallbackHarness.getReloadCount(), expectedReloads + 1);
+
+  // Across simulated page reloads (fresh 503 waking screen sharing sessionStorage), fallback
+  // respects bounded backoff (20s -> 22s -> 24s) so repeated 503 pages never tight-loop either.
+  const crossReloadStorage = new Map();
+  let crossClock = 1_700_000_900_000;
+  for (const expectedFirstFallback of [20_000, 22_000, 24_000]) {
+    const h = createWakingVmHarness({
+      initialNow: crossClock,
+      storageMap: crossReloadStorage,
+      fetchImpl: async () => ({ ok: false, status: 503, json: async () => ({ ready: false }) }),
+    });
+    await h.advanceBy(expectedFirstFallback - 1);
+    assert.equal(
+      h.getReloadCount(),
+      0,
+      `cross-reload fallback must wait ${expectedFirstFallback}ms`
+    );
+    await h.advanceBy(1);
+    assert.equal(h.getReloadCount(), 1);
+    assert.equal(h.statusEl.textContent, 'Checking gallery directly…');
+    crossClock = h.getNow() + 200;
+  }
 });

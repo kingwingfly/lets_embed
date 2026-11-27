@@ -26,9 +26,12 @@ pub(crate) const MAX_ADMIN_BODY_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_IMAGE_SEARCH_BODY_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_TEXT_SEARCH_BODY_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_REVEAL_BODY_BYTES: usize = 4096;
-/// Short-lived gateway-only cookie set by `GET /_gw/ready` once upstream `/healthz`
+/// Short-lived gateway-only cookie set by `GET /_gw/ready` once upstream `/health`
 /// returns `200 OK`, signaling post-ready HTML reloads to use `POST_WAKE_TIMEOUT_MS`.
 pub(crate) const WAKE_COOKIE_NAME: &str = "__le_gw_wake";
+/// Fallback Browser-Integrity-Check-safe `User-Agent` sent on upstream `/health`
+/// probes when the incoming request lacks a sanitized `Mozilla/` browser `User-Agent`.
+pub(crate) const HEALTH_PROBE_FALLBACK_USER_AGENT: &str = "LetsEmbedGateway/1.0";
 
 #[derive(Clone, Debug)]
 pub(crate) struct Upstreams {
@@ -271,7 +274,7 @@ pub(crate) fn has_wake_cookie(headers: &HeaderMap) -> bool {
     )
 }
 
-/// `Set-Cookie` header value emitted by `/_gw/ready` when origin `/healthz` is `200 OK`.
+/// `Set-Cookie` header value emitted by `/_gw/ready` when origin `/health` is `200 OK`.
 pub(crate) fn wake_set_cookie_header(secure: bool) -> &'static str {
     if secure {
         "__le_gw_wake=1; Path=/; Max-Age=30; SameSite=Lax; HttpOnly; Secure"
@@ -532,25 +535,44 @@ pub(crate) fn build_api_upstream_target(
     Ok(target_url)
 }
 
-/// Builds and validates `{API_UPSTREAM}/healthz` strictly pinned to `API_UPSTREAM`.
-pub(crate) fn build_api_healthz_target(
+/// Builds and validates `{API_UPSTREAM}/health` strictly pinned to `API_UPSTREAM`.
+pub(crate) fn build_api_health_target(
     upstreams: &Upstreams,
 ) -> std::result::Result<worker::Url, ()> {
     let upstream = parse_upstream_origin(upstreams.api.as_str()).map_err(|_| ())?;
     let base_url = worker::Url::parse(&upstream).map_err(|_| ())?;
-    let target_url = worker::Url::parse(&format!("{upstream}/healthz")).map_err(|_| ())?;
+    let target_url = worker::Url::parse(&format!("{upstream}/health")).map_err(|_| ())?;
     if target_url.scheme() != base_url.scheme()
         || target_url.host_str() != base_url.host_str()
         || target_url.port_or_known_default() != base_url.port_or_known_default()
         || !target_url.username().is_empty()
         || target_url.password().is_some()
-        || target_url.path() != "/healthz"
+        || target_url.path() != "/health"
         || target_url.query().is_some()
         || target_url.fragment().is_some()
     {
         return Err(());
     }
     Ok(target_url)
+}
+
+/// Selects a non-empty, Cloudflare Browser Integrity Check (BIC)-safe `User-Agent`
+/// for upstream `/health` probes and cold-start wakeups.
+///
+/// Forwards the incoming request's single `User-Agent` when it starts with `"Mozilla/"`
+/// (trimmed, non-empty, `<= 512` chars, and containing no control characters); otherwise
+/// falls back to [`HEALTH_PROBE_FALLBACK_USER_AGENT`].
+pub(crate) fn select_health_probe_user_agent(headers: &HeaderMap) -> String {
+    if let Ok(Some(raw)) = single_header(headers, "user-agent") {
+        let trimmed = raw.trim();
+        if trimmed.starts_with("Mozilla/")
+            && trimmed.len() <= 512
+            && !trimmed.chars().any(char::is_control)
+        {
+            return trimmed.to_string();
+        }
+    }
+    HEALTH_PROBE_FALLBACK_USER_AGENT.to_string()
 }
 
 /// Known search/social crawler User-Agent tokens (lowercase) that should wait for
@@ -1121,6 +1143,8 @@ const WAKING_INTERSTITIAL_HTML: &str = r#"<!DOCTYPE html>
   var RETRY_WINDOW_MS = 25000;
   var BACKOFF_BASE_MS = 2000;
   var BACKOFF_MAX_MS = 12000;
+  var FALLBACK_FIRST_MS = 20000;
+  var FALLBACK_REPEAT_MS = 15000;
   var READY_FETCH_TIMEOUT_MS = 8000;
   var MANUAL_PROBE_TIMEOUT_MS = 2500;
   var inFlight = false;
@@ -1128,8 +1152,11 @@ const WAKING_INTERSTITIAL_HTML: &str = r#"<!DOCTYPE html>
   var manualRetrying = false;
   var serverReady = false;
   var hasExplicitStatus = false;
+  var fallbackAttempts = 0;
+  var fallbackAnchorAt = startedAt + FALLBACK_FIRST_MS;
   var pollTimer = null;
   var reloadTimer = null;
+  var fallbackTimer = null;
   var activeCancel = null;
 
   function setExplicitStatus(msg) {
@@ -1171,7 +1198,7 @@ const WAKING_INTERSTITIAL_HTML: &str = r#"<!DOCTYPE html>
     try { sessionStorage.removeItem(RETRY_KEY); } catch (_) {}
   }
 
-  function cancelPending() {
+  function cancelPollAndReload() {
     if (pollTimer) {
       clearTimeout(pollTimer);
       pollTimer = null;
@@ -1180,6 +1207,18 @@ const WAKING_INTERSTITIAL_HTML: &str = r#"<!DOCTYPE html>
       clearTimeout(reloadTimer);
       reloadTimer = null;
     }
+  }
+
+  function cancelFallback() {
+    if (fallbackTimer) {
+      clearTimeout(fallbackTimer);
+      fallbackTimer = null;
+    }
+  }
+
+  function cancelPending() {
+    cancelPollAndReload();
+    cancelFallback();
   }
 
   function updateClock() {
@@ -1199,7 +1238,7 @@ const WAKING_INTERSTITIAL_HTML: &str = r#"<!DOCTYPE html>
 
   function schedulePoll(ms) {
     if (reloading || manualRetrying) return;
-    cancelPending();
+    cancelPollAndReload();
     pollTimer = setTimeout(function () {
       pollTimer = null;
       pollReady();
@@ -1215,6 +1254,12 @@ const WAKING_INTERSTITIAL_HTML: &str = r#"<!DOCTYPE html>
     }, ms);
   }
 
+  function scheduleFallback(ms) {
+    if (serverReady || reloading || manualRetrying) return;
+    cancelFallback();
+    fallbackTimer = setTimeout(onFallbackDue, Math.max(0, ms));
+  }
+
   function triggerReload(recordAttempt, statusMsg) {
     if (reloading) return;
     reloading = true;
@@ -1225,6 +1270,42 @@ const WAKING_INTERSTITIAL_HTML: &str = r#"<!DOCTYPE html>
       recordReloadAttempt();
     }
     window.location.reload();
+  }
+
+  function triggerFallbackReload() {
+    if (serverReady || reloading || manualRetrying) return;
+    if (activeCancel) {
+      var cancel = activeCancel;
+      activeCancel = null;
+      cancel();
+    }
+    inFlight = false;
+    fallbackAttempts += 1;
+    triggerReload(true, 'Checking gallery directly\u2026');
+    var st = readRetryState();
+    var effectiveCount = Math.max(st.count || 0, fallbackAttempts);
+    var nextInterval = FALLBACK_REPEAT_MS + backoffDelayMs(effectiveCount);
+    fallbackAnchorAt = Date.now() + FALLBACK_REPEAT_MS;
+    fallbackTimer = setTimeout(function () {
+      fallbackTimer = null;
+      if (serverReady || manualRetrying) return;
+      reloading = false;
+      onFallbackDue();
+    }, nextInterval);
+  }
+
+  function onFallbackDue() {
+    fallbackTimer = null;
+    if (serverReady || reloading || manualRetrying) return;
+    var st = readRetryState();
+    var effectiveCount = Math.max(st.count || 0, fallbackAttempts);
+    var delay = backoffDelayMs(effectiveCount);
+    var remaining = (fallbackAnchorAt + delay) - Date.now();
+    if (remaining > 0) {
+      scheduleFallback(remaining);
+      return;
+    }
+    triggerFallbackReload();
   }
 
   function fetchReady(timeoutMs) {
@@ -1289,6 +1370,7 @@ const WAKING_INTERSTITIAL_HTML: &str = r#"<!DOCTYPE html>
       if (reloading || manualRetrying) return;
       if (data && data.ready === true) {
         serverReady = true;
+        cancelFallback();
         var st = readRetryState();
         var delay = backoffDelayMs(st.count);
         if (delay > 0) {
@@ -1308,7 +1390,8 @@ const WAKING_INTERSTITIAL_HTML: &str = r#"<!DOCTYPE html>
 
   if (retryBtn) {
     retryBtn.addEventListener('click', function () {
-      if (reloading || manualRetrying) return;
+      if (manualRetrying || (reloading && !fallbackTimer)) return;
+      reloading = false;
       manualRetrying = true;
       clearReloadAttempts();
       cancelPending();
@@ -1336,6 +1419,7 @@ const WAKING_INTERSTITIAL_HTML: &str = r#"<!DOCTYPE html>
 
   setInterval(updateClock, 1000);
   updateClock();
+  scheduleFallback(FALLBACK_FIRST_MS);
   schedulePoll(1500);
 })();
 </script>
