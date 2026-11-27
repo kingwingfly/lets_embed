@@ -5,7 +5,10 @@ use axum::{
     body::Bytes,
     http::{
         HeaderMap, HeaderValue, Method, StatusCode, Uri,
-        header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE, IF_NONE_MATCH, SET_COOKIE},
+        header::{
+            ACCEPT, CACHE_CONTROL, CONTENT_TYPE, IF_NONE_MATCH, RETRY_AFTER, SET_COOKIE,
+            USER_AGENT, X_CONTENT_TYPE_OPTIONS,
+        },
     },
     response::{IntoResponse, Redirect, Response},
 };
@@ -499,6 +502,85 @@ pub(crate) fn build_api_upstream_target(
     Ok(target_url)
 }
 
+/// Builds and validates `{API_UPSTREAM}/healthz` strictly pinned to `API_UPSTREAM`.
+pub(crate) fn build_api_healthz_target(
+    upstreams: &Upstreams,
+) -> std::result::Result<worker::Url, ()> {
+    let upstream = parse_upstream_origin(upstreams.api.as_str()).map_err(|_| ())?;
+    let base_url = worker::Url::parse(&upstream).map_err(|_| ())?;
+    let target_url = worker::Url::parse(&format!("{upstream}/healthz")).map_err(|_| ())?;
+    if target_url.scheme() != base_url.scheme()
+        || target_url.host_str() != base_url.host_str()
+        || target_url.port_or_known_default() != base_url.port_or_known_default()
+        || !target_url.username().is_empty()
+        || target_url.password().is_some()
+        || target_url.path() != "/healthz"
+        || target_url.query().is_some()
+        || target_url.fragment().is_some()
+    {
+        return Err(());
+    }
+    Ok(target_url)
+}
+
+/// Known search/social crawler User-Agent tokens (lowercase) that should wait for
+/// the real HTML response instead of receiving the interactive cold-start waking screen.
+const CRAWLER_UA_TOKENS: &[&str] = &[
+    "googlebot",
+    "bingbot",
+    "slurp",
+    "duckduckbot",
+    "baiduspider",
+    "yandexbot",
+    "twitterbot",
+    "facebookexternalhit",
+    "discordbot",
+    "slackbot",
+];
+
+pub(crate) fn is_crawler_user_agent(headers: &HeaderMap) -> bool {
+    headers.get_all(USER_AGENT).iter().any(|val| {
+        val.to_str().ok().is_some_and(|ua| {
+            let lower = ua.to_ascii_lowercase();
+            CRAWLER_UA_TOKENS.iter().any(|tok| lower.contains(tok))
+        })
+    })
+}
+
+/// Interactive gallery/legal HTML routes eligible for the cold-start waking screen.
+/// Explicitly excludes `/api/*`, `/media/*`, `/pkg/*`, `/robots.txt`, `/favicon.ico`,
+/// `/sitemap*.xml`, `/user/*`, `/admin*`, and `/_gw/*`.
+pub(crate) fn is_waking_interstitial_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/" | "/terms" | "/privacy" | "/dmca" | "/content-policy"
+    ) || path
+        .strip_prefix("/details/")
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+/// Returns `true` iff this request is an interactive browser HTML `GET` navigation
+/// to a gallery/legal page (not a bot, API call, subresource, `HEAD`, or `POST`).
+pub(crate) fn should_serve_waking_interstitial(
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+) -> bool {
+    *method == Method::GET
+        && is_waking_interstitial_path(path)
+        && is_html_navigation(headers)
+        && !is_crawler_user_agent(headers)
+}
+
+/// Upstream statuses that indicate a transient cold-start / boot-race failure
+/// where the waking interstitial + readiness poll should take over.
+pub(crate) fn is_transient_cold_start_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
 /// Paths always accessible on `GET`/`HEAD` (after Step 0 geo check), even when
 /// `login_required=yes` or a site-wide age splash is active.
 pub(crate) fn is_always_public_path(path: &str) -> bool {
@@ -814,10 +896,10 @@ pub(crate) fn login_response(uri: &Uri, method: &Method) -> Response {
     )
 }
 
-pub(crate) fn payment_required(headers: &HeaderMap, guest: bool) -> Response {
+pub(crate) fn is_html_navigation(headers: &HeaderMap) -> bool {
     let mode = headers.get("sec-fetch-mode");
     let dest = headers.get("sec-fetch-dest");
-    let navigation = if mode.is_some() || dest.is_some() {
+    if mode.is_some() || dest.is_some() {
         mode.is_some_and(|value| value == "navigate")
             || dest.is_some_and(|value| value == "document")
     } else {
@@ -841,7 +923,299 @@ pub(crate) fn payment_required(headers: &HeaderMap, guest: bool) -> Response {
                             })
                 })
             })
-    };
+    }
+}
+
+const WAKING_INTERSTITIAL_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Waking up · Let&#39;s Embed</title>
+<noscript><meta http-equiv="refresh" content="6"></noscript>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: linear-gradient(180deg, #f0f9ff 0%, #ffffff 48%, #e0f2fe 100%);
+    color: #334155;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  main {
+    width: 100%;
+    max-width: 460px;
+    background: rgba(255, 255, 255, 0.94);
+    border: 1px solid #bae6fd;
+    border-radius: 22px;
+    padding: 32px 28px;
+    box-shadow: 0 12px 36px rgba(14, 165, 233, 0.12);
+    text-align: center;
+  }
+  .brand {
+    font-weight: 700;
+    font-size: 0.95rem;
+    letter-spacing: 0.01em;
+    color: #0284c7;
+    margin-bottom: 18px;
+  }
+  .spinner-wrap {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 18px;
+  }
+  .spinner {
+    width: 46px;
+    height: 46px;
+    border-radius: 50%;
+    border: 4px solid #e0f2fe;
+    border-top-color: #0284c7;
+    border-right-color: #38bdf8;
+    animation: le-spin 0.9s linear infinite;
+  }
+  @keyframes le-spin {
+    to { transform: rotate(360deg); }
+  }
+  h1 {
+    margin: 0 0 10px;
+    font-size: 1.25rem;
+    line-height: 1.3;
+    color: #0f172a;
+  }
+  p.desc {
+    margin: 0 0 20px;
+    font-size: 0.93rem;
+    line-height: 1.55;
+    color: #475569;
+  }
+  .progress-track {
+    width: 100%;
+    height: 8px;
+    border-radius: 999px;
+    background: #e0f2fe;
+    overflow: hidden;
+    margin-bottom: 14px;
+  }
+  .progress-fill {
+    height: 100%;
+    width: 12%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #38bdf8 0%, #0284c7 100%);
+    transition: width 0.6s ease;
+  }
+  .status-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 0.84rem;
+    color: #64748b;
+    margin-bottom: 20px;
+  }
+  .status-text {
+    text-align: left;
+    color: #0369a1;
+    font-weight: 500;
+  }
+  .elapsed {
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .actions {
+    display: flex;
+    justify-content: center;
+  }
+  button.retry-btn {
+    appearance: none;
+    border: 1px solid #7dd3fc;
+    background: #f0f9ff;
+    color: #0369a1;
+    font-weight: 600;
+    font-size: 0.88rem;
+    padding: 9px 18px;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+  }
+  button.retry-btn:hover {
+    background: #e0f2fe;
+    border-color: #38bdf8;
+  }
+  button.retry-btn:active {
+    transform: translateY(1px);
+  }
+  .noscript-note {
+    margin-top: 14px;
+    font-size: 0.82rem;
+    color: #64748b;
+  }
+</style>
+</head>
+<body>
+<main role="status" aria-live="polite">
+  <div class="brand">Let&#39;s Embed</div>
+  <div class="spinner-wrap" aria-hidden="true"><div class="spinner"></div></div>
+  <h1>Waking up the gallery server&#8230;</h1>
+  <p class="desc">
+    Our serverless backend is starting up from sleep. Cold starts usually take
+    15&#8211;25 seconds &#8212; this page will reload automatically as soon as it&#39;s ready.
+  </p>
+  <div class="progress-track" aria-hidden="true">
+    <div id="le-progress" class="progress-fill"></div>
+  </div>
+  <div class="status-row">
+    <span id="le-status" class="status-text">Starting backend instance&#8230;</span>
+    <span id="le-elapsed" class="elapsed">0s</span>
+  </div>
+  <div class="actions">
+    <button id="le-retry" class="retry-btn" type="button">Retry now</button>
+  </div>
+  <noscript>
+    <p class="noscript-note">JavaScript is disabled; this page will automatically refresh every 6 seconds.</p>
+  </noscript>
+</main>
+<script>
+(function () {
+  var startedAt = Date.now();
+  var statusEl = document.getElementById('le-status');
+  var elapsedEl = document.getElementById('le-elapsed');
+  var progressEl = document.getElementById('le-progress');
+  var retryBtn = document.getElementById('le-retry');
+  var inFlight = false;
+  var reloading = false;
+  var pollTimer = null;
+
+  function readRetryState() {
+    try {
+      var raw = sessionStorage.getItem('le_wake_retries');
+      if (!raw) return { ts: 0, count: 0 };
+      var parsed = JSON.parse(raw);
+      if (!parsed || Date.now() - parsed.ts > 60000) return { ts: 0, count: 0 };
+      return parsed;
+    } catch (_) {
+      return { ts: 0, count: 0 };
+    }
+  }
+
+  function recordReloadAttempt() {
+    try {
+      var st = readRetryState();
+      sessionStorage.setItem('le_wake_retries', JSON.stringify({
+        ts: st.ts || Date.now(),
+        count: (st.count || 0) + 1
+      }));
+    } catch (_) {}
+  }
+
+  function clearReloadAttempts() {
+    try { sessionStorage.removeItem('le_wake_retries'); } catch (_) {}
+  }
+
+  function updateClock() {
+    if (reloading) return;
+    var secs = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+    if (elapsedEl) elapsedEl.textContent = secs + 's';
+    var pct = Math.min(92, Math.round(12 + 80 * (1 - Math.exp(-secs / 14))));
+    if (progressEl) progressEl.style.width = pct + '%';
+    if (statusEl) {
+      if (secs >= 35) {
+        statusEl.textContent = 'Still starting up\u2014hang tight or click Retry now.';
+      } else if (secs >= 15) {
+        statusEl.textContent = 'Almost ready\u2014finishing initialization\u2026';
+      }
+    }
+  }
+
+  function schedulePoll(ms) {
+    if (reloading) return;
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = setTimeout(pollReady, ms);
+  }
+
+  function triggerReload() {
+    if (reloading) return;
+    reloading = true;
+    if (pollTimer) clearTimeout(pollTimer);
+    if (progressEl) progressEl.style.width = '100%';
+    if (statusEl) statusEl.textContent = 'Server is ready! Loading gallery\u2026';
+    recordReloadAttempt();
+    window.location.reload();
+  }
+
+  function pollReady() {
+    if (inFlight || reloading) return;
+    inFlight = true;
+    fetch('/_gw/ready', {
+      method: 'GET',
+      cache: 'no-store',
+      credentials: 'same-origin',
+      headers: { 'accept': 'application/json' }
+    })
+      .then(function (res) {
+        if (!res.ok) return null;
+        return res.json().catch(function () { return null; });
+      })
+      .then(function (data) {
+        if (data && data.ready === true) {
+          var st = readRetryState();
+          if (st.count >= 3) {
+            if (statusEl) statusEl.textContent = 'Backend is recovering\u2014retrying shortly\u2026';
+            schedulePoll(8000);
+            return;
+          }
+          triggerReload();
+          return;
+        }
+        var secs = Math.floor((Date.now() - startedAt) / 1000);
+        schedulePoll(secs >= 90 ? 5000 : 2000);
+      })
+      .catch(function () {
+        var secs = Math.floor((Date.now() - startedAt) / 1000);
+        schedulePoll(secs >= 90 ? 5000 : 2000);
+      })
+      .finally(function () {
+        inFlight = false;
+      });
+  }
+
+  if (retryBtn) {
+    retryBtn.addEventListener('click', function () {
+      clearReloadAttempts();
+      triggerReload();
+    });
+  }
+
+  setInterval(updateClock, 1000);
+  updateClock();
+  schedulePoll(1500);
+})();
+</script>
+</body>
+</html>"#;
+
+/// Self-contained 503 waking interstitial for interactive browser HTML navigations
+/// while the serverless GCP Cloud Run backend is cold-starting.
+pub(crate) fn waking_interstitial_response() -> Response {
+    let mut resp = (StatusCode::SERVICE_UNAVAILABLE, WAKING_INTERSTITIAL_HTML).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    h.insert(RETRY_AFTER, HeaderValue::from_static("3"));
+    h.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert("x-robots-tag", HeaderValue::from_static("noindex, nofollow"));
+    private_no_store(resp)
+}
+
+pub(crate) fn payment_required(headers: &HeaderMap, guest: bool) -> Response {
+    let navigation = is_html_navigation(headers);
     let response = if navigation {
         let target = if guest {
             format!("{UPGRADE_PATH}?reason=free_limit")

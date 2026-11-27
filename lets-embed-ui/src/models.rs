@@ -1032,6 +1032,19 @@ impl PresetTemplate {
     }
 }
 
+/// Autocomplete candidate item for [`QueryBuilder`](crate::components::QueryBuilder) inputs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuerySuggestion {
+    /// Canonical value inserted when selected (e.g. English WD tag name, author name, or post title).
+    pub value: String,
+    /// Optional suggestion kind (`"tag"`, `"author"`, `"title"`, or `""`).
+    #[serde(default)]
+    pub kind: String,
+    /// Optional multilingual translations/aliases (populated for `Tag`).
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
+
 /// Visual variant for [`FloatingHeader`](crate::components::FloatingHeader).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum HeaderVariant {

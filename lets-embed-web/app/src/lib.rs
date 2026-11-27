@@ -436,6 +436,7 @@ pub fn App() -> impl IntoView {
         }
     });
     provide_context(density);
+    provide_context(crate::types::SearchStatusState::new());
     provide_context(LikeStore::new());
 
     let safety_ui = SafetyUiState::new();
@@ -483,7 +484,7 @@ pub fn App() -> impl IntoView {
         <Meta name="twitter:card" content="summary_large_image"/>
         <Router>
             <div class="web-app-shell min-h-screen w-full flex flex-col overflow-x-clip bg-gradient-to-b from-sky-50 via-white to-sky-100">
-                <main class="web-main flex-1 w-full">
+                <main class="web-main flex-1 w-full pb-[calc(var(--web-footer-height,40px)+env(safe-area-inset-bottom,0px))]">
                     <Routes fallback=|| "Page not found.".into_view()>
                         <ParentRoute path=path!("") view=SearchBar>
                             <Route path=path!("/details/:id") view=ImageDetails ssr=SsrMode::Async/>
@@ -491,14 +492,14 @@ pub fn App() -> impl IntoView {
                         </ParentRoute>
                     </Routes>
                 </main>
-                <footer class="web-footer w-full py-4 px-4 border-t border-sky-200/70 bg-white/60 text-xs text-slate-500">
-                    <div class="web-footer-inner max-w-[1640px] mx-auto flex flex-wrap items-center justify-between gap-2">
-                        <span class="web-footer-brand font-medium text-sky-800/80">"Let\u{2019}s Embed"</span>
-                        <nav aria-label="Legal and policies" class="web-footer-nav flex flex-wrap items-center gap-3">
-                            <a href="/terms" rel="external" class="web-footer-link hover:text-sky-600 hover:underline">"Terms"</a>
-                            <a href="/privacy" rel="external" class="web-footer-link hover:text-sky-600 hover:underline">"Privacy"</a>
-                            <a href="/dmca" rel="external" class="web-footer-link hover:text-sky-600 hover:underline">"DMCA"</a>
-                            <a href="/content-policy" rel="external" class="web-footer-link hover:text-sky-600 hover:underline">"Content Policy"</a>
+                <footer class="web-footer fixed bottom-0 inset-x-0 z-[35] w-full px-3 sm:px-4 border-t border-sky-200/80 bg-white/88 backdrop-blur-md text-xs text-slate-500 shadow-[0_-4px_18px_rgba(24,100,151,0.08)]">
+                    <div class="web-footer-inner max-w-[1640px] mx-auto flex items-center justify-center sm:justify-between gap-2 sm:gap-3">
+                        <span class="web-footer-brand hidden sm:inline font-medium text-sky-800/80 whitespace-nowrap">"Let\u{2019}s Embed"</span>
+                        <nav aria-label="Legal and policies" class="web-footer-nav flex flex-wrap items-center justify-center gap-x-3 sm:gap-x-4 gap-y-1">
+                            <a href="/terms" rel="external" class="web-footer-link hover:text-sky-600 hover:underline whitespace-nowrap">"Terms"</a>
+                            <a href="/privacy" rel="external" class="web-footer-link hover:text-sky-600 hover:underline whitespace-nowrap">"Privacy"</a>
+                            <a href="/dmca" rel="external" class="web-footer-link hover:text-sky-600 hover:underline whitespace-nowrap">"DMCA"</a>
+                            <a href="/content-policy" rel="external" class="web-footer-link hover:text-sky-600 hover:underline whitespace-nowrap">"Content Policy"</a>
                         </nav>
                     </div>
                 </footer>
@@ -584,7 +585,10 @@ mod tests {
         let html = std::str::from_utf8(&bytes).unwrap();
         let (head, body) = html.split_once("</head>").expect("gallery document");
         assert!(head.contains(include_str!("../../../assets/gallery-allowance.js")));
-        // Legal footer links are always present.
+        // Legal footer links are always present and fixed to the bottom of the viewport.
+        assert!(body.contains(r#"class="web-footer fixed bottom-0 inset-x-0 z-[35]"#));
+        assert!(body.contains(r#"class="web-footer-brand hidden sm:inline"#));
+        assert!(body.contains(r#"class="web-main flex-1 w-full pb-[calc(var(--web-footer-height,40px)+env(safe-area-inset-bottom,0px))]""#));
         assert!(body.contains(r#"href="/terms""#));
         assert!(body.contains(r#"href="/privacy""#));
         assert!(body.contains(r#"href="/dmca""#));

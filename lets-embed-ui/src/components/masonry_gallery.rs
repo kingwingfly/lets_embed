@@ -309,9 +309,10 @@ pub fn MediaTile(
 
                 {show_overlay.then(|| {
                     let details_card = card_for_details.clone();
+                    let overlay_title = overlay_meta.clone();
                     view! {
                         <div class="gallery-overlay">
-                            <span class="gallery-overlay-meta">{overlay_meta}</span>
+                            <span class="gallery-overlay-meta" title=overlay_title>{overlay_meta}</span>
                             {details_href.map(|href| {
                                 let click_href = href.clone();
                                 view! {

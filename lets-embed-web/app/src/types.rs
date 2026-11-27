@@ -84,6 +84,23 @@ impl Default for GalleryDensityState {
     }
 }
 
+/// App-root context tracking whether the main gallery `<Results>` is currently
+/// executing a new page-0 query (drives header progress bar and Search button spinner).
+#[derive(Clone, Copy)]
+pub struct SearchStatusState(pub RwSignal<bool>);
+
+impl SearchStatusState {
+    pub fn new() -> Self {
+        Self(RwSignal::new(false))
+    }
+}
+
+impl Default for SearchStatusState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn load_gallery_density() -> Option<GalleryDensity> {
     lets_embed_ui::browser::load_density()
 }
@@ -370,24 +387,66 @@ pub fn mask_to_ui(mask: &MaskMetadata) -> GalleryMask {
     }
 }
 
+/// Full trimmed name of a `ProjectedImage::Clear` when non-empty.
+/// Always returns `None` for empty names, `Blurred`, and `Placeholder` (Policy v3 invariant).
+pub fn image_full_name(im: &ProjectedImage) -> Option<&str> {
+    match im {
+        ProjectedImage::Clear {
+            name: Some(raw), ..
+        } => {
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        }
+        _ => None,
+    }
+}
+
+/// Display-friendly image name: basename after the last `/` (trimmed if non-empty),
+/// falling back to the full trimmed name. Always returns `None` for empty, `Blurred`,
+/// and `Placeholder`.
+pub fn image_display_name(im: &ProjectedImage) -> Option<&str> {
+    let full = image_full_name(im)?;
+    let base = full
+        .rsplit('/')
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    Some(base.unwrap_or(full))
+}
+
+/// Primary card/UI label for a `ProjectedImage`: its display name when available,
+/// falling back to `#{id}`.
+pub fn image_card_label(im: &ProjectedImage) -> String {
+    image_display_name(im)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("#{}", im.id()))
+}
+
+/// Tooltip text for an image label: `"{full_name} (#{id})"` when named, else `#{id}`.
+pub fn image_card_tooltip(im: &ProjectedImage) -> String {
+    let id = im.id();
+    match image_full_name(im) {
+        Some(full) => format!("{full} (#{id})"),
+        None => format!("#{id}"),
+    }
+}
+
 pub fn projected_image_to_ui(img: &ProjectedImage, fallback_alt: impl Into<String>) -> GalleryMedia {
     let fallback_alt = fallback_alt.into();
     match img {
         ProjectedImage::Clear {
             id,
             url,
-            name,
             width,
             height,
+            ..
         } => GalleryMedia::Clear {
             id: *id,
             kind: GalleryMediaKind::Image,
             width: *width,
             height: *height,
             url: url.clone(),
-            alt: name
-                .as_deref()
-                .filter(|s| !s.is_empty())
+            alt: image_display_name(img)
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| {
                     if fallback_alt.is_empty() {
@@ -522,17 +581,18 @@ pub fn projected_image_to_card(
     liked: Option<bool>,
 ) -> GalleryCard {
     let id = img.id();
-    let title = title.into();
-    let media = projected_image_to_ui(img, &title);
+    let raw_title = title.into();
+    let resolved_title = if !raw_title.trim().is_empty() {
+        raw_title
+    } else {
+        image_card_label(img)
+    };
+    let media = projected_image_to_ui(img, &resolved_title);
     GalleryCard {
         key: format!("image:{id}"),
         id,
         kind: GalleryCardKind::Image,
-        title: if title.is_empty() {
-            format!("#{id}")
-        } else {
-            title
-        },
+        title: resolved_title,
         subtitle: None,
         media,
         image_count: 0,
@@ -548,8 +608,13 @@ pub fn projected_image_to_viewer_item(
     liked: Option<bool>,
 ) -> ViewerItem {
     let id = img.id();
-    let title = title.into();
-    let media = projected_image_to_ui(img, &title);
+    let raw_title = title.into();
+    let resolved_title = if !raw_title.trim().is_empty() {
+        raw_title
+    } else {
+        image_card_label(img)
+    };
+    let media = projected_image_to_ui(img, &resolved_title);
     let download_url = match img {
         ProjectedImage::Clear { url, .. } => Some(url.clone()),
         ProjectedImage::Blurred { .. } | ProjectedImage::Placeholder { .. } => None,
@@ -557,11 +622,7 @@ pub fn projected_image_to_viewer_item(
     ViewerItem {
         id,
         kind: GalleryMediaKind::Image,
-        title: if title.is_empty() {
-            format!("#{id}")
-        } else {
-            title
-        },
+        title: resolved_title,
         media,
         details_href: (!img.is_placeholder())
             .then(|| format!("/details/{id}?mode=similar&q={id}&limit=50")),
@@ -635,10 +696,12 @@ pub fn navigate_external(href: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SEARCH_LIMIT, MASK_NO_UNLOCK_MARKER, MAX_SEARCH_LIMIT, mask_to_ui, parse_url_limit,
-        parse_url_min_similarity, unlock_href_for_mask,
+        DEFAULT_SEARCH_LIMIT, MASK_NO_UNLOCK_MARKER, MAX_SEARCH_LIMIT, image_card_label,
+        image_card_tooltip, image_display_name, image_full_name, mask_to_ui, parse_url_limit,
+        parse_url_min_similarity, projected_image_to_card, projected_image_to_viewer_item,
+        unlock_href_for_mask,
     };
-    use search_types::{MaskMetadata, PlaceholderPreset};
+    use search_types::{MaskMetadata, PlaceholderPreset, ProjectedImage};
 
     #[test]
     fn parse_url_limit_defaults_non_positive_and_clamps_high() {
@@ -730,5 +793,116 @@ mod tests {
         });
         assert_eq!(no_unlock_mask.cta_label.as_deref(), Some(""));
         assert_eq!(no_unlock_mask.resolved_cta_opt(), None);
+    }
+
+    #[test]
+    fn image_display_name_and_card_label_handle_paths_empty_and_restricted_variants() {
+        let with_path = ProjectedImage::Clear {
+            id: 10,
+            url: "/images/a.webp".into(),
+            name: Some("Album Title/by Author - photo 1".into()),
+            width: 800,
+            height: 600,
+        };
+        assert_eq!(image_display_name(&with_path), Some("by Author - photo 1"));
+        assert_eq!(
+            image_full_name(&with_path),
+            Some("Album Title/by Author - photo 1")
+        );
+        assert_eq!(image_card_label(&with_path), "by Author - photo 1");
+        assert_eq!(
+            image_card_tooltip(&with_path),
+            "Album Title/by Author - photo 1 (#10)"
+        );
+
+        let simple = ProjectedImage::Clear {
+            id: 11,
+            url: "/images/b.webp".into(),
+            name: Some("  sunset_beach  ".into()),
+            width: 800,
+            height: 600,
+        };
+        assert_eq!(image_display_name(&simple), Some("sunset_beach"));
+        assert_eq!(image_full_name(&simple), Some("sunset_beach"));
+        assert_eq!(image_card_label(&simple), "sunset_beach");
+        assert_eq!(image_card_tooltip(&simple), "sunset_beach (#11)");
+
+        let trailing_slash = ProjectedImage::Clear {
+            id: 12,
+            url: "/images/c.webp".into(),
+            name: Some("folder/".into()),
+            width: 800,
+            height: 600,
+        };
+        assert_eq!(image_display_name(&trailing_slash), Some("folder/"));
+        assert_eq!(image_card_label(&trailing_slash), "folder/");
+
+        let empty_name = ProjectedImage::Clear {
+            id: 13,
+            url: "/images/d.webp".into(),
+            name: Some("   ".into()),
+            width: 800,
+            height: 600,
+        };
+        assert_eq!(image_display_name(&empty_name), None);
+        assert_eq!(image_full_name(&empty_name), None);
+        assert_eq!(image_card_label(&empty_name), "#13");
+        assert_eq!(image_card_tooltip(&empty_name), "#13");
+
+        let none_name = ProjectedImage::Clear {
+            id: 14,
+            url: "/images/e.webp".into(),
+            name: None,
+            width: 800,
+            height: 600,
+        };
+        assert_eq!(image_display_name(&none_name), None);
+        assert_eq!(image_card_label(&none_name), "#14");
+
+        let blurred = ProjectedImage::Blurred {
+            id: 15,
+            preview_url: None,
+            can_click_reveal: true,
+            policy_rev: 1,
+            matched_policy_ids: vec!["sensitive".into()],
+            label: "Sensitive".into(),
+            preset: PlaceholderPreset::Sensitive,
+            width: 800,
+            height: 600,
+        };
+        assert_eq!(image_display_name(&blurred), None);
+        assert_eq!(image_full_name(&blurred), None);
+        assert_eq!(image_card_label(&blurred), "#15");
+
+        let placeholder = ProjectedImage::Placeholder {
+            id: 16,
+            policy_rev: 1,
+            width: 800,
+            height: 600,
+            mask: MaskMetadata {
+                policy_id: "r18".into(),
+                matched_policy_ids: vec!["r18".into()],
+                label: "NSFW".into(),
+                preset: PlaceholderPreset::R18,
+                requires_login: true,
+                requires_age: false,
+                requires_terms: false,
+            },
+        };
+        assert_eq!(image_display_name(&placeholder), None);
+        assert_eq!(image_card_label(&placeholder), "#16");
+
+        // Card and viewer item helpers prefer image display name when caller title is empty.
+        let card = projected_image_to_card(&with_path, "", None);
+        assert_eq!(card.title, "by Author - photo 1");
+        let explicit_card = projected_image_to_card(&with_path, "Custom Title", Some(true));
+        assert_eq!(explicit_card.title, "Custom Title");
+        let fallback_card = projected_image_to_card(&placeholder, "", None);
+        assert_eq!(fallback_card.title, "#16");
+
+        let viewer_item = projected_image_to_viewer_item(&with_path, "", None);
+        assert_eq!(viewer_item.title, "by Author - photo 1");
+        let fallback_viewer = projected_image_to_viewer_item(&blurred, "", None);
+        assert_eq!(fallback_viewer.title, "#15");
     }
 }

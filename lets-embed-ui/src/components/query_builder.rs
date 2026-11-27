@@ -1,11 +1,15 @@
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use leptos::{ev, html, prelude::*};
 use serde::{Deserialize, Serialize};
 
+use crate::browser::{
+    use_window_keydown, use_window_pointerdown, use_window_resize, use_window_scroll_capture,
+};
 use crate::components::{OptionalScoreInput, SkySelect};
-use crate::models::{PresetTemplate, SelectOption, SelectVariant};
+use crate::models::{PresetTemplate, QuerySuggestion, SelectOption, SelectVariant};
 use crate::rule_syntax::{MAX_RULE_LEN, MAX_TERMS_PER_RULE};
 
 static NEXT_QB_NODE_ID: AtomicU64 = AtomicU64::new(1000);
@@ -1900,10 +1904,1345 @@ fn OperatorControl(
     }
 }
 
+const MAX_SUGGEST_LEN: usize = 200;
+#[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+const SUGGEST_DEBOUNCE_MS: u64 = 160;
+const SUGGEST_VIEWPORT_MARGIN_PX: f64 = 12.0;
+const SUGGEST_MENU_GAP_PX: f64 = 6.0;
+const SUGGEST_MENU_MAX_HEIGHT_CAP_PX: f64 = 260.0;
+#[cfg_attr(
+    not(any(test, all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))),
+    allow(dead_code)
+)]
+const SUGGEST_MENU_MIN_HEIGHT_PX: f64 = 84.0;
+#[cfg_attr(
+    not(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr"))),
+    allow(dead_code)
+)]
+const LOCAL_WD_SUGGEST_LIMIT: usize = 10;
+
+/// Returns `true` when `field` supports candidate autocomplete and `raw` meets the
+/// minimum character threshold (`>= 2` ASCII characters, or `>= 1` non-ASCII character).
+pub(crate) fn should_suggest_query(field: QueryFieldKind, raw: &str) -> bool {
+    if raw.len() > MAX_SUGGEST_LEN {
+        return false;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let meets_len = !trimmed.is_ascii() || trimmed.chars().count() >= 2;
+    meets_len
+        && matches!(
+            field,
+            QueryFieldKind::TitleAndAuthor
+                | QueryFieldKind::Title
+                | QueryFieldKind::Author
+                | QueryFieldKind::Tag
+                | QueryFieldKind::PostTag
+        )
+}
+
+/// Pure local candidate search over the bundled 10,861-tag canonical WD-Tagger v3
+/// vocabulary (`search_types::wd_vocab_tags`), normalizing spaces to `_` and matching
+/// case-insensitively ranked `exact > prefix > substring`.
+#[cfg_attr(
+    not(any(test, all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))),
+    allow(dead_code)
+)]
+pub(crate) fn suggest_wd_vocab_tags(query: &str, limit: usize) -> Vec<QuerySuggestion> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || limit == 0 || !trimmed.is_ascii() {
+        return Vec::new();
+    }
+    let q_raw = trimmed.to_ascii_lowercase();
+    let q_under = q_raw.replace(' ', "_");
+    let diff_under = q_under != q_raw;
+
+    let mut matches: Vec<(u8, usize, &'static str)> = Vec::new();
+    for tag in search_types::wd_vocab_tags() {
+        let rank = if tag == q_raw || (diff_under && tag == q_under) {
+            0u8
+        } else if tag.starts_with(&q_raw) || (diff_under && tag.starts_with(&q_under)) {
+            1u8
+        } else if tag.contains(&q_raw) || (diff_under && tag.contains(&q_under)) {
+            2u8
+        } else {
+            continue;
+        };
+        matches.push((rank, tag.len(), tag));
+    }
+
+    matches.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(b.2)));
+    matches
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, tag)| QuerySuggestion {
+            value: tag.to_string(),
+            kind: "tag".to_string(),
+            aliases: Vec::new(),
+        })
+        .collect()
+}
+
+/// Convert a DOM UTF-16 caret index (from `HtmlInputElement::selection_start`) into a
+/// safe UTF-8 byte boundary inside `s`.
+pub(crate) fn utf16_offset_to_byte(s: &str, utf16_pos: usize) -> usize {
+    let mut u16_acc = 0usize;
+    for (byte_idx, ch) in s.char_indices() {
+        if u16_acc >= utf16_pos {
+            return byte_idx;
+        }
+        u16_acc += ch.len_utf16();
+    }
+    s.len()
+}
+
+/// Convert a UTF-8 byte boundary inside `s` into a DOM UTF-16 caret index.
+pub(crate) fn byte_offset_to_utf16(s: &str, byte_pos: usize) -> usize {
+    let clamped = byte_pos.min(s.len());
+    let mut boundary = clamped;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    s[..boundary].encode_utf16().count()
+}
+
+fn unescape_quoted_raw(raw_inner: &str) -> String {
+    let mut out = String::with_capacity(raw_inner.len());
+    let mut chars = raw_inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Cursor-aware autocomplete context extracted from the raw query expression editor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RawSuggestSpan {
+    pub field: QueryFieldKind,
+    pub query: String,
+    pub replace_range: Range<usize>,
+    pub in_list: bool,
+    pub inside_quotes: bool,
+    pub existing_in_items: Vec<String>,
+}
+
+fn skip_ws_bytes(raw: &str, i: &mut usize) {
+    while *i < raw.len() {
+        let ch = raw[*i..].chars().next().unwrap();
+        if !ch.is_whitespace() {
+            break;
+        }
+        *i += ch.len_utf8();
+    }
+}
+
+fn peek_word_bytes(raw: &str, start: usize) -> Option<(&str, usize)> {
+    let mut i = start;
+    while i < raw.len() {
+        if raw[i..].starts_with(">=") {
+            break;
+        }
+        let ch = raw[i..].chars().next().unwrap();
+        if ch.is_whitespace() || matches!(ch, '(' | ')' | ':' | '"' | ',') {
+            break;
+        }
+        i += ch.len_utf8();
+    }
+    (i > start).then_some((&raw[start..i], i))
+}
+
+fn scan_quoted_bytes(raw: &str, open_quote_idx: usize) -> (usize, usize, bool) {
+    // `open_quote_idx` points to the opening `"`.
+    let mut i = open_quote_idx + 1;
+    while i < raw.len() {
+        let ch = raw[i..].chars().next().unwrap();
+        if ch == '\\' {
+            i += 1;
+            if i < raw.len() {
+                let next = raw[i..].chars().next().unwrap();
+                i += next.len_utf8();
+            }
+            continue;
+        }
+        if ch == '"' {
+            let inner_end = i;
+            return (inner_end, i + 1, true);
+        }
+        i += ch.len_utf8();
+    }
+    (raw.len(), raw.len(), false)
+}
+
+fn try_match_in_paren(raw: &str, start: usize) -> Option<usize> {
+    let mut look = start;
+    skip_ws_bytes(raw, &mut look);
+    let (w1, after1) = peek_word_bytes(raw, look)?;
+    let after_in = if w1.eq_ignore_ascii_case("IN") {
+        after1
+    } else if w1.eq_ignore_ascii_case("NOT") {
+        let mut p2 = after1;
+        skip_ws_bytes(raw, &mut p2);
+        let (w2, after2) = peek_word_bytes(raw, p2)?;
+        if !w2.eq_ignore_ascii_case("IN") {
+            return None;
+        }
+        after2
+    } else {
+        return None;
+    };
+    let mut paren_idx = after_in;
+    skip_ws_bytes(raw, &mut paren_idx);
+    raw[paren_idx..].starts_with('(').then_some(paren_idx)
+}
+
+fn raw_field_supports_suggest(field: QueryFieldKind) -> bool {
+    matches!(
+        field,
+        QueryFieldKind::TitleAndAuthor
+            | QueryFieldKind::Title
+            | QueryFieldKind::Author
+            | QueryFieldKind::Tag
+            | QueryFieldKind::PostTag
+    )
+}
+
+/// Inspect `raw` around `caret_utf16` and return the active suggestible field value span
+/// without clobbering surrounding tokens, parentheses, commas, or `>=threshold` suffixes.
+///
+/// Supports:
+/// - `field:value` / `-field:value` / `field:"quoted value"` (including unclosed quotes
+///   and `>=0.45` suffixes)
+/// - `field IN (a, b, ...)` / `field NOT IN (a, "b ...")` (replaces only the active list item)
+pub(crate) fn extract_raw_suggest_context(
+    raw: &str,
+    caret_utf16: usize,
+    mode: QueryBuilderMode,
+) -> Option<RawSuggestSpan> {
+    let caret_byte = utf16_offset_to_byte(raw, caret_utf16);
+    let mut i = 0usize;
+
+    while i < raw.len() {
+        skip_ws_bytes(raw, &mut i);
+        if i >= raw.len() {
+            break;
+        }
+        if raw[i..].starts_with(">=") {
+            i += 2;
+            skip_ws_bytes(raw, &mut i);
+            while i < raw.len() {
+                let ch = raw[i..].chars().next().unwrap();
+                if ch.is_whitespace() || matches!(ch, '(' | ')' | '"') {
+                    break;
+                }
+                i += ch.len_utf8();
+            }
+            continue;
+        }
+        let ch = raw[i..].chars().next().unwrap();
+        if matches!(ch, '(' | ')' | '-') {
+            i += ch.len_utf8();
+            continue;
+        }
+        if ch == '"' {
+            let (_, after_quote, closed) = scan_quoted_bytes(raw, i);
+            i = after_quote;
+            if !closed {
+                break;
+            }
+            continue;
+        }
+
+        // Read candidate field prefix or keyword.
+        let prefix_start = i;
+        while i < raw.len() {
+            if raw[i..].starts_with(">=") {
+                break;
+            }
+            let c = raw[i..].chars().next().unwrap();
+            if c == ':' || c.is_whitespace() || matches!(c, '(' | ')' | '"' | ',') {
+                break;
+            }
+            i += c.len_utf8();
+        }
+        let prefix = &raw[prefix_start..i];
+        if prefix.is_empty() {
+            let c = raw[i..].chars().next().unwrap();
+            i += c.len_utf8();
+            continue;
+        }
+
+        // Case 1: `field:value`
+        if i < raw.len() && raw.as_bytes()[i] == b':' {
+            i += 1; // consume ':'
+            let val_start = i;
+            let parsed_field = QueryFieldKind::parse_for_mode(prefix, mode)
+                .filter(|&f| raw_field_supports_suggest(f));
+
+            if i < raw.len() && raw.as_bytes()[i] == b'"' {
+                let inner_start = i + 1;
+                let (inner_end, after_quote, closed) = scan_quoted_bytes(raw, i);
+                if closed {
+                    let val_end = after_quote;
+                    i = val_end;
+                    if let Some(field) = parsed_field
+                        && caret_byte > val_start
+                        && caret_byte <= val_end
+                    {
+                        let q = unescape_quoted_raw(&raw[inner_start..inner_end]);
+                        let trimmed = q.trim().to_string();
+                        if !trimmed.is_empty() {
+                            return Some(RawSuggestSpan {
+                                field,
+                                query: trimmed,
+                                replace_range: val_start..val_end,
+                                in_list: false,
+                                inside_quotes: true,
+                                existing_in_items: Vec::new(),
+                            });
+                        }
+                    }
+                } else {
+                    // Unclosed quote: replace strictly up to `caret_byte` so any trailing
+                    // tokens after the cursor (e.g. `tag:"blue | AND tag:maid`) stay intact.
+                    if let Some(field) = parsed_field
+                        && caret_byte >= inner_start
+                        && caret_byte <= raw.len()
+                    {
+                        let q = unescape_quoted_raw(&raw[inner_start..caret_byte]);
+                        let trimmed = q.trim().to_string();
+                        if !trimmed.is_empty() {
+                            return Some(RawSuggestSpan {
+                                field,
+                                query: trimmed,
+                                replace_range: val_start..caret_byte,
+                                in_list: false,
+                                inside_quotes: true,
+                                existing_in_items: Vec::new(),
+                            });
+                        }
+                    }
+                    break;
+                }
+            } else {
+                while i < raw.len() {
+                    if raw[i..].starts_with(">=") {
+                        break;
+                    }
+                    let c = raw[i..].chars().next().unwrap();
+                    if c.is_whitespace() || matches!(c, '(' | ')' | '"') {
+                        break;
+                    }
+                    i += c.len_utf8();
+                }
+                let val_end = i;
+                if let Some(field) = parsed_field
+                    && caret_byte >= val_start
+                    && caret_byte <= val_end
+                {
+                    let trimmed = raw[val_start..val_end].trim();
+                    if !trimmed.is_empty() {
+                        return Some(RawSuggestSpan {
+                            field,
+                            query: trimmed.to_string(),
+                            replace_range: val_start..val_end,
+                            in_list: false,
+                            inside_quotes: false,
+                            existing_in_items: Vec::new(),
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Case 2: `field [NOT] IN (a, b, ...)`
+        if !prefix.eq_ignore_ascii_case("AND")
+            && !prefix.eq_ignore_ascii_case("OR")
+            && !prefix.eq_ignore_ascii_case("NOT")
+            && let Some(paren_idx) = try_match_in_paren(raw, i)
+            && let Some(field) = QueryFieldKind::parse_for_mode(prefix, mode)
+            && field.supports_in()
+            && raw_field_supports_suggest(field)
+        {
+            i = paren_idx + 1; // consume '('
+            let mut active: Option<(String, Range<usize>, bool)> = None;
+            let mut parsed_items: Vec<(String, Range<usize>)> = Vec::new();
+
+            while i < raw.len() {
+                skip_ws_bytes(raw, &mut i);
+                if i >= raw.len() {
+                    break;
+                }
+                let b = raw.as_bytes()[i];
+                if b == b')' {
+                    i += 1;
+                    break;
+                }
+                if b == b',' {
+                    i += 1;
+                    continue;
+                }
+                let item_start = i;
+                if b == b'"' {
+                    let inner_start = i + 1;
+                    let (inner_end, after_quote, closed) = scan_quoted_bytes(raw, i);
+                    if closed {
+                        let item_end = after_quote;
+                        i = item_end;
+                        let q = unescape_quoted_raw(&raw[inner_start..inner_end]);
+                        let trimmed = q.trim().to_string();
+                        if caret_byte > item_start && caret_byte <= item_end {
+                            if !trimmed.is_empty() {
+                                active = Some((trimmed.clone(), item_start..item_end, true));
+                            }
+                        } else if !trimmed.is_empty() {
+                            parsed_items.push((trimmed, item_start..item_end));
+                        }
+                    } else {
+                        // Unclosed quoted item inside `IN (...)`: cap replacement at `caret_byte`
+                        // so closing `)` and trailing `>= 0.45` are preserved.
+                        if caret_byte >= inner_start && caret_byte <= raw.len() {
+                            let q = unescape_quoted_raw(&raw[inner_start..caret_byte]);
+                            let trimmed = q.trim().to_string();
+                            if !trimmed.is_empty() {
+                                active = Some((trimmed, item_start..caret_byte, true));
+                            }
+                        }
+                        i = raw.len();
+                        break;
+                    }
+                } else {
+                    while i < raw.len() {
+                        let c = raw[i..].chars().next().unwrap();
+                        if matches!(c, ',' | ')' | '(' | '"') {
+                            break;
+                        }
+                        i += c.len_utf8();
+                    }
+                    let scan_end = i;
+                    let mut item_end = scan_end;
+                    while item_end > item_start && item_end > caret_byte {
+                        let prev = raw[..item_end].chars().next_back().unwrap();
+                        if !prev.is_whitespace() {
+                            break;
+                        }
+                        item_end -= prev.len_utf8();
+                    }
+                    let trimmed = raw[item_start..item_end].trim().to_string();
+                    if caret_byte >= item_start && caret_byte <= scan_end {
+                        if !trimmed.is_empty() {
+                            active = Some((trimmed, item_start..item_end, false));
+                        }
+                    } else if !trimmed.is_empty() {
+                        parsed_items.push((trimmed, item_start..item_end));
+                    }
+                }
+            }
+
+            if let Some((query, replace_range, inside_quotes)) = active {
+                let existing_in_items = parsed_items.into_iter().map(|(v, _)| v).collect();
+                return Some(RawSuggestSpan {
+                    field,
+                    query,
+                    replace_range,
+                    in_list: true,
+                    inside_quotes,
+                    existing_in_items,
+                });
+            }
+        }
+    }
+
+    None
+}
+
+/// Splice `candidate` into `raw` at `span.replace_range` using canonical quoting, returning
+/// `(new_raw_query, new_caret_utf16)` positioned immediately after the inserted candidate.
+pub(crate) fn splice_raw_suggestion(
+    raw: &str,
+    span: &RawSuggestSpan,
+    candidate: &str,
+) -> (String, usize) {
+    let formatted = if span.in_list {
+        quote_query_list_item_if_needed(candidate)
+    } else {
+        quote_query_value_if_needed(candidate)
+    };
+    let start = span.replace_range.start.min(raw.len());
+    let end = span.replace_range.end.min(raw.len()).max(start);
+    let mut out = String::with_capacity(raw.len() - (end - start) + formatted.len());
+    out.push_str(&raw[..start]);
+    out.push_str(&formatted);
+    let new_caret_byte = out.len();
+    out.push_str(&raw[end..]);
+    let new_caret_utf16 = byte_offset_to_utf16(&out, new_caret_byte);
+    (out, new_caret_utf16)
+}
+
+#[derive(Clone, Copy)]
+struct SuggestProvider {
+    mode: QueryBuilderMode,
+    on_suggest: Option<Callback<(QueryFieldKind, String, Callback<Vec<QuerySuggestion>>)>>,
+}
+
+impl SuggestProvider {
+    fn supports_field(self, field: QueryFieldKind) -> bool {
+        if self.on_suggest.is_some() {
+            raw_field_supports_suggest(field)
+        } else {
+            self.mode == QueryBuilderMode::SafetyPolicy && field == QueryFieldKind::Tag
+        }
+    }
+
+    #[cfg_attr(
+        not(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr"))),
+        allow(dead_code)
+    )]
+    fn fetch(self, field: QueryFieldKind, query: String, reply: Callback<Vec<QuerySuggestion>>) {
+        if !should_suggest_query(field, &query) {
+            reply.run(Vec::new());
+            return;
+        }
+        if let Some(cb) = self.on_suggest {
+            cb.run((field, query, reply));
+        } else if self.mode == QueryBuilderMode::SafetyPolicy && field == QueryFieldKind::Tag {
+            reply.run(suggest_wd_vocab_tags(&query, LOCAL_WD_SUGGEST_LIMIT));
+        } else {
+            reply.run(Vec::new());
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SuggestMenuPlacement {
+    open_above: bool,
+    top_px: Option<f64>,
+    bottom_px: Option<f64>,
+    left_px: f64,
+    width_px: f64,
+    max_height_px: u32,
+}
+
+impl Default for SuggestMenuPlacement {
+    fn default() -> Self {
+        Self {
+            open_above: false,
+            top_px: Some(SUGGEST_VIEWPORT_MARGIN_PX),
+            bottom_px: None,
+            left_px: SUGGEST_VIEWPORT_MARGIN_PX,
+            width_px: 260.0,
+            max_height_px: SUGGEST_MENU_MAX_HEIGHT_CAP_PX as u32,
+        }
+    }
+}
+
+impl SuggestMenuPlacement {
+    fn inline_style(&self) -> String {
+        let mut s = format!(
+            "position:fixed;z-index:10050;left:{:.1}px;width:{:.1}px;max-height:{}px;",
+            self.left_px, self.width_px, self.max_height_px
+        );
+        if let Some(bottom) = self.bottom_px {
+            s.push_str(&format!("bottom:{bottom:.1}px;top:auto;"));
+        } else if let Some(top) = self.top_px {
+            s.push_str(&format!("top:{top:.1}px;bottom:auto;"));
+        }
+        s
+    }
+}
+
+#[cfg_attr(
+    not(any(test, all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))),
+    allow(dead_code)
+)]
+fn compute_suggest_placement_from_metrics(
+    rect_top: f64,
+    rect_bottom: f64,
+    rect_left: f64,
+    rect_right: f64,
+    vw: f64,
+    vh: f64,
+    item_count: usize,
+) -> SuggestMenuPlacement {
+    let est_height = (item_count as f64 * 46.0 + 14.0).min(SUGGEST_MENU_MAX_HEIGHT_CAP_PX);
+    let space_below = (vh - rect_bottom - SUGGEST_VIEWPORT_MARGIN_PX - SUGGEST_MENU_GAP_PX).max(0.0);
+    let space_above = (rect_top - SUGGEST_VIEWPORT_MARGIN_PX - SUGGEST_MENU_GAP_PX).max(0.0);
+    let open_above = space_below < est_height && space_above > space_below;
+    let avail_h = if open_above { space_above } else { space_below };
+    let max_height_px = avail_h
+        .min(SUGGEST_MENU_MAX_HEIGHT_CAP_PX)
+        .max(avail_h.min(SUGGEST_MENU_MIN_HEIGHT_PX))
+        .max(64.0)
+        .round() as u32;
+
+    let (top_px, bottom_px) = if open_above {
+        let bottom = (vh - rect_top + SUGGEST_MENU_GAP_PX).max(SUGGEST_VIEWPORT_MARGIN_PX);
+        (None, Some(bottom))
+    } else {
+        let top = (rect_bottom + SUGGEST_MENU_GAP_PX).max(SUGGEST_VIEWPORT_MARGIN_PX);
+        (Some(top), None)
+    };
+
+    let viewport_cap_w = (vw - 2.0 * SUGGEST_VIEWPORT_MARGIN_PX).max(160.0);
+    let anchor_w = (rect_right - rect_left).max(0.0);
+    let width_px = anchor_w.max(240.0).min(viewport_cap_w);
+    let max_left = (vw - width_px - SUGGEST_VIEWPORT_MARGIN_PX).max(SUGGEST_VIEWPORT_MARGIN_PX);
+    let left_px = rect_left.clamp(SUGGEST_VIEWPORT_MARGIN_PX, max_left);
+
+    SuggestMenuPlacement {
+        open_above,
+        top_px,
+        bottom_px,
+        left_px,
+        width_px,
+        max_height_px,
+    }
+}
+
+#[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+fn compute_suggest_placement(anchor: &web_sys::Element, item_count: usize) -> SuggestMenuPlacement {
+    let rect = anchor.get_bounding_client_rect();
+    let win = web_sys::window();
+    let vw = win
+        .as_ref()
+        .and_then(|w| w.inner_width().ok())
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1024.0);
+    let vh = win
+        .as_ref()
+        .and_then(|w| w.inner_height().ok())
+        .and_then(|v| v.as_f64())
+        .unwrap_or(768.0);
+    compute_suggest_placement_from_metrics(
+        rect.top(),
+        rect.bottom(),
+        rect.left(),
+        rect.right(),
+        vw,
+        vh,
+        item_count,
+    )
+}
+
+fn scroll_suggest_option_into_view(uid: u64, idx: usize) {
+    #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+    {
+        use wasm_bindgen::{JsCast, JsValue};
+
+        if let Some(el) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.get_element_by_id(&format!("le-qb-suggest-opt-{uid}-{idx}")))
+        {
+            let _ = js_sys::Reflect::get(&el, &JsValue::from_str("scrollIntoView"))
+                .ok()
+                .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+                .and_then(|f| {
+                    let opts = js_sys::Object::new();
+                    let _ = js_sys::Reflect::set(
+                        &opts,
+                        &JsValue::from_str("block"),
+                        &JsValue::from_str("nearest"),
+                    );
+                    f.call1(&el, &opts).ok()
+                });
+        }
+    }
+    #[cfg(not(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr"))))]
+    {
+        let _ = (uid, idx);
+    }
+}
+
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr"))),
+    allow(dead_code)
+)]
+enum SuggestAnchor {
+    Input(NodeRef<html::Input>),
+    Div(NodeRef<html::Div>),
+}
+
+impl SuggestAnchor {
+    #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+    fn element(&self) -> Option<web_sys::Element> {
+        match *self {
+            Self::Input(r) => r.get_untracked().map(|el| {
+                let e: &web_sys::Element = el.as_ref();
+                e.clone()
+            }),
+            Self::Div(r) => r.get_untracked().map(|el| {
+                let e: &web_sys::Element = el.as_ref();
+                e.clone()
+            }),
+        }
+    }
+
+    #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+    fn contains_node(&self, node: &web_sys::Node) -> bool {
+        match *self {
+            Self::Input(r) => r.get_untracked().is_some_and(|el| el.contains(Some(node))),
+            Self::Div(r) => r.get_untracked().is_some_and(|el| el.contains(Some(node))),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SuggestController {
+    uid: u64,
+    provider: SuggestProvider,
+    #[cfg_attr(
+        not(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr"))),
+        allow(dead_code)
+    )]
+    anchor: SuggestAnchor,
+    focused: RwSignal<bool>,
+    items: RwSignal<Vec<QuerySuggestion>>,
+    shown_field: RwSignal<QueryFieldKind>,
+    active_idx: RwSignal<Option<usize>>,
+    placement: RwSignal<SuggestMenuPlacement>,
+    menu_ref: NodeRef<html::Div>,
+    req_id: StoredValue<u64>,
+    #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+    debounce_handle: StoredValue<Option<TimeoutHandle>, LocalStorage>,
+}
+
+impl SuggestController {
+    fn new(provider: SuggestProvider, anchor: SuggestAnchor) -> Self {
+        let ctrl = Self {
+            uid: alloc_qb_id(),
+            provider,
+            anchor,
+            focused: RwSignal::new(false),
+            items: RwSignal::new(Vec::new()),
+            shown_field: RwSignal::new(QueryFieldKind::Tag),
+            active_idx: RwSignal::new(None),
+            placement: RwSignal::new(SuggestMenuPlacement::default()),
+            menu_ref: NodeRef::new(),
+            req_id: StoredValue::new(0),
+            #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+            debounce_handle: StoredValue::new_local(None),
+        };
+
+        #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+        {
+            let dh = ctrl.debounce_handle;
+            on_cleanup(move || {
+                if let Some(h) = dh.try_update_value(|slot| slot.take()).flatten() {
+                    h.clear();
+                }
+            });
+        }
+
+        // Close popup cleanly on outside pointerdown, window resize, external scroll, or capture-phase Escape.
+        use_window_pointerdown(move |e: ev::PointerEvent| {
+            if !ctrl.is_open_untracked() {
+                return;
+            }
+            #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+            {
+                use wasm_bindgen::JsCast;
+                let target_node = e.target().and_then(|t| t.dyn_into::<web_sys::Node>().ok());
+                let inside_anchor = target_node
+                    .as_ref()
+                    .is_some_and(|n| ctrl.anchor.contains_node(n));
+                let inside_menu = ctrl
+                    .menu_ref
+                    .get_untracked()
+                    .is_some_and(|el| target_node.as_ref().is_some_and(|n| el.contains(Some(n))));
+                if !inside_anchor && !inside_menu {
+                    ctrl.cancel();
+                }
+            }
+            #[cfg(not(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr"))))]
+            {
+                let _ = e;
+            }
+        });
+
+        use_window_resize(move |_| {
+            if ctrl.is_open_untracked() {
+                ctrl.cancel();
+            }
+        });
+
+        use_window_scroll_capture(move |e: ev::Event| {
+            if !ctrl.is_open_untracked() {
+                return;
+            }
+            #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+            {
+                use wasm_bindgen::JsCast;
+                let target_node = e.target().and_then(|t| t.dyn_into::<web_sys::Node>().ok());
+                let inside_menu = ctrl
+                    .menu_ref
+                    .get_untracked()
+                    .is_some_and(|el| target_node.as_ref().is_some_and(|n| el.contains(Some(n))));
+                if !inside_menu {
+                    ctrl.cancel();
+                }
+            }
+            #[cfg(not(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr"))))]
+            {
+                let _ = e;
+            }
+        });
+
+        use_window_keydown(true, move |e: ev::KeyboardEvent| {
+            if !ctrl.is_open_untracked() {
+                return;
+            }
+            if e.key() == "Escape"
+                && !e.is_composing()
+                && e.key_code() != 229
+                && !e.alt_key()
+                && !e.ctrl_key()
+                && !e.meta_key()
+            {
+                e.prevent_default();
+                e.stop_propagation();
+                ctrl.cancel();
+            }
+        });
+
+        ctrl
+    }
+
+    fn list_id(self) -> String {
+        format!("le-qb-suggest-list-{}", self.uid)
+    }
+
+    fn active_descendant(self) -> Option<String> {
+        self.is_open()
+            .then(|| {
+                self.active_idx
+                    .get()
+                    .map(|i| format!("le-qb-suggest-opt-{}-{i}", self.uid))
+            })
+            .flatten()
+    }
+
+    fn is_open(self) -> bool {
+        self.focused.get() && !self.items.with(Vec::is_empty)
+    }
+
+    fn is_open_untracked(self) -> bool {
+        self.focused.get_untracked() && !self.items.with_untracked(Vec::is_empty)
+    }
+
+    fn clear_debounce(self) {
+        #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+        {
+            if let Some(h) = self
+                .debounce_handle
+                .try_update_value(|slot| slot.take())
+                .flatten()
+            {
+                h.clear();
+            }
+        }
+    }
+
+    fn cancel(self) {
+        self.clear_debounce();
+        let next = self.req_id.get_value().wrapping_add(1);
+        self.req_id.set_value(next);
+        let _ = self.items.try_set(Vec::new());
+        let _ = self.active_idx.try_set(None);
+    }
+
+    fn schedule(self, field: QueryFieldKind, query: String, exclude: Vec<String>) {
+        self.clear_debounce();
+        let next_id = self.req_id.get_value().wrapping_add(1);
+        self.req_id.set_value(next_id);
+        let _ = self.active_idx.try_set(None);
+
+        if !self.provider.supports_field(field) || !should_suggest_query(field, &query) {
+            let _ = self.items.try_set(Vec::new());
+            return;
+        }
+
+        // Clear stale candidates immediately while debouncing the new text.
+        let _ = self.items.try_set(Vec::new());
+
+        #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+        {
+            use std::time::Duration;
+
+            let req_id_store = self.req_id;
+            let focused_sig = self.focused;
+            let items_sig = self.items;
+            let shown_field_sig = self.shown_field;
+            let active_idx_sig = self.active_idx;
+            let placement_sig = self.placement;
+            let anchor = self.anchor;
+            let provider = self.provider;
+
+            if let Ok(handle) = set_timeout_with_handle(
+                move || {
+                    if req_id_store.try_get_value() != Some(next_id)
+                        || focused_sig.try_get_untracked() != Some(true)
+                    {
+                        return;
+                    }
+                    let exclude_list = exclude;
+                    let reply = Callback::new(move |raw_items: Vec<QuerySuggestion>| {
+                        if req_id_store.try_get_value() != Some(next_id)
+                            || focused_sig.try_get_untracked() != Some(true)
+                        {
+                            return;
+                        }
+                        let filtered: Vec<QuerySuggestion> = if exclude_list.is_empty() {
+                            raw_items
+                        } else {
+                            raw_items
+                                .into_iter()
+                                .filter(|s| {
+                                    !exclude_list
+                                        .iter()
+                                        .any(|ex| ex.eq_ignore_ascii_case(&s.value))
+                                })
+                                .collect()
+                        };
+                        if !filtered.is_empty()
+                            && let Some(el) = anchor.element()
+                        {
+                            let _ = placement_sig
+                                .try_set(compute_suggest_placement(&el, filtered.len()));
+                        }
+                        let _ = shown_field_sig.try_set(field);
+                        let _ = items_sig.try_set(filtered);
+                        let _ = active_idx_sig.try_set(None);
+                    });
+                    provider.fetch(field, query, reply);
+                },
+                Duration::from_millis(SUGGEST_DEBOUNCE_MS),
+            ) {
+                let _ = self.debounce_handle.try_set_value(Some(handle));
+            }
+        }
+        #[cfg(not(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr"))))]
+        {
+            let _ = exclude;
+        }
+    }
+
+    /// Handle `ArrowDown`, `ArrowUp`, `Escape`, and `Enter` when the candidate menu is open.
+    /// Returns `Some(picked)` if `Enter` selected an active candidate, or `None` otherwise
+    /// (with `ev.default_prevented()` set when the key was consumed by the menu).
+    fn handle_keydown(self, ev: &ev::KeyboardEvent) -> Option<QuerySuggestion> {
+        if ev.is_composing() || ev.key_code() == 229 {
+            return None;
+        }
+        let len = self.items.with_untracked(Vec::len);
+        if len == 0 || !self.focused.get_untracked() {
+            return None;
+        }
+        match ev.key().as_str() {
+            "ArrowDown" => {
+                ev.prevent_default();
+                let next = match self.active_idx.get_untracked() {
+                    Some(i) if i + 1 < len => i + 1,
+                    _ => 0,
+                };
+                self.active_idx.set(Some(next));
+                scroll_suggest_option_into_view(self.uid, next);
+                None
+            }
+            "ArrowUp" => {
+                ev.prevent_default();
+                let next = match self.active_idx.get_untracked() {
+                    Some(0) | None => len - 1,
+                    Some(i) => i - 1,
+                };
+                self.active_idx.set(Some(next));
+                scroll_suggest_option_into_view(self.uid, next);
+                None
+            }
+            "Escape" => {
+                ev.prevent_default();
+                ev.stop_propagation();
+                self.cancel();
+                None
+            }
+            "Enter" => {
+                if let Some(i) = self.active_idx.get_untracked()
+                    && let Some(picked) = self.items.with_untracked(|list| list.get(i).cloned())
+                {
+                    ev.prevent_default();
+                    ev.stop_propagation();
+                    return Some(picked);
+                }
+                None
+            }
+            "Tab" => {
+                self.cancel();
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_suggest_menu_view(
+    menu_ref: NodeRef<html::Div>,
+    uid: u64,
+    list_id: String,
+    indigo: bool,
+    show_kind_badge: bool,
+    items: Vec<QuerySuggestion>,
+    pl: SuggestMenuPlacement,
+    active_idx: RwSignal<Option<usize>>,
+    on_pick: Callback<QuerySuggestion>,
+) -> impl IntoView {
+    let menu_cls = if indigo {
+        "le-qb-suggest-menu le-qb-suggest-menu--indigo"
+    } else {
+        "le-qb-suggest-menu"
+    };
+    let menu_style = pl.inline_style();
+
+    view! {
+        <div
+            node_ref=menu_ref
+            id=list_id
+            role="listbox"
+            aria-label="Tag and query suggestions"
+            style=menu_style
+            class=menu_cls
+            on:mousedown=|ev| ev.prevent_default()
+            on:click=|ev: ev::MouseEvent| ev.stop_propagation()
+        >
+            {items.into_iter().enumerate().map(|(i, s)| {
+                let picked = s.clone();
+                let opt_id = format!("le-qb-suggest-opt-{uid}-{i}");
+                let alias_line = (!s.aliases.is_empty()).then(|| s.aliases.join(" \u{00B7} "));
+                let badge = if show_kind_badge {
+                    match s.kind.as_str() {
+                        "author" => Some(("@ Author", "le-qb-suggest-badge le-qb-suggest-badge--author")),
+                        "title" => Some(("Title", "le-qb-suggest-badge le-qb-suggest-badge--title")),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                view! {
+                    <button
+                        id=opt_id
+                        type="button"
+                        role="option"
+                        tabindex="-1"
+                        aria-selected=move || (active_idx.get() == Some(i)).to_string()
+                        class=move || if active_idx.get() == Some(i) {
+                            "le-qb-suggest-item is-active"
+                        } else {
+                            "le-qb-suggest-item"
+                        }
+                        on:mousedown=|ev| ev.prevent_default()
+                        on:mouseenter=move |_| active_idx.set(Some(i))
+                        on:click=move |ev: ev::MouseEvent| {
+                            ev.stop_propagation();
+                            on_pick.run(picked.clone());
+                        }
+                    >
+                        <div class="le-qb-suggest-item-row">
+                            <span class="le-qb-suggest-value">{s.value}</span>
+                            {badge.map(|(lbl, cls)| view! {
+                                <span class=cls>{lbl}</span>
+                            })}
+                        </div>
+                        {alias_line.map(|line| view! {
+                            <span class="le-qb-suggest-aliases">{line}</span>
+                        })}
+                    </button>
+                }
+            }).collect_view()}
+        </div>
+    }
+}
+
+#[component]
+fn SuggestPortalMenu(
+    ctrl: SuggestController,
+    indigo: bool,
+    on_pick: Callback<QuerySuggestion>,
+) -> impl IntoView {
+    let list_id_sv = StoredValue::new(ctrl.list_id());
+    view! {
+        {move || {
+            ctrl.is_open().then(move || {
+                #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+                {
+                    view! {
+                        <leptos::portal::Portal>
+                            {move || {
+                                let list = ctrl.items.get();
+                                let pl = ctrl.placement.get();
+                                let show_badge =
+                                    ctrl.shown_field.get() == QueryFieldKind::TitleAndAuthor;
+                                render_suggest_menu_view(
+                                    ctrl.menu_ref,
+                                    ctrl.uid,
+                                    list_id_sv.get_value(),
+                                    indigo,
+                                    show_badge,
+                                    list,
+                                    pl,
+                                    ctrl.active_idx,
+                                    on_pick,
+                                )
+                            }}
+                        </leptos::portal::Portal>
+                    }
+                    .into_any()
+                }
+                #[cfg(not(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr"))))]
+                {
+                    let list = ctrl.items.get();
+                    let pl = ctrl.placement.get();
+                    let show_badge = ctrl.shown_field.get() == QueryFieldKind::TitleAndAuthor;
+                    render_suggest_menu_view(
+                        ctrl.menu_ref,
+                        ctrl.uid,
+                        list_id_sv.get_value(),
+                        indigo,
+                        show_badge,
+                        list,
+                        pl,
+                        ctrl.active_idx,
+                        on_pick,
+                    )
+                    .into_any()
+                }
+            })
+        }}
+    }
+}
+
+/// Single-value condition text input with fixed-portal autocomplete candidates.
+#[component]
+fn SuggestTextInput(
+    field: Signal<QueryFieldKind>,
+    mode: QueryBuilderMode,
+    aria_label: &'static str,
+    value: Signal<String>,
+    provider: SuggestProvider,
+    indigo: bool,
+    on_value_change: Callback<String>,
+) -> impl IntoView {
+    let input_ref = NodeRef::<html::Input>::new();
+    let ctrl = SuggestController::new(provider, SuggestAnchor::Input(input_ref));
+    let list_id_aria = ctrl.list_id();
+
+    Effect::new(move |_| {
+        let _ = field.get();
+        ctrl.cancel();
+    });
+
+    let on_pick = Callback::new(move |picked: QuerySuggestion| {
+        ctrl.cancel();
+        on_value_change.run(picked.value);
+    });
+
+    view! {
+        <input
+            node_ref=input_ref
+            type="text"
+            role="combobox"
+            autocomplete="off"
+            aria-label=aria_label
+            aria-autocomplete="list"
+            aria-expanded=move || ctrl.is_open().to_string()
+            aria-controls=move || ctrl.is_open().then(|| list_id_aria.clone())
+            aria-activedescendant=move || ctrl.active_descendant()
+            class="le-qb-value-input"
+            placeholder=move || field.get().placeholder(mode)
+            value=move || value.get()
+            prop:value=move || value.get()
+            on:focus=move |_| {
+                ctrl.focused.set(true);
+                let cur = value.get_untracked();
+                let f = field.get_untracked();
+                if should_suggest_query(f, &cur) {
+                    ctrl.schedule(f, cur, Vec::new());
+                }
+            }
+            on:input=move |ev| {
+                let next = event_target_value(&ev);
+                on_value_change.run(next.clone());
+                ctrl.focused.set(true);
+                ctrl.schedule(field.get_untracked(), next, Vec::new());
+            }
+            on:keydown=move |ev: ev::KeyboardEvent| {
+                if let Some(picked) = ctrl.handle_keydown(&ev) {
+                    on_pick.run(picked);
+                }
+            }
+            on:blur=move |_| {
+                ctrl.focused.set(false);
+                ctrl.cancel();
+            }
+        />
+        <SuggestPortalMenu ctrl=ctrl indigo=indigo on_pick=on_pick />
+    }
+}
+
+/// Raw query expression editor with cursor-aware token candidate autocomplete.
+#[component]
+fn RawQueryInput(
+    input_id: String,
+    placeholder: &'static str,
+    mode: QueryBuilderMode,
+    draft: RwSignal<QueryBuilderDraft>,
+    provider: SuggestProvider,
+    on_apply_raw: Callback<String>,
+) -> impl IntoView {
+    let input_ref = NodeRef::<html::Input>::new();
+    let ctrl = SuggestController::new(provider, SuggestAnchor::Input(input_ref));
+    let active_span: StoredValue<Option<RawSuggestSpan>> = StoredValue::new(None);
+    let list_id_aria = ctrl.list_id();
+
+    let read_caret_utf16 = move |fallback_raw: &str| -> usize {
+        #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+        {
+            if let Some(el) = input_ref.get_untracked()
+                && let Ok(Some(pos)) = el.selection_start()
+            {
+                return pos as usize;
+            }
+        }
+        fallback_raw.encode_utf16().count()
+    };
+
+    let refresh_from_cursor = move |raw_val: String| {
+        let caret = read_caret_utf16(&raw_val);
+        if let Some(span) = extract_raw_suggest_context(&raw_val, caret, mode)
+            && provider.supports_field(span.field)
+            && should_suggest_query(span.field, &span.query)
+        {
+            let field = span.field;
+            let query = span.query.clone();
+            let exclude = span.existing_in_items.clone();
+            active_span.set_value(Some(span));
+            ctrl.schedule(field, query, exclude);
+        } else {
+            active_span.set_value(None);
+            ctrl.cancel();
+        }
+    };
+
+    let on_pick = Callback::new(move |picked: QuerySuggestion| {
+        let cur_raw = draft.with_untracked(|d| d.query.clone());
+        let caret = read_caret_utf16(&cur_raw);
+        let span_opt = extract_raw_suggest_context(&cur_raw, caret, mode)
+            .or_else(|| active_span.get_value());
+        let Some(span) = span_opt else {
+            ctrl.cancel();
+            return;
+        };
+        let (next_raw, next_caret_utf16) = splice_raw_suggestion(&cur_raw, &span, &picked.value);
+        ctrl.cancel();
+        active_span.set_value(None);
+
+        #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+        if let Some(el) = input_ref.get_untracked() {
+            el.set_value(&next_raw);
+            let pos = next_caret_utf16 as u32;
+            let _ = el.set_selection_range(pos, pos);
+            let _ = el.focus();
+        }
+
+        on_apply_raw.run(next_raw.clone());
+
+        #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+        {
+            use std::time::Duration;
+            let expected = next_raw;
+            let pos = next_caret_utf16 as u32;
+            set_timeout(
+                move || {
+                    if let Some(el) = input_ref.try_get_untracked().flatten()
+                        && el.value() == expected
+                    {
+                        let _ = el.set_selection_range(pos, pos);
+                    }
+                },
+                Duration::ZERO,
+            );
+        }
+        #[cfg(not(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr"))))]
+        {
+            let _ = next_caret_utf16;
+        }
+    });
+
+    view! {
+        <input
+            node_ref=input_ref
+            id=input_id
+            type="text"
+            role="combobox"
+            autocomplete="off"
+            aria-autocomplete="list"
+            aria-expanded=move || ctrl.is_open().to_string()
+            aria-controls=move || ctrl.is_open().then(|| list_id_aria.clone())
+            aria-activedescendant=move || ctrl.active_descendant()
+            class="le-qb-raw-input"
+            placeholder=placeholder
+            value=move || draft.with(|d| d.query.clone())
+            prop:value=move || draft.with(|d| d.query.clone())
+            on:focus=move |_| {
+                ctrl.focused.set(true);
+            }
+            on:click=move |_| {
+                ctrl.focused.set(true);
+                refresh_from_cursor(draft.with_untracked(|d| d.query.clone()));
+            }
+            on:input=move |ev| {
+                let next_raw = event_target_value(&ev);
+                on_apply_raw.run(next_raw.clone());
+                ctrl.focused.set(true);
+                refresh_from_cursor(next_raw);
+            }
+            on:keydown=move |ev: ev::KeyboardEvent| {
+                if let Some(picked) = ctrl.handle_keydown(&ev) {
+                    on_pick.run(picked);
+                }
+            }
+            on:keyup=move |ev: ev::KeyboardEvent| {
+                if ev.is_composing() || ev.key_code() == 229 {
+                    return;
+                }
+                if matches!(ev.key().as_str(), "ArrowLeft" | "ArrowRight" | "Home" | "End")
+                    && ctrl.focused.get_untracked()
+                {
+                    refresh_from_cursor(draft.with_untracked(|d| d.query.clone()));
+                }
+            }
+            on:blur=move |_| {
+                ctrl.focused.set(false);
+                active_span.set_value(None);
+                ctrl.cancel();
+            }
+        />
+        <SuggestPortalMenu ctrl=ctrl indigo=false on_pick=on_pick />
+    }
+}
+
 /// Multi-chip pill editor rendered when a condition uses `in` or `not in`.
 ///
 /// Supports:
 /// - `Enter` or `,` to commit trimmed deduplicated chip(s) (preventing form submission)
+/// - Live candidate autocomplete filtering out already-selected chips
 /// - Pasting comma/newline-separated tags splits and adds all items immediately
 /// - `Backspace` on an empty input removes the last chip
 /// - Clicking `×` removes a specific chip
@@ -1913,12 +3252,17 @@ fn ChipListInput(
     field: QueryFieldKind,
     negated: Signal<bool>,
     values: Signal<Vec<String>>,
+    provider: SuggestProvider,
+    indigo: bool,
     on_commit_raw: Callback<String>,
     on_remove_chip: Callback<String>,
     on_remove_last: Callback<()>,
 ) -> impl IntoView {
     let pending = RwSignal::new(String::new());
+    let box_ref = NodeRef::<html::Div>::new();
     let input_ref = NodeRef::<html::Input>::new();
+    let ctrl = SuggestController::new(provider, SuggestAnchor::Div(box_ref));
+    let list_id_aria = ctrl.list_id();
 
     let focus_input = move |_| {
         #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
@@ -1933,12 +3277,24 @@ fn ChipListInput(
             on_commit_raw.run(cur);
         }
         pending.set(String::new());
+        ctrl.cancel();
     };
+
+    let on_pick = Callback::new(move |picked: QuerySuggestion| {
+        on_commit_raw.run(picked.value);
+        pending.set(String::new());
+        ctrl.cancel();
+        #[cfg(all(any(feature = "csr", feature = "hydrate"), not(feature = "ssr")))]
+        if let Some(el) = input_ref.get_untracked() {
+            let _ = el.focus();
+        }
+    });
 
     let placeholder_text = field.chip_placeholder();
 
     view! {
         <div
+            node_ref=box_ref
             class=move || if negated.get() {
                 "le-qb-chips-box is-negated"
             } else {
@@ -1976,8 +3332,14 @@ fn ChipListInput(
             <input
                 node_ref=input_ref
                 type="text"
-                class="le-qb-chips-input"
+                role="combobox"
+                autocomplete="off"
                 aria-label="Add list value"
+                aria-autocomplete="list"
+                aria-expanded=move || ctrl.is_open().to_string()
+                aria-controls=move || ctrl.is_open().then(|| list_id_aria.clone())
+                aria-activedescendant=move || ctrl.active_descendant()
+                class="le-qb-chips-input"
                 placeholder=move || if values.with(Vec::is_empty) {
                     placeholder_text
                 } else {
@@ -1985,17 +3347,34 @@ fn ChipListInput(
                 }
                 value=move || pending.get()
                 prop:value=move || pending.get()
+                on:focus=move |_| {
+                    ctrl.focused.set(true);
+                    let cur = pending.get_untracked();
+                    if should_suggest_query(field, &cur) {
+                        ctrl.schedule(field, cur, values.get_untracked());
+                    }
+                }
                 on:input=move |ev| {
                     let next = event_target_value(&ev);
                     if next.contains(',') || next.contains('\n') || next.contains('\r') {
                         on_commit_raw.run(next);
                         pending.set(String::new());
+                        ctrl.cancel();
                     } else {
-                        pending.set(next);
+                        pending.set(next.clone());
+                        ctrl.focused.set(true);
+                        ctrl.schedule(field, next, values.get_untracked());
                     }
                 }
                 on:keydown=move |ev: ev::KeyboardEvent| {
                     if ev.is_composing() || ev.key_code() == 229 {
+                        return;
+                    }
+                    if let Some(picked) = ctrl.handle_keydown(&ev) {
+                        on_pick.run(picked);
+                        return;
+                    }
+                    if ev.default_prevented() {
                         return;
                     }
                     match ev.key().as_str() {
@@ -2004,16 +3383,20 @@ fn ChipListInput(
                             commit_pending();
                         }
                         "Backspace" if pending.get_untracked().is_empty() => {
+                            ctrl.cancel();
                             on_remove_last.run(());
                         }
                         _ => {}
                     }
                 }
                 on:blur=move |_| {
+                    ctrl.focused.set(false);
+                    ctrl.cancel();
                     commit_pending();
                 }
             />
         </div>
+        <SuggestPortalMenu ctrl=ctrl indigo=indigo on_pick=on_pick />
     }
 }
 
@@ -2147,9 +3530,16 @@ pub fn QueryBuilder(
     #[prop(optional)] on_change: Option<Callback<QueryBuilderDraft>>,
     #[prop(optional)] on_preset_select: Option<Callback<PresetTemplate>>,
     #[prop(optional)] render_upload_slot: Option<Callback<u64, AnyView>>,
+    #[prop(optional)] on_suggest: Option<
+        Callback<(QueryFieldKind, String, Callback<Vec<QuerySuggestion>>)>,
+    >,
     #[prop(default = true)] show_raw_editor: bool,
 ) -> impl IntoView {
     let effective_mode = mode.unwrap_or_else(|| draft.with_untracked(|d| d.mode));
+    let suggest_provider = SuggestProvider {
+        mode: effective_mode,
+        on_suggest,
+    };
     let show_preset_bar = show_presets.unwrap_or(effective_mode == QueryBuilderMode::SafetyPolicy);
     let preset_list = if show_preset_bar {
         presets.unwrap_or_else(PresetTemplate::builtins)
@@ -2627,6 +4017,8 @@ pub fn QueryBuilder(
                                                         field=f
                                                         negated=Signal::derive(move || op_sig.get().is_negated())
                                                         values=Signal::derive(move || values_sig.get())
+                                                        provider=suggest_provider
+                                                        indigo=false
                                                         on_commit_raw=on_commit_raw
                                                         on_remove_chip=on_remove_chip
                                                         on_remove_last=on_remove_last
@@ -2674,28 +4066,30 @@ pub fn QueryBuilder(
                                                         .into_any()
                                                     }
                                                 }
-                                                _ => view! {
-                                                    <input
-                                                        type="text"
-                                                        class="le-qb-value-input"
-                                                        aria-label="Condition value"
-                                                        placeholder=f.placeholder(effective_mode)
-                                                        value=move || val_sig.get()
-                                                        prop:value=move || val_sig.get()
-                                                        on:input=move |ev| {
-                                                            let next = event_target_value(&ev);
-                                                            draft.update(|d| {
-                                                                if let Some(QueryBuilderNode::Condition { condition, .. }) =
-                                                                    d.nodes.iter_mut().find(|n| n.id() == node_id)
-                                                                {
-                                                                    condition.value = next;
-                                                                }
-                                                            });
-                                                            sync_from_nodes();
-                                                        }
-                                                    />
+                                                _ => {
+                                                    let on_val_change = Callback::new(move |next: String| {
+                                                        draft.update(|d| {
+                                                            if let Some(QueryBuilderNode::Condition { condition, .. }) =
+                                                                d.nodes.iter_mut().find(|n| n.id() == node_id)
+                                                            {
+                                                                condition.value = next;
+                                                            }
+                                                        });
+                                                        sync_from_nodes();
+                                                    });
+                                                    view! {
+                                                        <SuggestTextInput
+                                                            field=Signal::derive(move || field_sig.get())
+                                                            mode=effective_mode
+                                                            aria_label="Condition value"
+                                                            value=Signal::derive(move || val_sig.get())
+                                                            provider=suggest_provider
+                                                            indigo=false
+                                                            on_value_change=on_val_change
+                                                        />
+                                                    }
+                                                    .into_any()
                                                 }
-                                                .into_any(),
                                             }
                                         }}
 
@@ -3151,6 +4545,8 @@ pub fn QueryBuilder(
                                                                             field=f
                                                                             negated=Signal::derive(move || c_op.get().is_negated())
                                                                             values=Signal::derive(move || c_values.get())
+                                                                            provider=suggest_provider
+                                                                            indigo=true
                                                                             on_commit_raw=on_inner_commit_raw
                                                                             on_remove_chip=on_inner_remove_chip
                                                                             on_remove_last=on_inner_remove_last
@@ -3165,27 +4561,27 @@ pub fn QueryBuilder(
                                                                     }
                                                                     .into_any()
                                                                 } else {
-                                                                    view! {
-                                                                        <input
-                                                                            type="text"
-                                                                            class="le-qb-value-input"
-                                                                            aria-label="Inner condition value"
-                                                                            placeholder=f.placeholder(effective_mode)
-                                                                            value=move || c_val.get()
-                                                                            prop:value=move || c_val.get()
-                                                                            on:input=move |ev| {
-                                                                                let next = event_target_value(&ev);
-                                                                                draft.update(|d| {
-                                                                                    if let Some(QueryBuilderNode::Group(g)) =
-                                                                                        d.nodes.iter_mut().find(|n| n.id() == node_id)
-                                                                                        && let Some(c) =
-                                                                                            g.conditions.iter_mut().find(|c| c.id == cid)
-                                                                                    {
-                                                                                        c.value = next;
-                                                                                    }
-                                                                                });
-                                                                                sync_from_nodes();
+                                                                    let on_inner_val_change = Callback::new(move |next: String| {
+                                                                        draft.update(|d| {
+                                                                            if let Some(QueryBuilderNode::Group(g)) =
+                                                                                d.nodes.iter_mut().find(|n| n.id() == node_id)
+                                                                                && let Some(c) =
+                                                                                    g.conditions.iter_mut().find(|c| c.id == cid)
+                                                                            {
+                                                                                c.value = next;
                                                                             }
+                                                                        });
+                                                                        sync_from_nodes();
+                                                                    });
+                                                                    view! {
+                                                                        <SuggestTextInput
+                                                                            field=Signal::derive(move || c_field.get())
+                                                                            mode=effective_mode
+                                                                            aria_label="Inner condition value"
+                                                                            value=Signal::derive(move || c_val.get())
+                                                                            provider=suggest_provider
+                                                                            indigo=true
+                                                                            on_value_change=on_inner_val_change
                                                                         />
                                                                     }
                                                                     .into_any()
@@ -3232,40 +4628,39 @@ pub fn QueryBuilder(
             {show_raw_editor.then(|| {
                 let raw_for_id = raw_input_id.clone();
                 let raw_el_id = raw_input_id.clone();
+                let on_apply_raw = Callback::new(move |next_raw: String| {
+                    let mut alloc = alloc_qb_id;
+                    match parse_query_to_nodes(effective_mode, &next_raw, &mut alloc) {
+                        Ok(parsed) => {
+                            raw_parse_error.set(None);
+                            draft.update(|d| {
+                                d.mode = effective_mode;
+                                d.active_preset = None;
+                                d.query = next_raw;
+                                d.nodes = parsed;
+                            });
+                            emit_change();
+                        }
+                        Err(err) => {
+                            raw_parse_error.set(Some(err));
+                            draft.update(|d| {
+                                d.active_preset = None;
+                                d.query = next_raw;
+                            });
+                            emit_change();
+                        }
+                    }
+                });
                 view! {
                     <div class="le-qb-raw">
                         <label class="le-field-label" for=raw_for_id>{raw_label}</label>
-                        <input
-                            id=raw_el_id
-                            type="text"
-                            class="le-qb-raw-input"
+                        <RawQueryInput
+                            input_id=raw_el_id
                             placeholder=raw_placeholder
-                            value=move || draft.with(|d| d.query.clone())
-                            prop:value=move || draft.with(|d| d.query.clone())
-                            on:input=move |ev| {
-                                let next_raw = event_target_value(&ev);
-                                let mut alloc = alloc_qb_id;
-                                match parse_query_to_nodes(effective_mode, &next_raw, &mut alloc) {
-                                    Ok(parsed) => {
-                                        raw_parse_error.set(None);
-                                        draft.update(|d| {
-                                            d.mode = effective_mode;
-                                            d.active_preset = None;
-                                            d.query = next_raw;
-                                            d.nodes = parsed;
-                                        });
-                                        emit_change();
-                                    }
-                                    Err(err) => {
-                                        raw_parse_error.set(Some(err));
-                                        draft.update(|d| {
-                                            d.active_preset = None;
-                                            d.query = next_raw;
-                                        });
-                                        emit_change();
-                                    }
-                                }
-                            }
+                            mode=effective_mode
+                            draft=draft
+                            provider=suggest_provider
+                            on_apply_raw=on_apply_raw
                         />
                     </div>
                 }
@@ -3275,5 +4670,261 @@ pub fn QueryBuilder(
                 <div class="le-qb-error" role="alert">{err}</div>
             })}
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggest_wd_vocab_ranks_exact_prefix_substring_and_normalizes_spaces_and_case() {
+        let res = suggest_wd_vocab_tags("maid", 10);
+        assert_eq!(res.len(), 10);
+        assert_eq!(res[0].value, "maid");
+        assert_eq!(res[0].kind, "tag");
+        assert!(res[0].aliases.is_empty());
+        // Prefix matches precede pure substring matches.
+        let first_non_prefix = res.iter().position(|s| !s.value.starts_with("maid"));
+        if let Some(idx) = first_non_prefix {
+            assert!(res[idx..].iter().all(|s| !s.value.starts_with("maid")));
+        }
+
+        // Case-insensitive and space-to-underscore normalization.
+        let sky = suggest_wd_vocab_tags("Blue Sky", 10);
+        assert!(!sky.is_empty());
+        assert_eq!(sky[0].value, "blue_sky");
+
+        // Substring-only query finds tags containing it, sorted by length then lexicographically.
+        let sub = suggest_wd_vocab_tags("censoring", 5);
+        assert!(sub.iter().any(|s| s.value == "mosaic_censoring"));
+
+        // Non-ASCII and empty inputs return empty safely without panicking.
+        assert!(suggest_wd_vocab_tags("", 10).is_empty());
+        assert!(suggest_wd_vocab_tags("   ", 10).is_empty());
+        assert!(suggest_wd_vocab_tags("女仆", 10).is_empty());
+        assert!(suggest_wd_vocab_tags("maid", 0).is_empty());
+    }
+
+    #[test]
+    fn should_suggest_query_enforces_field_and_length_thresholds() {
+        assert!(!should_suggest_query(QueryFieldKind::Tag, ""));
+        assert!(!should_suggest_query(QueryFieldKind::Tag, "a"));
+        assert!(should_suggest_query(QueryFieldKind::Tag, "ab"));
+        assert!(should_suggest_query(QueryFieldKind::Tag, "猫"));
+        assert!(should_suggest_query(QueryFieldKind::Author, "渡"));
+        assert!(should_suggest_query(QueryFieldKind::Title, "ab"));
+        assert!(should_suggest_query(QueryFieldKind::TitleAndAuthor, "ab"));
+        assert!(!should_suggest_query(QueryFieldKind::ClipText, "sunset"));
+        assert!(!should_suggest_query(QueryFieldKind::SimilarId, "12345"));
+        assert!(!should_suggest_query(QueryFieldKind::UploadImage, "0"));
+        assert!(!should_suggest_query(QueryFieldKind::Unclassified, "un"));
+    }
+
+    #[test]
+    fn raw_suggest_handles_simple_negated_thresholds_and_surrounding_tokens() {
+        let mode = QueryBuilderMode::AdvancedSearch;
+
+        // Simple prefix at end
+        let raw = "tag:blu";
+        let span = extract_raw_suggest_context(raw, raw.len(), mode).expect("simple tag");
+        assert_eq!(span.field, QueryFieldKind::Tag);
+        assert_eq!(span.query, "blu");
+        assert_eq!(span.replace_range, 4..7);
+        assert!(!span.in_list);
+        assert_eq!(
+            splice_raw_suggestion(raw, &span, "blue_sky"),
+            ("tag:blue_sky".to_string(), 12)
+        );
+
+        // Negated with `-tag:` + surrounding tokens preserved
+        let raw = "-tag:mon AND clip:\"sunset\"";
+        let span = extract_raw_suggest_context(raw, 8, mode).expect("negated tag");
+        assert_eq!(span.field, QueryFieldKind::Tag);
+        assert_eq!(span.query, "mon");
+        assert_eq!(span.replace_range, 5..8);
+        assert_eq!(
+            splice_raw_suggestion(raw, &span, "monochrome"),
+            ("-tag:monochrome AND clip:\"sunset\"".to_string(), 15)
+        );
+
+        // Preserves `>=0.50` threshold suffix right after value
+        let raw = "tag:blu>=0.50 AND NOT tag:monochrome";
+        let span = extract_raw_suggest_context(raw, 7, mode).expect("tag before threshold");
+        assert_eq!(span.query, "blu");
+        assert_eq!(span.replace_range, 4..7);
+        assert_eq!(
+            splice_raw_suggestion(raw, &span, "blue_sky"),
+            ("tag:blue_sky>=0.50 AND NOT tag:monochrome".to_string(), 12)
+        );
+
+        // Caret inside numeric threshold does NOT trigger tag suggestions
+        assert!(extract_raw_suggest_context("tag:maid>=0.45", 13, mode).is_none());
+
+        // Inside parenthesized group preserves `)` and trailing tokens
+        let raw = "(tag:maid OR tag:ap) NOT tag:monochrome";
+        let span = extract_raw_suggest_context(raw, 19, mode).expect("tag in group");
+        assert_eq!(span.query, "ap");
+        assert_eq!(
+            splice_raw_suggestion(raw, &span, "apron"),
+            ("(tag:maid OR tag:apron) NOT tag:monochrome".to_string(), 22)
+        );
+    }
+
+    #[test]
+    fn raw_suggest_handles_quoted_values_and_unclosed_quotes_without_clobbering() {
+        let mode = QueryBuilderMode::AdvancedSearch;
+
+        // Unclosed quote at end of string
+        let raw = "tag:\"blue ";
+        let span = extract_raw_suggest_context(raw, raw.len(), mode).expect("unclosed quote");
+        assert_eq!(span.field, QueryFieldKind::Tag);
+        assert_eq!(span.query, "blue");
+        assert!(span.inside_quotes);
+        assert_eq!(
+            splice_raw_suggestion(raw, &span, "blue_sky"),
+            ("tag:blue_sky".to_string(), 12)
+        );
+        assert_eq!(
+            splice_raw_suggestion(raw, &span, "blue sky"),
+            ("tag:\"blue sky\"".to_string(), 14)
+        );
+
+        // Unclosed quote BEFORE trailing tokens does not clobber following clause
+        let raw = "tag:\"blue  AND tag:maid";
+        let span = extract_raw_suggest_context(raw, 9, mode).expect("unclosed mid-query");
+        assert_eq!(span.query, "blue");
+        assert_eq!(span.replace_range, 4..9);
+        assert_eq!(
+            splice_raw_suggestion(raw, &span, "blue_sky"),
+            ("tag:blue_sky  AND tag:maid".to_string(), 12)
+        );
+
+        // Closed quote before `>=0.45` replaces quoted span while preserving `>=0.45`
+        let raw = "tag:\"blue sk\">=0.45";
+        let span = extract_raw_suggest_context(raw, 12, mode).expect("closed quote before gte");
+        assert_eq!(span.query, "blue sk");
+        assert_eq!(span.replace_range, 4..13);
+        assert_eq!(
+            splice_raw_suggestion(raw, &span, "blue_sky"),
+            ("tag:blue_sky>=0.45".to_string(), 12)
+        );
+    }
+
+    #[test]
+    fn raw_suggest_handles_in_and_not_in_lists_and_excludes_existing_items() {
+        let mode = QueryBuilderMode::AdvancedSearch;
+
+        // Active item inside `tag IN (maid, apr) >= 0.45`
+        let raw = "tag IN (maid, apr) >= 0.45";
+        let span = extract_raw_suggest_context(raw, 17, mode).expect("tag IN item");
+        assert_eq!(span.field, QueryFieldKind::Tag);
+        assert!(span.in_list);
+        assert_eq!(span.query, "apr");
+        assert_eq!(span.replace_range, 14..17);
+        assert_eq!(span.existing_in_items, vec!["maid".to_string()]);
+        assert_eq!(
+            splice_raw_suggestion(raw, &span, "apron"),
+            ("tag IN (maid, apron) >= 0.45".to_string(), 19)
+        );
+
+        // Unclosed quote inside `tag NOT IN (maid, "blue ) >= 0.45` preserves `) >= 0.45`
+        let raw = "tag NOT IN (maid, \"blue ) >= 0.45";
+        let span = extract_raw_suggest_context(raw, 24, mode).expect("unclosed quote in NOT IN");
+        assert_eq!(span.field, QueryFieldKind::Tag);
+        assert!(span.in_list);
+        assert!(span.inside_quotes);
+        assert_eq!(span.query, "blue");
+        assert_eq!(span.existing_in_items, vec!["maid".to_string()]);
+        assert_eq!(
+            splice_raw_suggestion(raw, &span, "blue_sky"),
+            ("tag NOT IN (maid, blue_sky) >= 0.45".to_string(), 26)
+        );
+        assert_eq!(
+            splice_raw_suggestion(raw, &span, "blue sky"),
+            ("tag NOT IN (maid, \"blue sky\") >= 0.45".to_string(), 28)
+        );
+
+        // `author IN (...)` with value requiring quotes (comma/space)
+        let raw = "author IN (alice, bob s)";
+        let span = extract_raw_suggest_context(raw, 23, mode).expect("author IN item");
+        assert_eq!(span.field, QueryFieldKind::Author);
+        assert!(span.in_list);
+        assert_eq!(span.query, "bob s");
+        assert_eq!(span.existing_in_items, vec!["alice".to_string()]);
+        assert_eq!(
+            splice_raw_suggestion(raw, &span, "bob smith"),
+            ("author IN (alice, \"bob smith\")".to_string(), 29)
+        );
+    }
+
+    #[test]
+    fn raw_suggest_handles_utf16_cjk_emoji_carets_and_mode_restrictions() {
+        let adv = QueryBuilderMode::AdvancedSearch;
+        let safety = QueryBuilderMode::SafetyPolicy;
+
+        // CJK + supplementary emoji UTF-16 offset conversion
+        let raw = "title:✨星光 AND author:渡久 NOT tag:蓝";
+        // `title:`(6) + `✨`(1 u16) + `星`(1) + `光`(1) + ` AND author:`(12) + `渡`(1) + `久`(1) = 23 u16
+        let author_caret_u16 = byte_offset_to_utf16(raw, raw.find(" NOT").unwrap());
+        let span = extract_raw_suggest_context(raw, author_caret_u16, adv).expect("CJK author");
+        assert_eq!(span.field, QueryFieldKind::Author);
+        assert_eq!(span.query, "渡久");
+        let (spliced, next_u16) = splice_raw_suggestion(raw, &span, "渡久山");
+        assert_eq!(spliced, "title:✨星光 AND author:渡久山 NOT tag:蓝");
+        assert_eq!(
+            next_u16,
+            byte_offset_to_utf16(&spliced, spliced.find(" NOT").unwrap())
+        );
+
+        // Emoji (surrogate pair = 2 UTF-16 code units, 4 UTF-8 bytes) before `tag:ma`
+        let emoji_raw = "title:🎨 AND tag:ma";
+        let end_u16 = emoji_raw.encode_utf16().count();
+        assert_eq!(utf16_offset_to_byte(emoji_raw, end_u16), emoji_raw.len());
+        let emoji_span = extract_raw_suggest_context(emoji_raw, end_u16, adv).expect("after emoji");
+        assert_eq!(emoji_span.field, QueryFieldKind::Tag);
+        assert_eq!(emoji_span.query, "ma");
+        assert_eq!(
+            splice_raw_suggestion(emoji_raw, &emoji_span, "maid"),
+            ("title:🎨 AND tag:maid".to_string(), end_u16 + 2)
+        );
+
+        // Mode restrictions: `title:` and `all:` work in AdvancedSearch, rejected in SafetyPolicy;
+        // vector fields (`clip:`, `dino:`, `upload:`) never trigger suggestions.
+        assert_eq!(
+            extract_raw_suggest_context("title:sun", 9, adv).map(|s| s.field),
+            Some(QueryFieldKind::Title)
+        );
+        assert_eq!(
+            extract_raw_suggest_context("all:sun", 7, adv).map(|s| s.field),
+            Some(QueryFieldKind::TitleAndAuthor)
+        );
+        assert!(extract_raw_suggest_context("title:sun", 9, safety).is_none());
+        assert_eq!(
+            extract_raw_suggest_context("author:foo", 10, safety).map(|s| s.field),
+            Some(QueryFieldKind::Author)
+        );
+        assert!(extract_raw_suggest_context("clip:sunset", 11, adv).is_none());
+        assert!(extract_raw_suggest_context("dino:1234", 9, adv).is_none());
+        assert!(extract_raw_suggest_context("upload:0", 8, adv).is_none());
+    }
+
+    #[test]
+    fn suggest_placement_flips_above_when_near_bottom_and_clamps_to_viewport() {
+        let below = compute_suggest_placement_from_metrics(100.0, 136.0, 40.0, 320.0, 1024.0, 768.0, 5);
+        assert!(!below.open_above);
+        assert!(below.top_px.is_some());
+        assert!(below.bottom_px.is_none());
+        assert_eq!(below.width_px, 280.0);
+
+        let above = compute_suggest_placement_from_metrics(690.0, 726.0, 40.0, 320.0, 1024.0, 768.0, 6);
+        assert!(above.open_above);
+        assert!(above.bottom_px.is_some());
+        assert!(above.top_px.is_none());
+
+        // Narrow mobile viewport clamps width & left margin
+        let mobile = compute_suggest_placement_from_metrics(200.0, 236.0, 10.0, 350.0, 360.0, 640.0, 4);
+        assert!(mobile.width_px <= 336.0);
+        assert!(mobile.left_px >= SUGGEST_VIEWPORT_MARGIN_PX);
     }
 }

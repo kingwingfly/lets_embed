@@ -33,8 +33,8 @@ pub use models::{
     AuthorChip, Density, GalleryBlurMode, GalleryCard, GalleryCardKind, GalleryMask,
     GalleryMaskPreset, GalleryMedia, GalleryMediaKind, HeaderVariant, LightboxAlbum,
     LikeTargetKind, LikeVariant, MAX_REPORT_NOTE_CHARS, NoticeContent, NoticeTone, PresetTemplate,
-    ReportReason, ReportSubmission, ReportTargetKind, RuleBlock, RuleBlockKind, RuleClause,
-    RuleConnector, RuleDraft, RuleField, RuleGroupCombinator, RuleMode, SelectOption,
+    QuerySuggestion, ReportReason, ReportSubmission, ReportTargetKind, RuleBlock, RuleBlockKind,
+    RuleClause, RuleConnector, RuleDraft, RuleField, RuleGroupCombinator, RuleMode, SelectOption,
     SelectVariant, ViewerItem,
 };
 

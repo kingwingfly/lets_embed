@@ -2,7 +2,7 @@ use crate::{
     components::{BlurredMediaCard, Lightbox, LikeButton, LikeVariant, Results, Viewer},
     types::{
         ImageQuery, ImageQueryPayload, PostItem, ProjectedImageDetails, SafetyUiState,
-        handle_mask_unlock, mask_to_ui,
+        handle_mask_unlock, image_display_name, image_full_name, mask_to_ui,
     },
     util::{format_duration, layout_image_masonry, public_origin, set_document_title},
 };
@@ -245,11 +245,12 @@ fn PostAlbumMasonry(
                                 let aspect_style = format!("aspect-ratio:{w}/{h};");
                                 let ring_cls = if is_current { "ring-2 ring-sky-400" } else { "" };
 
+                                let alt_clear = image_display_name(&image)
+                                    .map(ToOwned::to_owned)
+                                    .unwrap_or_else(|| format!("Image #{img_id}"));
                                 match image {
-                                    ProjectedImage::Clear { url, name, .. } => {
-                                        let alt = name
-                                            .filter(|s| !s.is_empty())
-                                            .unwrap_or_else(|| format!("Image #{img_id}"));
+                                    ProjectedImage::Clear { url, .. } => {
+                                        let alt = alt_clear;
                                         let cls = format!(
                                             "relative block w-full p-0 border-0 rounded-lg overflow-hidden bg-sky-100 \
                                              cursor-zoom-in hover:opacity-85 hover:scale-[1.02] transition-all \
@@ -412,6 +413,7 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                 .post
                 .as_ref()
                 .map(|p| p.title.clone())
+                .or_else(|| image_display_name(&d.image).map(ToOwned::to_owned))
                 .unwrap_or_else(|| format!("Image #{}", d.image.id()));
             set_document_title(&page_title);
             current_post_id.set(d.post.map(|p| p.id));
@@ -894,9 +896,16 @@ fn ImageDetailPage(id: String) -> impl IntoView {
             }
         };
 
+        let image_name = image_display_name(&image).map(ToOwned::to_owned);
+        let image_full = image_full_name(&image).map(ToOwned::to_owned);
+        let report_label = image_name
+            .as_ref()
+            .map(|n| format!("{n} (#{image_id})"))
+            .unwrap_or_else(|| format!("Image #{image_id}"));
         let seo_title = post
             .as_ref()
             .map(|p| p.title.clone())
+            .or_else(|| image_name.clone())
             .unwrap_or_else(|| format!("Image #{image_id}"));
         let full_title = format!("{seo_title} \u{00B7} Let's Embed");
         let seo_description =
@@ -913,9 +922,9 @@ fn ImageDetailPage(id: String) -> impl IntoView {
         };
 
         let hero_stage = match image {
-            ProjectedImage::Clear { url, name, .. } => {
-                let alt = name
-                    .filter(|s| !s.is_empty())
+            ProjectedImage::Clear { url, .. } => {
+                let alt = image_name
+                    .clone()
                     .unwrap_or_else(|| format!("Image #{image_id}"));
                 let open_zoom_hero = open_zoom_btn.clone();
                 view! {
@@ -1097,25 +1106,40 @@ fn ImageDetailPage(id: String) -> impl IntoView {
                             >
                                 "\u{2605} Favorites"
                             </a>
-                            {move || safety.filter(|s| s.is_managed.get()).map(|s| view! {
-                                <button
-                                    type="button"
-                                    title="Report content"
-                                    class="web-details-report-btn inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm font-medium
-                                           text-rose-700 bg-rose-50 ring-1 ring-rose-200 hover:bg-rose-100 transition-colors cursor-pointer"
-                                    on:click=move |_| {
-                                        s.open_report(
-                                            ReportTargetKind::Image,
-                                            image_id,
-                                            format!("Image #{image_id}"),
-                                        );
-                                    }
-                                >
-                                    "Report"
-                                </button>
+                            {move || safety.filter(|s| s.is_managed.get()).map(|s| {
+                                let report_label = report_label.clone();
+                                view! {
+                                    <button
+                                        type="button"
+                                        title="Report content"
+                                        class="web-details-report-btn inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm font-medium
+                                               text-rose-700 bg-rose-50 ring-1 ring-rose-200 hover:bg-rose-100 transition-colors cursor-pointer"
+                                        on:click=move |_| {
+                                            s.open_report(
+                                                ReportTargetKind::Image,
+                                                image_id,
+                                                report_label.clone(),
+                                            );
+                                        }
+                                    >
+                                        "Report"
+                                    </button>
+                                }
                             })}
                         </div>
                         <div class="web-details-meta-strip flex items-center justify-center flex-wrap gap-1.5 text-xs text-slate-500">
+                            {image_name.clone().map(|name| {
+                                let tip = image_full.clone().unwrap_or_else(|| name.clone());
+                                view! {
+                                    <span
+                                        title=tip
+                                        class="web-details-image-name inline-flex items-center px-2.5 py-0.5 rounded-full bg-sky-50
+                                               text-sky-800 ring-1 ring-sky-200/80 font-medium truncate max-w-[14rem] sm:max-w-[18rem]"
+                                    >
+                                        {name}
+                                    </span>
+                                }
+                            })}
                             <button
                                 type="button"
                                 title="Copy image ID (for DINO search)"

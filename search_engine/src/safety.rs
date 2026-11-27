@@ -1032,7 +1032,7 @@ impl CompiledPolicy {
                             Ok((url, _exp)) => ProjectedImage::Clear {
                                 id: image.id,
                                 url,
-                                name: None,
+                                name: Some(effective_name.to_string()),
                                 width: image.width,
                                 height: image.height,
                             },
@@ -1222,7 +1222,7 @@ impl CompiledPolicy {
                             Ok((url, _exp)) => ProjectedVideo::Clear {
                                 id: video.id,
                                 url,
-                                name: None,
+                                name: Some(effective_name.to_string()),
                                 width: video.width,
                                 height: video.height,
                                 duration: video.duration,
@@ -3634,7 +3634,11 @@ mod tests {
         let clear_outcome = compiled.evaluate_image(&facts, &user);
         let clear_proj = compiled.project_image(&stale_img, clear_outcome, &user, &signer);
         match clear_proj {
-            ProjectedImage::Clear { ref url, .. } => {
+            ProjectedImage::Clear {
+                ref url, ref name, ..
+            } => {
+                assert_eq!(name.as_deref(), Some("2026/01/renamed_canonical"));
+                assert_eq!(clear_proj.display_name(), Some("renamed_canonical"));
                 let tok = url.split("cap=").nth(1).unwrap();
                 let verified = verify_media_capability(
                     tok,
@@ -3652,7 +3656,8 @@ mod tests {
             other => panic!("expected Clear, got {other:?}"),
         }
 
-        // Blurred preview capability uses canonical_name AND seals it in the wire token (F20).
+        // Blurred preview capability uses canonical_name AND seals it in the wire token (F20),
+        // and serialized ProjectedImage::Blurred NEVER contains `name` or the filename.
         let mut blur_facts = ImageFacts::completed_with_floor(
             Some(0.05),
             HashMap::from([("lingerie".into(), 0.90)]),
@@ -3660,6 +3665,12 @@ mod tests {
         blur_facts.canonical_name = Some("2026/01/secret_blurred_title".into());
         let blur_outcome = compiled.evaluate_image(&blur_facts, &user);
         let blur_proj = compiled.project_image(&stale_img, blur_outcome, &user, &signer);
+        let blur_json = serde_json::to_value(&blur_proj).unwrap();
+        assert!(!blur_json.as_object().unwrap().contains_key("name"));
+        assert!(!blur_json.to_string().contains("secret_blurred_title"));
+        assert!(!blur_json.to_string().contains("old_stale_name"));
+        assert_eq!(blur_proj.clear_name(), None);
+        assert_eq!(blur_proj.display_name(), None);
         match blur_proj {
             ProjectedImage::Blurred {
                 preview_url: Some(ref p),
@@ -3684,6 +3695,111 @@ mod tests {
             }
             other => panic!("expected Blurred with preview_url, got {other:?}"),
         }
+
+        // Placeholder NEVER serializes `name` or leaks the filename.
+        let mut blocked_facts = ImageFacts::completed_with_floor(
+            Some(0.05),
+            HashMap::from([("explicit".into(), 0.95)]),
+        );
+        blocked_facts.canonical_name = Some("2026/01/secret_blocked_title".into());
+        let blocked_outcome = compiled.evaluate_image(&blocked_facts, &user);
+        let blocked_proj = compiled.project_image(&stale_img, blocked_outcome, &user, &signer);
+        assert!(blocked_proj.is_placeholder());
+        let blocked_json = serde_json::to_value(&blocked_proj).unwrap();
+        assert!(!blocked_json.as_object().unwrap().contains_key("name"));
+        assert!(!blocked_json.to_string().contains("secret_blocked_title"));
+        assert!(!blocked_json.to_string().contains("old_stale_name"));
+        assert_eq!(blocked_proj.clear_name(), None);
+        assert_eq!(blocked_proj.display_name(), None);
+
+        // Managed Clear video populates `name` (canonical_name when present, else video.name),
+        // while Blurred & Placeholder videos NEVER serialize `name`.
+        let vid = Video {
+            id: 88,
+            name: "Album A/by Artist - clip.mp4".into(),
+            width: 1920,
+            height: 1080,
+            duration: 24,
+        };
+        let clear_vid_outcome = MediaOutcome::Clear {
+            matched_blocks: vec![],
+            matched_blurs: vec![],
+            facts_rev: 1,
+            canonical_name: Some("Album A/by Artist - renamed_clip.mp4".into()),
+        };
+        let clear_vid_proj = compiled.project_video(&vid, clear_vid_outcome, &user, &signer);
+        match clear_vid_proj {
+            ProjectedVideo::Clear { ref name, .. } => {
+                assert_eq!(name.as_deref(), Some("Album A/by Artist - renamed_clip.mp4"));
+                assert_eq!(clear_vid_proj.display_name(), Some("by Artist - renamed_clip.mp4"));
+            }
+            other => panic!("expected Clear video, got {other:?}"),
+        }
+
+        let clear_vid_fallback = compiled.project_video(
+            &vid,
+            MediaOutcome::Clear {
+                matched_blocks: vec![],
+                matched_blurs: vec![],
+                facts_rev: 1,
+                canonical_name: None,
+            },
+            &user,
+            &signer,
+        );
+        assert_eq!(
+            clear_vid_fallback.clear_name(),
+            Some("Album A/by Artist - clip.mp4")
+        );
+        assert_eq!(
+            clear_vid_fallback.display_name(),
+            Some("by Artist - clip.mp4")
+        );
+
+        let blurred_vid_proj = compiled.project_video(
+            &vid,
+            MediaOutcome::Blurred {
+                policy_id: "sensitive".into(),
+                matched_policy_ids: vec!["sensitive".into()],
+                label: "Suggestive".into(),
+                preset: PlaceholderPreset::Sensitive,
+                can_click_reveal: true,
+                matched_blocks: vec![],
+                matched_blurs: vec![PolicyRef::new("sensitive", 3)],
+                facts_rev: 1,
+                canonical_name: Some("Album A/secret_blurred_clip.mp4".into()),
+            },
+            &user,
+            &signer,
+        );
+        let blurred_vid_json = serde_json::to_value(&blurred_vid_proj).unwrap();
+        assert!(!blurred_vid_json.as_object().unwrap().contains_key("name"));
+        assert!(!blurred_vid_json.to_string().contains("secret_blurred_clip"));
+        assert_eq!(blurred_vid_proj.clear_name(), None);
+        assert_eq!(blurred_vid_proj.display_name(), None);
+
+        let blocked_vid_proj = compiled.project_video(
+            &vid,
+            MediaOutcome::Placeholder {
+                mask: MaskMetadata {
+                    policy_id: "r18".into(),
+                    matched_policy_ids: vec!["r18".into()],
+                    label: "NSFW".into(),
+                    preset: PlaceholderPreset::R18,
+                    requires_login: true,
+                    requires_age: true,
+                    requires_terms: true,
+                },
+                facts_rev: 1,
+            },
+            &user,
+            &signer,
+        );
+        let blocked_vid_json = serde_json::to_value(&blocked_vid_proj).unwrap();
+        assert!(!blocked_vid_json.as_object().unwrap().contains_key("name"));
+        assert!(!blocked_vid_json.to_string().contains("clip.mp4"));
+        assert_eq!(blocked_vid_proj.clear_name(), None);
+        assert_eq!(blocked_vid_proj.display_name(), None);
     }
 
     #[test]

@@ -1472,3 +1472,250 @@ test('embedded resources navigate only for a same-origin gallery allowance denia
   assert.deepEqual(probes[2], [standaloneVideo.target.currentSrc, 'HEAD']);
   assert.equal(destinations.length, 3);
 });
+
+test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in workerd', async (t) => {
+  const pendingTimers = new Set();
+  const delayedResponse = (ms, makeResp) =>
+    new Promise((resolve) => {
+      const id = setTimeout(() => {
+        pendingTimers.delete(id);
+        resolve(makeResp());
+      }, ms);
+      pendingTimers.add(id);
+    });
+  t.after(() => {
+    for (const id of pendingTimers) clearTimeout(id);
+    pendingTimers.clear();
+  });
+
+  const healthzCalls = [];
+  let healthzHandler = () => {
+    const h = new Headers({ 'content-type': 'text/plain; charset=utf-8' });
+    h.append('set-cookie', 'CF_Authorization=should-never-leak; Path=/; Secure; HttpOnly');
+    return new Response('ok', { status: 200, headers: h });
+  };
+  let nextApiHandler = null;
+  let apiHits = 0;
+
+  const outbound = (request, target) => {
+    if (target.host === new URL(apiUpstream).host && target.pathname === '/healthz') {
+      healthzCalls.push({
+        method: request.method,
+        clientId: request.headers.get('cf-access-client-id'),
+        clientSecret: request.headers.get('cf-access-client-secret'),
+        assertion: request.headers.get('x-gateway-assertion'),
+        cookie: request.headers.get('cookie'),
+      });
+      return healthzHandler(request, target);
+    }
+    apiHits += 1;
+    if (nextApiHandler) {
+      const fn = nextApiHandler;
+      nextApiHandler = null;
+      return fn(request, target);
+    }
+    return new Response('<html><body>Warm Gallery</body></html>', {
+      status: 200,
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    });
+  };
+
+  const mf = new Miniflare(
+    convertV4MiniflareOptions({
+      cf: { country: 'US', httpProtocol: 'HTTP/1.1' },
+      workers: [
+        gatewayWorkerConfig('coldstart-gateway', appHost, undefined, outbound),
+        {
+          name: 'lets-embed-user-worker',
+          compatibilityDate: '2026-06-01',
+          modules: true,
+          script: mockUserWorkerScript,
+          durableObjects: {
+            USER_ACCOUNT: 'UserAccount',
+            SITE_POLICY: 'SitePolicyDO',
+          },
+        },
+        {
+          name: 'lets-embed-admin-dashboard-worker',
+          compatibilityDate: '2026-06-01',
+          modules: true,
+          bindings: { SITE_SECRET: siteSecret },
+          script: mockAdminDashboardScript,
+        },
+      ],
+    })
+  );
+  t.after(() => mf.dispose());
+
+  const policyNs = await mf.getDurableObjectNamespace('SITE_POLICY', 'lets-embed-user-worker');
+  const policyStub = policyNs.get(policyNs.idFromName('global'));
+  const policy = defaultPublicPolicyV3();
+  await policyStub.fetch('https://site-policy/__test/set', {
+    method: 'POST',
+    body: JSON.stringify({
+      policy,
+      digest: computePolicyDigest(policy),
+      fail: false,
+      corruptDigest: false,
+    }),
+  });
+
+  const accountNs = await mf.getDurableObjectNamespace('USER_ACCOUNT', 'lets-embed-user-worker');
+  const setLoginRequired = async (val) => {
+    const r = await accountNs.get(accountNs.idFromName(userDoKey)).fetch('https://do/__test/config', {
+      method: 'POST',
+      body: JSON.stringify({ loginRequired: val }),
+    });
+    assert.equal(r.status, 200);
+  };
+
+  const site = (url, options = {}) =>
+    mf.dispatchFetch('https://' + appHost + url, { ...options, redirect: 'manual' });
+  const browserNavHeaders = {
+    accept: 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.8',
+    'sec-fetch-mode': 'navigate',
+    'sec-fetch-dest': 'document',
+    'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36',
+  };
+  const waitForHealthzCount = async (expected) => {
+    const start = Date.now();
+    while (healthzCalls.length < expected && Date.now() - start < 1500) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.ok(
+      healthzCalls.length >= expected,
+      `expected >= ${expected} /healthz calls, got ${healthzCalls.length}`
+    );
+  };
+
+  // 1. Precedence under login_required=true: anonymous `/` -> 303 (no waking page, no upstream),
+  //    while `/_gw/ready` and `/terms` remain reachable and Step 0 geo-block still returns 451.
+  await setLoginRequired(true);
+  const loginRedir = await site('/', { headers: browserNavHeaders });
+  assert.equal(loginRedir.status, 303);
+  assert.match(loginRedir.headers.get('location') || '', /^\/user\/login\?/);
+  assert.equal(apiHits, 0);
+
+  assert.equal(
+    (await site('/', { cf: { country: 'KP', httpProtocol: 'HTTP/1.1' }, headers: browserNavHeaders })).status,
+    451
+  );
+  assert.equal(
+    (await site('/_gw/ready', { cf: { country: 'KP', httpProtocol: 'HTTP/1.1' } })).status,
+    451
+  );
+  assert.equal(apiHits, 0);
+  assert.equal(healthzCalls.length, 0);
+
+  // `/_gw/ready` works under login_required=true, strips Set-Cookie, and sends CF-Access headers only.
+  const readyOk = await site('/_gw/ready');
+  assert.equal(readyOk.status, 200);
+  assert.equal(readyOk.headers.get('cache-control'), 'private, no-store');
+  assert.equal(readyOk.headers.get('set-cookie'), null);
+  assert.deepEqual(await readyOk.json(), { ready: true });
+  assert.equal(healthzCalls.length, 1);
+  assert.deepEqual(healthzCalls[0], {
+    method: 'GET',
+    clientId: 'local-svc-id',
+    clientSecret: 'local-svc-secret',
+    assertion: null,
+    cookie: null,
+  });
+
+  const readyHead = await site('/_gw/ready', { method: 'HEAD' });
+  assert.equal(readyHead.status, 200);
+  assert.equal(await readyHead.text(), '');
+
+  const readyPost = await site('/_gw/ready', { method: 'POST' });
+  assert.equal(readyPost.status, 405);
+  assert.equal(readyPost.headers.get('allow'), 'GET, HEAD');
+
+  healthzHandler = () => new Response('starting', { status: 503 });
+  const ready503 = await site('/_gw/ready');
+  assert.equal(ready503.status, 503);
+  assert.equal(ready503.headers.get('cache-control'), 'private, no-store');
+  assert.deepEqual(await ready503.json(), { ready: false });
+
+  // `/_gw/ready` timeout (>3500ms) -> 503 {"ready":false}
+  healthzHandler = () => delayedResponse(3800, () => new Response('late ok', { status: 200 }));
+  const readyTimeout = await site('/_gw/ready');
+  assert.equal(readyTimeout.status, 503);
+  assert.deepEqual(await readyTimeout.json(), { ready: false });
+  healthzHandler = () => new Response('ok', { status: 200 });
+
+  // Public legal route `/terms` under login_required=true still renders waking interstitial on 503.
+  nextApiHandler = () => new Response('cold', { status: 503 });
+  const prevHealthz = healthzCalls.length;
+  const termsWake = await site('/terms', { headers: browserNavHeaders });
+  assert.equal(termsWake.status, 503);
+  assert.equal(termsWake.headers.get('content-type'), 'text/html; charset=utf-8');
+  assert.equal(termsWake.headers.get('retry-after'), '3');
+  assert.equal(termsWake.headers.get('cache-control'), 'private, no-store');
+  assert.equal(termsWake.headers.get('content-security-policy'), null);
+  const termsHtml = await termsWake.text();
+  assert.match(termsHtml, /\/_gw\/ready/);
+  assert.match(termsHtml, /<meta http-equiv="refresh" content="6">/);
+  await waitForHealthzCount(prevHealthz + 1);
+
+  // 2. Warm path & Cold timeout (>2000ms) on gallery HTML navigation.
+  await setLoginRequired(false);
+  const warm = await site('/', { headers: browserNavHeaders });
+  assert.equal(warm.status, 200);
+  assert.equal(await warm.text(), '<html><body>Warm Gallery</body></html>');
+
+  const beforeTimeoutHealthz = healthzCalls.length;
+  nextApiHandler = () =>
+    delayedResponse(2400, () => new Response('<html><body>Late</body></html>', { status: 200 }));
+  const coldTimeout = await site('/details/42', { headers: browserNavHeaders });
+  assert.equal(coldTimeout.status, 503);
+  assert.equal(coldTimeout.headers.get('content-type'), 'text/html; charset=utf-8');
+  assert.equal(coldTimeout.headers.get('retry-after'), '3');
+  assert.equal(coldTimeout.headers.get('cache-control'), 'private, no-store');
+  assert.equal(coldTimeout.headers.get('content-security-policy'), null);
+  const coldHtml = await coldTimeout.text();
+  assert.match(coldHtml, /\/_gw\/ready/);
+  assert.match(coldHtml, /Retry now/);
+  await waitForHealthzCount(beforeTimeoutHealthz + 1);
+
+  // 3. Transient 502/504 -> waking interstitial for browser HTML nav.
+  for (const status of [502, 504]) {
+    const hBefore = healthzCalls.length;
+    nextApiHandler = () => new Response('bad gateway', { status });
+    const r = await site('/', { headers: browserNavHeaders });
+    assert.equal(r.status, 503);
+    assert.equal(r.headers.get('content-type'), 'text/html; charset=utf-8');
+    await waitForHealthzCount(hBefore + 1);
+  }
+
+  // 4. Non-HTML, XHR, crawler UA, HEAD, POST /api/*, /pkg/*, /robots.txt, /sitemap.xml
+  //    MUST bypass the waking interstitial and keep upstream status codes intact.
+  const bypassCases = [
+    ['crawler UA', '/', { headers: { ...browserNavHeaders, 'user-agent': 'Googlebot/2.1' } }],
+    ['XHR fetch', '/', { headers: { accept: 'text/html', 'sec-fetch-mode': 'cors', 'sec-fetch-dest': 'empty' } }],
+    ['HEAD /', '/', { method: 'HEAD', headers: browserNavHeaders }],
+    ['static /pkg/*', '/pkg/lets-embed-web.js', { headers: browserNavHeaders }],
+    ['robots.txt', '/robots.txt', { headers: browserNavHeaders }],
+    ['sitemap.xml', '/sitemap.xml', { headers: browserNavHeaders }],
+    [
+      'POST /api/search_by_desc',
+      '/api/search_by_desc',
+      {
+        method: 'POST',
+        headers: {
+          origin: 'https://' + appHost,
+          'sec-fetch-site': 'same-origin',
+          accept: 'text/html',
+          'content-type': 'application/x-www-form-urlencoded',
+        },
+        body: 'q=sunset',
+      },
+    ],
+  ];
+  const healthzBeforeBypass = healthzCalls.length;
+  for (const [label, url, opts] of bypassCases) {
+    nextApiHandler = () => new Response('raw-502', { status: 502 });
+    const resp = await site(url, opts);
+    assert.equal(resp.status, 502, `${label} must not receive waking interstitial`);
+  }
+  assert.equal(healthzCalls.length, healthzBeforeBypass);
+});

@@ -8,7 +8,10 @@ use web_sys::TouchEvent;
 
 use crate::{
     components::{BlurredMediaCard, LikeButton, LikeVariant},
-    types::{SafetyUiState, handle_mask_unlock, mask_to_ui},
+    types::{
+        SafetyUiState, handle_mask_unlock, image_card_label, image_card_tooltip,
+        image_display_name, mask_to_ui,
+    },
     util::{lock_body_scroll, navigate_from_modal, push_modal_history, trap_dialog_tab},
 };
 
@@ -236,16 +239,12 @@ pub fn Viewer(
             .enumerate()
             .map(|(slide_idx, im)| {
                 let content = match im {
-                    ProjectedImage::Clear {
-                        id, url, name, ..
-                    } => {
+                    ProjectedImage::Clear { id, url, .. } => {
                         let href = details_href(*id);
                         let click_href = href.clone();
                         let nav = nav_slide.clone();
                         let src = url.clone();
-                        let alt = name
-                            .as_deref()
-                            .filter(|s| !s.is_empty())
+                        let alt = image_display_name(im)
                             .map(ToOwned::to_owned)
                             .unwrap_or_else(|| format!("Image #{id}"));
                         view! {
@@ -392,9 +391,23 @@ pub fn Viewer(
                         {move || index.get().map(|i| format!("{} / {}", i + 1, total)).unwrap_or_default()}
                     </div>
                     {move || current_image.get().and_then(|im| {
+                        (!im.is_placeholder()).then(|| {
+                            let label = image_card_label(&im);
+                            let tip = image_card_tooltip(&im);
+                            view! {
+                                <span
+                                    title=tip
+                                    class="web-viewer-name text-xs sm:text-sm font-medium text-sky-100/90 bg-white/10 px-2.5 py-1 rounded-full truncate min-w-0 max-w-[38vw] sm:max-w-[36vw]"
+                                >
+                                    {label}
+                                </span>
+                            }
+                        })
+                    })}
+                    {move || current_image.get().and_then(|im| {
                         let (w, h) = (im.width(), im.height());
                         (w > 0 && h > 0).then(|| view! {
-                            <span class="web-viewer-dims hidden sm:inline-block text-xs text-sky-200/75 bg-white/5 px-2.5 py-1 rounded-full tabular-nums">
+                            <span class="web-viewer-dims hidden sm:inline-block shrink-0 text-xs text-sky-200/75 bg-white/5 px-2.5 py-1 rounded-full tabular-nums">
                                 {format!("{w} × {h}")}
                             </span>
                         })
@@ -414,6 +427,9 @@ pub fn Viewer(
                     {move || current_image.get().map(|im| {
                         let im_id = im.id();
                         let is_placeholder = im.is_placeholder();
+                        let report_label = image_display_name(&im)
+                            .map(|name| format!("{name} (#{im_id})"))
+                            .unwrap_or_else(|| format!("Image #{im_id}"));
                         let href = details_href(im_id);
                         let click_href = href.clone();
                         let nav = nav_bar.clone();
@@ -425,23 +441,26 @@ pub fn Viewer(
                                 show_label=true
                                 hide_label_mobile=true
                             />
-                            {safety.filter(|s| s.is_managed.get()).map(|s| view! {
-                                <button
-                                    type="button"
-                                    title="Report image"
-                                    class="web-viewer-report-btn px-2.5 py-1.5 rounded-full bg-white/10 hover:bg-rose-500/70
-                                           text-sky-100 text-xs font-medium transition-colors cursor-pointer whitespace-nowrap"
-                                    on:click=move |ev: ev::MouseEvent| {
-                                        ev.stop_propagation();
-                                        s.open_report(
-                                            ReportTargetKind::Image,
-                                            im_id,
-                                            format!("Image #{im_id}"),
-                                        );
-                                    }
-                                >
-                                    "Report"
-                                </button>
+                            {safety.filter(|s| s.is_managed.get()).map(|s| {
+                                let report_label = report_label.clone();
+                                view! {
+                                    <button
+                                        type="button"
+                                        title="Report image"
+                                        class="web-viewer-report-btn px-2.5 py-1.5 rounded-full bg-white/10 hover:bg-rose-500/70
+                                               text-sky-100 text-xs font-medium transition-colors cursor-pointer whitespace-nowrap"
+                                        on:click=move |ev: ev::MouseEvent| {
+                                            ev.stop_propagation();
+                                            s.open_report(
+                                                ReportTargetKind::Image,
+                                                im_id,
+                                                report_label.clone(),
+                                            );
+                                        }
+                                    >
+                                        "Report"
+                                    </button>
+                                }
                             })}
                             {(!is_placeholder).then(|| view! {
                                 <a
