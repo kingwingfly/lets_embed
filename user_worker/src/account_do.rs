@@ -304,6 +304,38 @@ const HOLD_TTL_SECS: i64 = 600;
 const PREVIEW_BUDGET_WINDOW_SECS: i64 = 300;
 const PREVIEW_BUDGET_MAX_PER_WINDOW: u32 = 240;
 const PREVIEW_ITEM_MAX_HITS_PER_WINDOW: u32 = 4;
+/// Bounded in-memory TTL for D1 `site_settings` reads inside `UserAccount` DO.
+/// Skips redundant DO->D1 round-trips across guest/session requests while still
+/// picking up admin settings updates within seconds.
+const SETTINGS_CACHE_TTL_MS: u64 = 20_000;
+
+/// Single-slot bounded in-memory TTL cache for [`Policy`] loaded from D1 `site_settings`.
+struct SettingsCache {
+    ttl_ms: u64,
+    entry: std::cell::RefCell<Option<(u64, Policy)>>,
+}
+
+impl SettingsCache {
+    fn new(ttl_ms: u64) -> Self {
+        Self {
+            ttl_ms,
+            entry: std::cell::RefCell::new(None),
+        }
+    }
+
+    fn get(&self, now_ms: u64) -> Option<Policy> {
+        let guard = self.entry.borrow();
+        let (fetched_at_ms, policy) = guard.as_ref()?;
+        // Reject both expired entries and backward clock jumps so a skewed clock
+        // can never pin stale site settings beyond `ttl_ms`.
+        let age_ms = now_ms.checked_sub(*fetched_at_ms)?;
+        (age_ms < self.ttl_ms).then(|| policy.clone())
+    }
+
+    fn put(&self, now_ms: u64, policy: Policy) {
+        *self.entry.borrow_mut() = Some((now_ms, policy));
+    }
+}
 
 /// Pure session-context evaluator (host-testable).
 #[derive(Debug, Clone)]
@@ -620,8 +652,12 @@ struct ChargeHold {
     free_hash: Vec<u8>,
 }
 
+fn now_ms() -> u64 {
+    Date::now().as_millis()
+}
+
 fn now_secs() -> u64 {
-    Date::now().as_millis() / 1000
+    now_ms() / 1000
 }
 
 fn json<T: serde::Serialize>(v: &T, status: u16) -> Result<Response> {
@@ -643,6 +679,7 @@ pub struct UserAccount {
     refunding_holds: std::cell::RefCell<HashSet<String>>,
     sessions_schema_ready: std::cell::Cell<bool>,
     sessions_last_purge: std::cell::Cell<i64>,
+    settings_cache: SettingsCache,
 }
 
 impl DurableObject for UserAccount {
@@ -657,6 +694,7 @@ impl DurableObject for UserAccount {
             refunding_holds: std::cell::RefCell::new(HashSet::new()),
             sessions_schema_ready: std::cell::Cell::new(false),
             sessions_last_purge: std::cell::Cell::new(0),
+            settings_cache: SettingsCache::new(SETTINGS_CACHE_TTL_MS),
         }
     }
 
@@ -741,38 +779,111 @@ impl DurableObject for UserAccount {
             (Method::Post, "/release-guest") => {
                 return self.release_guest(req.json().await?).await;
             }
-            _ => {}
-        }
-        let policy = settings::load(&self.env).await?;
-        match (req.method(), path.as_str()) {
-            (Method::Post, "/init") => self.init(req.json().await?, &policy).await,
-            (Method::Post, "/charge") => self.charge(req.json().await?, &policy, false).await,
-            (Method::Post, "/can-charge") => self.charge(req.json().await?, &policy, true).await,
-            (Method::Post, "/reserve") => self.reserve(req.json().await?, &policy).await,
-            (Method::Post, "/credit") => self.credit(req.json().await?, &policy).await,
             (Method::Post, "/payment-applied") => {
                 let hash: String = req.json().await?;
                 let applied = self.get_or(&format!("credit:tx:{hash}"), false).await?;
-                json(&applied, 200)
+                return json(&applied, 200);
             }
-            (Method::Get, "/status") => json(&self.status_resp(&policy).await?, 200),
             (Method::Post, "/check-active") => {
-                if self.get_or("banned", false).await? || self.get_or("suspended", false).await? {
+                return if self.get_or("banned", false).await?
+                    || self.get_or("suspended", false).await?
+                {
                     Response::error("banned or suspended", 403)
                 } else {
                     Response::ok("")
-                }
+                };
             }
-            (Method::Post, "/subscribe") => self.subscribe(req.json().await?, &policy).await,
-            (Method::Post, "/unsubscribe") => self.unsubscribe(&policy).await,
-            (Method::Post, "/ban") => self.ban(req.json().await?, &policy).await,
-            (Method::Post, "/guest") => self.guest(req.json().await?, &policy).await,
-            (Method::Post, "/reserve-guest") => self.reserve_guest(req.json().await?, &policy).await,
-            (Method::Post, "/preview-budget") => self.preview_budget(req.json().await?, &policy).await,
-            (Method::Post, "/admin-plan") => self.admin_plan(req.json().await?, &policy).await,
-            (Method::Post, "/merge-preview") => self.merge_preview(req.json().await?, &policy).await,
-            (Method::Post, "/merge-drain") => self.merge_drain(req.json().await?, &policy).await,
-            (Method::Post, "/merge-receive") => self.merge_receive(req.json().await?, &policy).await,
+            (Method::Post, "/preview-budget") => {
+                let body: PreviewBudgetReq = req.json().await?;
+                // Only guest preview requests need `policy.login_required`; authenticated
+                // callers skip D1 entirely even on a cold DO.
+                let login_required = if body.guest {
+                    self.load_policy_cached().await?.login_required
+                } else {
+                    false
+                };
+                return self.preview_budget(body, login_required).await;
+            }
+            _ => {}
+        }
+
+        // Hot read/metering routes use the short-TTL in-memory cache to skip redundant
+        // DO->D1 round-trips; rare billing/admin mutations always read fresh from D1 and
+        // refresh the cache.
+        match (req.method(), path.as_str()) {
+            (Method::Post, "/guest") => {
+                let body = req.json().await?;
+                let policy = self.load_policy_cached().await?;
+                self.guest(body, &policy).await
+            }
+            (Method::Post, "/reserve-guest") => {
+                let body = req.json().await?;
+                let policy = self.load_policy_cached().await?;
+                self.reserve_guest(body, &policy).await
+            }
+            (Method::Post, "/charge") => {
+                let body = req.json().await?;
+                let policy = self.load_policy_cached().await?;
+                self.charge(body, &policy, false).await
+            }
+            (Method::Post, "/can-charge") => {
+                let body = req.json().await?;
+                let policy = self.load_policy_cached().await?;
+                self.charge(body, &policy, true).await
+            }
+            (Method::Post, "/reserve") => {
+                let body = req.json().await?;
+                let policy = self.load_policy_cached().await?;
+                self.reserve(body, &policy).await
+            }
+            (Method::Get, "/status") => {
+                let policy = self.load_policy_cached().await?;
+                json(&self.status_resp(&policy).await?, 200)
+            }
+            (Method::Post, "/init") => {
+                let body = req.json().await?;
+                let policy = self.load_policy_fresh().await?;
+                self.init(body, &policy).await
+            }
+            (Method::Post, "/credit") => {
+                let body = req.json().await?;
+                let policy = self.load_policy_fresh().await?;
+                self.credit(body, &policy).await
+            }
+            (Method::Post, "/subscribe") => {
+                let body = req.json().await?;
+                let policy = self.load_policy_fresh().await?;
+                self.subscribe(body, &policy).await
+            }
+            (Method::Post, "/unsubscribe") => {
+                let policy = self.load_policy_fresh().await?;
+                self.unsubscribe(&policy).await
+            }
+            (Method::Post, "/ban") => {
+                let body = req.json().await?;
+                let policy = self.load_policy_fresh().await?;
+                self.ban(body, &policy).await
+            }
+            (Method::Post, "/admin-plan") => {
+                let body = req.json().await?;
+                let policy = self.load_policy_fresh().await?;
+                self.admin_plan(body, &policy).await
+            }
+            (Method::Post, "/merge-preview") => {
+                let body = req.json().await?;
+                let policy = self.load_policy_fresh().await?;
+                self.merge_preview(body, &policy).await
+            }
+            (Method::Post, "/merge-drain") => {
+                let body = req.json().await?;
+                let policy = self.load_policy_fresh().await?;
+                self.merge_drain(body, &policy).await
+            }
+            (Method::Post, "/merge-receive") => {
+                let body = req.json().await?;
+                let policy = self.load_policy_fresh().await?;
+                self.merge_receive(body, &policy).await
+            }
             _ => Response::error("not found", 404),
         }
     }
@@ -797,6 +908,20 @@ impl DurableObject for UserAccount {
 }
 
 impl UserAccount {
+    async fn load_policy_cached(&self) -> Result<Policy> {
+        let now = now_ms();
+        if let Some(policy) = self.settings_cache.get(now) {
+            return Ok(policy);
+        }
+        self.load_policy_fresh().await
+    }
+
+    async fn load_policy_fresh(&self) -> Result<Policy> {
+        let policy = settings::load(&self.env).await?;
+        self.settings_cache.put(now_ms(), policy.clone());
+        Ok(policy)
+    }
+
     async fn write_fields(&self, fields: serde_json::Value) -> Result<()> {
         // DO multi-put takes a plain JS object. BigInt preserves exact i64 balances.
         let serializer = serde_wasm_bindgen::Serializer::new()
@@ -1411,34 +1536,35 @@ impl UserAccount {
         if policy.login_required {
             return Response::error("Login required", 401);
         }
+        let Some(item) = req.item else {
+            return Response::ok("");
+        };
         let now = now_secs();
         let _ = self.reclaim_expired_holds(now as i64, false).await;
-        if let Some(item) = req.item {
-            let holds_db = self.ensure_holds_table()?;
-            let cutoff = (now as i64).saturating_sub(HOLD_TTL_SECS);
-            self.reclaim_expired_holds_for_item(
-                &holds_db,
-                true,
-                item.kind.name(),
-                &item.path,
-                cutoff,
-            )
-            .await?;
-            let limit = policy.item(item.kind).daily_free;
-            let in_scope = policy.free_media_in_scope(&item);
-            let mut ok = in_scope && self.free_item(&item, limit, now / 86_400, req.head)?;
-            if !ok
-                && in_scope
-                && self.reclaim_expired_holds(now as i64, true).await? > 0
-            {
-                ok = self.free_item(&item, limit, now / 86_400, req.head)?;
-            }
-            if !ok {
-                return Response::error(
-                    "Sign in to access this item or continue beyond the daily free allowance",
-                    402,
-                );
-            }
+        let holds_db = self.ensure_holds_table()?;
+        let cutoff = (now as i64).saturating_sub(HOLD_TTL_SECS);
+        self.reclaim_expired_holds_for_item(
+            &holds_db,
+            true,
+            item.kind.name(),
+            &item.path,
+            cutoff,
+        )
+        .await?;
+        let limit = policy.item(item.kind).daily_free;
+        let in_scope = policy.free_media_in_scope(&item);
+        let mut ok = in_scope && self.free_item(&item, limit, now / 86_400, req.head)?;
+        if !ok
+            && in_scope
+            && self.reclaim_expired_holds(now as i64, true).await? > 0
+        {
+            ok = self.free_item(&item, limit, now / 86_400, req.head)?;
+        }
+        if !ok {
+            return Response::error(
+                "Sign in to access this item or continue beyond the daily free allowance",
+                402,
+            );
         }
         Response::ok("")
     }
@@ -2705,7 +2831,7 @@ impl UserAccount {
         let db = self.ensure_session_tables(now as i64)?;
         let safety = self.read_safety_state(&db)?;
 
-        let session_row = if let Some(sid) = req.sid.as_deref() {
+        let session_row = if !banned && !suspended && let Some(sid) = req.sid.as_deref() {
             #[derive(serde::Deserialize)]
             struct SRow {
                 assurance_level: String,
@@ -3051,8 +3177,8 @@ impl UserAccount {
     /// Separate preview transform rate budget — NEVER touches clear-view `balance`,
     /// `seen:{day}`, `free_usage`, `charge_holds`, `win_views`, or `total_views` (M1)!
     /// Enforces `policy.login_required` for guests (Cycle 2 A-3).
-    async fn preview_budget(&self, req: PreviewBudgetReq, policy: &Policy) -> Result<Response> {
-        if req.guest && policy.login_required {
+    async fn preview_budget(&self, req: PreviewBudgetReq, login_required: bool) -> Result<Response> {
+        if req.guest && login_required {
             return Response::error("Login required", 401);
         }
         if !req.guest && self.get_or("banned", false).await? {
@@ -4364,5 +4490,41 @@ mod tests {
         assert_eq!(legacy_sub.plan_refund_paid, 10_000);
         assert_eq!(legacy_sub.total_transferable, 10_000);
         assert_eq!(legacy_sub.total_free_forfeited, 3_000);
+    }
+
+    #[test]
+    fn settings_cache_enforces_ttl_expiry_overwrites_and_clock_rollback() {
+        let cache = SettingsCache::new(SETTINGS_CACHE_TTL_MS);
+        let t0 = 1_750_000_000_000u64;
+
+        // Cold cache misses.
+        assert!(cache.get(t0).is_none());
+
+        let mut open_policy = Policy::default();
+        open_policy.login_required = false;
+        open_policy.signup_points = 1_234;
+        cache.put(t0, open_policy);
+
+        // Fresh hits up to `ttl_ms - 1`.
+        let hit0 = cache.get(t0).expect("hit at t0");
+        assert!(!hit0.login_required);
+        assert_eq!(hit0.signup_points, 1_234);
+        assert!(cache.get(t0 + SETTINGS_CACHE_TTL_MS - 1).is_some());
+
+        // Exact TTL boundary and past TTL expire so admin updates take effect promptly.
+        assert!(cache.get(t0 + SETTINGS_CACHE_TTL_MS).is_none());
+        assert!(cache.get(t0 + SETTINGS_CACHE_TTL_MS + 5_000).is_none());
+
+        // Backward clock jump MUST miss rather than pinning stale policy indefinitely.
+        assert!(cache.get(t0 - 1).is_none());
+
+        // Overwrite refreshes timestamp and returns the updated policy.
+        let mut locked_policy = Policy::default();
+        locked_policy.login_required = true;
+        let t1 = t0 + SETTINGS_CACHE_TTL_MS + 100;
+        cache.put(t1, locked_policy);
+        let refreshed = cache.get(t1 + 1_000).expect("hit after refresh");
+        assert!(refreshed.login_required);
+        assert!(cache.get(t1 + SETTINGS_CACHE_TTL_MS).is_none());
     }
 }

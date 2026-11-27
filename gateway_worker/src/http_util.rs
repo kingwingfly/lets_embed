@@ -26,6 +26,9 @@ pub(crate) const MAX_ADMIN_BODY_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_IMAGE_SEARCH_BODY_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_TEXT_SEARCH_BODY_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_REVEAL_BODY_BYTES: usize = 4096;
+/// Short-lived gateway-only cookie set by `GET /_gw/ready` once upstream `/healthz`
+/// returns `200 OK`, signaling post-ready HTML reloads to use `POST_WAKE_TIMEOUT_MS`.
+pub(crate) const WAKE_COOKIE_NAME: &str = "__le_gw_wake";
 
 #[derive(Clone, Debug)]
 pub(crate) struct Upstreams {
@@ -245,19 +248,45 @@ pub(crate) fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
-/// Strips sensitive gateway/auth cookies across ALL incoming `Cookie` headers
-/// before forwarding requests to `API_UPSTREAM` (`lets-embed-web`).
+/// Strips sensitive gateway/auth cookies (and the internal `__le_gw_wake` cookie)
+/// across ALL incoming `Cookie` headers before forwarding requests to `API_UPSTREAM`.
 pub(crate) fn sanitize_origin_cookie(headers: &HeaderMap) -> Option<String> {
     let mut kept = Vec::new();
     for raw in headers.get_all("cookie").iter().filter_map(|v| v.to_str().ok()) {
         for cookie in raw.split(';').map(str::trim).filter(|c| !c.is_empty()) {
             let name = cookie.split('=').next().unwrap_or("").trim();
-            if !STRIPPED_ORIGIN_COOKIES.contains(&name) {
+            if !STRIPPED_ORIGIN_COOKIES.contains(&name) && name != WAKE_COOKIE_NAME {
                 kept.push(cookie);
             }
         }
     }
     (!kept.is_empty()).then(|| kept.join("; "))
+}
+
+/// Returns `true` iff the incoming request carries a single `__le_gw_wake=1` cookie.
+pub(crate) fn has_wake_cookie(headers: &HeaderMap) -> bool {
+    matches!(
+        extract_single_cookie(headers, WAKE_COOKIE_NAME),
+        CookieLookup::Single("1")
+    )
+}
+
+/// `Set-Cookie` header value emitted by `/_gw/ready` when origin `/healthz` is `200 OK`.
+pub(crate) fn wake_set_cookie_header(secure: bool) -> &'static str {
+    if secure {
+        "__le_gw_wake=1; Path=/; Max-Age=30; SameSite=Lax; HttpOnly; Secure"
+    } else {
+        "__le_gw_wake=1; Path=/; Max-Age=30; SameSite=Lax; HttpOnly"
+    }
+}
+
+/// `Set-Cookie` header value clearing `__le_gw_wake` after a successful HTML navigation.
+pub(crate) fn wake_clear_cookie_header(secure: bool) -> &'static str {
+    if secure {
+        "__le_gw_wake=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly; Secure"
+    } else {
+        "__le_gw_wake=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly"
+    }
 }
 
 /// Strict single-occurrence cookie extractor: detects duplicate cookie names across
@@ -357,6 +386,7 @@ pub(crate) fn sanitize_user_worker_cookie(headers: &HeaderMap) -> Option<String>
                     | GUEST_SESSION_COOKIE
                     | LEGACY_GUEST_SESSION_COOKIE
                     | LEGACY_SESSION_COOKIE
+                    | WAKE_COOKIE_NAME
                     | "CF_Authorization"
             );
             let is_encoded_auth_spoof = is_encoded
@@ -1087,34 +1117,69 @@ const WAKING_INTERSTITIAL_HTML: &str = r#"<!DOCTYPE html>
   var elapsedEl = document.getElementById('le-elapsed');
   var progressEl = document.getElementById('le-progress');
   var retryBtn = document.getElementById('le-retry');
+  var RETRY_KEY = 'le_wake_retries';
+  var RETRY_WINDOW_MS = 25000;
+  var BACKOFF_BASE_MS = 2000;
+  var BACKOFF_MAX_MS = 12000;
+  var READY_FETCH_TIMEOUT_MS = 8000;
+  var MANUAL_PROBE_TIMEOUT_MS = 2500;
   var inFlight = false;
   var reloading = false;
+  var manualRetrying = false;
+  var serverReady = false;
+  var hasExplicitStatus = false;
   var pollTimer = null;
+  var reloadTimer = null;
+  var activeCancel = null;
+
+  function setExplicitStatus(msg) {
+    hasExplicitStatus = true;
+    if (statusEl) statusEl.textContent = msg;
+  }
 
   function readRetryState() {
     try {
-      var raw = sessionStorage.getItem('le_wake_retries');
+      var raw = sessionStorage.getItem(RETRY_KEY);
       if (!raw) return { ts: 0, count: 0 };
       var parsed = JSON.parse(raw);
-      if (!parsed || Date.now() - parsed.ts > 60000) return { ts: 0, count: 0 };
+      if (!parsed || typeof parsed.ts !== 'number' || typeof parsed.count !== 'number') {
+        return { ts: 0, count: 0 };
+      }
+      if (Date.now() - parsed.ts > RETRY_WINDOW_MS) return { ts: 0, count: 0 };
       return parsed;
     } catch (_) {
       return { ts: 0, count: 0 };
     }
   }
 
+  function backoffDelayMs(count) {
+    if (!count || count <= 0) return 0;
+    return Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * Math.pow(2, count - 1));
+  }
+
   function recordReloadAttempt() {
     try {
       var st = readRetryState();
-      sessionStorage.setItem('le_wake_retries', JSON.stringify({
-        ts: st.ts || Date.now(),
+      sessionStorage.setItem(RETRY_KEY, JSON.stringify({
+        ts: Date.now(),
         count: (st.count || 0) + 1
       }));
     } catch (_) {}
   }
 
   function clearReloadAttempts() {
-    try { sessionStorage.removeItem('le_wake_retries'); } catch (_) {}
+    try { sessionStorage.removeItem(RETRY_KEY); } catch (_) {}
+  }
+
+  function cancelPending() {
+    if (pollTimer) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    if (reloadTimer) {
+      clearTimeout(reloadTimer);
+      reloadTimer = null;
+    }
   }
 
   function updateClock() {
@@ -1123,7 +1188,7 @@ const WAKING_INTERSTITIAL_HTML: &str = r#"<!DOCTYPE html>
     if (elapsedEl) elapsedEl.textContent = secs + 's';
     var pct = Math.min(92, Math.round(12 + 80 * (1 - Math.exp(-secs / 14))));
     if (progressEl) progressEl.style.width = pct + '%';
-    if (statusEl) {
+    if (statusEl && !hasExplicitStatus) {
       if (secs >= 35) {
         statusEl.textContent = 'Still starting up\u2014hang tight or click Retry now.';
       } else if (secs >= 15) {
@@ -1133,61 +1198,139 @@ const WAKING_INTERSTITIAL_HTML: &str = r#"<!DOCTYPE html>
   }
 
   function schedulePoll(ms) {
-    if (reloading) return;
-    if (pollTimer) clearTimeout(pollTimer);
-    pollTimer = setTimeout(pollReady, ms);
+    if (reloading || manualRetrying) return;
+    cancelPending();
+    pollTimer = setTimeout(function () {
+      pollTimer = null;
+      pollReady();
+    }, ms);
   }
 
-  function triggerReload() {
+  function scheduleReload(ms) {
+    if (reloading || manualRetrying) return;
+    cancelPending();
+    reloadTimer = setTimeout(function () {
+      reloadTimer = null;
+      triggerReload(true, 'Server is ready \u2014 loading gallery\u2026');
+    }, ms);
+  }
+
+  function triggerReload(recordAttempt, statusMsg) {
     if (reloading) return;
     reloading = true;
-    if (pollTimer) clearTimeout(pollTimer);
+    cancelPending();
     if (progressEl) progressEl.style.width = '100%';
-    if (statusEl) statusEl.textContent = 'Server is ready! Loading gallery\u2026';
-    recordReloadAttempt();
+    setExplicitStatus(statusMsg || 'Server is ready \u2014 loading gallery\u2026');
+    if (recordAttempt) {
+      recordReloadAttempt();
+    }
     window.location.reload();
   }
 
+  function fetchReady(timeoutMs) {
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    var aborted = false;
+    var timer = null;
+    return new Promise(function (resolve) {
+      var settled = false;
+      function finish(val) {
+        if (settled) return;
+        settled = true;
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        if (activeCancel === cancelFn) {
+          activeCancel = null;
+        }
+        resolve(val);
+      }
+      function cancelFn() {
+        aborted = true;
+        if (controller) {
+          try { controller.abort(); } catch (_) {}
+        }
+        finish(null);
+      }
+      activeCancel = cancelFn;
+      timer = setTimeout(cancelFn, timeoutMs);
+      var opts = {
+        method: 'GET',
+        cache: 'no-store',
+        credentials: 'same-origin',
+        headers: { 'accept': 'application/json' }
+      };
+      if (controller) {
+        opts.signal = controller.signal;
+      }
+      try {
+        fetch('/_gw/ready', opts)
+          .then(function (res) {
+            if (aborted || !res || !res.ok) return null;
+            return res.json().catch(function () { return null; });
+          })
+          .then(function (data) {
+            finish(data);
+          })
+          .catch(function () {
+            finish(null);
+          });
+      } catch (_) {
+        finish(null);
+      }
+    });
+  }
+
   function pollReady() {
-    if (inFlight || reloading) return;
+    if (inFlight || reloading || manualRetrying) return;
     inFlight = true;
-    fetch('/_gw/ready', {
-      method: 'GET',
-      cache: 'no-store',
-      credentials: 'same-origin',
-      headers: { 'accept': 'application/json' }
-    })
-      .then(function (res) {
-        if (!res.ok) return null;
-        return res.json().catch(function () { return null; });
-      })
-      .then(function (data) {
-        if (data && data.ready === true) {
-          var st = readRetryState();
-          if (st.count >= 3) {
-            if (statusEl) statusEl.textContent = 'Backend is recovering\u2014retrying shortly\u2026';
-            schedulePoll(8000);
-            return;
-          }
-          triggerReload();
+    fetchReady(READY_FETCH_TIMEOUT_MS).then(function (data) {
+      inFlight = false;
+      if (reloading || manualRetrying) return;
+      if (data && data.ready === true) {
+        serverReady = true;
+        var st = readRetryState();
+        var delay = backoffDelayMs(st.count);
+        if (delay > 0) {
+          setExplicitStatus(
+            'Still warming up \u2014 retrying in ' + Math.ceil(delay / 1000) + 's\u2026'
+          );
+          scheduleReload(delay);
           return;
         }
-        var secs = Math.floor((Date.now() - startedAt) / 1000);
-        schedulePoll(secs >= 90 ? 5000 : 2000);
-      })
-      .catch(function () {
-        var secs = Math.floor((Date.now() - startedAt) / 1000);
-        schedulePoll(secs >= 90 ? 5000 : 2000);
-      })
-      .finally(function () {
-        inFlight = false;
-      });
+        triggerReload(true, 'Server is ready \u2014 loading gallery\u2026');
+        return;
+      }
+      var secs = Math.floor((Date.now() - startedAt) / 1000);
+      schedulePoll(secs >= 90 ? 5000 : 2000);
+    });
   }
 
   if (retryBtn) {
     retryBtn.addEventListener('click', function () {
+      if (reloading || manualRetrying) return;
+      manualRetrying = true;
       clearReloadAttempts();
-      triggerReload();
+      cancelPending();
+      if (activeCancel) {
+        var cancel = activeCancel;
+        activeCancel = null;
+        cancel();
+      }
+      inFlight = false;
+      if (serverReady) {
+        triggerReload(false, 'Server is ready \u2014 loading gallery\u2026');
+        return;
+      }
+      setExplicitStatus('Checking server\u2026');
+      fetchReady(MANUAL_PROBE_TIMEOUT_MS).then(function (data) {
+        if (data && data.ready === true) {
+          serverReady = true;
+          triggerReload(false, 'Server is ready \u2014 loading gallery\u2026');
+        } else {
+          triggerReload(false, 'Checking server\u2026');
+        }
+      });
     });
   }
 

@@ -238,7 +238,7 @@ probe_web_healthz() {
 }
 lets-embed-web "$@" &
 web_pid=$!
-deadline=$((SECONDS + 20))
+deadline=$((SECONDS + 60))
 web_ready=0
 while (( SECONDS < deadline )); do
     if (( sig_code )); then
@@ -263,7 +263,7 @@ if ! kill -0 "$web_pid" 2>/dev/null; then
     exit $?
 fi
 if (( ! web_ready )); then
-    echo "start.sh: lets-embed-web not ready on 127.0.0.1:3000/healthz after 20s; starting gateway anyway" >&2
+    echo "start.sh: lets-embed-web not ready on 127.0.0.1:3000/healthz after 60s; starting gateway anyway" >&2
 fi
 gateway &
 if (( sig_code )); then
@@ -370,7 +370,7 @@ probe_web_healthz() {
 }
 lets-embed-web "$@" &
 web_pid=$!
-deadline=$((SECONDS + 20))
+deadline=$((SECONDS + 60))
 web_ready=0
 while (( SECONDS < deadline )); do
     if (( sig_code )); then
@@ -395,7 +395,7 @@ if ! kill -0 "$web_pid" 2>/dev/null; then
     exit $?
 fi
 if (( ! web_ready )); then
-    echo "start.sh: lets-embed-web not ready on 127.0.0.1:3000/healthz after 20s; starting gateway anyway" >&2
+    echo "start.sh: lets-embed-web not ready on 127.0.0.1:3000/healthz after 60s; starting gateway anyway" >&2
 fi
 gateway &
 if (( sig_code )); then
@@ -465,7 +465,7 @@ probe_web_healthz() {
 }
 lets-embed-web "$@" &
 web_pid=$!
-deadline=$((SECONDS + 20))
+deadline=$((SECONDS + 60))
 web_ready=0
 while (( SECONDS < deadline )); do
     if (( sig_code )); then
@@ -490,7 +490,7 @@ if ! kill -0 "$web_pid" 2>/dev/null; then
     exit $?
 fi
 if (( ! web_ready )); then
-    echo "start.sh: lets-embed-web not ready on 127.0.0.1:3000/healthz after 20s; starting gateway anyway" >&2
+    echo "start.sh: lets-embed-web not ready on 127.0.0.1:3000/healthz after 60s; starting gateway anyway" >&2
 fi
 gateway &
 if (( sig_code )); then

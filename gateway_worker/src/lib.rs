@@ -60,13 +60,14 @@ use crate::http_util::{
     MAX_REVEAL_BODY_BYTES, MEDIA_ALLOWED_METHODS, USER_ALLOWED_METHODS, Upstreams, browse_route,
     build_api_healthz_target, build_api_upstream_target, build_sitemap_cache_key,
     cache_control_allows_edge_cache, checked_gallery_method, checked_media_method,
-    checked_user_method, extract_single_cookie, guest_id, has_reveal_csrf_header,
+    checked_user_method, extract_single_cookie, guest_id, has_reveal_csrf_header, has_wake_cookie,
     if_none_match_matches, is_always_public_path, is_canonical_path, is_hop_by_hop,
     is_https_request, is_public_cacheable_path, is_same_origin, is_segment_prefix,
     is_sitemap_path, is_transient_cold_start_status, login_response, metered_item,
     method_not_allowed, payment_required, private_no_store, request_host, sanitize_origin_cookie,
     sanitize_user_worker_cookie, should_serve_waking_interstitial, should_strip_api_request_header,
-    strip_cf_access_set_cookies, waking_interstitial_response,
+    strip_cf_access_set_cookies, wake_clear_cookie_header, wake_set_cookie_header,
+    waking_interstitial_response,
 };
 use crate::media::{
     PreviewBlurConfig, PreviewBudgetReq, build_facts_rev_target, build_media_upstream_target,
@@ -173,11 +174,26 @@ const MAX_CACHED_SITEMAP_BYTES: usize = 16 * 1024 * 1024;
 /// Internal header preserving the origin's client-facing `Cache-Control` while the
 /// Workers Cache API stores the entry with `public, max-age=300` for edge TTL.
 const SITEMAP_CACHE_CLIENT_CC_HEADER: &str = "x-gw-client-cache-control";
-/// Edge wait budget (ms) before serving the 503 waking interstitial to interactive
-/// browser HTML navigations while GCP Cloud Run cold-starts.
+/// Maximum edge wait budget (ms) before serving the 503 waking interstitial to
+/// interactive browser HTML navigations while GCP Cloud Run cold-starts.
 const COLD_START_TIMEOUT_MS: u64 = 2_000;
+/// Total end-to-end Worker latency budget (ms) for initial cold-start HTML
+/// navigations so cold DO hops are deducted before waiting on upstream.
+const COLD_START_TOTAL_BUDGET_MS: u64 = 2_200;
+/// Floor (ms) on the initial cold-start upstream timeout so slow DO hops never
+/// false-trigger the waking screen against a warm Cloud Run origin.
+const MIN_COLD_START_UPSTREAM_TIMEOUT_MS: u64 = 800;
+/// Generous upstream timeout (ms) for post-ready HTML reloads carrying the
+/// `__le_gw_wake=1` cookie so cold PolicyStore sync + first SSR completes cleanly.
+const POST_WAKE_TIMEOUT_MS: u64 = 15_000;
 /// Per-poll timeout (ms) for `/_gw/ready` probing `{API_UPSTREAM}/healthz`.
 const READY_PROBE_TIMEOUT_MS: u64 = 3_500;
+
+fn compute_cold_start_upstream_timeout_ms(elapsed_ms: u64) -> u64 {
+    COLD_START_TOTAL_BUDGET_MS
+        .saturating_sub(elapsed_ms)
+        .clamp(MIN_COLD_START_UPSTREAM_TIMEOUT_MS, COLD_START_TIMEOUT_MS)
+}
 
 enum UpstreamFetchOutcome {
     Response(Response),
@@ -244,6 +260,7 @@ impl From<worker::Error> for BackendError {
 #[allow(async_fn_in_trait)]
 trait GatewayBackend {
     fn now_secs(&self) -> u64;
+    fn now_ms(&self) -> u64;
     /// Generates a cryptographically random 128-bit lowercase hex string (32 chars).
     fn random_hex_128(&self) -> std::result::Result<String, BackendError>;
     /// Lazily resolves `KeyDomain::AdminAssertion` ONLY when handling `/admin*` routes.
@@ -280,6 +297,13 @@ trait GatewayBackend {
         req: UpstreamFetchReq,
         timeout_ms: u64,
     ) -> std::result::Result<UpstreamFetchOutcome, BackendError>;
+    /// Probes an upstream endpoint (e.g. `/healthz`) with a timeout, draining/cancelling
+    /// its response body cleanly before returning its status code (or `None` on timeout).
+    async fn probe_upstream_status_with_timeout(
+        &self,
+        req: UpstreamFetchReq,
+        timeout_ms: u64,
+    ) -> std::result::Result<Option<StatusCode>, BackendError>;
     fn spawn_origin_wakeup(&self, req: UpstreamFetchReq);
     async fn fetch_facts_rev(
         &self,
@@ -384,9 +408,20 @@ fn build_worker_upstream_request(
     Ok(Request::from(web_req))
 }
 
+async fn cancel_worker_response_body(resp: worker::Response) {
+    let raw: worker::web_sys::Response = resp.into();
+    if let Some(body) = raw.body() {
+        let _ = worker::js_sys::futures::JsFuture::from(body.cancel()).await;
+    }
+}
+
 impl GatewayBackend for WorkerBackend<'_> {
     fn now_secs(&self) -> u64 {
-        worker::Date::now().as_millis() / 1000
+        self.now_ms() / 1000
+    }
+
+    fn now_ms(&self) -> u64 {
+        worker::js_sys::Date::now() as u64
     }
 
     fn random_hex_128(&self) -> std::result::Result<String, BackendError> {
@@ -576,13 +611,44 @@ impl GatewayBackend for WorkerBackend<'_> {
         }
     }
 
+    async fn probe_upstream_status_with_timeout(
+        &self,
+        req: UpstreamFetchReq,
+        timeout_ms: u64,
+    ) -> std::result::Result<Option<StatusCode>, BackendError> {
+        let worker_req = build_worker_upstream_request(req)?;
+        let controller = worker::AbortController::default();
+        let signal = controller.signal();
+        let fetch = Fetch::Request(worker_req);
+        let fetch_fut = std::pin::pin!(fetch.send_with_signal(&signal));
+        let delay_fut = std::pin::pin!(worker::Delay::from(std::time::Duration::from_millis(
+            timeout_ms
+        )));
+        match futures::future::select(fetch_fut, delay_fut).await {
+            futures::future::Either::Left((res, _)) => {
+                let resp = res?;
+                let status =
+                    StatusCode::from_u16(resp.status_code()).unwrap_or(StatusCode::BAD_GATEWAY);
+                cancel_worker_response_body(resp).await;
+                Ok(Some(status))
+            }
+            futures::future::Either::Right(((), _)) => {
+                controller.abort();
+                Ok(None)
+            }
+        }
+    }
+
     fn spawn_origin_wakeup(&self, req: UpstreamFetchReq) {
         let Ok(worker_req) = build_worker_upstream_request(req) else {
             return;
         };
         self.ctx.wait_until(async move {
-            if let Err(err) = Fetch::Request(worker_req).send().await {
-                worker::console_error!("origin wakeup /healthz failed: {err:?}");
+            match Fetch::Request(worker_req).send().await {
+                Ok(resp) => cancel_worker_response_body(resp).await,
+                Err(err) => {
+                    worker::console_error!("origin wakeup /healthz failed: {err:?}");
+                }
             }
         });
     }
@@ -1091,15 +1157,16 @@ fn trigger_origin_wakeup(backend: &impl GatewayBackend, cfg: &GatewayConfig) {
 async fn handle_ready_probe(
     backend: &impl GatewayBackend,
     cfg: &GatewayConfig,
+    uri: &Uri,
     is_head: bool,
 ) -> Response {
     let ready = match build_healthz_request(cfg) {
         Some(req) => match backend
-            .fetch_upstream_with_timeout(req, READY_PROBE_TIMEOUT_MS)
+            .probe_upstream_status_with_timeout(req, READY_PROBE_TIMEOUT_MS)
             .await
         {
-            Ok(UpstreamFetchOutcome::Response(resp)) => resp.status() == StatusCode::OK,
-            Ok(UpstreamFetchOutcome::TimedOut) => false,
+            Ok(Some(status)) => status == StatusCode::OK,
+            Ok(None) => false,
             Err(err) => {
                 log_backend_error("origin /healthz readiness probe failed", &err);
                 false
@@ -1127,6 +1194,12 @@ async fn handle_ready_probe(
     if let Ok(len) = HeaderValue::from_str(&json_body.len().to_string()) {
         h.insert(header::CONTENT_LENGTH, len);
     }
+    if ready {
+        h.append(
+            header::SET_COOKIE,
+            HeaderValue::from_static(wake_set_cookie_header(is_https_request(uri))),
+        );
+    }
     private_no_store(resp)
 }
 
@@ -1141,10 +1214,12 @@ async fn proxy_to_api(
     signed_assertion: &str,
     allow_public_cache: bool,
     allow_waking_interstitial: bool,
+    started_at_ms: u64,
 ) -> Response {
     let Ok(target_url) = build_api_upstream_target(uri, &cfg.upstreams) else {
         return private_no_store((StatusCode::BAD_REQUEST, "invalid request URI").into_response());
     };
+    let has_wake = allow_waking_interstitial && has_wake_cookie(headers);
     let req = UpstreamFetchReq {
         url: target_url,
         headers: build_api_headers(
@@ -1161,9 +1236,13 @@ async fn proxy_to_api(
         preview_blur: None,
     };
     let outcome = if allow_waking_interstitial {
-        backend
-            .fetch_upstream_with_timeout(req, COLD_START_TIMEOUT_MS)
-            .await
+        let timeout_ms = if has_wake {
+            POST_WAKE_TIMEOUT_MS
+        } else {
+            let elapsed_ms = backend.now_ms().saturating_sub(started_at_ms);
+            compute_cold_start_upstream_timeout_ms(elapsed_ms)
+        };
+        backend.fetch_upstream_with_timeout(req, timeout_ms).await
     } else {
         backend
             .fetch_upstream(req)
@@ -1176,6 +1255,12 @@ async fn proxy_to_api(
             if allow_waking_interstitial && is_transient_cold_start_status(resp.status()) {
                 trigger_origin_wakeup(backend, cfg);
                 return waking_interstitial_response();
+            }
+            if has_wake && !resp.status().is_server_error() {
+                resp.headers_mut().append(
+                    header::SET_COOKIE,
+                    HeaderValue::from_static(wake_clear_cookie_header(is_https_request(uri))),
+                );
             }
             if allow_public_cache
                 && (resp.status().is_success() || resp.status() == StatusCode::NOT_MODIFIED)
@@ -1805,6 +1890,7 @@ async fn forward_gallery_request(
     headers: &HeaderMap,
     body: Bytes,
     now: u64,
+    started_at_ms: u64,
     mut actor: ActorBinding,
     access: PolicyAccessResult,
     flags: AssertionFlags,
@@ -1884,6 +1970,7 @@ async fn forward_gallery_request(
         &signed_assertion,
         allow_public_cache && minted_guest_cookie.is_none(),
         allow_waking_interstitial,
+        started_at_ms,
     )
     .await;
 
@@ -1978,6 +2065,7 @@ async fn handle_gateway_request(
     cookies: Cookies,
     body: Bytes,
 ) -> Response {
+    let started_at_ms = backend.now_ms();
     let path = uri.path();
     if !is_canonical_path(path) {
         return private_no_store((StatusCode::BAD_REQUEST, "Invalid request path").into_response());
@@ -1989,8 +2077,33 @@ async fn handle_gateway_request(
         return handle_admin_route(backend, cfg, &uri, &method, &headers, body).await;
     }
 
+    let now = backend.now_secs();
+    // On gallery routes that will always inspect live session context after Step 0 geo,
+    // overlap `SITE_POLICY` DO fetch with the read-only `USER_ACCOUNT` `/session-context`
+    // lookup (which only fires if a valid HMAC-signed session cookie is present; guests
+    // incur zero DO calls here and `POST /guest` still runs strictly after geo-block).
+    // Step 0 geo-block (451) and `SITE_POLICY` outage (503) are STILL evaluated FIRST.
+    let should_prefetch_session = path != "/_gw/ready"
+        && !is_segment_prefix(path, "/user")
+        && !is_segment_prefix(path, "/media")
+        && checked_gallery_method(&method).is_some()
+        && !is_segment_prefix(path, "/images")
+        && !is_segment_prefix(path, "/videos")
+        && !is_segment_prefix(path, "/internal")
+        && !(matches!(method, Method::GET | Method::HEAD) && is_always_public_path(path));
+
     // Load authoritative Policy v3 from singleton `SITE_POLICY` DO (fail closed!).
-    let snapshot = match backend.load_site_policy().await {
+    let (policy_res, prefetched_session) = if should_prefetch_session {
+        let (policy_res, session_res) = futures::future::join(
+            backend.load_site_policy(),
+            resolve_live_session(backend, cfg, &headers, now),
+        )
+        .await;
+        (policy_res, Some(session_res))
+    } else {
+        (backend.load_site_policy().await, None)
+    };
+    let snapshot = match policy_res {
         Ok(snapshot) => snapshot,
         Err(err) => {
             log_backend_error("SITE_POLICY unavailable", &err);
@@ -2020,7 +2133,7 @@ async fn handle_gateway_request(
         if !matches!(method, Method::GET | Method::HEAD) {
             return method_not_allowed("GET, HEAD");
         }
-        return handle_ready_probe(backend, cfg, method == Method::HEAD).await;
+        return handle_ready_probe(backend, cfg, &uri, method == Method::HEAD).await;
     }
 
     // `/user/admin` & `/user/admin/*` retired unconditionally -> 404.
@@ -2070,7 +2183,6 @@ async fn handle_gateway_request(
         };
     }
 
-    let now = backend.now_secs();
     let live_admin_email = cfg.live_admin_email();
     let admin_pass = cookies
         .get(ADMIN_VIEW_COOKIE)
@@ -2135,12 +2247,17 @@ async fn handle_gateway_request(
             &signed,
             allow_public_cache,
             allow_waking_interstitial,
+            started_at_ms,
         )
         .await;
     }
 
     // Resolve live caller session via `USER_ACCOUNT` DO (`POST /session-context`).
-    let (auth, clear_cookie) = match resolve_live_session(backend, cfg, &headers, now).await {
+    let session_res = match prefetched_session {
+        Some(res) => res,
+        None => resolve_live_session(backend, cfg, &headers, now).await,
+    };
+    let (auth, clear_cookie) = match session_res {
         SessionResolution::Authenticated(live) => (Some(live), false),
         SessionResolution::Unauthenticated { clear_cookie } => (None, clear_cookie),
         SessionResolution::Banned => {
@@ -2254,6 +2371,7 @@ async fn handle_gateway_request(
             &headers,
             body,
             now,
+            started_at_ms,
             actor,
             access,
             assertion_flags,
@@ -2314,6 +2432,7 @@ async fn handle_gateway_request(
                     &signed_assertion,
                     false,
                     false,
+                    started_at_ms,
                 )
                 .await;
                 // Never forward an upstream 3xx response (and its body) alongside a
@@ -2378,6 +2497,7 @@ async fn handle_gateway_request(
             &headers,
             body,
             now,
+            started_at_ms,
             actor,
             access,
             assertion_flags,
@@ -2414,6 +2534,7 @@ async fn handle_gateway_request(
                 &headers,
                 body,
                 now,
+                started_at_ms,
                 actor,
                 access,
                 assertion_flags,
@@ -2596,6 +2717,10 @@ mod tests {
 
     struct MockBackend {
         now: u64,
+        clock_offset_ms: Cell<u64>,
+        policy_delay_ms: u64,
+        session_delay_ms: u64,
+        account_delay_ms: u64,
         rng_counter: Cell<u64>,
         admin_secret_result: std::result::Result<Vec<u8>, String>,
         admin_secret_loads: Cell<usize>,
@@ -2620,6 +2745,7 @@ mod tests {
         healthz_status: Option<StatusCode>,
         healthz_timed_out: bool,
         healthz_error: Option<&'static str>,
+        healthz_body_drained: Cell<usize>,
         sitemap_cache: RefCell<HashMap<String, CachedSitemapEntry>>,
         account_calls: RefCell<Vec<RecordedAccountCall>>,
         session_calls: RefCell<Vec<(String, Option<String>)>>,
@@ -2634,6 +2760,10 @@ mod tests {
             let env_json = policy_envelope_json(&policy);
             Self {
                 now: TEST_NOW,
+                clock_offset_ms: Cell::new(0),
+                policy_delay_ms: 0,
+                session_delay_ms: 0,
+                account_delay_ms: 0,
                 rng_counter: Cell::new(1),
                 admin_secret_result: Ok(test_admin_secret()),
                 admin_secret_loads: Cell::new(0),
@@ -2658,6 +2788,7 @@ mod tests {
                 healthz_status: None,
                 healthz_timed_out: false,
                 healthz_error: None,
+                healthz_body_drained: Cell::new(0),
                 sitemap_cache: RefCell::new(HashMap::new()),
                 account_calls: RefCell::new(Vec::new()),
                 session_calls: RefCell::new(Vec::new()),
@@ -2672,6 +2803,12 @@ mod tests {
     impl GatewayBackend for MockBackend {
         fn now_secs(&self) -> u64 {
             self.now
+        }
+
+        fn now_ms(&self) -> u64 {
+            self.now
+                .saturating_mul(1000)
+                .saturating_add(self.clock_offset_ms.get())
         }
 
         fn random_hex_128(&self) -> std::result::Result<String, BackendError> {
@@ -2689,6 +2826,8 @@ mod tests {
         }
 
         async fn load_site_policy(&self) -> std::result::Result<SitePolicySnapshot, BackendError> {
+            self.clock_offset_ms
+                .set(self.clock_offset_ms.get().saturating_add(self.policy_delay_ms));
             match &self.policy_envelope {
                 Ok(raw) => parse_site_policy_envelope_v3(raw).map_err(BackendError),
                 Err(msg) => Err(BackendError(msg.clone())),
@@ -2700,6 +2839,8 @@ mod tests {
             do_key: &str,
             sid: Option<&str>,
         ) -> std::result::Result<SessionContext, BackendError> {
+            self.clock_offset_ms
+                .set(self.clock_offset_ms.get().saturating_add(self.session_delay_ms));
             self.session_calls
                 .borrow_mut()
                 .push((do_key.to_string(), sid.map(str::to_string)));
@@ -2715,6 +2856,8 @@ mod tests {
             operation: &str,
             payload: serde_json::Value,
         ) -> std::result::Result<u16, BackendError> {
+            self.clock_offset_ms
+                .set(self.clock_offset_ms.get().saturating_add(self.account_delay_ms));
             self.account_calls.borrow_mut().push(RecordedAccountCall {
                 do_key: do_key.to_string(),
                 operation: operation.to_string(),
@@ -2852,6 +2995,23 @@ mod tests {
             self.fetch_upstream(req)
                 .await
                 .map(UpstreamFetchOutcome::Response)
+        }
+
+        async fn probe_upstream_status_with_timeout(
+            &self,
+            req: UpstreamFetchReq,
+            timeout_ms: u64,
+        ) -> std::result::Result<Option<StatusCode>, BackendError> {
+            match self.fetch_upstream_with_timeout(req, timeout_ms).await? {
+                UpstreamFetchOutcome::Response(resp) => {
+                    let status = resp.status();
+                    let _ = axum::body::to_bytes(resp.into_body(), 4096).await;
+                    self.healthz_body_drained
+                        .set(self.healthz_body_drained.get() + 1);
+                    Ok(Some(status))
+                }
+                UpstreamFetchOutcome::TimedOut => Ok(None),
+            }
         }
 
         fn spawn_origin_wakeup(&self, req: UpstreamFetchReq) {
@@ -5782,7 +5942,17 @@ mod tests {
             ready_ok.headers().get("content-type").unwrap(),
             "application/json; charset=utf-8"
         );
-        assert!(ready_ok.headers().get("set-cookie").is_none());
+        let ready_set_cookies: Vec<&str> = ready_ok
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(
+            ready_set_cookies,
+            vec!["__le_gw_wake=1; Path=/; Max-Age=30; SameSite=Lax; HttpOnly; Secure"]
+        );
+        assert!(backend.healthz_body_drained.get() >= 1);
         let ok_body = block_on(axum::body::to_bytes(ready_ok.into_body(), 1024)).unwrap();
         assert_eq!(&ok_body[..], br#"{"ready":true}"#);
         assert!(backend.account_calls.borrow().is_empty());
@@ -5831,7 +6001,8 @@ mod tests {
         let head_body = block_on(axum::body::to_bytes(ready_head.into_body(), 1024)).unwrap();
         assert!(head_body.is_empty());
 
-        // Non-200, timeout, and BackendError on `/healthz` all return 503 `{"ready":false}`.
+        // Non-200, timeout, and BackendError on `/healthz` all return 503 `{"ready":false}`
+        // and MUST NOT set the `__le_gw_wake` cookie.
         backend.healthz_status = Some(StatusCode::SERVICE_UNAVAILABLE);
         let ready_503 = dispatch(
             &backend,
@@ -5842,6 +6013,7 @@ mod tests {
             Bytes::new(),
         );
         assert_eq!(ready_503.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(ready_503.headers().get("set-cookie").is_none());
         let body_503 = block_on(axum::body::to_bytes(ready_503.into_body(), 1024)).unwrap();
         assert_eq!(&body_503[..], br#"{"ready":false}"#);
 
@@ -5856,6 +6028,7 @@ mod tests {
             Bytes::new(),
         );
         assert_eq!(ready_timeout.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(ready_timeout.headers().get("set-cookie").is_none());
         let body_to = block_on(axum::body::to_bytes(ready_timeout.into_body(), 1024)).unwrap();
         assert_eq!(&body_to[..], br#"{"ready":false}"#);
 
@@ -5870,7 +6043,338 @@ mod tests {
             Bytes::new(),
         );
         assert_eq!(ready_err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(ready_err.headers().get("set-cookie").is_none());
         let body_err = block_on(axum::body::to_bytes(ready_err.into_body(), 1024)).unwrap();
         assert_eq!(&body_err[..], br#"{"ready":false}"#);
+    }
+
+    #[test]
+    fn cold_start_elapsed_timeout_deducts_do_latency_and_clamps() {
+        assert_eq!(compute_cold_start_upstream_timeout_ms(0), COLD_START_TIMEOUT_MS);
+        assert_eq!(compute_cold_start_upstream_timeout_ms(199), COLD_START_TIMEOUT_MS);
+        assert_eq!(compute_cold_start_upstream_timeout_ms(200), COLD_START_TIMEOUT_MS);
+        assert_eq!(compute_cold_start_upstream_timeout_ms(500), 1_700);
+        assert_eq!(compute_cold_start_upstream_timeout_ms(1_100), 1_100);
+        assert_eq!(
+            compute_cold_start_upstream_timeout_ms(1_400),
+            MIN_COLD_START_UPSTREAM_TIMEOUT_MS
+        );
+        assert_eq!(
+            compute_cold_start_upstream_timeout_ms(2_500),
+            MIN_COLD_START_UPSTREAM_TIMEOUT_MS
+        );
+        assert_eq!(
+            compute_cold_start_upstream_timeout_ms(u64::MAX),
+            MIN_COLD_START_UPSTREAM_TIMEOUT_MS
+        );
+
+        let html_nav_headers = || {
+            let mut h = HeaderMap::new();
+            h.insert("sec-fetch-mode", "navigate".parse().unwrap());
+            h.insert("sec-fetch-dest", "document".parse().unwrap());
+            h.insert("accept", "text/html".parse().unwrap());
+            h
+        };
+
+        let policy = sample_safety_policy();
+        let cfg = test_cfg();
+        let mut backend = MockBackend::with_policy(policy);
+        backend.policy_delay_ms = 600;
+        backend.account_delay_ms = 500; // 1_100ms total DO latency before upstream fetch
+
+        let resp = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/",
+            html_nav_headers(),
+            Bytes::new(),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            backend.timeout_calls.borrow().last().unwrap(),
+            &("https://api.gallery.test/".to_string(), 1_100)
+        );
+
+        // Extreme DO latency clamps at MIN_COLD_START_UPSTREAM_TIMEOUT_MS (800ms)
+        backend.policy_delay_ms = 2_400;
+        backend.account_delay_ms = 600;
+        let resp2 = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/",
+            html_nav_headers(),
+            Bytes::new(),
+        );
+        assert_eq!(resp2.status(), StatusCode::OK);
+        assert_eq!(
+            backend.timeout_calls.borrow().last().unwrap(),
+            &(
+                "https://api.gallery.test/".to_string(),
+                MIN_COLD_START_UPSTREAM_TIMEOUT_MS
+            )
+        );
+    }
+
+    #[test]
+    fn wake_cookie_parsing_stripping_clearing_and_post_wake_timeout() {
+        // 1. Parsing helper
+        assert!(!has_wake_cookie(&HeaderMap::new()));
+
+        let mut h = HeaderMap::new();
+        h.insert("cookie", "__le_gw_wake=1".parse().unwrap());
+        assert!(has_wake_cookie(&h));
+
+        let mut h_multi = HeaderMap::new();
+        h_multi.insert("cookie", "theme=dark; __le_gw_wake=1; lang=en".parse().unwrap());
+        assert!(has_wake_cookie(&h_multi));
+
+        let mut h_wrong_val = HeaderMap::new();
+        h_wrong_val.insert("cookie", "__le_gw_wake=0".parse().unwrap());
+        assert!(!has_wake_cookie(&h_wrong_val));
+
+        let mut h_dup = HeaderMap::new();
+        h_dup.insert("cookie", "__le_gw_wake=1; __le_gw_wake=1".parse().unwrap());
+        assert!(!has_wake_cookie(&h_dup));
+
+        // 2. Stripping helper removes __le_gw_wake for both origin and user_worker
+        assert_eq!(
+            sanitize_origin_cookie(&h_multi).as_deref(),
+            Some("theme=dark; lang=en")
+        );
+        assert_eq!(sanitize_origin_cookie(&h), None);
+        assert_eq!(
+            sanitize_user_worker_cookie(&h_multi).as_deref(),
+            Some("theme=dark; lang=en")
+        );
+        assert_eq!(sanitize_user_worker_cookie(&h), None);
+
+        // 3. `/_gw/ready` emits Secure on https:// and omits Secure on http://
+        let policy = sample_safety_policy();
+        let cfg = test_cfg();
+        let mut backend = MockBackend::with_policy(policy);
+        backend.healthz_status = Some(StatusCode::OK);
+        backend.upstream_set_cookie = Some("CF_Authorization=should-not-leak; Path=/; HttpOnly");
+
+        let ready_http = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "http://127.0.0.1:8787/_gw/ready",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(ready_http.status(), StatusCode::OK);
+        assert_eq!(
+            ready_http.headers().get("set-cookie").unwrap(),
+            "__le_gw_wake=1; Path=/; Max-Age=30; SameSite=Lax; HttpOnly"
+        );
+
+        let ready_https = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/_gw/ready",
+            HeaderMap::new(),
+            Bytes::new(),
+        );
+        assert_eq!(ready_https.status(), StatusCode::OK);
+        assert_eq!(
+            ready_https.headers().get("set-cookie").unwrap(),
+            "__le_gw_wake=1; Path=/; Max-Age=30; SameSite=Lax; HttpOnly; Secure"
+        );
+
+        // 4. Reloaded HTML navigation with `__le_gw_wake=1` uses POST_WAKE_TIMEOUT_MS (15_000ms)
+        //    even after slow DO hops, strips `__le_gw_wake` upstream, and clears cookie on non-5xx.
+        let nav_with_wake = || {
+            let mut hdrs = HeaderMap::new();
+            hdrs.insert("sec-fetch-mode", "navigate".parse().unwrap());
+            hdrs.insert("sec-fetch-dest", "document".parse().unwrap());
+            hdrs.insert("accept", "text/html".parse().unwrap());
+            hdrs.insert("cookie", "theme=dark; __le_gw_wake=1".parse().unwrap());
+            hdrs
+        };
+
+        backend.policy_delay_ms = 1_800;
+        backend.upstream_status = StatusCode::OK;
+        backend.upstream_set_cookie = None;
+        let ok_https = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/",
+            nav_with_wake(),
+            Bytes::new(),
+        );
+        assert_eq!(ok_https.status(), StatusCode::OK);
+        assert_eq!(
+            backend.timeout_calls.borrow().last().unwrap(),
+            &("https://api.gallery.test/".to_string(), POST_WAKE_TIMEOUT_MS)
+        );
+        let upstream_calls = backend.upstream_calls.borrow();
+        let forwarded_cookie = header_value(&upstream_calls.last().unwrap().headers, "cookie");
+        assert_eq!(forwarded_cookie, Some("theme=dark"));
+        drop(upstream_calls);
+        assert_eq!(
+            ok_https.headers().get("set-cookie").unwrap(),
+            "__le_gw_wake=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly; Secure"
+        );
+
+        // Plain http clears without `; Secure`
+        let ok_http = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "http://127.0.0.1:8787/terms",
+            nav_with_wake(),
+            Bytes::new(),
+        );
+        assert_eq!(ok_http.status(), StatusCode::OK);
+        assert_eq!(
+            backend.timeout_calls.borrow().last().unwrap(),
+            &(
+                "https://api.gallery.test/terms".to_string(),
+                POST_WAKE_TIMEOUT_MS
+            )
+        );
+        assert_eq!(
+            ok_http.headers().get("set-cookie").unwrap(),
+            "__le_gw_wake=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly"
+        );
+
+        // Non-5xx (404) clears cookie; 500 and 503 waking screen do NOT clear cookie.
+        backend.upstream_status = StatusCode::NOT_FOUND;
+        let resp_404 = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/details/999",
+            nav_with_wake(),
+            Bytes::new(),
+        );
+        assert_eq!(resp_404.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp_404.headers().get("set-cookie").unwrap(),
+            "__le_gw_wake=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly; Secure"
+        );
+
+        backend.upstream_status = StatusCode::INTERNAL_SERVER_ERROR;
+        let resp_500 = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/",
+            nav_with_wake(),
+            Bytes::new(),
+        );
+        assert_eq!(resp_500.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(resp_500.headers().get("set-cookie").is_none());
+
+        backend.upstream_status = StatusCode::SERVICE_UNAVAILABLE;
+        let resp_503 = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/",
+            nav_with_wake(),
+            Bytes::new(),
+        );
+        assert_eq!(resp_503.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp_503.headers().get("set-cookie").is_none());
+
+        // Non-waking public cacheable route (`/robots.txt`) strips cookie upstream and
+        // does NOT emit Set-Cookie clearing header (preserving public cacheability).
+        backend.upstream_status = StatusCode::OK;
+        let robots = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/robots.txt",
+            nav_with_wake(),
+            Bytes::new(),
+        );
+        assert_eq!(robots.status(), StatusCode::OK);
+        assert!(robots.headers().get("set-cookie").is_none());
+        assert_eq!(
+            robots.headers().get("cache-control").unwrap(),
+            "public, max-age=3600"
+        );
+    }
+
+    #[test]
+    fn session_policy_overlap_preserves_geo_block_and_policy_outage_precedence() {
+        let policy = sample_safety_policy();
+        let cfg = test_cfg();
+        let do_key = "usr:550e8400-e29b-41d4-a716-446655440000";
+        let cookie_hdr = make_v2_cookie(&cfg, "user-42", do_key, "sid-1");
+
+        let mut backend = MockBackend::with_policy(policy);
+        backend.session_contexts.insert(
+            do_key.to_string(),
+            SessionContext {
+                active: true,
+                banned: false,
+                suspended: false,
+                sid_valid: true,
+                ..SessionContext::default()
+            },
+        );
+
+        // 1. Authenticated gallery GET succeeds via overlapped policy + session lookup
+        let mut authed_hdrs = HeaderMap::new();
+        authed_hdrs.insert("cookie", cookie_hdr.parse().unwrap());
+        let ok = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/",
+            authed_hdrs.clone(),
+            Bytes::new(),
+        );
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(backend.session_calls.borrow().len(), 1);
+        assert!(backend.account_calls.borrow().is_empty());
+
+        // 2. Geo-blocked country STILL returns 451 even when session is banned or revoked,
+        //    with ZERO Set-Cookie leak and ZERO upstream calls.
+        backend.upstream_calls.borrow_mut().clear();
+        backend.session_contexts.insert(
+            do_key.to_string(),
+            SessionContext {
+                active: true,
+                banned: true,
+                suspended: false,
+                sid_valid: false,
+                ..SessionContext::default()
+            },
+        );
+        let mut blocked_cfg = test_cfg();
+        blocked_cfg.visitor_country = Some("KP".to_string());
+        let geo_resp = dispatch(
+            &backend,
+            &blocked_cfg,
+            Method::GET,
+            "https://gallery.test/",
+            authed_hdrs.clone(),
+            Bytes::new(),
+        );
+        assert_eq!(geo_resp.status(), StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS);
+        assert!(geo_resp.headers().get("set-cookie").is_none());
+        assert!(backend.upstream_calls.borrow().is_empty());
+
+        // 3. SITE_POLICY outage STILL returns 503 even with a valid/banned session cookie.
+        backend.policy_envelope = Err("SITE_POLICY DO down".to_string());
+        let outage_resp = dispatch(
+            &backend,
+            &cfg,
+            Method::GET,
+            "https://gallery.test/",
+            authed_hdrs,
+            Bytes::new(),
+        );
+        assert_eq!(outage_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(outage_resp.headers().get("set-cookie").is_none());
+        assert!(backend.upstream_calls.borrow().is_empty());
     }
 }

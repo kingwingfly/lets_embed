@@ -123,14 +123,29 @@ fn build_app_router(
 
 /// Maximum wall-clock time the non-blocking startup warm-up may spend establishing
 /// DNS/TLS/HTTP2 connectivity to `POLICY_URL` before giving up and releasing the lock.
-const POLICY_STARTUP_WARMUP_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Sized to let a cold `user_worker` + `SitePolicyDO` round-trip complete during
+/// `Engine::new` without cancelling the TLS/HTTP2 handshake mid-flight.
+const POLICY_STARTUP_WARMUP_TIMEOUT: Duration = Duration::from_millis(3500);
+
+/// Maximum wall-clock time the non-blocking startup DB pool warm-up may spend
+/// establishing spare pooled connections and priming the initial gallery query.
+const DB_STARTUP_WARMUP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Target number of warm pooled Postgres connections to pre-establish after
+/// `Engine::new` so concurrent cold-boot requests avoid fresh TCP/TLS + `after_connect`
+/// session GUC latency on the first `GET /`.
+const DB_POOL_WARMUP_CONNECTIONS: usize = 2;
 
 /// Kicks off a non-blocking, fail-closed background warm-up against `POLICY_URL`
 /// in Managed Mode while the search engine initializes.
 ///
-/// Uses an impossible probe assertion (`rev = u64::MAX`, empty digest) so `PolicyStore`
-/// NEVER stores an unverified policy snapshot, while still warming DNS, TLS, HTTP/2
-/// keep-alive pooling, and the upstream `SITE_POLICY` DO before `:3000` serves traffic.
+/// `PolicyStore` only exposes assertion-pinned resolution (`resolve_for_assertion*`),
+/// and `GET /user/api/policy` returns an unsigned canonical JSON body + SHA-256
+/// `X-Policy-Digest` rather than a `SITE_SECRET`-signed envelope. Uses an impossible
+/// probe assertion (`rev = u64::MAX`, empty digest) so `PolicyStore` NEVER stores an
+/// unverified policy snapshot (preserving fail-closed & monotonic-revision invariants),
+/// while still warming DNS, TLS, HTTP/2 keep-alive pooling, and the upstream
+/// `SITE_POLICY` DO before `:3000` serves traffic.
 fn spawn_managed_policy_warmup(policy_store: Arc<PolicyStore>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let probe = GatewayAssertion {
@@ -166,6 +181,47 @@ fn spawn_managed_policy_warmup(policy_store: Arc<PolicyStore>) -> tokio::task::J
                 tracing::debug!(
                     timeout_ms = POLICY_STARTUP_WARMUP_TIMEOUT.as_millis(),
                     "managed policy endpoint pre-warm timed out; continuing startup"
+                );
+            }
+        }
+    })
+}
+
+/// Runs a non-blocking, bounded background DB pool warm-up after `Engine::new`:
+/// acquires `DB_POOL_WARMUP_CONNECTIONS` connections concurrently so `PgPool`
+/// pre-establishes a spare warm connection (running `after_connect` session GUCs
+/// off the request path) and runs a lightweight read-only `newest_posts_vec(1, 0)`
+/// query to verify connectivity and prime the statement cache before the first `GET /`.
+fn spawn_db_pool_warmup(engine: Arc<search_engine::Engine>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let work = async {
+            let pool = engine.pool();
+            let futs = (0..DB_POOL_WARMUP_CONNECTIONS).map(|_| pool.acquire());
+            let conns = futures::future::join_all(futs).await;
+            let warmed_conns = conns.iter().filter(|r| r.is_ok()).count();
+            drop(conns);
+
+            let query_ok = if warmed_conns > 0 {
+                engine.newest_posts_vec(1, 0).await.is_ok()
+            } else {
+                false
+            };
+            (warmed_conns, query_ok)
+        };
+        match tokio::time::timeout(DB_STARTUP_WARMUP_TIMEOUT, work).await {
+            Ok((warmed_conns, query_ok)) => {
+                tracing::debug!(
+                    warmed_conns,
+                    query_ok,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "database pool startup pre-warm completed"
+                );
+            }
+            Err(_) => {
+                tracing::debug!(
+                    timeout_ms = DB_STARTUP_WARMUP_TIMEOUT.as_millis(),
+                    "database pool startup pre-warm timed out; continuing startup"
                 );
             }
         }
@@ -244,6 +300,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let (engine, routes) = tokio::try_join!(engine_fut, routes_fut)?;
     let engine = Arc::new(engine);
+    let _db_warmup_task = spawn_db_pool_warmup(Arc::clone(&engine));
     tracing::info!(
         mode = runtime.mode.as_str(),
         elapsed_ms = startup_t0.elapsed().as_millis(),
@@ -1206,5 +1263,13 @@ mod tests {
             .expect("real assertion sync succeeds after warmup");
         assert_eq!(compiled.policy.revision, 3);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn db_pool_warmup_handles_unreachable_db_gracefully_without_blocking() {
+        let engine = test_engine();
+        spawn_db_pool_warmup(engine)
+            .await
+            .expect("db warmup task should complete without panicking");
     }
 }

@@ -323,6 +323,7 @@ const mockUserWorkerScript = `
 let currentPolicy = null;
 let failPolicy = false;
 let corruptDigest = false;
+let policyDelayMs = 0;
 let loginRequired = true;
 
 export class SitePolicyDO {
@@ -335,9 +336,13 @@ export class SitePolicyDO {
       if ('digest' in body) this.digest = body.digest;
       if ('fail' in body) failPolicy = !!body.fail;
       if ('corruptDigest' in body) corruptDigest = !!body.corruptDigest;
+      if ('delayMs' in body) policyDelayMs = Number(body.delayMs) || 0;
       return Response.json({ ok: true });
     }
     if (request.method === 'GET' && url.pathname === '/policy') {
+      if (policyDelayMs > 0) {
+        await new Promise((r) => setTimeout(r, policyDelayMs));
+      }
       if (failPolicy) return new Response('unavailable', { status: 503 });
       return Response.json({
         policy: currentPolicy,
@@ -625,7 +630,7 @@ function gatewayWorkerConfig(name, hostname, access, onUpstream, extra = {}) {
       assert.equal(request.headers.get('cf-ipcountry'), null);
       assert.doesNotMatch(
         request.headers.get('cookie') || '',
-        /ue_admin_view|ue_session|le_guest_sid|gw_token|gw_app|__Host-auth_tx|CF_Authorization/
+        /ue_admin_view|ue_session|le_guest_sid|gw_token|gw_app|__Host-auth_tx|CF_Authorization|__le_gw_wake/
       );
       if (onUpstream) {
         const reply = onUpstream(request, target);
@@ -1607,11 +1612,17 @@ test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in wor
   assert.equal(apiHits, 0);
   assert.equal(healthzCalls.length, 0);
 
-  // `/_gw/ready` works under login_required=true, strips Set-Cookie, and sends CF-Access headers only.
+  // `/_gw/ready` works under login_required=true, strips upstream CF_Authorization,
+  // sets the short-lived `__le_gw_wake=1` cookie ONLY when ready, and sends CF-Access headers only.
   const readyOk = await site('/_gw/ready');
   assert.equal(readyOk.status, 200);
   assert.equal(readyOk.headers.get('cache-control'), 'private, no-store');
-  assert.equal(readyOk.headers.get('set-cookie'), null);
+  const readySetCookie = readyOk.headers.get('set-cookie');
+  assert.equal(
+    readySetCookie,
+    '__le_gw_wake=1; Path=/; Max-Age=30; SameSite=Lax; HttpOnly; Secure'
+  );
+  assert.doesNotMatch(readySetCookie, /CF_Authorization/i);
   assert.deepEqual(await readyOk.json(), { ready: true });
   assert.equal(healthzCalls.length, 1);
   assert.deepEqual(healthzCalls[0], {
@@ -1621,6 +1632,16 @@ test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in wor
     assertion: null,
     cookie: null,
   });
+
+  // Plain http `/_gw/ready` omits `; Secure` so local localhost/Miniflare workflows work.
+  const readyHttp = await mf.dispatchFetch('http://' + appHost + '/_gw/ready', {
+    redirect: 'manual',
+  });
+  assert.equal(readyHttp.status, 200);
+  assert.equal(
+    readyHttp.headers.get('set-cookie'),
+    '__le_gw_wake=1; Path=/; Max-Age=30; SameSite=Lax; HttpOnly'
+  );
 
   const readyHead = await site('/_gw/ready', { method: 'HEAD' });
   assert.equal(readyHead.status, 200);
@@ -1634,14 +1655,20 @@ test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in wor
   const ready503 = await site('/_gw/ready');
   assert.equal(ready503.status, 503);
   assert.equal(ready503.headers.get('cache-control'), 'private, no-store');
+  assert.equal(ready503.headers.get('set-cookie'), null);
   assert.deepEqual(await ready503.json(), { ready: false });
 
-  // `/_gw/ready` timeout (>3500ms) -> 503 {"ready":false}
+  // `/_gw/ready` timeout (>3500ms) -> 503 {"ready":false} without setting wake cookie
   healthzHandler = () => delayedResponse(3800, () => new Response('late ok', { status: 200 }));
   const readyTimeout = await site('/_gw/ready');
   assert.equal(readyTimeout.status, 503);
+  assert.equal(readyTimeout.headers.get('set-cookie'), null);
   assert.deepEqual(await readyTimeout.json(), { ready: false });
-  healthzHandler = () => new Response('ok', { status: 200 });
+  healthzHandler = () => {
+    const h = new Headers({ 'content-type': 'text/plain; charset=utf-8' });
+    h.append('set-cookie', 'CF_Authorization=should-never-leak; Path=/; Secure; HttpOnly');
+    return new Response('ok', { status: 200, headers: h });
+  };
 
   // Public legal route `/terms` under login_required=true still renders waking interstitial on 503.
   nextApiHandler = () => new Response('cold', { status: 503 });
@@ -1718,4 +1745,379 @@ test('Cold-start waking interstitial and /_gw/ready probe work end-to-end in wor
     assert.equal(resp.status, 502, `${label} must not receive waking interstitial`);
   }
   assert.equal(healthzCalls.length, healthzBeforeBypass);
+
+  // 5. Production regression: `/healthz` returns 200 immediately while first `GET /` takes 2800ms
+  //    (simulating cold PolicyStore sync + Postgres SSR).
+  //    - Initial `GET /` fast-aborts at ~2s into the 503 waking screen.
+  //    - `GET /_gw/ready` returns 200 `{"ready":true}` with `Set-Cookie: __le_gw_wake=1...`
+  //      (and NO `CF_Authorization`).
+  //    - Reloaded `GET /` with `Cookie: __le_gw_wake=1; theme=dark` waits past 2s (`POST_WAKE_TIMEOUT_MS`)
+  //      and returns 200, stripping `__le_gw_wake` before upstream and clearing the cookie in response!
+  let observedUpstreamCookie = null;
+  const regHealthzBefore = healthzCalls.length;
+  nextApiHandler = () =>
+    delayedResponse(2800, () => new Response('<html><body>Slow Cold SSR</body></html>', { status: 200 }));
+  const regInitial = await site('/', { headers: browserNavHeaders });
+  assert.equal(regInitial.status, 503);
+  assert.equal(regInitial.headers.get('content-type'), 'text/html; charset=utf-8');
+  const regWakingHtml = await regInitial.text();
+  await waitForHealthzCount(regHealthzBefore + 1);
+
+  const regReady = await site('/_gw/ready');
+  assert.equal(regReady.status, 200);
+  const regWakeCookieHdr = regReady.headers.get('set-cookie');
+  assert.equal(
+    regWakeCookieHdr,
+    '__le_gw_wake=1; Path=/; Max-Age=30; SameSite=Lax; HttpOnly; Secure'
+  );
+  assert.doesNotMatch(regWakeCookieHdr, /CF_Authorization/i);
+  assert.deepEqual(await regReady.json(), { ready: true });
+
+  const wakePair = regWakeCookieHdr.split(';')[0];
+  assert.equal(wakePair, '__le_gw_wake=1');
+  nextApiHandler = (request) => {
+    observedUpstreamCookie = request.headers.get('cookie');
+    return delayedResponse(
+      2800,
+      () =>
+        new Response('<html><body>Post-Wake SSR OK</body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html; charset=utf-8' },
+        })
+    );
+  };
+  const regReload = await site('/', {
+    headers: {
+      ...browserNavHeaders,
+      cookie: `${wakePair}; theme=dark`,
+    },
+  });
+  assert.equal(regReload.status, 200);
+  assert.equal(await regReload.text(), '<html><body>Post-Wake SSR OK</body></html>');
+  assert.equal(observedUpstreamCookie, 'theme=dark');
+  assert.equal(
+    regReload.headers.get('set-cookie'),
+    '__le_gw_wake=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly; Secure'
+  );
+
+  // 6. Elapsed-time budget deduction in workerd: when SITE_POLICY DO takes 900ms,
+  //    upstream budget shrinks to ~1300ms (2200 - 900), so a 1700ms upstream stalls
+  //    into the 503 waking screen instead of waiting the full 2000ms + 900ms.
+  await policyStub.fetch('https://site-policy/__test/set', {
+    method: 'POST',
+    body: JSON.stringify({ delayMs: 900 }),
+  });
+  try {
+    nextApiHandler = () =>
+      delayedResponse(1700, () => new Response('<html><body>Too Slow</body></html>', { status: 200 }));
+    const t0 = Date.now();
+    const deducted = await site('/', { headers: browserNavHeaders });
+    const elapsed = Date.now() - t0;
+    assert.equal(deducted.status, 503);
+    assert.equal(deducted.headers.get('content-type'), 'text/html; charset=utf-8');
+    assert.ok(
+      elapsed < 2600,
+      `expected total time near ~2.2s with DO latency deducted, got ${elapsed}ms`
+    );
+  } finally {
+    await policyStub.fetch('https://site-policy/__test/set', {
+      method: 'POST',
+      body: JSON.stringify({ delayMs: 0 }),
+    });
+  }
+
+  // 7. Execute the ACTUAL inline <script> extracted from the 503 waking HTML in Node `vm`:
+  //    verify bounded exponential backoff (no 60s freeze!), protected explicit status text,
+  //    8s AbortController fetch timeout recovery, and Retry now behavior.
+  const scriptMatch = regWakingHtml.match(/<script>([\s\S]*?)<\/script>/);
+  assert.ok(scriptMatch, 'waking interstitial HTML must contain inline <script>');
+  const wakingScript = scriptMatch[1];
+  const vm = require('node:vm');
+
+  function createWakingVmHarness({ initialNow = 1_700_000_000_000, storageMap = new Map(), fetchImpl }) {
+    let now = initialNow;
+    let nextTimerId = 1;
+    const timers = new Map();
+    const statusEl = { textContent: 'Starting backend instance…' };
+    const elapsedEl = { textContent: '0s' };
+    const progressEl = { style: { width: '12%' } };
+    const clickListeners = [];
+    const retryBtn = {
+      addEventListener(ev, fn) {
+        if (ev === 'click') clickListeners.push(fn);
+      },
+    };
+    let reloadCount = 0;
+
+    class FakeDate extends Date {
+      constructor(...args) {
+        if (args.length === 0) super(now);
+        else super(...args);
+      }
+      static now() {
+        return now;
+      }
+    }
+
+    const sessionStorage = {
+      getItem: (k) => (storageMap.has(k) ? storageMap.get(k) : null),
+      setItem: (k, v) => storageMap.set(k, String(v)),
+      removeItem: (k) => storageMap.delete(k),
+    };
+
+    const sandbox = {
+      Date: FakeDate,
+      Math,
+      JSON,
+      Promise,
+      AbortController,
+      sessionStorage,
+      document: {
+        getElementById(id) {
+          if (id === 'le-status') return statusEl;
+          if (id === 'le-elapsed') return elapsedEl;
+          if (id === 'le-progress') return progressEl;
+          if (id === 'le-retry') return retryBtn;
+          return null;
+        },
+      },
+      window: {
+        location: {
+          reload() {
+            reloadCount += 1;
+          },
+        },
+      },
+      fetch: fetchImpl,
+      setTimeout(fn, ms) {
+        const id = nextTimerId++;
+        timers.set(id, { id, fn, at: now + Math.max(0, Number(ms) || 0), interval: null });
+        return id;
+      },
+      clearTimeout(id) {
+        timers.delete(id);
+      },
+      setInterval(fn, ms) {
+        const id = nextTimerId++;
+        const period = Math.max(1, Number(ms) || 1);
+        timers.set(id, { id, fn, at: now + period, interval: period });
+        return id;
+      },
+      clearInterval(id) {
+        timers.delete(id);
+      },
+    };
+
+    vm.runInNewContext(wakingScript, sandbox);
+
+    const flushMicrotasks = async () => {
+      for (let i = 0; i < 8; i++) {
+        await Promise.resolve();
+      }
+    };
+
+    const advanceBy = async (deltaMs) => {
+      const target = now + deltaMs;
+      while (true) {
+        let next = null;
+        for (const t of timers.values()) {
+          if (t.at <= target && (!next || t.at < next.at || (t.at === next.at && t.id < next.id))) {
+            next = t;
+          }
+        }
+        if (!next) break;
+        now = next.at;
+        if (next.interval !== null) {
+          next.at = now + next.interval;
+        } else {
+          timers.delete(next.id);
+        }
+        next.fn();
+        await flushMicrotasks();
+      }
+      now = target;
+      await flushMicrotasks();
+    };
+
+    return {
+      statusEl,
+      elapsedEl,
+      progressEl,
+      storageMap,
+      getNow: () => now,
+      getReloadCount: () => reloadCount,
+      clickRetry: async () => {
+        for (const fn of clickListeners) fn();
+        await flushMicrotasks();
+      },
+      advanceBy,
+      flushMicrotasks,
+    };
+  }
+
+  // (a) Bounded exponential backoff (0s -> 2s -> 4s -> 8s -> 12s -> 12s cap), NEVER freezing 60s!
+  const sharedStorage = new Map();
+  let clock = 1_700_000_000_000;
+  const expectedBackoffs = [0, 2000, 4000, 8000, 12000, 12000];
+  for (let attempt = 0; attempt < expectedBackoffs.length; attempt++) {
+    const expectedDelay = expectedBackoffs[attempt];
+    const h = createWakingVmHarness({
+      initialNow: clock,
+      storageMap: sharedStorage,
+      fetchImpl: async () => ({ ok: true, json: async () => ({ ready: true }) }),
+    });
+    await h.advanceBy(1500);
+    if (expectedDelay === 0) {
+      assert.equal(h.getReloadCount(), 1, `attempt ${attempt} should reload immediately`);
+      assert.match(h.statusEl.textContent, /Server is ready/);
+    } else {
+      assert.equal(h.getReloadCount(), 0, `attempt ${attempt} should back off by ${expectedDelay}ms`);
+      assert.equal(
+        h.statusEl.textContent,
+        `Still warming up — retrying in ${expectedDelay / 1000}s…`
+      );
+      await h.advanceBy(expectedDelay - 1);
+      assert.equal(h.getReloadCount(), 0);
+      await h.advanceBy(1);
+      assert.equal(h.getReloadCount(), 1, `attempt ${attempt} must auto-reload after ${expectedDelay}ms`);
+      assert.match(h.statusEl.textContent, /Server is ready/);
+    }
+    // Simulate a brief 200ms reload turnaround before next 503 page arrives
+    clock = h.getNow() + 200;
+  }
+
+  // After rolling window (>25s idle), backoff resets cleanly to 0ms!
+  clock += 26_000;
+  const afterWindow = createWakingVmHarness({
+    initialNow: clock,
+    storageMap: sharedStorage,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ ready: true }) }),
+  });
+  await afterWindow.advanceBy(1500);
+  assert.equal(afterWindow.getReloadCount(), 1);
+
+  // (b) `updateClock()` MUST NEVER overwrite explicit status text even past 15s and 35s!
+  const protectStorage = new Map([
+    ['le_wake_retries', JSON.stringify({ ts: 1_700_000_100_000, count: 4 })],
+  ]);
+  const protectHarness = createWakingVmHarness({
+    initialNow: 1_700_000_100_000,
+    storageMap: protectStorage,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ ready: true }) }),
+  });
+  // First let clock reach 15s while ready=false is NOT yet resolved? Better: wait 1500ms so
+  // explicit status "Still warming up — retrying in 12s…" is set, then verify 1s interval ticks
+  // up to 11s keep it intact AND also verify starting after 16s elapsed keeps it intact past 35s!
+  await protectHarness.advanceBy(1500);
+  assert.equal(protectHarness.statusEl.textContent, 'Still warming up — retrying in 12s…');
+  await protectHarness.advanceBy(11_000);
+  assert.equal(protectHarness.statusEl.textContent, 'Still warming up — retrying in 12s…');
+  assert.equal(protectHarness.elapsedEl.textContent, '12s');
+
+  // Verify explicit status survives crossing both 15s and 35s updateClock thresholds!
+  let allowReady = false;
+  const thresholdStorage = new Map([
+    ['le_wake_retries', JSON.stringify({ ts: 1_700_000_200_000, count: 4 })],
+  ]);
+  const thresholdHarness = createWakingVmHarness({
+    initialNow: 1_700_000_200_000,
+    storageMap: thresholdStorage,
+    fetchImpl: async () => ({ ok: true, json: async () => ({ ready: allowReady }) }),
+  });
+  await thresholdHarness.advanceBy(16_000);
+  assert.match(thresholdHarness.statusEl.textContent, /Almost ready/);
+  // Refresh retry window timestamp so backoff of 12s activates at t=30s (crossing 35s!)
+  thresholdStorage.set('le_wake_retries', JSON.stringify({ ts: thresholdHarness.getNow(), count: 4 }));
+  await thresholdHarness.advanceBy(14_000); // now t=30s
+  allowReady = true;
+  await thresholdHarness.advanceBy(2000); // polls ready -> sets explicit "Still warming up — retrying in 12s…"
+  assert.equal(thresholdHarness.statusEl.textContent, 'Still warming up — retrying in 12s…');
+  await thresholdHarness.advanceBy(10_000); // crosses t=35s -> updateClock MUST NOT overwrite it!
+  assert.equal(thresholdHarness.statusEl.textContent, 'Still warming up — retrying in 12s…');
+  assert.ok(parseInt(thresholdHarness.elapsedEl.textContent, 10) >= 35);
+
+  // (c) Hung `fetch('/_gw/ready')` aborts via AbortController after 8s and resumes polling!
+  let hungFetchCalls = 0;
+  let firstSignal = null;
+  const hungHarness = createWakingVmHarness({
+    initialNow: 1_700_000_300_000,
+    fetchImpl: (_url, opts) => {
+      hungFetchCalls += 1;
+      if (hungFetchCalls === 1) {
+        firstSignal = opts && opts.signal;
+        return new Promise(() => {}); // hangs forever!
+      }
+      return Promise.resolve({ ok: true, json: async () => ({ ready: true }) });
+    },
+  });
+  await hungHarness.advanceBy(1500);
+  assert.equal(hungFetchCalls, 1);
+  assert.ok(firstSignal, 'fetch must receive an AbortSignal');
+  assert.equal(firstSignal.aborted, false);
+  await hungHarness.advanceBy(7999);
+  assert.equal(firstSignal.aborted, false);
+  assert.equal(hungFetchCalls, 1);
+  await hungHarness.advanceBy(1); // 8000ms timeout fires!
+  assert.equal(firstSignal.aborted, true);
+  assert.equal(hungHarness.getReloadCount(), 0);
+  // Polling resumes 2000ms later and reloads cleanly when ready!
+  await hungHarness.advanceBy(2000);
+  assert.equal(hungFetchCalls, 2);
+  assert.equal(hungHarness.getReloadCount(), 1);
+
+  // (d) `Retry now` resets backoff, cancels pending poll timer, probes `/_gw/ready` when not
+  //     yet known ready (setting `__le_gw_wake=1`), and reloads cleanly.
+  const retryStorage = new Map([
+    ['le_wake_retries', JSON.stringify({ ts: 1_700_000_400_000, count: 4 })],
+  ]);
+  let resolveManualProbe = null;
+  const retryFetchUrls = [];
+  const retryHarness = createWakingVmHarness({
+    initialNow: 1_700_000_400_000,
+    storageMap: retryStorage,
+    fetchImpl: (url) => {
+      retryFetchUrls.push(url);
+      return new Promise((resolve) => {
+        resolveManualProbe = () => resolve({ ok: true, json: async () => ({ ready: true }) });
+      });
+    },
+  });
+  // Click Retry now BEFORE initial 1500ms poll fires!
+  await retryHarness.advanceBy(500);
+  assert.equal(retryFetchUrls.length, 0);
+  await retryHarness.clickRetry();
+  assert.equal(retryStorage.has('le_wake_retries'), false, 'Retry now must clear backoff state');
+  assert.equal(retryHarness.statusEl.textContent, 'Checking server…');
+  assert.deepEqual(retryFetchUrls, ['/_gw/ready']);
+  assert.equal(retryHarness.getReloadCount(), 0);
+  // Advancing past the original 1500ms poll timer must NOT trigger a duplicate poll!
+  await retryHarness.advanceBy(1200);
+  assert.equal(retryFetchUrls.length, 1);
+  assert.equal(retryHarness.statusEl.textContent, 'Checking server…');
+  resolveManualProbe();
+  await retryHarness.flushMicrotasks();
+  assert.equal(retryHarness.getReloadCount(), 1);
+  assert.equal(retryStorage.has('le_wake_retries'), false);
+
+  // When serverReady is already true (waiting in backoff), Retry now reloads immediately!
+  const readyRetryStorage = new Map([
+    ['le_wake_retries', JSON.stringify({ ts: 1_700_000_500_000, count: 3 })],
+  ]);
+  let readyRetryFetches = 0;
+  const readyRetryHarness = createWakingVmHarness({
+    initialNow: 1_700_000_500_000,
+    storageMap: readyRetryStorage,
+    fetchImpl: async () => {
+      readyRetryFetches += 1;
+      return { ok: true, json: async () => ({ ready: true }) };
+    },
+  });
+  await readyRetryHarness.advanceBy(1500);
+  assert.equal(readyRetryFetches, 1);
+  assert.equal(readyRetryHarness.getReloadCount(), 0);
+  assert.equal(readyRetryHarness.statusEl.textContent, 'Still warming up — retrying in 8s…');
+  await readyRetryHarness.clickRetry();
+  assert.equal(readyRetryStorage.has('le_wake_retries'), false);
+  assert.equal(readyRetryHarness.getReloadCount(), 1);
+  assert.equal(readyRetryFetches, 1, 'already-ready Retry now should reload without extra probe');
 });
